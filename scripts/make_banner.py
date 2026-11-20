@@ -5,8 +5,7 @@ project icon, a giant zoomed crop of the same icon bleeding off the right edge, 
 and descriptor set in a hand-made bitmap font. Everything (icon, lettering, grid) is defined in this
 file and drawn with Pillow, so the output is reproducible byte for byte and no font file is loaded.
 
-The icon is an hourglass whose sand settles into rising bars, held between two fader tracks with
-their knobs at different settings: time series, adapted.
+The icon is an hourglass whose falling sand settles into three rising bars: time series, tuned.
 
 Pillow is not a project dependency. Run from the repository root:
 
@@ -53,31 +52,30 @@ TEXT_SOFT = rgb("#b6d8fe")
 TEXT_MUTED = rgb("#a3adc6")
 
 # ---------------------------------------------------------------------------------------------
-# Icon: 16 x 21 cells. An hourglass held between two fader tracks whose knobs sit at different
-# settings; the falling sand settles into rising bars.
+# Icon: 14 x 18 cells. A framed hourglass: plates top and bottom, a lit post on the left and a
+# shaded one on the right, two glass bulbs joined by a two-cell neck. A little sand is left in the
+# top bulb, dipping where it drains into the stream; the rest has fallen and settled into three
+# bars that rise from left to right. No columns or parts sit outside the frame.
 # ---------------------------------------------------------------------------------------------
 ICON = [
-    ".BBBBBBBBBBBBBB.",
-    "BSSSSSSSSSSSSSSB",
-    "NBBBBBBBBBBBBBBN",
-    ".N.PPPPPPPPPP.N.",
-    ".N.PWWPPPPPPP.N.",
-    ".N.PWPPPPPPPP.N.",
-    "OOO.PooooooP..N.",
-    "NNN..oooooo...N.",
-    "OOO...oOoo....N.",
-    ".N.....OP.....N.",
-    ".N.....PP.....N.",
-    ".N....POPP...OOO",
-    ".N...PPPPPW..NNN",
-    ".N..PWPOPPPW.OOO",
-    ".N.PWPPPPPOOP.N.",
-    ".N.PPPPOOPOOP.N.",
-    ".N.POOPOOPOOP.N.",
-    ".N.OOOOOOOOOO.N.",
-    "NBBBBBBBBBBBBBBN",
-    "BSSSSSSSSSSSSSSB",
-    ".NNNNNNNNNNNNNN.",
+    "BBBBBBBBBBBBBB",
+    "BSSSSSSSSSSSSB",
+    ".S.PPPPPPPP.B.",
+    ".SPWWPPPPPPPB.",
+    ".SPWPPPPPPPPB.",
+    ".S.PPPPPWWP.B.",
+    ".S..ooPooo..B.",
+    ".S...oOoo...B.",
+    ".S....OP....B.",
+    ".S....OP....B.",
+    ".S...POPP...B.",
+    ".S..PPPPPP..B.",
+    ".S.PPPPPPOO.B.",
+    ".SWPPPOOPOOPB.",
+    ".SPOOPOOPOOPB.",
+    ".S.OOOOOOOO.B.",
+    "BSSSSSSSSSSSSB",
+    "NNNNNNNNNNNNNN",
 ]
 ICON_COLOURS = {
     "N": NAVY,
@@ -156,8 +154,8 @@ def draw_text(img: Image.Image, x: int, y: int, runs: list[tuple[str, Colour]], 
             x += (len(rows[0]) + 1) * scale
 
 
-def draw_icon(img: Image.Image, x: int, y: int, cell: int, first_col: int = 0) -> Image.Image:
-    """Draw the icon with its top-left cell corner at (x, y), skipping columns left of ``first_col``.
+def draw_icon(img: Image.Image, x: int, y: int, cell: int) -> Image.Image:
+    """Draw the icon with its top-left cell corner at (x, y).
 
     Returns a mask of the orange cells, used to put a soft glow on the giant crop.
     """
@@ -166,7 +164,7 @@ def draw_icon(img: Image.Image, x: int, y: int, cell: int, first_col: int = 0) -
     orange_draw = ImageDraw.Draw(orange)
     for cy, row in enumerate(ICON):
         for cx, key in enumerate(row):
-            if key == "." or cx < first_col:
+            if key == ".":
                 continue
             box = (x + cx * cell, y + cy * cell, x + (cx + 1) * cell - 1, y + (cy + 1) * cell - 1)
             draw.rectangle(box, fill=ICON_COLOURS[key])
@@ -215,10 +213,11 @@ def build() -> Image.Image:
     img = background()
 
     # --- layout -------------------------------------------------------------------------------
-    zoom = 64  # size of one icon cell in the giant crop
-    card = 5 * zoom  # the card is one grid cell; a whole number of crop cells keeps edges clean
+    zoom = 56  # size of one icon cell in the giant crop
+    card = 6 * zoom  # the card is one grid cell; a whole number of crop cells keeps edges clean
     card_y = (H - card) // 2
-    cell = 8  # size of one icon cell on the card
+    assert card_y % zoom == 0, "crop rows should line up with the card and the canvas edges"
+    cell = 9  # size of one icon cell on the card
     grid_left, text_x = 56, 96
 
     title_scale, desc_scale, small_scale = 8, 4, 3
@@ -235,7 +234,7 @@ def build() -> Image.Image:
     ]
     text_right = text_x + max(widths)
     card_x = text_right + 72
-    assert W - (card_x + card) >= 5 * zoom, "card leaves too little room for the zoomed crop"
+    assert W - (card_x + card) >= 7 * zoom, "card leaves too little room for the zoomed crop"
 
     # --- grid ---------------------------------------------------------------------------------
     draw = ImageDraw.Draw(img)
@@ -249,17 +248,21 @@ def build() -> Image.Image:
     img.paste(ARC, mask=arc_layer((grid_left - 0.75 * card, card_y - 0.67 * card), card))
 
     # --- giant crop of the icon, bleeding off the right, top and bottom ------------------------
-    # Icon column 8 starts at the card's right edge and the bottom row of the bars (row 16) starts
-    # at the card's bottom edge, so cell edges line up with the card and the rising bars and the
-    # right-hand fader are in view. Columns 0-4 would reach towards the lettering, so the crop
-    # starts at column 5; that edge only shows below the card.
-    origin_x, origin_y = card_x + card - 8 * zoom, card_y + card - 16 * zoom
-    orange = draw_icon(img, origin_x, origin_y, zoom, first_col=5)
-    # A slight warm glow on the big orange blocks, centred on the tallest bar.
+    # A straight zoom of the card's icon, cropped the way a magnifier would: the left post sits
+    # behind the card (visible above and below it), column 3 starts at the card's right edge so the
+    # neck lands in the middle of the open space, and row 8 (the top of the neck) starts at the
+    # card's top edge. That shows the end of the sand in the top bulb, the neck, the rising bars and
+    # the base, with the right half of the glass running off the edge.
+    origin_x, origin_y = card_x + card - 3 * zoom, card_y - 8 * zoom
+    orange = draw_icon(img, origin_x, origin_y, zoom)
+    # A slight warm glow on the big orange blocks, centred on the bars.
     glow_size = 8 * zoom
     glow = ImageChops.invert(Image.radial_gradient("L").resize((glow_size, glow_size), Image.BICUBIC))
     glow_mask = Image.new("L", (W, H), 0)
-    glow_mask.paste(glow.point(lambda v: v * 100 // 255), (origin_x + 11 * zoom - glow_size // 2, origin_y + 14 * zoom))
+    glow_mask.paste(
+        glow.point(lambda v: v * 100 // 255),
+        (origin_x + 7 * zoom - glow_size // 2, origin_y + 14 * zoom - glow_size // 2),
+    )
     img.paste(GLOW, mask=ImageChops.multiply(glow_mask, orange))
 
     # --- card with the icon, then markers on top -------------------------------------------------
