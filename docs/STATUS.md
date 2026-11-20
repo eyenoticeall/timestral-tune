@@ -59,6 +59,7 @@ Full list in spec §12. The ones that affect the next steps:
 
 ## Branch state
 
-See `git log` and `git branch`. The scaffold was merged into `main` by fast-forward and pushed to the
-private `origin` on 2026-11-21. The rest of Phase 0 (loader, device shims, T14) is not done and goes on a
-new branch off `main`.
+See `git log` and `git branch`. `main` is the only branch. The scaffold and the spec rename were merged by
+fast-forward and pushed to the private `origin` on 2026-11-21, and their branches were deleted. Branch
+policy is in `AGENTS.md` §6: work on `main`; branches only for a phase, a new version or a large
+adaptation. The rest of Phase 0 (loader, device shims, T14) is phase work.

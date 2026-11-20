@@ -71,7 +71,7 @@ uv run python scripts/probes/<name>.py    # verification probes (download checkp
 
 **Start:** read the files in §1. Confirm `uv run pytest` and lint are green before you begin.
 
-**During:** work on a branch (§6). Implement against the spec section and acceptance tests named in the
+**During:** work on `main` unless the work qualifies for a branch (§6). Implement against the spec section and acceptance tests named in the
 stub's docstring. Commit in small logical steps.
 
 **End, every session, even if unfinished:**
@@ -84,8 +84,13 @@ stub's docstring. Commit in small logical steps.
 
 ## 6. Commits and branches
 
-- **Branch per unit of work**, off `main`: `phase-1/training-forward`, `fix/collator-padding`,
-  `docs/verification-cuda`. Do not commit directly to `main`.
+- **Work on `main` by default.** Fixes, documentation, tooling and other small or self-contained changes
+  are committed straight to `main`.
+- **Branches are reserved** for three things: a roadmap phase (`phase-1`), a new version (`v0.2`), or a
+  large adaptation that will take many commits and may not land (`adapt/tiled-training`). One branch per
+  such effort, not one per task within it. Keep the number of open branches small.
+- **Close branches out.** When a branch's work is merged, fast-forward `main` where possible and delete the
+  branch. Do not leave merged branches around.
 - **One logical change per commit.** Do not mix a feature with unrelated formatting or docs. Tests for a
   change go in the same commit as the change.
 - **Every commit should pass** `uv run pytest -m "not network"` and lint, so history stays bisectable.
@@ -98,4 +103,4 @@ stub's docstring. Commit in small logical steps.
 - **Documentation updates** from §5 go in their own `docs:` commit at the end of the session, unless a
   spec change is inseparable from the code change it describes.
 - **Re-vendoring** is always its own commit: `build(vendor): re-vendor timestral at <short sha>`.
-- **Do not push, merge to `main`, tag or publish** unless the maintainer asks.
+- **Do not push, merge a branch into `main`, tag or publish** unless the maintainer asks.

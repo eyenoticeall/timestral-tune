@@ -72,6 +72,10 @@ setup-uv actions as targeting a deprecated Node.js version; they still ran.
 is no longer a handoff note but the project's standing specification. References across the repo now say
 "spec". Earlier entries in this log, and older commit messages, use the old name and the word "handoff".
 
+**Branch policy.** The maintainer asked for fewer branches: work on `main`, and reserve branches for
+phases, new versions and large adaptations. `AGENTS.md` §6 was rewritten accordingly (it previously
+required a branch per unit of work), and the two merged branches were deleted.
+
 **Left open.**
 
 - Phase 0 is not finished: loader, device shims and T14 are still stubs.
