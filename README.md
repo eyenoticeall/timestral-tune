@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="assets/banner.png" width="100%"
+       alt="timestral-tune: fine-tuning, selective LoRA and conformal calibration for Timestral time-series models">
+</p>
+
 # timestral-tune
 
 Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
@@ -49,6 +54,7 @@ src/timestral_tune/                  The package (stubs) and the vendored upstre
 tests/                               Scaffold checks and acceptance-test placeholders
 scripts/                             Vendoring, drift check, and verification probes
 papers/                              Reference papers (only the CC BY Timestral paper is tracked)
+assets/                              README banner (drawn by scripts/make_banner.py)
 archive/                             The original draft of the specification
 ```
 
