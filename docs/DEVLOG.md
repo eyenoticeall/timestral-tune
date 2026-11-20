@@ -77,5 +77,5 @@ is no longer a handoff note but the project's standing specification. References
 - Phase 0 is not finished: loader, device shims and T14 are still stubs.
 - The target-frame check (D2) has not been run.
 - The CPU gradient gap is unexplained.
-- Nothing has run on CUDA, on Linux, or on the PyTorch 2.4 floor.
-- CI has never run.
+- Nothing has run on CUDA or on the PyTorch 2.4 floor. Linux has run only the scaffold tests, in CI.
+- The weekly drift job has not had its first scheduled run.

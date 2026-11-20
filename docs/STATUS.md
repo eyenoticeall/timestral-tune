@@ -15,7 +15,7 @@
 | Scaffold tests | 6 pass (Python 3.10 and 3.13, macOS) |
 | Acceptance tests T1–T14 | **0 of 14 implemented.** All 14 are skipped placeholders in `tests/acceptance/` |
 | Verification probes | 4 working probes in `scripts/probes/`; results in `docs/VERIFICATION.md` |
-| CI workflows | Written (`.github/workflows/`); **never run**, because nothing has been pushed |
+| CI | Green on the first run (2026-11-21): lint, build, network-free tests on Python 3.10–3.13, Linux. The weekly drift job is enabled; its first scheduled run is pending |
 | Process docs | `AGENTS.md`, this folder |
 
 ## What has been verified, and where
@@ -28,7 +28,8 @@ Only on one machine (Apple M4, PyTorch 2.15.0, macOS). See `docs/VERIFICATION.md
 - A prototype of the full training step (normalised forward, median-folded frame, pinball loss) runs and
   differentiates on CPU and the Apple GPU.
 
-Not verified anywhere yet: CUDA, Linux, the PyTorch 2.4 floor, the 123M and 209M checkpoints.
+Linux has only run the network-free scaffold tests (in CI). Not verified anywhere yet: CUDA, the PyTorch
+2.4 floor, the 123M and 209M checkpoints.
 
 ## Next steps
 
@@ -39,7 +40,6 @@ In order. Details and exit criteria are in spec §10.
    - `models/device.py`: the float64-on-CPU shims as subclasses (prototype: `install_cpu_offload` in
      `scripts/probes/_common.py`).
    - Implement acceptance test T14 (prototype: `scripts/probes/device_parity.py`).
-   - Push to a remote and get CI green on Python 3.10–3.13.
 2. **Start Phase 1.** `models/forward.py` and tests T1–T3 first (prototype: `norm_forward` in
    `scripts/probes/_common.py`), then the loss (T8), then the data layer (T4–T7, T12).
 3. **Run the target-frame check** (spec §4.3 and §12): pretrained loss and coverage under
@@ -53,12 +53,12 @@ Full list in spec §12. The ones that affect the next steps:
 - **CPU fp32 gradient gap**, cause unknown (`docs/VERIFICATION.md` §6). Compare gradients against the
   float64-weights reference.
 - **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
-- **Not pushed.** The private `origin` remote holds only the initial commit. CI and the weekly drift job do
-  nothing until the work is pushed.
+- **CI actions use a deprecated Node.js version.** GitHub warns that `actions/checkout@v4` and
+  `astral-sh/setup-uv@v5` target Node.js 20. They still run; bump them when newer majors are confirmed.
 - **PyTorch floor.** The spec says 2.4+; everything so far ran on 2.15.0.
 
 ## Branch state
 
-See `git log` and `git branch`. The scaffold was merged into `main` by fast-forward on 2026-11-21. The
-rest of Phase 0 (loader, device shims, T14, first CI run) is not done and goes on a new branch off `main`.
-Nothing has been pushed.
+See `git log` and `git branch`. The scaffold was merged into `main` by fast-forward and pushed to the
+private `origin` on 2026-11-21. The rest of Phase 0 (loader, device shims, T14) is not done and goes on a
+new branch off `main`.

@@ -15,7 +15,7 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - **Packaging.** Hatchling, src layout, version read from `src/timestral_tune/__init__.py`. The wheel
   includes the vendored `LICENSE` and manifest.
 - **Core dependencies** are exactly upstream's four. Dataframe libraries will be extras, added in Phase 1.
-- **Still to do:** `models/loader.py`, `models/device.py`, acceptance test T14, a first CI run.
+- **Still to do:** `models/loader.py`, `models/device.py`, acceptance test T14.
 - **Device shims.** The prototype (`install_cpu_offload`) patches three functions, which also covers
   `_cap_quantiles` because it patches the module-level statistics function. The library version uses
   subclasses and must override four methods: model `scale`, and forecaster `_cap_quantiles`,
@@ -35,3 +35,4 @@ Add dated bullets here as work lands, with the evidence (which tests pass, on wh
 - 2026-11-21: Vendored upstream at `a534bdb`; package skeleton, packaging, scaffold tests, probes, CI
   workflow files and process docs added. Evidence: 6 scaffold tests pass on Python 3.10 and 3.13; wheel
   builds with the vendored licence inside; drift check reports no drift. CI itself has not run.
+- 2026-11-21: Pushed `main`; first CI run green (lint, build, tests on Python 3.10–3.13).
