@@ -58,5 +58,6 @@ Full list in handoff §12. The ones that affect the next steps:
 
 ## Branch state
 
-See `git log` and `git branch`. As of this update, the scaffold lives on the `phase-0/scaffold` branch and
-`main` holds only the initial commit. Nothing has been pushed.
+See `git log` and `git branch`. The scaffold was merged into `main` by fast-forward on 2026-11-21. The
+rest of Phase 0 (loader, device shims, T14, first CI run) is not done and goes on a new branch off `main`.
+Nothing has been pushed.

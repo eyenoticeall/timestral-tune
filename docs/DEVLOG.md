@@ -57,6 +57,9 @@ contains the vendored licence. Drift check: no drift. Probe results: `docs/VERIF
 rule can only hold from the commit that adds the tests onward; earlier commits in the series add the
 specification, vendored code and packaging before any test exists.
 
+**Merge.** At the maintainer's prompt, `phase-0/scaffold` was fast-forwarded into `main`. This merges the
+scaffold only; Phase 0 itself is still open.
+
 **Left open.**
 
 - Phase 0 is not finished: loader, device shims and T14 are still stubs.
