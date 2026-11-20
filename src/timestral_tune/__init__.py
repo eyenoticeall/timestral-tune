@@ -1,12 +1,14 @@
 """timestral-tune: fine-tuning, selective LoRA and conformal calibration for Timestral models.
 
-Status: pre-alpha scaffold. No training, adaptation or calibration functionality is implemented
-yet. See `README.md`, `docs/STATUS.md` and `docs/SPEC.md`.
-
-The public API of spec §7 (`TimestralTrainer`, `TrainingConfig`, `LoraConfig`, ...) is exported
-from here as each piece lands. Until then only `__version__` is exported.
+Status: pre-alpha. Implemented so far: loading on any device, the dataset and collator, the
+normalised-space training forward and loss, and `head_only` training. The LoRA modes, full
+fine-tuning, conformal calibration and export are not built yet. See `README.md`,
+`docs/STATUS.md` and `docs/SPEC.md`.
 """
+
+from .config import TrainingConfig
+from .trainer import TimestralTrainer
 
 __version__ = "0.1.0.dev0"
 
-__all__ = ["__version__"]
+__all__ = ["TimestralTrainer", "TrainingConfig", "__version__"]

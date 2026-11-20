@@ -250,3 +250,41 @@ def role_kwargs(columns: dict[str, np.ndarray]) -> dict[str, object]:
         "categorical_past_covariates": named("cp"),
         "categorical_known_covariates": named("ck"),
     }
+
+
+def make_toy_dataset(patch_size: int, *, series: int = 6, seed: int = 0, covariates: bool = False):
+    """A small training set sized to a model's patch: noisy seasonal series, optionally with covariates.
+
+    Context is 8 patches, horizon 2 patches, and each series yields a handful of windows.
+    """
+    from timestral_tune.data import SeriesData, TimeSeriesDataset
+
+    rng = np.random.default_rng(seed)
+    steps = 16 * patch_size
+    time = np.arange(steps)
+    data = []
+    for index in range(series):
+        period = patch_size * rng.choice([1, 2, 3])
+        driver = rng.standard_normal(steps)
+        values = 20 + 5 * np.sin(2 * np.pi * time / period + rng.uniform(0, 6)) + rng.standard_t(3, steps)
+        if covariates:
+            values = values + 2 * driver
+        empty = np.empty((0, steps))
+        data.append(
+            SeriesData(
+                series_id=f"toy{index}",
+                timestamps=time.astype(np.int64),
+                targets=values[None].astype(np.float32),
+                past=(rng.standard_normal((1, steps)) if covariates else empty).astype(np.float32),
+                known=(driver[None] if covariates else empty).astype(np.float32),
+                categorical_past=empty.astype(np.float64),
+                categorical_known=empty.astype(np.float64),
+            )
+        )
+    return TimeSeriesDataset(
+        data,
+        context_length=8 * patch_size,
+        forecast_horizon=2 * patch_size,
+        stride=2 * patch_size,
+        min_context=8 * patch_size,
+    )
