@@ -15,7 +15,7 @@
 | Scaffold tests | 6 pass (Python 3.10 and 3.13, macOS) |
 | Acceptance tests T1–T14 | **0 of 14 implemented.** All 14 are skipped placeholders in `tests/acceptance/` |
 | Verification probes | 4 working probes in `scripts/probes/`; results in `docs/VERIFICATION.md` |
-| CI workflows | Written (`.github/workflows/`); **never run**, because the repository has no remote |
+| CI workflows | Written (`.github/workflows/`); **never run**, because nothing has been pushed |
 | Process docs | `AGENTS.md`, this folder |
 
 ## What has been verified, and where
@@ -53,7 +53,8 @@ Full list in handoff §12. The ones that affect the next steps:
 - **CPU fp32 gradient gap**, cause unknown (`docs/VERIFICATION.md` §6). Compare gradients against the
   float64-weights reference.
 - **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
-- **No remote.** CI and the weekly drift job do nothing until the repository is pushed.
+- **Not pushed.** The private `origin` remote holds only the initial commit. CI and the weekly drift job do
+  nothing until the work is pushed.
 - **PyTorch floor.** The spec says 2.4+; everything so far ran on 2.15.0.
 
 ## Branch state

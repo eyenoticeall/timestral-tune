@@ -37,7 +37,7 @@ is the project's overview guide and source of truth.
 | Acceptance tests T1–T14 | 0 of 14 implemented; all are skipped placeholders |
 | Scaffold tests | 6 passing (imports, vendoring integrity, a tiny random model) |
 | Verification probes | Working; they reproduce the measurements the specification cites |
-| CI workflows | Written; not yet run, since the repository has no remote |
+| CI workflows | Written; not yet run, since nothing has been pushed |
 
 ## Repository layout
 

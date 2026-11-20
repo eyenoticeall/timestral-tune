@@ -47,7 +47,7 @@ reference, cause unknown. Recorded in handoff §12 and `docs/VERIFICATION.md` §
 - Tests: 6 scaffold checks, 14 skipped acceptance placeholders.
 - Ported the ad-hoc verification scripts into `scripts/probes/` and re-ran them against the vendored code;
   the specification's measured numbers were updated to the reproducible runs.
-- CI and drift workflows written, not run (no remote).
+- CI and drift workflows written, not run (nothing pushed).
 - Process docs: `AGENTS.md` and `docs/`.
 
 **Evidence.** `uv run pytest`: 6 passed, 14 skipped, on Python 3.13 and 3.10. Lint clean. Wheel builds and
@@ -59,6 +59,10 @@ specification, vendored code and packaging before any test exists.
 
 **Merge.** At the maintainer's prompt, `phase-0/scaffold` was fast-forwarded into `main`. This merges the
 scaffold only; Phase 0 itself is still open.
+
+**Correction.** Earlier notes in this session, and the body of the `ci:` commit, say the repository has no
+remote. That was wrong: a private `origin` exists and held only the initial commit. The accurate statement
+is that nothing had been pushed. The docs were corrected; the commit message was left as is.
 
 **Left open.**
 

@@ -558,7 +558,7 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
 - [x] Vendor upstream at the pinned commit with LICENSE and NOTICE; drift-check script (run locally: no drift).
 - [x] Package skeleton of documented stubs; scaffold tests pass on Python 3.10 and 3.13. The `[lacuna]` extra is declared with a 3.11 marker and resolves in the lockfile, but has not been installed or exercised.
 - [x] Verification probes in `scripts/probes/`, with results in `docs/VERIFICATION.md`.
-- [ ] CI green on Python 3.10–3.13 and the weekly drift job running. The workflow files exist but have never run; the repository has no remote yet.
+- [ ] CI green on Python 3.10–3.13 and the weekly drift job running. The workflow files exist but have never run; nothing has been pushed yet.
 - [ ] Checkpoint loader with pinned Hub revisions; config always read from `config.json`.
 - [ ] Device shims for the float64 statistics (§5.4); test T14 on CPU and MPS.
 
