@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Vendored files are hash-checked against a manifest; never normalise their line endings.
+src/timestral_tune/_vendor/** -text

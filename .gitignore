@@ -1,0 +1,23 @@
+# Reference PDFs whose license does not allow redistribution (see papers/README.md)
+papers/*.pdf
+!papers/timestral_arxiv_2610.37585v1.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Local artefacts: trained checkpoints and run outputs are never committed (weights licence, size)
+checkpoints/
+runs/
+*.safetensors
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
