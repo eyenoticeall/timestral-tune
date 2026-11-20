@@ -2,9 +2,9 @@
 
 **Status:** In progress
 **Goal:** Make the repository buildable and the upstream dependency safe, so later phases only add logic.
-**Spec sections:** `timestral_tune_handoff_document.md` §3.5, §5.4 (devices), §6.1 (vendoring), §9 (T14), §10
+**Spec sections:** `docs/SPEC.md` §3.5, §5.4 (devices), §6.1 (vendoring), §9 (T14), §10
 
-The task checklist and exit criteria are in the handoff, §10. This file holds working notes for whoever
+The task checklist and exit criteria are in the spec, §10. This file holds working notes for whoever
 implements the phase. Add to it as you learn things; do not copy the checklist here.
 
 ## Notes for the implementer

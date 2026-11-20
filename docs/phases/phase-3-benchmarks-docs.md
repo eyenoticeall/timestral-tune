@@ -2,9 +2,9 @@
 
 **Status:** Not started
 **Goal:** Evidence that the modes work, defaults backed by sweeps, the Lacuna integration, and a first release.
-**Spec sections:** `timestral_tune_handoff_document.md` §5.3 (forgetting metric), §5.4, §5.5, §7.5, §8, §10, §12
+**Spec sections:** `docs/SPEC.md` §5.3 (forgetting metric), §5.4, §5.5, §7.5, §8, §10, §12
 
-The task checklist and exit criteria are in the handoff, §10. This file holds working notes for whoever
+The task checklist and exit criteria are in the spec, §10. This file holds working notes for whoever
 implements the phase. Add to it as you learn things; do not copy the checklist here.
 
 ## Notes for the implementer
@@ -21,7 +21,7 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 ## Open questions
 
 - Benchmark datasets are not chosen; licences must be checked first.
-- Whether sign-flip augmentation helps (handoff §5.3).
+- Whether sign-flip augmentation helps (spec §5.3).
 
 ## Log of what was done
 

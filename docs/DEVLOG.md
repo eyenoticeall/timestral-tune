@@ -27,7 +27,7 @@ Main findings:
 The original draft is kept at `archive/timestral_tune_handoff_document.v0.md`.
 
 **2. Specification rewrite.**
-Rewrote `timestral_tune_handoff_document.md` on the original's structure, with provenance tags on every claim, a model-facts section,
+Rewrote `docs/SPEC.md` on the original's structure, with provenance tags on every claim, a model-facts section,
 acceptance tests T1–T13, a decisions log (§11) and open risks (§12). Decisions D1–D10 were made here.
 The one resting on interpretation rather than evidence is D2 (the target frame).
 
@@ -63,6 +63,14 @@ scaffold only; Phase 0 itself is still open.
 **Correction.** Earlier notes in this session, and the body of the `ci:` commit, say the repository has no
 remote. That was wrong: a private `origin` exists and held only the initial commit. The accurate statement
 is that nothing had been pushed. The docs were corrected; the commit message was left as is.
+
+**First push and CI.** `main` was pushed to the private `origin`. The first CI run passed: lint, build, and
+the network-free tests on Python 3.10, 3.11, 3.12 and 3.13 (Linux runners). GitHub flagged the checkout and
+setup-uv actions as targeting a deprecated Node.js version; they still ran.
+
+**Rename.** The specification was renamed from `timestral_tune_handoff_document.md` at the repository root to `docs/SPEC.md`, since it
+is no longer a handoff note but the project's standing specification. References across the repo now say
+"spec". Earlier entries in this log, and older commit messages, use the old name and the word "handoff".
 
 **Left open.**
 

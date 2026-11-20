@@ -2,9 +2,9 @@
 
 **Status:** Not started
 **Goal:** Replay and distillation, tiled DHF training, and wider Apple GPU coverage.
-**Spec sections:** `timestral_tune_handoff_document.md` §5.3, §10, decision D1
+**Spec sections:** `docs/SPEC.md` §5.3, §10, decision D1
 
-The task checklist and exit criteria are in the handoff, §10. This file holds working notes for whoever
+The task checklist and exit criteria are in the spec, §10. This file holds working notes for whoever
 implements the phase. Add to it as you learn things; do not copy the checklist here.
 
 ## Notes for the implementer

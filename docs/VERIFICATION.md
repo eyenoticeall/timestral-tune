@@ -1,10 +1,10 @@
 # Verification Record
 
-Measured evidence behind every **[V]** tag in `timestral_tune_handoff_document.md`. Each row names the
+Measured evidence behind every **[V]** tag in `docs/SPEC.md`. Each row names the
 probe that reproduces it. Probes live in `scripts/probes/` and run the released checkpoints through the
 vendored upstream code.
 
-When you add a `[V]` claim to the handoff, add its probe and a row here in the same change.
+When you add a `[V]` claim to the spec, add its probe and a row here in the same change.
 
 ## Environment of the recorded runs
 
@@ -130,14 +130,14 @@ Probe: `uv run python scripts/probes/cpu_gradient_gap.py --size 5M` (and `--size
 Forward outputs on CPU fp32 agree with the reference to about 3e-7, so only the backward pass is affected.
 Replacing the attention call removes the gap inside the model, yet the same call is accurate in isolation.
 In a one-off run, changing only RMSNorm's `rsqrt` to a division by `sqrt` also moved the 5M gap (see §7).
-No single cause is established. Tracked in handoff §12.
+No single cause is established. Tracked in spec §12.
 
 Practical consequence: device gradient checks (acceptance test T14) compare against the float64-weights
 reference, never against CPU fp32.
 
 ## 7. One-off results not covered by a probe
 
-These were measured once in throwaway scripts during the 2026-11-21 session and are cited in the handoff.
+These were measured once in throwaway scripts during the 2026-11-21 session and are cited in the spec.
 They are not reproduced by anything in `scripts/probes/`. Re-measure before relying on them, and move
 them into a probe if they start to matter.
 
@@ -153,5 +153,5 @@ them into a probe if they start to matter.
 ## 8. Facts read from sources, not measured
 
 For completeness, these `[H]` and `[U]` facts were read, not run: the four checkpoints'
-`config.json` values (handoff §3.1), and that the released `quantile_width_factor` is 3.0 while the code
+`config.json` values (spec §3.1), and that the released `quantile_width_factor` is 3.0 while the code
 default is 2.0.

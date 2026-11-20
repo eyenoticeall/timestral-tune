@@ -1,4 +1,4 @@
-"""Loss-mask test (handoff §9, T8).
+"""Loss-mask test (spec §9, T8).
 
 Placeholders only: every test here is skipped until it is implemented. A skipped placeholder is
 not a passing acceptance test. Replace the skip marker when implementing; keep the test name.

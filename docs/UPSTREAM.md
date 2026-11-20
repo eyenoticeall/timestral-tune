@@ -1,7 +1,7 @@
 # Upstream: Pins and Vendoring
 
 `timestral-tune` builds on Mistral AI's official inference package, which is vendored into this repo.
-The decision and its reasons are in the handoff, §6.1 and decision D3.
+The decision and its reasons are in the spec, §6.1 and decision D3.
 
 ## Pins
 
@@ -34,7 +34,7 @@ gets a four-line notice header, as Apache 2.0 requires for modified files.
 The manifest records, per file, the sha256 of the pristine upstream bytes, the sha256 of the vendored
 bytes, and whether it was modified.
 
-**Line numbers.** The handoff cites upstream as `[U file:line]` at the pinned commit. In the five modified
+**Line numbers.** The spec cites upstream as `[U file:line]` at the pinned commit. In the five modified
 vendored files, every line sits **four lines lower** than upstream because of the header. Unmodified files
 match exactly.
 
@@ -45,7 +45,7 @@ match exactly.
 - New behaviour goes outside `_vendor/`: subclass, wrap, or call the vendored functions.
 - Never rename upstream parameters. Exported weights must load in the official package with `strict=True`.
 - If a real change to vendored code ever becomes unavoidable, make it in the script (so it is repeatable),
-  extend the notice header to describe it, and record the decision in handoff §11.
+  extend the notice header to describe it, and record the decision in spec §11.
 
 ## Checking for drift
 
@@ -69,7 +69,7 @@ Last checked 2026-11-21: no drift (upstream `main` was still the pinned commit).
 3. Run the full test suite. Forward-parity tests (T1–T3) and the export round-trip (T11) are the ones
    that prove nothing we depend on changed.
 4. Re-run the probes and update `docs/VERIFICATION.md` if any number moves.
-5. Update the pins table above and in the handoff header, and fix any `[U file:line]` references that moved.
+5. Update the pins table above and in the spec header, and fix any `[U file:line]` references that moved.
 6. Commit as its own commit: `build(vendor): re-vendor timestral at <short sha>`.
 
 If Mistral publishes new checkpoint revisions, update the Hub pins the same way and re-run the probes.

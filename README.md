@@ -24,7 +24,7 @@ with a ladder of increasingly invasive options:
 Design goals: reproduce the paper's objective, masks and normalisation exactly and prove it with tests
 against the official code; export checkpoints that load in the official package; make runs auditable.
 
-The full design is in **[timestral_tune_handoff_document.md](timestral_tune_handoff_document.md)**, which
+The full design is in **[docs/SPEC.md](docs/SPEC.md)**, which
 is the project's overview guide and source of truth.
 
 ## What exists today
@@ -42,9 +42,9 @@ is the project's overview guide and source of truth.
 ## Repository layout
 
 ```
-timestral_tune_handoff_document.md   Specification and overview guide (start here)
+docs/SPEC.md                         Specification and overview guide (start here)
 AGENTS.md                            How to work in this repo: rules, commands, commit conventions
-docs/                                Status, development log, verification record, upstream notes, phase notes
+docs/                                Also: status, development log, verification record, upstream and phase notes
 src/timestral_tune/                  The package (stubs) and the vendored upstream code in _vendor/
 tests/                               Scaffold checks and acceptance-test placeholders
 scripts/                             Vendoring, drift check, and verification probes

@@ -1,4 +1,4 @@
 """Loss functions.
 
-See handoff §4.
+See spec §4.
 """

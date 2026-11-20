@@ -1,4 +1,4 @@
-"""LoRA adapter tests (handoff §9, T9-T10).
+"""LoRA adapter tests (spec §9, T9-T10).
 
 Placeholders only: every test here is skipped until it is implemented. A skipped placeholder is
 not a passing acceptance test. Replace the skip marker when implementing; keep the test name.

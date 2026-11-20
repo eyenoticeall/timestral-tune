@@ -31,7 +31,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Optional Lacuna integration (handoff §7.5). Lacuna itself requires Python 3.11+.
+# Optional Lacuna integration (spec §7.5). Lacuna itself requires Python 3.11+.
 lacuna = ["lacuna-quant>=0.14.1; python_version >= '3.11'"]
 
 [dependency-groups]
@@ -44,13 +44,13 @@ path = "src/timestral_tune/__init__.py"
 packages = ["src/timestral_tune"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "scripts", "docs", "README.md", "NOTICE", "LICENSE", "timestral_tune_handoff_document.md"]
+include = ["src", "tests", "scripts", "docs", "README.md", "NOTICE", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
-    "acceptance: one of the acceptance tests T1-T14 from handoff §9",
+    "acceptance: one of the acceptance tests T1-T14 from spec §9",
     "network: needs to download released checkpoints from the Hugging Face Hub",
 ]
 

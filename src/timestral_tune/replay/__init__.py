@@ -1,4 +1,4 @@
 """Anti-forgetting: replay sources and distillation (stretch scope).
 
-See handoff §5.3.
+See spec §5.3.
 """

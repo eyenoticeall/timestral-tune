@@ -2,9 +2,9 @@
 
 **Status:** Not started
 **Goal:** A training forward pass and loss that provably match upstream inference, a leak-free data layer, and the first end-to-end `head_only` run.
-**Spec sections:** `timestral_tune_handoff_document.md` §3.3, §3.4, §4, §6.2, §6.3, §9 (T1–T8, T12), §10
+**Spec sections:** `docs/SPEC.md` §3.3, §3.4, §4, §6.2, §6.3, §9 (T1–T8, T12), §10
 
-The task checklist and exit criteria are in the handoff, §10. This file holds working notes for whoever
+The task checklist and exit criteria are in the spec, §10. This file holds working notes for whoever
 implements the phase. Add to it as you learn things; do not copy the checklist here.
 
 ## Notes for the implementer
@@ -19,7 +19,7 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - **Perturbation tests** need non-constant noise (see `docs/DEVELOPMENT.md`).
 - **Target-frame check.** Compare the pretrained model's normalised pinball loss and interval coverage
   under `median_folded` and `true_values` on horizons longer than one patch. Record the outcome in
-  handoff §4.3 and §12, and revise decision D2 if `true_values` is clearly better.
+  spec §4.3 and §12, and revise decision D2 if `true_values` is clearly better.
 
 ## Open questions
 

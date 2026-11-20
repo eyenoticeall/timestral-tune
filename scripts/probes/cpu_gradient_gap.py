@@ -1,4 +1,4 @@
-"""Probe: the unexplained CPU fp32 gradient gap (handoff §12).
+"""Probe: the unexplained CPU fp32 gradient gap (spec §12).
 
     uv run python scripts/probes/cpu_gradient_gap.py            # 5M
     uv run python scripts/probes/cpu_gradient_gap.py --size 28M

@@ -5,7 +5,7 @@ samples.
 
 Status: not implemented (scaffold only).
 
-- Spec: `timestral_tune_handoff_document.md` §5.3
+- Spec: `docs/SPEC.md` §5.3
 - Roadmap phase: 4
 - Acceptance tests: none yet
 - Planned public names: `distillation_loss`

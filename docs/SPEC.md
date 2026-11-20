@@ -1,4 +1,4 @@
-# `timestral-tune` — Project Specification & Technical Handoff
+# `timestral-tune` — Project Specification
 
 > **Repository Name:** `timestral-tune`
 > **Tagline:** Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
@@ -6,6 +6,7 @@
 > **Target Python Version:** 3.10+ (PyTorch 2.4+), matching upstream. The optional Lacuna integration needs 3.11+.
 > **Devices (v0.1):** CUDA, CPU, and Apple GPU (MPS, fp32 only; see §5.4).
 > **Spec revision:** 4, dated 2026-11-21, describing library release v0.1. The original draft is kept at `archive/timestral_tune_handoff_document.v0.md`.
+> **File name:** this document was `timestral_tune_handoff_document.md` at the repository root until 2026-11-21; older commit messages use that name.
 > **Working in this repo:** start with `AGENTS.md`; current state is in `docs/STATUS.md`.
 
 ### How to read this document

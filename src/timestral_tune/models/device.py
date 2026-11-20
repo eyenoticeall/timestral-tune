@@ -7,7 +7,7 @@ the same idea lives in `scripts/probes/_common.py`.
 
 Status: not implemented (scaffold only).
 
-- Spec: `timestral_tune_handoff_document.md` §3.5, §5.4
+- Spec: `docs/SPEC.md` §3.5, §5.4
 - Roadmap phase: 0
 - Acceptance tests: T14
 - Planned public names: `TuneTimestralModel`, `TuneTimestralForecaster`

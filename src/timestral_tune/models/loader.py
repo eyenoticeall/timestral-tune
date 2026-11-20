@@ -6,7 +6,7 @@ hyperparameters from the checkpoint's `config.json`, and returns the device-shim
 
 Status: not implemented (scaffold only).
 
-- Spec: `timestral_tune_handoff_document.md` §3.1, §5.4, §7.2
+- Spec: `docs/SPEC.md` §3.1, §5.4, §7.2
 - Roadmap phase: 0
 - Acceptance tests: T11, T14
 - Planned public names: `load_model`, `load_forecaster`

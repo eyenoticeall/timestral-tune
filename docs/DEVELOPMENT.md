@@ -1,7 +1,7 @@
 # Development Guide
 
 Practical reference for working in this repository. Rules and commit conventions are in `AGENTS.md`;
-design is in `timestral_tune_handoff_document.md`.
+design is in `docs/SPEC.md`.
 
 ## Setup
 
@@ -43,7 +43,7 @@ src/timestral_tune/
   utils/                 Metrics and verifiers
 tests/
   test_scaffold.py       Network-free checks of the scaffold itself
-  acceptance/            T1–T14 from handoff §9
+  acceptance/            T1–T14 from spec §9
 scripts/
   vendor_upstream.py     Regenerates _vendor/timestral
   check_upstream_drift.py
@@ -60,7 +60,7 @@ names. Start there when implementing a module.
    the `@NOT_IMPLEMENTED` marker, keep the test's name and docstring.
 3. Implement against the vendored code. Import from `timestral_tune._vendor.timestral`, never from a
    top-level `timestral`.
-4. Export new public names from the subpackage `__init__.py` and, when they are part of handoff §7, from
+4. Export new public names from the subpackage `__init__.py` and, when they are part of spec §7, from
    `timestral_tune/__init__.py`.
 5. Update the stub's "Status" line, then follow the end-of-session steps in `AGENTS.md`.
 
@@ -74,7 +74,7 @@ shims). They are prototypes: the library versions must not monkeypatch the vendo
 - **Acceptance tests** (`tests/acceptance/`) are the definition of done. Each carries the `acceptance`
   marker. Most need released checkpoints; mark those `network` so CI can exclude them.
 - **Tests that need a checkpoint** should use the smallest one that proves the point (5M), at its pinned
-  Hub revision, and repeat on 28M where the handoff asks for it.
+  Hub revision, and repeat on 28M where the spec asks for it.
 - **Tolerance.** Compare forward results with a relative tolerance, and gradients against the
   float64-weights reference, not against CPU fp32 (see `docs/VERIFICATION.md` §6).
 - **Perturbation tests** must use non-constant noise. A constant offset is absorbed by the normalisation
@@ -84,7 +84,7 @@ shims). They are prototypes: the library versions must not monkeypatch the vendo
 ## Devices
 
 - CPU works everywhere.
-- The Apple GPU needs the float64 statistics to run on CPU and supports fp32 only (handoff §5.4).
+- The Apple GPU needs the float64 statistics to run on CPU and supports fp32 only (spec §5.4).
 - CUDA is planned as the main training target but has not been exercised yet.
 
 ## Probes

@@ -1,4 +1,4 @@
-"""Leakage and point-in-time tests on the training forward (handoff §9, T4-T7 and T12).
+"""Leakage and point-in-time tests on the training forward (spec §9, T4-T7 and T12).
 
 Perturbations must be non-constant noise: a constant offset is absorbed by the normalisation
 and would make a firewall test pass vacuously.

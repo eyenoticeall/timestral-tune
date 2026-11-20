@@ -6,7 +6,7 @@ ratios.
 
 Status: not implemented (scaffold only).
 
-- Spec: `timestral_tune_handoff_document.md` §7.5
+- Spec: `docs/SPEC.md` §7.5
 - Roadmap phase: 3
 - Acceptance tests: none yet
 - Planned public names: `LacunaExporter`, `write_signal_frame`

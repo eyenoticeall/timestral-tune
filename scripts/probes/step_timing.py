@@ -1,4 +1,4 @@
-"""Probe: time one full training step on CPU and on another device (handoff §5.4).
+"""Probe: time one full training step on CPU and on another device (spec §5.4).
 
     uv run python scripts/probes/step_timing.py --device mps
     uv run python scripts/probes/step_timing.py --device mps --sizes 5M 28M --batch 32
@@ -6,7 +6,7 @@
 The step is the real one: normalised forward, median-folded target frame (with its CPU round
 trip), pinball loss on target rows, backward, AdamW update. Context 1,024 steps, horizon 96.
 Reports the median of the steps after the first. Results depend on the machine; the ones behind
-the handoff document are recorded in docs/VERIFICATION.md.
+the specification are recorded in docs/VERIFICATION.md.
 """
 
 from __future__ import annotations

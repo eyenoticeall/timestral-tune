@@ -1,7 +1,7 @@
-"""Device parity (handoff §9, T14).
+"""Device parity (spec §9, T14).
 
 A prototype of this check is `scripts/probes/device_parity.py`. Compare gradients against the
-float64-weights reference, not against CPU fp32 (see handoff §12 and docs/VERIFICATION.md).
+float64-weights reference, not against CPU fp32 (see spec §12 and docs/VERIFICATION.md).
 
 Placeholders only: every test here is skipped until it is implemented. A skipped placeholder is
 not a passing acceptance test. Replace the skip marker when implementing; keep the test name.

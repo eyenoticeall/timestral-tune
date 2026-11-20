@@ -1,4 +1,4 @@
-"""Probe: does a non-CPU device reproduce CPU forecasts and accurate gradients? (handoff §5.4, T14)
+"""Probe: does a non-CPU device reproduce CPU forecasts and accurate gradients? (spec §5.4, T14)
 
     uv run python scripts/probes/device_parity.py --device mps            # 5M
     uv run python scripts/probes/device_parity.py --device mps --size 28M

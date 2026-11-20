@@ -6,7 +6,7 @@ cutoff plus an embargo of at least one forecast horizon.
 
 Status: not implemented (scaffold only).
 
-- Spec: `timestral_tune_handoff_document.md` §6.2, §6.3, §7.1
+- Spec: `docs/SPEC.md` §6.2, §6.3, §7.1
 - Roadmap phase: 1
 - Acceptance tests: T5, T12
 - Planned public names: `TimeSeriesDataset`

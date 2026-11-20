@@ -6,7 +6,7 @@ source, distillation weight).
 
 Status: not implemented (scaffold only).
 
-- Spec: `timestral_tune_handoff_document.md` §5 (modes), §5.1 (LoRA), §5.3 (replay), §5.4 (trainer), §7.1 (API example)
+- Spec: `docs/SPEC.md` §5 (modes), §5.1 (LoRA), §5.3 (replay), §5.4 (trainer), §7.1 (API example)
 - Roadmap phase: 1 (TrainingConfig), 2 (LoraConfig), 4 (ReplayConfig)
 - Acceptance tests: none directly; exercised by all
 - Planned public names: `TrainingConfig`, `LoraConfig`, `ReplayConfig`

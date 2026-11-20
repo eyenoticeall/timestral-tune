@@ -1,4 +1,4 @@
 """Training loop and callbacks.
 
-See handoff §5.4.
+See spec §5.4.
 """

@@ -1,4 +1,4 @@
-"""Forward and frame parity with upstream inference (handoff §9, T1-T3).
+"""Forward and frame parity with upstream inference (spec §9, T1-T3).
 
 Placeholders only: every test here is skipped until it is implemented. A skipped placeholder is
 not a passing acceptance test. Replace the skip marker when implementing; keep the test name.

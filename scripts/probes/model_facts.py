@@ -1,4 +1,4 @@
-"""Probe: structural and behavioural facts about the released checkpoints (handoff §3, §5.1, §9).
+"""Probe: structural and behavioural facts about the released checkpoints (spec §3, §5.1, §9).
 
     uv run python scripts/probes/model_facts.py              # 5M
     uv run python scripts/probes/model_facts.py --size 28M

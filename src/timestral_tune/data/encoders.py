@@ -5,7 +5,7 @@ Per-window, context-only target encoding that reuses the vendored
 
 Status: not implemented (scaffold only).
 
-- Spec: `timestral_tune_handoff_document.md` §6.3 rule 4
+- Spec: `docs/SPEC.md` §6.3 rule 4
 - Roadmap phase: 1
 - Acceptance tests: T12
 - Planned public names: `encode_categorical_window`

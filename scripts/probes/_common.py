@@ -1,6 +1,6 @@
 """Shared helpers for the verification probes.
 
-The probes are the evidence behind every **[V]** tag in the handoff document. They run the
+The probes are the evidence behind every **[V]** tag in the specification. They run the
 released checkpoints through the vendored upstream code, so they need network access to the
 Hugging Face Hub the first time. Results are recorded in docs/VERIFICATION.md.
 
@@ -9,7 +9,7 @@ Two things here are prototypes of library code that does not exist yet:
 - `install_cpu_offload` monkeypatches the vendored modules so that the float64 statistics run on
   CPU. The library version (`timestral_tune/models/device.py`) will use subclasses instead.
 - `norm_forward` and `real_loss` are a working sketch of the training forward and loss of
-  handoff §4. The library version is `timestral_tune/models/forward.py`.
+  spec §4. The library version is `timestral_tune/models/forward.py`.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from timestral_tune._vendor.timestral.masks import (
 )
 from timestral_tune._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET, TimestralModel
 
-# Hub revisions pinned in the handoff document.
+# Hub revisions pinned in the specification.
 REVISIONS = {
     "5M": "bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f",
     "28M": "49b26409ac87b5935539a5d8ffe7f397b720db47",
@@ -170,7 +170,7 @@ def norm_forward(
 
 
 def real_loss(model: TimestralModel, batch, device: str, double: bool = False) -> Tensor:
-    """The training step of handoff §4: normalised forward, median-folded frame, pinball on targets.
+    """The training step of spec §4: normalised forward, median-folded frame, pinball on targets.
 
     The frame statistics are computed on CPU in float64 with gradients stopped, as the spec requires.
     With `double`, inputs are float64 (for the float64-weights reference; the model must be `.double()`).

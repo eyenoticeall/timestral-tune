@@ -1,4 +1,4 @@
-"""Export round-trip (handoff §9, T11).
+"""Export round-trip (spec §9, T11).
 
 Placeholders only: every test here is skipped until it is implemented. A skipped placeholder is
 not a passing acceptance test. Replace the skip marker when implementing; keep the test name.

@@ -2,9 +2,9 @@
 
 **Status:** Not started
 **Goal:** All five adaptation modes, both conformal calibrators, and exports that load in the official package.
-**Spec sections:** `timestral_tune_handoff_document.md` §3.2, §5.1, §5.2, §7.3, §7.4, §9 (T9–T11, T13), §10
+**Spec sections:** `docs/SPEC.md` §3.2, §5.1, §5.2, §7.3, §7.4, §9 (T9–T11, T13), §10
 
-The task checklist and exit criteria are in the handoff, §10. This file holds working notes for whoever
+The task checklist and exit criteria are in the spec, §10. This file holds working notes for whoever
 implements the phase. Add to it as you learn things; do not copy the checklist here.
 
 ## Notes for the implementer
@@ -15,7 +15,7 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
   upstream names. T11 guards this.
 - **Single-row guard** is measured, not theoretical: query and key perturbations change nothing on
   univariate input.
-- **Conformal formulas** are quoted from the papers in handoff §5.2; the PDFs are in `papers/` locally.
+- **Conformal formulas** are quoted from the papers in spec §5.2; the PDFs are in `papers/` locally.
 - **`config.json` must stay byte-compatible** with upstream; metadata goes in `tune_metadata.json`.
 
 ## Open questions
