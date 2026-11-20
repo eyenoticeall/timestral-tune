@@ -35,7 +35,13 @@ dependencies = [
 lacuna = ["lacuna-quant>=0.14.1; python_version >= '3.11'"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = [
+    "pandas>=2.3.3",
+    "polars>=2.0.0",
+    "pyarrow>=25.0.1",
+    "pytest>=8",
+    "ruff>=0.6",
+]
 
 [tool.hatch.version]
 path = "src/timestral_tune/__init__.py"

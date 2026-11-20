@@ -167,3 +167,86 @@ def l2_rel(actual: Tensor, expected: Tensor) -> float:
     """Relative L2 difference."""
     actual, expected = actual.detach().cpu().double(), expected.detach().cpu().double()
     return ((actual - expected).norm() / expected.norm().clamp_min(1e-300)).item()
+
+
+FRAME_KINDS = ("pandas", "polars", "arrow")
+
+
+def make_columns(
+    seed: int,
+    *,
+    series: int = 3,
+    steps: int = 60,
+    targets: int = 1,
+    past: int = 0,
+    known: int = 0,
+    categorical_past: int = 0,
+    categorical_known: int = 0,
+    missing: float = 0.05,
+) -> dict[str, np.ndarray]:
+    """Long-format columns: `id`, hourly `time`, targets `y*`, numeric `p*` / `k*`, categorical `cp*` / `ck*`.
+
+    Missing values are NaN in numeric columns and None in categorical ones. Every series is complete
+    (no absent time steps) and has `steps` rows.
+    """
+    rng = np.random.default_rng(seed)
+    rows = series * steps
+    start = np.datetime64("2024-01-01T00:00", "us")
+    columns: dict[str, np.ndarray] = {
+        "id": np.repeat(np.array([f"s{i}" for i in range(series)], dtype=object), steps),
+        "time": np.tile(start + np.arange(steps) * np.timedelta64(1, "h"), series),
+    }
+
+    def numeric(walk: bool) -> np.ndarray:
+        noise = rng.standard_normal((series, steps))
+        values = (noise.cumsum(-1) * 3 + 100 if walk else noise).reshape(rows)
+        values[rng.random(rows) < missing] = np.nan
+        return values
+
+    for i in range(targets):
+        columns[f"y{i}"] = numeric(walk=True)
+    for i in range(past):
+        columns[f"p{i}"] = numeric(walk=False)
+    for i in range(known):
+        columns[f"k{i}"] = numeric(walk=False)
+    labels = np.array(["a", "b", "c", "d"], dtype=object)
+    for prefix, count in (("cp", categorical_past), ("ck", categorical_known)):
+        for i in range(count):
+            values = labels[rng.integers(0, len(labels), rows)]
+            values[rng.random(rows) < missing] = None
+            columns[f"{prefix}{i}"] = values
+    return columns
+
+
+def to_frame(columns: dict[str, np.ndarray], kind: str):
+    """`columns` as a pandas or polars DataFrame, or a pyarrow Table."""
+    if kind == "pandas":
+        import pandas
+
+        return pandas.DataFrame(columns)
+    if kind == "polars":
+        import polars
+
+        return polars.DataFrame({name: list(v) if v.dtype == object else v for name, v in columns.items()})
+    if kind == "arrow":
+        import pyarrow
+
+        return pyarrow.table({name: list(v) if v.dtype == object else v for name, v in columns.items()})
+    raise ValueError(kind)
+
+
+def role_kwargs(columns: dict[str, np.ndarray]) -> dict[str, object]:
+    """The `from_frame` role arguments for columns made by `make_columns`."""
+
+    def named(prefix: str) -> list[str]:
+        return sorted(name for name in columns if name.rstrip("0123456789") == prefix)
+
+    return {
+        "id_col": "id",
+        "time_col": "time",
+        "target_cols": named("y"),
+        "past_covariates": named("p"),
+        "known_covariates": named("k"),
+        "categorical_past_covariates": named("cp"),
+        "categorical_known_covariates": named("ck"),
+    }

@@ -2,3 +2,21 @@
 
 See spec §6.2 (data contract) and §6.3 (point-in-time rules).
 """
+
+from .batch import TrainingBatch
+from .collator import DHFDataCollator, Window
+from .dataset import ColumnRoles, SeriesData, TimeSeriesDataset, WindowStats
+from .encoders import encode_categorical_window, encoding_target, forward_fill
+
+__all__ = [
+    "ColumnRoles",
+    "DHFDataCollator",
+    "SeriesData",
+    "TimeSeriesDataset",
+    "TrainingBatch",
+    "Window",
+    "WindowStats",
+    "encode_categorical_window",
+    "encoding_target",
+    "forward_fill",
+]
