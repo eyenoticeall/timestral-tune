@@ -1,0 +1,35 @@
+timestral-tune
+Copyright 2026 The timestral-tune contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------------
+Third-party software
+------------------------------------------------------------------------------
+
+This product includes software developed by Mistral AI:
+
+  timestral — https://github.com/mistralai/timestral
+  Commit a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff
+  Licensed under the Apache License, Version 2.0.
+
+A copy is vendored at src/timestral_tune/_vendor/timestral/. It was modified in one
+way only: absolute `timestral.*` imports were rewritten to relative imports, and a
+notice header was added to each file changed. The files, their upstream hashes and
+which ones were modified are listed in VENDOR_MANIFEST.json in that directory. The
+upstream licence text is included there as LICENSE.
+
+------------------------------------------------------------------------------
+Independence and model weights
+------------------------------------------------------------------------------
+
+timestral-tune is an independent community project. It is not affiliated with,
+sponsored by, or endorsed by Mistral AI. "Timestral", its architecture and its
+model weights are Mistral AI's.
+
+No model weights are part of this software or distributed with it. Timestral weights
+are downloaded by the user from the Hugging Face Hub and are governed by Mistral AI's
+Modified MIT License, which is separate from, and more restrictive than, the licence
+of this software. In particular it withholds all rights from anyone whose company had
+global consolidated revenue above $20 million in the preceding month, and it applies
+to derivatives, including fine-tuned weights produced with this software.

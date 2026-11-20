@@ -1,0 +1,58 @@
+{
+  "repo": "mistralai/timestral",
+  "commit": "a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff",
+  "upstream_package_dir": "src/timestral",
+  "modification": "absolute `timestral.*` imports rewritten to relative imports; notice header added",
+  "files": {
+    "__init__.py": {
+      "upstream_sha256": "46777bcb15b903f7721a3d6d91a6cb93463fc454816da238799eb8d5360e5ab5",
+      "vendored_sha256": "8798f0ada12678a25311cdd7656b08adcabe52a9eb97abf3c7d14eba7ccf4b20",
+      "modified": true
+    },
+    "config.py": {
+      "upstream_sha256": "d46e37020875c536e7a75e1b6ace3f67419ba2f2c9d9e8465f4b07f837e92ed6",
+      "vendored_sha256": "d46e37020875c536e7a75e1b6ace3f67419ba2f2c9d9e8465f4b07f837e92ed6",
+      "modified": false
+    },
+    "covariate_encoding.py": {
+      "upstream_sha256": "1c7f5c320fa4b7622d3705f765f53ab9676b829cb1d4fd68f839ec593b8404c0",
+      "vendored_sha256": "1c7f5c320fa4b7622d3705f765f53ab9676b829cb1d4fd68f839ec593b8404c0",
+      "modified": false
+    },
+    "forecaster.py": {
+      "upstream_sha256": "12a712f9be777d1e160513b7f8c81d545b991fcfe6cd4a46004a03533b7cb8fd",
+      "vendored_sha256": "93bd3cae449e0d1416fb1133f6938a5520e254e23338eccd6389b0254be83d42",
+      "modified": true
+    },
+    "layers.py": {
+      "upstream_sha256": "480ba93e7e3681dea185e5fa08a96dcce327cf938931c715ae54e6b02934527d",
+      "vendored_sha256": "5f3fc080937ba76080399ae9d49614c71deba7c0f5f2facac860ed01c5e370a8",
+      "modified": true
+    },
+    "loading.py": {
+      "upstream_sha256": "179257fa74e798c207887e2fed162e9a2fef9c37cadadb9437fabfeae68b3d6f",
+      "vendored_sha256": "4d9e267cfdb2fea853158bcd07b8737c7f917f177a74534aa6386521749442d6",
+      "modified": true
+    },
+    "masks.py": {
+      "upstream_sha256": "1792898d809b99034bb70e2cc1ab74f897ce8478886f83140e705fc67e6762b3",
+      "vendored_sha256": "1792898d809b99034bb70e2cc1ab74f897ce8478886f83140e705fc67e6762b3",
+      "modified": false
+    },
+    "model.py": {
+      "upstream_sha256": "988121c6a089e843c4941732cbc5c64b10cb0eccd9310e228abe38ecf2dfb668",
+      "vendored_sha256": "be2c81cfe35e17925b1e94d0c76571111b9a9fbb48111f015c9570616ff25e3c",
+      "modified": true
+    },
+    "scaler.py": {
+      "upstream_sha256": "838da836f70b1640bcaed7701a70a1a358e30442693e63522a93f878e157a8ca",
+      "vendored_sha256": "838da836f70b1640bcaed7701a70a1a358e30442693e63522a93f878e157a8ca",
+      "modified": false
+    },
+    "LICENSE": {
+      "upstream_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "vendored_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "modified": false
+    }
+  }
+}
