@@ -544,6 +544,7 @@ def test_incompatible_datasets_and_models_are_rejected_at_construction(tiny_fore
         {"batch_size": np.bool_(True)},
         {"max_steps": np.float64(3.0)},
         {"cache_frozen_features": "yes"},
+        {"sign_flip": "yes"},
         {"compile_model": 1},
         {"compile_mode": "max-autotune"},
     ],
@@ -984,3 +985,64 @@ def test_trainer_resumes_from_load_lora_and_rejects_mismatched_pre_injected_mode
         TimestralTrainer(
             fixed_batch_config(dataset, "cpu", mode="head_only", max_steps=1), dataset, model=resumed_model
         )
+
+
+def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny_forecaster):
+    from timestral_tune.data import flip_batch_signs
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, series=4, covariates=True)
+    batch = dataset.collator(tiny_forecaster.model.config)([dataset[i] for i in range(6)])
+
+    # p=1.0 negates all values while preserving masks, roles, and group_ids.
+    neg = flip_batch_signs(batch, p=1.0)
+    assert torch.equal(neg.context, -batch.context)
+    assert torch.equal(neg.targets, -batch.targets)
+    assert batch.known_future is not None and neg.known_future is not None
+    assert torch.equal(neg.known_future, -batch.known_future)
+    assert torch.equal(neg.context_mask, batch.context_mask) and torch.equal(neg.loss_weight, batch.loss_weight)
+
+    # Random flip preserves within-series sign coherence and is deterministic for a seed.
+    f1 = flip_batch_signs(batch, torch.Generator().manual_seed(7))
+    f2 = flip_batch_signs(batch, torch.Generator().manual_seed(7))
+    assert torch.equal(f1.context, f2.context)
+    rows_per = dataset.rows_per_series
+    for s in range(6):
+        sl = slice(s * rows_per, (s + 1) * rows_per)
+        same = torch.equal(f1.context[sl], batch.context[sl])
+        flipped = torch.equal(f1.context[sl], -batch.context[sl])
+        assert same or flipped, "rows within one series got inconsistent signs"
+
+    # With sign_flip=True in head_only, training bypasses the frozen-feature cache while validation still caches.
+    train, val = dataset.split_by_time(12 * tiny_forecaster.patch_size)
+    model = fresh_model(tiny_forecaster)
+    cfg = config_for(
+        "cpu",
+        mode="head_only",
+        batch_size=len(train),
+        max_steps=3,
+        learning_rate=1e-2,
+        sign_flip=True,
+        cache_frozen_features=True,
+        shuffle=False,
+    )
+    trainer = TimestralTrainer(cfg, train, val, model=model)
+    assert trainer._get_head_cache(train) is None
+    assert trainer._get_head_cache(val) is not None
+
+    # Training with sign_flip=True is deterministic for a seed in LoRA too.
+    states = []
+    for _ in range(2):
+        m = fresh_model(tiny_forecaster)
+        c = config_for(
+            "cpu",
+            mode="lora_variate",
+            batch_size=len(train),
+            max_steps=4,
+            learning_rate=1e-2,
+            sign_flip=True,
+            seed=5,
+        )
+        TimestralTrainer(c, train, model=m).fit()
+        states.append(merged_state_dict(m))
+    for k in states[0]:
+        assert torch.equal(states[0][k], states[1][k]), f"sign_flip diverged on {k}"

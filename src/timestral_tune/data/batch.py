@@ -21,7 +21,7 @@ from torch import Tensor
 
 from .._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET
 
-__all__ = ["TrainingBatch", "bucket_series_count", "pad_batch_to_series"]
+__all__ = ["TrainingBatch", "bucket_series_count", "flip_batch_signs", "pad_batch_to_series"]
 
 _VALID_ROLES = (ROLE_TARGET, ROLE_PAST_COV, ROLE_KNOWN_COV)
 
@@ -225,4 +225,39 @@ def pad_batch_to_series(batch: TrainingBatch, target_series: int) -> TrainingBat
         known_future_mask=known_future_mask,
         targets=torch.cat([batch.targets, targets_pad], dim=0),
         loss_weight=torch.cat([batch.loss_weight, weight_pad], dim=0),
+    )
+
+
+def flip_batch_signs(
+    batch: TrainingBatch,
+    generator: torch.Generator | None = None,
+    *,
+    p: float = 0.5,
+) -> TrainingBatch:
+    """Randomly negate whole series (targets and covariates together) with probability `p` (spec §5.3).
+
+    Every row sharing a `group_id` receives the same sign `{-1, +1}`, keeping target and covariate
+    relationships coherent with upstream's reflected symmetric-averaging pass. Masks, `group_ids`,
+    and `role_ids` are unchanged.
+    """
+    if not 0.0 <= p <= 1.0:
+        raise ValueError(f"p must lie in [0, 1], got {p!r}")
+    if p == 0.0 or batch.num_rows == 0:
+        return batch
+    unique_groups, inverse = torch.unique(batch.group_ids, return_inverse=True)
+    if p == 1.0:
+        group_signs = torch.full((unique_groups.numel(),), -1.0, dtype=batch.context.dtype, device=batch.device)
+    else:
+        draw = torch.rand((unique_groups.numel(),), generator=generator)
+        group_signs = torch.where(draw < p, -1.0, 1.0).to(dtype=batch.context.dtype, device=batch.device)
+    row_signs = group_signs[inverse].unsqueeze(-1)  # (R, 1)
+    return TrainingBatch(
+        context=batch.context * row_signs,
+        context_mask=batch.context_mask,
+        group_ids=batch.group_ids,
+        role_ids=batch.role_ids,
+        known_future=None if batch.known_future is None else batch.known_future * row_signs,
+        known_future_mask=batch.known_future_mask,
+        targets=batch.targets * row_signs,
+        loss_weight=batch.loss_weight,
     )

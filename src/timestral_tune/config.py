@@ -153,6 +153,9 @@ class TrainingConfig:
             from the evaluation with the lowest loss.
         log_every: Log training progress every this many steps.
         shuffle: Shuffle the training windows each epoch.
+        sign_flip: Randomly negate whole series (targets and covariates together, p=0.5 per series)
+            during training so fine-tuning on one-signed data stays coherent with upstream's
+            symmetric averaging (spec §5.3). Bypasses frozen-feature caching for training batches.
         cache_frozen_features: In `head_only` mode, cache the frozen transformer's per-window
             horizon representations on CPU (up to 256 MiB per dataset) so multi-epoch training and
             repeated evaluations skip re-running the frozen body. Ignored in other modes, and falls
@@ -186,6 +189,7 @@ class TrainingConfig:
     restore_best: bool = True
     log_every: int = 50
     shuffle: bool = True
+    sign_flip: bool = False
     cache_frozen_features: bool = True
     compile_model: bool = False
     compile_mode: CompileMode = "default"
@@ -197,7 +201,7 @@ class TrainingConfig:
         _one_of("lr_schedule", self.lr_schedule, get_args(LearningRateSchedule))
         _one_of("target_frame", self.target_frame, TARGET_FRAMES)
         _one_of("compile_mode", self.compile_mode, get_args(CompileMode))
-        for flag in ("cache_frozen_features", "compile_model", "restore_best", "shuffle"):
+        for flag in ("cache_frozen_features", "compile_model", "restore_best", "shuffle", "sign_flip"):
             if not isinstance(getattr(self, flag), bool):
                 raise ValueError(f"{flag} must be a bool, got {getattr(self, flag)!r}")
         if self.learning_rate is not None and not (math.isfinite(self.learning_rate) and self.learning_rate > 0):

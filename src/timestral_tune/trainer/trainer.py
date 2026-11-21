@@ -22,7 +22,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from ..config import LoraConfig, TrainingConfig
-from ..data.batch import TrainingBatch
+from ..data.batch import TrainingBatch, flip_batch_signs
 from ..data.collator import DHFDataCollator
 from ..data.dataset import TimeSeriesDataset
 from ..export import dataset_fingerprint, export_checkpoint
@@ -384,6 +384,8 @@ class TimestralTrainer:
         if self.config.mode != "head_only" or not self.config.cache_frozen_features:
             return None
         if dataset is self.train_dataset:
+            if self.config.sign_flip:
+                return None
             if self._train_head_cache is not None:
                 return self._train_head_cache
         elif dataset is self.val_dataset:
@@ -586,6 +588,7 @@ class TimestralTrainer:
 
         patch = self.model.config.patch_size
         non_blocking = self.device.type == "cuda"
+        flip_generator = torch.Generator().manual_seed(config.seed + 1_000_003) if config.sign_flip else None
         for callback in self.callbacks:
             callback.on_fit_start(self)
         self.model.train()
@@ -599,6 +602,8 @@ class TimestralTrainer:
                         skipped += 1
                         continue
                     if isinstance(batch, TrainingBatch):
+                        if flip_generator is not None:
+                            batch = flip_batch_signs(batch, flip_generator)
                         batch.validate(patch)
                     learning_rate = self.optimizer.param_groups[0]["lr"]
                     loss = self.training_step(batch.to(self.device, non_blocking=non_blocking), validate=False)

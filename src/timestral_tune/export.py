@@ -232,6 +232,7 @@ def _serialise_training_config(config: TrainingConfig) -> dict[str, Any]:
         "early_stopping_patience": config.early_stopping_patience,
         "restore_best": config.restore_best,
         "shuffle": config.shuffle,
+        "sign_flip": config.sign_flip,
         "cache_frozen_features": config.cache_frozen_features,
         "compile_model": config.compile_model,
         "compile_mode": config.compile_mode,
