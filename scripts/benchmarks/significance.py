@@ -471,9 +471,7 @@ def main() -> None:
         # 2. Zero-shot predictions
         zs_m = copy.deepcopy(base_cpu).to(args.device).eval()
         zs_m.transformer.rope.rebuild_inv_freq()
-        zs_preds, ys, _ = collect_conformal_data(
-            TuneTimestralForecaster(zs_m), splits.test, batch_size=args.batch_size
-        )
+        zs_preds, ys, _ = collect_conformal_data(TuneTimestralForecaster(zs_m), splits.test, batch_size=args.batch_size)
         ctxs = _collect_contexts(splits.test)
         del zs_m
         if args.device == "cuda":

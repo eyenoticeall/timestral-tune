@@ -570,5 +570,12 @@ not started.
     `< 5 GiB` VRAM and `25–45 s` on L4; `lora_temporal` achieved the lowest test wQL across both domains on both
     sizes (`123M`: `0.2111` vol / `0.1950` retail; `209M`: `0.2127` vol / `0.1924` retail — −13.5% vs zero-shot).
 
+- **Statistical significance, multi-seed variance, extended 2026 volatility holdout & classical baselines (`cf0520c`, `scripts/benchmarks/significance.py`, `docs/BENCHMARKS.md` §4, L4 VM deleted immediately after):**
+  - Quantified 3-seed variance on `28M` (`wQL` std `0.0002–0.0010` on retail, `0.0002–0.0017` on post-Oct volatility).
+  - Paired clustered bootstrap 95% CIs (10,000 resamples) + Newey-West Diebold-Mariano tests:
+    - Retail (`64` SKUs × `6` blocks): `lora_temporal` `0.1969 ± 0.0010` vs zero-shot `0.2192` and `seasonal_ridge` `0.2189`; improves `64/64` SKUs (`CI [-0.0263, -0.0206]`) and `6/6` time blocks (`CI [-0.0282, -0.0187]`).
+    - Extended 10-month 2026 volatility (`51` equities × `49` market blocks, trained strictly on 2024–2025): `lora_temporal` `0.1819` vs zero-shot `0.1926` and Corsi `har_rv` `0.1981`; improves `49/51` equities (`CI [-0.0128, -0.0087]`) and `44/49` market blocks (`CI [-0.0140, -0.0076]`, `DM p = 4.1e-10`).
+    - Strict 3-week post-Oct 27, 2026 slice (`3` blocks): beats `har_rv` (`0.2171 ± 0.0016` vs `0.2253`) and `38/51` equities (`series CI [-0.0208, -0.0006]`), while 3-block time CI straddles zero (`[-0.0293, +0.0061]`, `2/3` blocks) as expected for `n=3`.
+
 **Not done / open.** `phase-3` is unpushed and unmerged pending review; PyPI release awaits maintainer
 approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.

@@ -203,3 +203,70 @@ Measured on the same NVIDIA L4 VM (`bf16`, `sign_flip=True`, 160 steps, `eval_ev
 
 On both `123M` and `209M`, `fp32` default SDPA, `fp32` math SDPA, and `bf16` default SDPA agree within `0.0002–0.0007` wQL on real data, and every mode — including `209M full_ft` — fits in `< 5 GiB` VRAM and trains in under 45 seconds on a single L4 GPU.
 
+---
+
+## 4. Statistical significance, multi-seed variance & classical baselines (Timestral-28M)
+
+Reproduce:
+
+```bash
+uv run python scripts/benchmarks/significance.py --device cuda --bf16 --max-steps 200 --batch-size 32 --seeds 0 1 2
+```
+
+To quantify sampling uncertainty, training-seed variance, regime-count power on volatility, and
+performance relative to classical non-foundation baselines (all scored by the same raw-space
+`evaluate_predictions` on identical test windows):
+
+- **Multi-seed runs:** `seeds = [0, 1, 2]` on `Timestral-28M` (`bf16`, `sign_flip=True`, 200 steps).
+- **Clustered paired inference vs `zero_shot`:** 10,000-resample paired bootstrap 95% CIs on
+  `ΔwQL = wQL(tuned) - wQL(zero_shot)`, clustered separately by **series** (51 equities / 64 SKUs)
+  and by **non-overlapping time block** (controlling for contemporaneous cross-asset shocks), plus
+  lag-1 Newey-West Diebold-Mariano p-values where cluster count is large (`k >= 49`).
+- **Extended 10-month 2026 volatility holdout:** trained strictly on `2024–2025` only (`4,386` train /
+  `714` val windows) and evaluated across all `49` non-overlapping 32-hour market blocks of
+  `2026-01-02` to `2026-11-20` (`2,499` test windows).
+- **Classical baselines (validation residual quantiles, non-negative clipped):**
+  - `seasonal_naive`: last seasonal cycle (`s=7` trading hours on volatility; `s=24` hours on retail).
+  - `har_rv`: Corsi (2009) HAR lags (`1`, `7`, `35`, `140` bars) + past/known covariates direct Ridge.
+  - `seasonal_ridge`: `1h/24h/48h/168h` lags + 24h profile + past/known covariates direct Ridge.
+
+### Retail demand (64 store-SKU series × 6 time blocks = 384 windows)
+
+| Method | wQL (`mean ± std`, 3 seeds) | MASE (`mean ± std`) | Series 95% CI on ΔwQL (wins) | Time-block 95% CI on ΔwQL (wins) |
+|---|---:|---:|---|---|
+| `seasonal_naive` (`s=24`) | 0.2932 | 1.1369 | — | — |
+| `seasonal_ridge` (covariates) | 0.2189 | 0.8621 | — | — |
+| `28M zero_shot` | 0.2192 | 0.8477 | baseline | baseline |
+| `28M lora_variate` | 0.1985 ± 0.0003 | 0.7848 ± 0.0008 | `[-0.0232, -0.0175]` (64/64) | `[-0.0238, -0.0173]` (6/6) |
+| `28M lora_temporal` | 0.1969 ± 0.0010 | **0.7774 ± 0.0028** | `[-0.0263, -0.0206]` (64/64) | `[-0.0282, -0.0187]` (6/6) |
+| `28M full_ft` | **0.1965 ± 0.0002** | 0.7782 ± 0.0002 | `[-0.0258, -0.0200]` (64/64) | `[-0.0276, -0.0185]` (6/6) |
+
+### Realised volatility — extended 10-month 2026 holdout (51 equities × 49 market blocks = 2,499 windows; trained on 2024–2025)
+
+| Method | wQL | MASE | Series 95% CI on ΔwQL (wins) | Time-block 95% CI on ΔwQL (wins, DM p) |
+|---|---:|---:|---|---|
+| `seasonal_naive` (`s=7`) | 0.2639 | 1.8894 | — | — |
+| `har_rv` (Corsi HAR + covariates) | 0.1981 | 1.4837 | — | — |
+| `28M zero_shot` | 0.1926 | 1.4514 | baseline | baseline |
+| `28M lora_variate` | 0.1827 | 1.3704 | `[-0.0118, -0.0080]` (49/51) | `[-0.0127, -0.0073]` (45/49, `p = 1.4e-11`) |
+| `28M lora_temporal` | **0.1819** | **1.3700** | `[-0.0128, -0.0087]` (49/51) | `[-0.0140, -0.0076]` (44/49, `p = 4.1e-10`) |
+| `28M full_ft` | 0.1826 | 1.3702 | `[-0.0117, -0.0084]` (51/51) | `[-0.0129, -0.0074]` (44/49, `p = 5.9e-11`) |
+
+### Realised volatility — strict 3-week post-Oct 27, 2026 slice (51 equities × 3 blocks = 153 windows)
+
+| Method | wQL (`mean ± std`, 3 seeds) | MASE (`mean ± std`) | Series 95% CI on ΔwQL (wins) | Time-block 95% CI on ΔwQL (wins) |
+|---|---:|---:|---|---|
+| `seasonal_naive` (`s=7`) | 0.2967 | 2.2553 | — | — |
+| `har_rv` (Corsi HAR + covariates) | 0.2253 | 1.7725 | — | — |
+| `28M zero_shot` | 0.2293 | 1.8785 | baseline | baseline |
+| `28M lora_variate` | 0.2204 ± 0.0017 | 1.7909 ± 0.0103 | `[-0.0185, -0.0028]` (40/51) | `[-0.0248, +0.0018]` (2/3) |
+| `28M lora_temporal` | **0.2171 ± 0.0016** | **1.7633 ± 0.0168** | `[-0.0208, -0.0006]` (38/51) | `[-0.0293, +0.0061]` (2/3) |
+| `28M full_ft` | 0.2190 ± 0.0002 | 1.7853 ± 0.0019 | `[-0.0185, -0.0028]` (40/51) | `[-0.0317, +0.0056]` (2/3) |
+
+### Summary of caveat measurements
+
+1. **Seed variance is tiny:** across 3 seeds, `wQL` standard deviation is `0.0002–0.0010` on retail (vs `−0.022` gain) and `0.0002–0.0017` on volatility (vs `−0.012` gain).
+2. **Statistical significance holds under time-block clustering:** on retail (`6/6` blocks, `64/64` SKUs) and on the 10-month 2026 volatility holdout (`44–45/49` market blocks, `49–51/51` equities, Newey-West DM `p <= 4.1e-10`), 95% CIs exclude zero by a wide margin. On the strict 3-week post-Oct 27, 2026 volatility slice alone, series-level CIs exclude zero (`38–40/51` equities) while the 3-block time CI straddles zero (`2/3` blocks), confirming that 3 weeks is too short for time-block significance by itself.
+3. **Beats classical domain baselines:** `28M zero_shot` merely tied `seasonal_ridge` on retail (`0.2192` vs `0.2189`) and trailed `har_rv` on post-release volatility (`0.2293` vs `0.2253`); after adaptation, `lora_temporal` beats `seasonal_ridge` by **−10.0% wQL** on retail (`0.1969` vs `0.2189`), beats `har_rv` by **−8.2% wQL** across 10 months of 2026 (`0.1819` vs `0.1981`), and beats `har_rv` on the post-release volatility slice as well (`0.2171` vs `0.2253`).
+
+
