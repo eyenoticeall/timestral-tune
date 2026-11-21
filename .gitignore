@@ -21,3 +21,6 @@ runs/
 .DS_Store
 .idea/
 .vscode/
+
+# Output of scripts/cuda_check.sh
+cuda_check.log

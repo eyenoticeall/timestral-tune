@@ -578,7 +578,7 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
 - [x] Target-frame check on horizons longer than one patch. Result: the checkpoints are calibrated in the median-folded frame, which confirms D2 (§4.3).
 - [x] `head_only` training end to end on a toy dataset, on CPU and the Apple GPU, on the tiny model, 5M and 28M: the loss falls and no weight outside the head changes.
 - [x] T14's gradient check on the PyTorch 2.4 floor: passes on CPU. The Apple GPU does not work below PyTorch 2.8, which is now its stated floor.
-- [ ] T14 on CUDA. **Not done: no CUDA hardware was available.** It is one command once there is: `uv run pytest tests/acceptance/test_device_parity.py`.
+- [ ] T14 on CUDA. **Not done: no CUDA hardware was available.** It is one command once there is: `bash scripts/cuda_check.sh`.
 
 **Exit:** T1–T8 and T12 pass on 5M and 28M; the frame decision is confirmed or revised. **Met on 2026-11-21.** The one open item is the CUDA run.
 

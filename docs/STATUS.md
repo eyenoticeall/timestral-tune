@@ -41,7 +41,8 @@ tests, in CI.
 
 ## Next steps
 
-1. **Run T14 on CUDA** when hardware is available: `uv run pytest tests/acceptance/test_device_parity.py`.
+1. **Run T14 on CUDA** when hardware is available: `bash scripts/cuda_check.sh` (it also runs the whole
+   suite and the probes there, and writes `cuda_check.log`).
    This closes Phase 1's last box.
 2. **Push `phase-1` and let CI run** on the new tests (it has only ever run on the scaffold).
 3. **Start Phase 2** (spec §10): the slice LoRA adapter (T9, T10), `full_ft`, the conformal calibrators
