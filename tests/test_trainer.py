@@ -738,7 +738,7 @@ def test_bf16_training_on_cuda(tiny_forecaster, mode):
     assert result.steps == 10 and math.isfinite(loss_after) and loss_after < loss_before
     if mode == "head_only":
         cache = trainer._get_head_cache(dataset)
-        assert cache is not None and cache.hidden.dtype == torch.bfloat16
+        assert cache is not None and cache.horizon_hidden.shape[0] == len(dataset)
         stream = TimestralTrainer(
             fixed_batch_config(
                 dataset,
@@ -752,6 +752,13 @@ def test_bf16_training_on_cuda(tiny_forecaster, mode):
             model=fresh_model(tiny_forecaster),
         )
         assert loss_before == pytest.approx(stream.evaluate(dataset).loss, rel=1e-4)
+        fp32 = TimestralTrainer(
+            fixed_batch_config(dataset, "cuda", mode="head_only", mixed_precision="fp32", max_steps=1),
+            dataset,
+            model=fresh_model(tiny_forecaster),
+        )
+        fp32_cache = fp32._get_head_cache(dataset)
+        assert fp32_cache is not None and not torch.equal(cache.horizon_hidden, fp32_cache.horizon_hidden)
 
 
 def test_compile_model_trains_and_produces_clean_merged_state_dict(tiny_forecaster):

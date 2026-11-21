@@ -722,7 +722,8 @@ def collect_conformal_data(
             b_size, n_targets, _, num_q = q_np.shape
 
             # Scale-invariant context std per (window, target_variate): preserve arbitrarily small
-            # real scales (e.g. realised variance ~1e-6), falling back to 1.0 only on constant / <2-point series.
+            # real scales (e.g. realised variance ~1e-6); on flat non-zero contexts fall back to
+            # context magnitude `max(|obs|)` rather than 1.0, and to 1.0 only when identically zero.
             flat_ctx = context.astype(np.float64).reshape(b_size * n_targets, ctx_len)
             scales_b = np.empty(b_size * n_targets, dtype=np.float64)
             for row_i in range(flat_ctx.shape[0]):
@@ -730,7 +731,14 @@ def collect_conformal_data(
                 if obs.size >= 2:
                     std = float(np.std(obs))
                     mag = float(np.max(np.abs(obs)))
-                    scales_b[row_i] = std if (math.isfinite(std) and std > 0.0 and std > 1e-12 * mag) else 1.0
+                    if math.isfinite(std) and std > 0.0 and std > 1e-12 * mag:
+                        scales_b[row_i] = std
+                    elif math.isfinite(mag) and mag > 0.0:
+                        scales_b[row_i] = mag
+                    else:
+                        scales_b[row_i] = 1.0
+                elif obs.size == 1 and math.isfinite(float(abs(obs[0]))) and abs(float(obs[0])) > 0.0:
+                    scales_b[row_i] = float(abs(obs[0]))
                 else:
                     scales_b[row_i] = 1.0
 

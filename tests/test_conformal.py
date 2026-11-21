@@ -365,3 +365,55 @@ def test_collect_conformal_data_matches_upstream_and_preserves_small_scales(tiny
     cal = ConformalCalibrator(target_coverage=0.80, bucket_size=patch).fit(s_preds, s_actuals, s_scale)
     out = cal.transform(s_preds, s_scale)
     assert out.shape == s_preds.shape and np.all(np.diff(out, axis=-1) >= 0.0)
+
+    # 3. Flat non-zero small-magnitude context falls back to its own magnitude (not 1.0), and
+    # categorical covariates + clip_nonnegative flag are forwarded accurately to upstream forecast().
+    flat_vals = np.full((1, steps), 3e-5, dtype=np.float32)
+    # Non-negative high-variance context touching 0 so unclipped lower quantiles go negative.
+    ramp_vals = np.where(np.arange(steps) % 2 == 0, 0.0, 10.0).astype(np.float32)[None, :]
+    cat_past = (np.arange(steps) % 3).astype(np.float64)[None, :]
+    cat_known = (np.arange(steps) % 4).astype(np.float64)[None, :]
+    cat_ds = TimeSeriesDataset(
+        [
+            SeriesData(
+                series_id="flat-small",
+                timestamps=np.arange(steps, dtype=np.int64),
+                targets=flat_vals,
+                past=np.empty((0, steps), dtype=np.float32),
+                known=np.empty((0, steps), dtype=np.float32),
+                categorical_past=cat_past,
+                categorical_known=cat_known,
+            ),
+            SeriesData(
+                series_id="nonneg-ramp",
+                timestamps=np.arange(steps, dtype=np.int64),
+                targets=ramp_vals,
+                past=np.empty((0, steps), dtype=np.float32),
+                known=np.empty((0, steps), dtype=np.float32),
+                categorical_past=cat_past,
+                categorical_known=cat_known,
+            ),
+        ],
+        context_length=4 * patch,
+        forecast_horizon=2 * patch,
+        stride=2 * patch,
+        min_context=4 * patch,
+    )
+    c_preds, _, c_scale = collect_conformal_data(tiny_forecaster, cat_ds, batch_size=2, clip_nonnegative=True)
+    c_preds_noclip, _, _ = collect_conformal_data(tiny_forecaster, cat_ds, batch_size=2, clip_nonnegative=False)
+    assert c_scale[0] == pytest.approx(3e-5, rel=1e-5), f"flat small context jumped to {c_scale[0]}"
+    assert np.all(c_preds >= 0.0), "clip_nonnegative=True must clamp non-negative context forecasts at 0"
+    assert not np.allclose(c_preds, c_preds_noclip), "clip_nonnegative=False should differ from True"
+    w_cat = cat_ds[1]
+    ref_cat = (
+        tiny_forecaster.forecast(
+            w_cat.target_context[None],
+            cat_ds.forecast_horizon,
+            categorical_past_covariates=w_cat.categorical_past[None],
+            categorical_known_covariates=w_cat.categorical_known[None],
+            clip_nonnegative=False,
+        )
+        .quantiles.cpu()
+        .numpy()[0, 0]
+    )
+    np.testing.assert_allclose(c_preds_noclip[1], ref_cat, rtol=1e-5, atol=1e-5)
