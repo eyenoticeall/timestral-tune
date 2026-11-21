@@ -501,9 +501,11 @@ mutation-test gaps) and verified a 5M LoRA export inside a standalone isolated i
   `symmetric_averaging`, `clip_nonnegative`, forecast-vs-step ACI window, median clamp, upper `1 + gamma`
   bound, wired trainer bucketing & head-cache trimming, `_series_index` fingerprint, fallback `license_path`),
   fixed `test_bf16_training_on_cuda`'s head-cache check to assert `cache.horizon_hidden`, streaming `bf16`
-  parity, and difference from an `fp32` cache, fixed `head_bucket_trainer` in `test_trainer.py` to compile
-  on CUDA when available, fixed `SPEC.md` §5.2's repair guarantee wording, added D17/D18 to §11, and
-  restored the `b0980cb` L4 log line in Phase 2 notes.
+  parity, and difference from an `fp32` cache, fixed `SPEC.md` §5.2's repair guarantee wording, added
+  D17/D18 to §11, and restored the `b0980cb` L4 log line in Phase 2 notes. The first L4 attempt at
+  `163ae4a` failed `test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_overhead`
+  because `head_bucket_trainer` hardcoded `device="cpu"` with `compile_model=True` on a minimal Linux VM
+  without `g++`; fixing it to use `device` (`"cuda"` when available) in `6880061` resolved the failure.
 
 **Evidence.** Ruff check & format clean; `uv build` clean; `check_upstream_drift.py` reports no drift.
 Local macOS suite: **526 passed, 4 skipped** (PyTorch 2.15.0, Python 3.13); PyTorch 2.4.0 floor

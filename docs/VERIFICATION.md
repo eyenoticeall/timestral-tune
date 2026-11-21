@@ -318,8 +318,8 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 | 2.14.1 | 3.10 | 510 passed, 4 skipped (`3fe5bc9`; `uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
 | 2.15.0 | 3.13 | 526 passed, 4 skipped (includes all Phase 2 review-fix and mutation-guard tests) |
 
-These are the counts on `phase-2` (2026-11-21), all on macOS. Zero acceptance test placeholders remain.
-The CUDA run (§13) used Linux on the same branch (`3fe5bc9`) and passed all 4 `bf16` tests as well.
+These are the counts on `phase-2` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
+The CUDA run (§13) used Linux on the same branch (`6880061`) and passed all 4 `bf16` tests as well (528 passed, 2 skipped).
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
@@ -384,9 +384,13 @@ float64-RMSNorm reference of §6.
 | `step_timing.py --device cuda --mode lora_variate --bf16 --compile reduce-overhead` (`b0980cb`) | 5M cov5 18 ms; 28M cov5 43 ms |
 | Real Hub export of `mistralai/Timestral-5M` (`lora_variate`, `bf16`, run at `3fe5bc9`) | Copies verbatim 1,687-byte `Modified MIT License` from Hub; reloads via upstream `load_model(..., strict=True)` on CUDA (`5,208,960` params) |
 
-The first attempt at this run, one commit earlier, failed a single case on the VM's x86 CPU, not on CUDA:
-explicit attention on 5M with past-only covariates gave 5.3e-3 against a 5e-3 bound. That is the near-tie
-case of §6, which now has its own bound.
+The first attempt at this run (at `163ae4a`, one commit earlier) failed
+`test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_overhead` because
+`head_bucket_trainer` hardcoded `device="cpu"` with `compile_model=True` on a minimal Linux VM without
+`g++`; switching it to `device` (`"cuda"` when available) in `6880061` resolved the failure and exercised
+the compiled head-cache bucketing path on CUDA. (Historical Phase 1 note: the first attempt at the Phase 1
+CUDA run before `50c170a` failed one x86 CPU case — explicit attention on 5M with past-only covariates at
+5.3e-3 against a 5e-3 bound, the near-tie case of §6 which now has its own bound.)
 
 Forward, relative L2 difference from CPU (`device_parity.py --device cuda`):
 

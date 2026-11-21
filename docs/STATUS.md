@@ -18,7 +18,7 @@
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
 | Test suite | 526 passed, 4 skipped (CUDA-only `bf16`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; earlier commit `3fe5bc9`: 510/4 on 2.14.1 and 2.8.0, 411/26 on 2.4.0; macOS). On NVIDIA L4 CUDA (Linux, `6880061`): **528 passed, 2 skipped** |
-| CI | Green on `main` (`fc26d03`, Python 3.10–3.13 on Linux); `phase-2` is pushed to `origin/phase-2` and awaits a PR/merge for CI |
+| CI | Green on `main` (`fc26d03`, Python 3.10–3.13 on Linux); `phase-2` awaits a PR/merge for CI |
 
 ## What does not exist yet
 
@@ -61,7 +61,7 @@ Full list in spec §12. The ones that matter next:
   `origin/main` (`fc26d03`). `perf/phase1-kernels` (merged into `main`) and `fix/math-sdpa-backend`
   (closed by D15) have been deleted locally and on `origin`.
 - `phase-2`: all of Phase 2 (LoRA, `full_ft`, CQR/ACI conformal calibration, upstream-loadable export,
-  `bf16` + `torch.compile` on CUDA, T9–T11 & T13 passing), verified locally and on NVIDIA L4; pushed to
-  `origin/phase-2`, not yet merged into `main`.
+  `bf16` + `torch.compile` with shape bucketing on CUDA, T9–T11 & T13 passing), verified locally and on
+  NVIDIA L4 (`6880061`); open off `main`, not yet merged.
 
 Branch policy is in `AGENTS.md` §6.
