@@ -1,8 +1,8 @@
 # Project Status
 
 **Last updated:** 2026-11-21
-**Stage:** pre-alpha. Phase 0 and Phase 1 are built and verified.
-**Next phase:** Phase 2 (Adaptation & Calibration). See spec §10.
+**Stage:** pre-alpha. Phase 0 and Phase 1 are built, verified and merged into `main`.
+**Next phase:** Phase 2 (Adaptation & Calibration), not started. See spec §10.
 
 ## What works today
 
@@ -16,7 +16,7 @@
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **10 of 14 implemented and passing**: T1–T8, T12, T14. T9, T10, T11, T13 are Phase 2 placeholders |
 | Test suite | 438 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; 349 passed, 26 skipped on 2.4.0; macOS). On CUDA, at an earlier commit: 290 passed, 6 skipped |
-| CI | Green on the last push (scaffold only). The Phase 1 work has not been pushed, so CI has not run on it |
+| CI | Green on Phase 1 (pull request #1, 2026-11-21): lint, build, and the network-free tests on Python 3.10–3.13, on Linux |
 
 ## What does not exist yet
 
@@ -40,13 +40,17 @@ All on one machine (Apple M4, macOS); details in `docs/VERIFICATION.md`.
 
 Not verified anywhere: the 123M and 209M checkpoints, real datasets, `bf16`. Everything changed after the
 CUDA run (T14's `head_only` check, the past-only-covariate scenario, the review fixes, the float64-RMSNorm
-gradient reference) has run on CPU and the Apple GPU only. CI has run only the scaffold.
+gradient reference) has run on CPU and the Apple GPU only. CI covers the network-free tests on Linux; the tests on the released
+checkpoints run only locally.
 
 ## Next steps
 
-1. **Push `phase-1` and let CI run** on the new tests (it has only ever run on the scaffold).
-2. **Start Phase 2** (spec §10): the slice LoRA adapter (T9, T10), `full_ft`, the conformal calibrators
-   (T13), export (T11), `bf16` on CUDA.
+1. **Start Phase 2** (spec §10) when the maintainer says so: the slice LoRA adapter (T9, T10), `full_ft`, the
+   conformal calibrators (T13), export (T11), `bf16` on CUDA.
+2. **Re-run `bash scripts/cuda_check.sh`** on a GPU machine early in Phase 2: nothing since commit `ecbab9d`
+   has run on CUDA.
+3. **Decide the attention kernel** once a mode trains body weights (spec D15); the held option is on
+   `fix/math-sdpa-backend`.
 
 ## Open questions and known issues
 

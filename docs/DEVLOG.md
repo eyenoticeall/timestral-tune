@@ -301,3 +301,8 @@ be the wrong mechanism next to explicit attention. At the maintainer's direction
 Where this entry says the option was "added", read: added on that branch. Suite on `phase-1` after the
 split: 438 passed, 4 skipped on PyTorch 2.15.0, 2.14.1 (Python 3.10) and 2.8.0; 349 passed, 26 skipped on
 2.4.0.
+
+**Merged.** `phase-1` was rebased on `main`, pushed, and run through CI as pull request #1: lint, build and
+the network-free tests passed on Python 3.10 to 3.13 on Linux, the first CI run on any Phase 1 work. `main`
+was fast-forwarded and pushed, and `phase-1` deleted locally and on the remote. `fix/math-sdpa-backend` is
+one commit on top of `main`, pushed, and stays open. Phase 2 has not been started.
