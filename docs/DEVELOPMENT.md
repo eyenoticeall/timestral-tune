@@ -18,7 +18,7 @@ the lockfile stays in step, and commit it with the change.
 ## Everyday commands
 
 ```bash
-uv run pytest                          # everything; placeholders show as skipped
+uv run pytest                          # everything (downloads 5M and 28M on first run)
 uv run pytest -m "not network"         # what CI runs
 uv run pytest tests/test_scaffold.py   # scaffold checks only
 uv run pytest -m acceptance            # acceptance tests only
@@ -32,17 +32,18 @@ uv build                               # build wheel and sdist
 ```
 src/timestral_tune/
   _vendor/timestral/     Official inference package at a pinned commit (generated; do not edit)
-  config.py              TrainingConfig
+  config.py              TrainingConfig, LoraConfig
   data/                  Batch layout, dataset, collator, categorical encoders
-  models/                Loader, device shims, training forward (built); LoRA adapter, conformal (stubs)
+  models/                Loader, device shims, training forward, slice LoRA adapter, conformal calibrators
   losses/                Pinball loss
   trainer/               Loss step, training loop, callbacks
+  export.py              Upstream-loadable checkpoint export, adapters, conformal, sidecar, LICENSE/NOTICE
   utils/                 Verifiers (built); metrics (stub)
-  replay/, export.py, integrations/    Stubs for later phases
+  replay/, integrations/ Stubs for Phases 3–4
 tests/
   conftest.py, helpers.py   Fixtures and builders shared by all tests
   test_*.py                 Unit tests per module
-  acceptance/               T1–T14 from spec §9
+  acceptance/               T1–T14 from spec §9 (all 14 implemented and passing)
 scripts/
   vendor_upstream.py     Regenerates _vendor/timestral
   check_upstream_drift.py
@@ -55,8 +56,8 @@ names. Start there when implementing a module.
 ## Implementing a module
 
 1. Read the stub's docstring and the spec sections it names.
-2. Find its acceptance tests in `tests/acceptance/`. Implement the test first where practical: replace
-   the `@NOT_IMPLEMENTED` marker, keep the test's name and docstring.
+2. Find or add its acceptance tests in `tests/acceptance/` (following `test_tNN_*`), keeping the test
+   names aligned with spec §9.
 3. Implement against the vendored code. Import from `timestral_tune._vendor.timestral`, never from a
    top-level `timestral`.
 4. Export new public names from the subpackage `__init__.py` and, when they are part of spec §7, from
@@ -78,9 +79,10 @@ a batch with upstream's own input assembly as ground truth).
 - **Acceptance tests** (`tests/acceptance/`) are the definition of done and carry the `acceptance` marker.
 - **Ground truth is upstream.** Compare with the vendored forecaster on the same inputs
   (`tests/helpers.py::upstream_batch`, `forecast()`), not with hand-computed expectations.
-- **Tolerances.** Forward results agree with upstream at float32 round-off (1e-6); do not assert
-  bit-identity, which does not hold across PyTorch versions. Compare gradients with the float64-weights
-  reference, never with CPU float32 (`docs/VERIFICATION.md` §6).
+- **Tolerances.** Forward results agree with upstream at float32 round-off (1e-6 for T1; 1e-5 fp32 and
+  1e-12 fp64 for T2's trimmed covariate layout); do not assert bit-identity, which does not hold across
+  PyTorch versions. Compare gradients with the float64-weights reference, never with CPU float32
+  (`docs/VERIFICATION.md` §6).
 - **Perturbation tests** must use non-constant noise. A constant offset is absorbed by the normalisation
   and makes leakage tests pass vacuously.
 - **Device tests** take their device list from `tests/conftest.py::available_accelerators` and skip
@@ -95,7 +97,7 @@ a batch with upstream's own input assembly as ground truth).
 - CPU works everywhere, from PyTorch 2.4.
 - The Apple GPU needs PyTorch 2.8 or newer, runs float32 only, and has no float64: move tensors to CPU
   before converting them to float64. `models/device.py` does this for upstream's code.
-- CUDA is the intended main training target. It has been verified once, on a rented GPU
+- CUDA is the intended main training target. Verified on an NVIDIA L4 in fp32 and `bf16`
   (`docs/VERIFICATION.md` §13); there is no CUDA machine in CI. After changing anything device-related, run
   `bash scripts/cuda_check.sh` on a GPU machine. It needs a C compiler and Python headers; a uv-managed
   Python has them.

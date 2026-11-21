@@ -11,7 +11,7 @@ Two rules from the spec are enforced here:
   the caller names another revision.
 
 - Spec: `docs/SPEC.md` §3.1, §5.4, §7.2
-- Acceptance tests: T14 (and T11 once export exists)
+- Acceptance tests: T11, T14
 """
 
 from __future__ import annotations

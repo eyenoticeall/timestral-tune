@@ -18,7 +18,7 @@
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
 | Test suite | 519 passed, 4 skipped (CUDA-only `bf16`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; earlier commit `3fe5bc9`: 510/4 on 2.14.1 and 2.8.0, 411/26 on 2.4.0; macOS). On NVIDIA L4 CUDA (Linux, `b0980cb`): **521 passed, 2 skipped** |
-| CI | Green on Phase 1 (PR #1, Python 3.10–3.13 on Linux); `phase-2` has not been pushed yet |
+| CI | Green on `main` (`fc26d03`, Python 3.10–3.13 on Linux); `phase-2` is pushed to `origin/phase-2` and awaits a PR/merge for CI |
 
 ## What does not exist yet
 
@@ -57,8 +57,14 @@ Full list in spec §12. The ones that matter next:
 
 ## Branch state
 
-- `main`: Phases 0 and 1 (including the trimmed covariate layout and `head_only` caching).
-- `phase-2`: all of Phase 2 (LoRA, `full_ft`, CQR/ACI conformal calibration, upstream-loadable export, `bf16` + `torch.compile` on CUDA, T9–T11 & T13 passing), verified locally and on NVIDIA L4. Not merged, not pushed.
-- `fix/math-sdpa-backend`: historical held branch for public `attention_backend` plumbing; D15 CUDA training-trajectory results show default SDPA suffices, so this branch can likely be closed.
+- `main`: Phases 0 and 1 (including the trimmed covariate layout and `head_only` caching), pushed to
+  `origin/main` (`fc26d03`).
+- `phase-2`: all of Phase 2 (LoRA, `full_ft`, CQR/ACI conformal calibration, upstream-loadable export,
+  `bf16` + `torch.compile` on CUDA, T9–T11 & T13 passing), verified locally and on NVIDIA L4; pushed to
+  `origin/phase-2`, not yet merged into `main`.
+- `perf/phase1-kernels`: already fast-forwarded into `main` (identical to `main` at `fc26d03` locally and
+  on `origin`); ready to delete per `AGENTS.md` §6.
+- `fix/math-sdpa-backend`: historical held branch (`e06d313`, pushed); D15 CUDA training-trajectory
+  results show default SDPA suffices, ready to close/delete.
 
 Branch policy is in `AGENTS.md` §6.

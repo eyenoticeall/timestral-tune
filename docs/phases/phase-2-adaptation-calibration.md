@@ -1,6 +1,6 @@
 # Phase 2 — Adaptation & Calibration
 
-**Status:** Complete on branch `phase-2` (2026-11-21); unmerged and unpushed.
+**Status:** Complete on branch `phase-2` (2026-11-21); pushed to `origin/phase-2`, not yet merged into `main`.
 **Goal:** All five adaptation modes, both conformal calibrators, and exports that load in the official package.
 **Spec sections:** `docs/SPEC.md` §3.2, §5.1, §5.2, §7.3, §7.4, §9 (T9–T11, T13), §10
 

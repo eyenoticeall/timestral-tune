@@ -11,4 +11,6 @@ The three git-ignored PDFs are local reading copies. The arXiv non-exclusive lic
 allow redistribution, so they are excluded in the repo's `.gitignore`; re-download them from
 the links above.
 
-The two conformal papers are candidates: the spec does not yet name a conformal method.
+Both conformal papers are implemented in `src/timestral_tune/models/conformal.py` (spec §5.2,
+decision D6): CQR for static calibration (`ConformalCalibrator`) and ACI for online calibration
+(`OnlineConformalCalibrator`).
