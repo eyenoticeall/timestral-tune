@@ -137,3 +137,91 @@ def test_aci_never_clips_alpha_t_sets_saturated_and_round_trips(tmp_path):
     np.testing.assert_array_equal(online.alpha_t, reloaded.alpha_t)
     assert online.saturated == reloaded.saturated
     np.testing.assert_array_equal(online.transform(preds, scale), reloaded.transform(preds, scale))
+
+
+def test_cqr_exact_order_statistic_and_edge_cases():
+    """Verify exact CQR eq. 10 order statistic `ceil((n + 1) * cov)` (e.g. n=9, cov=0.8 -> 8th of 9),
+    plus `n_valid=1`, `bucket_size > H`, `bucket_size=1`, `H=0`, `N=0`, and all-NaN bucket guards.
+    """
+    # Construct 9 calibration points with known scaled scores 1..9 for the 0.80 pair.
+    n, h = 9, 1
+    preds = np.zeros((n, h, len(DEFAULT_QUANTILE_LEVELS)), dtype=np.float64)
+    actuals = np.arange(1.0, 10.0, dtype=np.float64)[:, None]  # scores = 1, 2, ..., 9
+    cal = ConformalCalibrator(target_coverage=0.80, bucket_size=1).fit(preds, actuals)
+    # ceil((9 + 1) * 0.8) = 8 -> exact 8th smallest score = 8.0 (not 9.0).
+    assert cal.offsets_ is not None and cal.offsets_[0, 0] == pytest.approx(8.0)
+
+    # n_valid = 1 hits the finite-sample rank > n upper bound -> max(scores).
+    cal1 = ConformalCalibrator(target_coverage=0.80, bucket_size=32).fit(preds[:1], actuals[:1])
+    assert cal1.offsets_ is not None and cal1.offsets_[0, 0] == pytest.approx(1.0)
+
+    # Empty N=0 or H=0 raises ValueError cleanly (never IndexError).
+    empty_h = np.zeros((4, 0, len(DEFAULT_QUANTILE_LEVELS)))
+    empty_y = np.zeros((4, 0))
+    with pytest.raises(ValueError, match="non-zero"):
+        ConformalCalibrator(0.80).fit(empty_h, empty_y)
+    with pytest.raises(ValueError, match="non-zero"):
+        cal.transform(empty_h)
+    with pytest.raises(ValueError, match="non-zero"):
+        OnlineConformalCalibrator(0.80).transform(empty_h)
+
+    # All-NaN bucket raises ValueError cleanly.
+    nan_y = np.full((5, 4), np.nan)
+    with pytest.raises(ValueError, match="no finite actuals"):
+        ConformalCalibrator(0.80, bucket_size=4).fit(np.zeros((5, 4, len(DEFAULT_QUANTILE_LEVELS))), nan_y)
+
+
+def test_from_dict_rejects_corrupted_cqr_and_aci_payloads():
+    preds, actuals, scale = _make_simple(12, 8, seed=7)
+    cqr_data = ConformalCalibrator(0.80, bucket_size=4).fit(preds, actuals, scale).to_dict()
+
+    for mutate in (
+        lambda d: d.update(offsets=[[float("nan"), 0.1]]),
+        lambda d: d.update(offsets=[[0.1, 0.2], [0.3, 0.4]]),  # wrong pair count
+        lambda d: d.update(offsets=[[]]),  # 0 buckets
+        lambda d: d.update(bucket_counts=[1]),  # mismatched bucket count
+    ):
+        bad = dict(cqr_data)
+        mutate(bad)
+        with pytest.raises(ValueError):
+            ConformalCalibrator.from_dict(bad)
+
+    aci = OnlineConformalCalibrator(0.80, bucket_size=4).update(preds, actuals, scale)
+    aci_data = aci.to_dict()
+    for mutate in (
+        lambda d: d.update(alpha_t=[[0.2]]),  # truncated bucket row
+        lambda d: d.update(alpha_t=[[float("nan"), 0.2]]),
+        lambda d: d.update(scores=[]),
+        lambda d: d.update(num_buckets=-1),
+    ):
+        bad = dict(aci_data)
+        mutate(bad)
+        with pytest.raises(ValueError):
+            OnlineConformalCalibrator.from_dict(bad)
+
+
+def test_aci_transform_is_read_only_and_update_uses_repaired_interval():
+    preds, actuals, scale = _make_simple(6, 8, seed=8)
+    online = OnlineConformalCalibrator(target_coverage=0.80, bucket_size=4)
+    before = online.to_dict()
+    out = online.transform(preds, scale)
+    assert online.to_dict() == before, "transform() must not mutate calibrator state"
+    assert np.all(np.diff(out, axis=-1) >= 0.0)
+
+    # Verify update evaluates err_t on the *repaired* interval: if 0.50's huge offset widens the 0.80
+    # interval to cover y, 0.80 registers err=0 (so its alpha_t rises rather than falling).
+    multi = OnlineConformalCalibrator(target_coverage=(0.50, 0.80), gamma=0.1, window=20, bucket_size=4)
+    p1 = np.zeros((1, 4, len(DEFAULT_QUANTILE_LEVELS)))
+    # Seed 0.50 with score 10.0 and 0.80 with score 0.0, with alpha_t=0.5 / 0.2.
+    multi._ensure_buckets(1)
+    multi._push_score(0, 0, 10.0)
+    multi._push_score(1, 0, 0.0)
+    alpha_80_before = float(multi.alpha_t[1, 0])
+    # y=5.0 lies outside raw 0.80 [0, 0] + 0 = [0, 0], but INSIDE repaired 0.80 [-10, 10] pushed by 0.50!
+    multi.update(p1, np.full((1, 4), 5.0), np.ones(1))
+    assert float(multi.alpha_t[1, 0]) > alpha_80_before, "ACI should score err_t against the repaired interval"
+
+    # bfloat16 and requires_grad=True inputs work cleanly without error.
+    t_bf16 = torch.tensor(preds, dtype=torch.bfloat16, requires_grad=True)
+    t_out = multi.transform(t_bf16)
+    assert isinstance(t_out, torch.Tensor) and t_out.dtype == torch.bfloat16 and (t_out.diff(dim=-1) >= 0).all()

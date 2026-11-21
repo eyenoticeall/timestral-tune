@@ -4,12 +4,14 @@ Two distribution-free calibrators operating on raw-space forecast quantiles with
 model weights (spec §5.2, decision D6):
 
 - `ConformalCalibrator`: static split Conformalized Quantile Regression (Romano et al., 2019,
-  eqs. 9-11), with scale-normalised conformity scores, horizon buckets, finite-sample quantile
-  level `(1 - alpha) * (1 + 1 / n)`, and outward monotonicity repair from the unshifted median.
+  eqs. 9-11), with scale-normalised conformity scores, horizon buckets, exact finite-sample
+  order statistic `ceil((n + 1) * (1 - alpha))` computed in O(n) via `np.partition`, and
+  outward monotonicity repair from the unshifted median.
 - `OnlineConformalCalibrator`: Adaptive Conformal Inference (Gibbs & Candès, 2021) for
   non-exchangeable series, maintaining per-bucket working miscoverage `alpha_t` over a rolling
-  score window. `alpha_t` is never clipped (ACI Lemma 4.1); saturation at `alpha_t <= 0` uses the
-  largest score in the window and raises `.saturated`.
+  score window (kept sorted for O(1) quantile lookup). `err_t` is evaluated on the actual
+  emitted (monotone-repaired) interval; `alpha_t` is never clipped (ACI Lemma 4.1); saturation
+  at `alpha_t <= 0` uses the largest score in the window and raises `.saturated`.
 
 - Spec: `docs/SPEC.md` §5.2, §7.3, §11 (D6)
 - Acceptance tests: T13
@@ -17,6 +19,7 @@ model weights (spec §5.2, decision D6):
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import numbers
@@ -131,6 +134,8 @@ def _validate_inputs(
     preds, is_tensor, device, dtype = _to_numpy_f64(predictions, "predictions")
     if preds.ndim != 3:
         raise ValueError(f"predictions must have shape (N, H, Q), got {preds.shape}")
+    if preds.shape[0] == 0 or preds.shape[1] == 0:
+        raise ValueError(f"predictions must have non-zero N and H, got shape {preds.shape}")
     if preds.shape[2] != num_quantiles:
         raise ValueError(f"predictions have {preds.shape[2]} quantiles on the last axis, expected {num_quantiles}")
     if not np.isfinite(preds).all():
@@ -157,12 +162,24 @@ def _validate_inputs(
     return preds, y, scale, is_tensor, device, dtype
 
 
+def _cqr_order_statistic(scores: np.ndarray, coverage: float) -> float:
+    """Exact CQR finite-sample order statistic `ceil((n + 1) * coverage)` in O(n) (Romano et al., eq. 10).
+
+    When `ceil((n + 1) * coverage) > n` (finite-sample boundary at very small `n` or high
+    coverage), returns `max(scores)` as the finite upper bound.
+    """
+    n = scores.size
+    rank = math.ceil((n + 1) * coverage)
+    if rank > n:
+        return float(np.max(scores))
+    idx = max(0, rank - 1)
+    return float(np.partition(scores, idx)[idx])
+
+
 def _repair_monotonicity_outward(quantiles: np.ndarray, median_idx: int) -> np.ndarray:
     """Outward monotonicity repair from the unshifted median (spec §5.2): intervals can only widen."""
     out = quantiles.copy()
-    # Upper half: q[k] = max(q[k], q[k - 1]) moving outward from median.
     out[..., median_idx:] = np.maximum.accumulate(out[..., median_idx:], axis=-1)
-    # Lower half: q[k] = min(q[k], q[k + 1]) moving outward from median.
     out[..., : median_idx + 1] = np.minimum.accumulate(out[..., median_idx::-1], axis=-1)[..., ::-1]
     return out
 
@@ -178,7 +195,7 @@ def _apply_offsets(
     """Apply `(num_pairs, num_buckets)` scaled offsets and outward monotonicity repair."""
     _, h, _ = preds.shape
     bucket_ids = np.arange(h) // bucket_size
-    if bucket_ids[-1] >= offsets.shape[1]:
+    if int(bucket_ids[-1]) >= offsets.shape[1]:
         raise ValueError(
             f"horizon {h} requires bucket {int(bucket_ids[-1])}, but calibrator only has {offsets.shape[1]} bucket(s)"
         )
@@ -258,11 +275,7 @@ class ConformalCalibrator:
                 q_low = preds[:, start:end, low_idx][valid]
                 q_high = preds[:, start:end, high_idx][valid]
                 scores = np.maximum(q_low - y_valid, y_valid - q_high) / scale_b
-                level = cov * (1.0 + 1.0 / n_valid)
-                if level >= 1.0:
-                    offsets[pair_idx, b] = float(np.max(scores))
-                else:
-                    offsets[pair_idx, b] = float(np.quantile(scores, level, method="higher"))
+                offsets[pair_idx, b] = _cqr_order_statistic(scores, cov)
 
         self.offsets_ = offsets
         self.bucket_counts_ = counts
@@ -300,18 +313,34 @@ class ConformalCalibrator:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ConformalCalibrator:
-        if data.get("kind") != "cqr":
-            raise ValueError(f"expected kind='cqr', got {data.get('kind')!r}")
+        if not isinstance(data, dict) or data.get("kind") != "cqr":
+            raise ValueError(f"expected kind='cqr', got {data.get('kind') if isinstance(data, dict) else data!r}")
+        for required in ("coverages", "bucket_size", "quantile_levels"):
+            if required not in data:
+                raise ValueError(f"missing required key {required!r} in CQR payload")
         cal = cls(
             target_coverage=data["coverages"],
             bucket_size=data["bucket_size"],
             quantile_levels=data["quantile_levels"],
         )
         if data.get("offsets") is not None:
-            cal.offsets_ = np.asarray(data["offsets"], dtype=np.float64)
-            cal.bucket_counts_ = (
-                None if data.get("bucket_counts") is None else np.asarray(data["bucket_counts"], dtype=np.int64)
-            )
+            try:
+                offsets = np.asarray(data["offsets"], dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("offsets must be a 2-D numeric array") from exc
+            if offsets.ndim != 2 or offsets.shape[0] != len(cal.pairs) or offsets.shape[1] < 1:
+                raise ValueError(
+                    f"offsets shape {offsets.shape} invalid for {len(cal.pairs)} coverage pair(s) "
+                    "(need 2-D with at least 1 bucket)"
+                )
+            if not np.isfinite(offsets).all():
+                raise ValueError("offsets must be finite")
+            cal.offsets_ = offsets
+            if data.get("bucket_counts") is not None:
+                counts = np.asarray(data["bucket_counts"], dtype=np.int64)
+                if counts.shape != (offsets.shape[1],) or (counts < 0).any():
+                    raise ValueError(f"bucket_counts shape {counts.shape} does not match {offsets.shape[1]} buckets")
+                cal.bucket_counts_ = counts
         return cal
 
     def save(self, path: str | Path) -> Path:
@@ -327,9 +356,12 @@ class ConformalCalibrator:
 class OnlineConformalCalibrator:
     """Adaptive Conformal Inference (ACI; Gibbs & Candès, 2021) for non-exchangeable series.
 
-    Maintains a rolling score window and unclipped working miscoverage `alpha_t` per
-    `(coverage_pair, horizon_bucket)`. When `alpha_t <= 0`, the largest score in the window is
-    used and `.saturated` is True; when `alpha_t >= 1`, the smallest score is used.
+    Maintains a rolling score window (with a sorted mirror for O(1) quantile lookup) and
+    unclipped working miscoverage `alpha_t` per `(coverage_pair, horizon_bucket)`. Realised
+    miscoverage `err_t` is evaluated on the actual emitted (monotone-repaired) interval; with
+    `bucket_size > 1`, `err_t` is the mean miscoverage fraction across observed steps in the
+    bucket. When `alpha_t <= 0`, the largest score in the window is used and `.saturated` is
+    True; when `alpha_t >= 1`, the smallest score is used.
 
     Args:
         target_coverage: Nominal central coverage(s) or `"all"`.
@@ -355,10 +387,10 @@ class OnlineConformalCalibrator:
         self.gamma = float(gamma)
         self.window = _positive_int("window", window)
         self.bucket_size = _positive_int("bucket_size", bucket_size)
-        # Per-bucket state grows lazily as horizons are seen.
         self._num_buckets: int = 0
         self._alpha_t: list[list[float]] = [[] for _ in self.pairs]
         self._scores: list[list[deque[float]]] = [[] for _ in self.pairs]
+        self._sorted: list[list[list[float]]] = [[] for _ in self.pairs]
 
     @property
     def coverages(self) -> tuple[float, ...]:
@@ -371,20 +403,33 @@ class OnlineConformalCalibrator:
             alpha = 1.0 - cov
             for _ in range(num_buckets - self._num_buckets):
                 self._alpha_t[pair_idx].append(alpha)
-                self._scores[pair_idx].append(deque(maxlen=self.window))
+                self._scores[pair_idx].append(deque())
+                self._sorted[pair_idx].append([])
         self._num_buckets = num_buckets
 
+    def _push_score(self, pair_idx: int, bucket_idx: int, score: float) -> None:
+        fifo = self._scores[pair_idx][bucket_idx]
+        ordered = self._sorted[pair_idx][bucket_idx]
+        if len(fifo) >= self.window:
+            evicted = fifo.popleft()
+            del ordered[bisect.bisect_left(ordered, evicted)]
+        fifo.append(score)
+        bisect.insort(ordered, score)
+
     def _bucket_offset(self, pair_idx: int, bucket_idx: int) -> tuple[float, bool]:
-        scores = self._scores[pair_idx][bucket_idx]
-        if not scores:
+        if bucket_idx >= self._num_buckets:
+            return 0.0, False
+        ordered = self._sorted[pair_idx][bucket_idx]
+        m = len(ordered)
+        if m == 0:
             return 0.0, False
         alpha_t = self._alpha_t[pair_idx][bucket_idx]
-        arr = np.fromiter(scores, dtype=np.float64, count=len(scores))
         if alpha_t <= 0.0:
-            return float(np.max(arr)), True
+            return ordered[-1], True
         if alpha_t >= 1.0:
-            return float(np.min(arr)), False
-        return float(np.quantile(arr, 1.0 - alpha_t, method="higher")), False
+            return ordered[0], False
+        idx = min(m - 1, max(0, math.ceil(m * (1.0 - alpha_t)) - 1))
+        return ordered[idx], False
 
     @property
     def alpha_t(self) -> np.ndarray:
@@ -397,17 +442,18 @@ class OnlineConformalCalibrator:
     def saturated(self) -> bool:
         """True if any calibrated `(coverage, bucket)` currently has `alpha_t <= 0` with scores present."""
         return any(
-            bool(self._scores[p][b]) and self._alpha_t[p][b] <= 0.0
+            bool(self._sorted[p][b]) and self._alpha_t[p][b] <= 0.0
             for p in range(len(self.pairs))
             for b in range(self._num_buckets)
         )
 
     def current_offsets(self, horizon: int) -> np.ndarray:
-        num_buckets = math.ceil(horizon / self.bucket_size)
-        self._ensure_buckets(num_buckets)
+        """Current `(num_pairs, num_buckets)` offsets for `horizon`, without mutating calibrator state."""
+        h = _positive_int("horizon", horizon)
+        num_buckets = math.ceil(h / self.bucket_size)
         offsets = np.zeros((len(self.pairs), num_buckets), dtype=np.float64)
         for p in range(len(self.pairs)):
-            for b in range(num_buckets):
+            for b in range(min(num_buckets, self._num_buckets)):
                 offsets[p, b], _ = self._bucket_offset(p, b)
         return offsets
 
@@ -422,7 +468,7 @@ class OnlineConformalCalibrator:
         predictions: ArrayOrTensor,
         context_scale: ArrayOrTensor | None = None,
     ) -> ArrayOrTensor:
-        """Apply the current online offsets and outward monotonicity repair to raw-space forecasts."""
+        """Apply the current online offsets and outward monotonicity repair without mutating state."""
         preds, _, scale, is_tensor, device, dtype = _validate_inputs(
             predictions, len(self.quantile_levels), None, context_scale
         )
@@ -445,6 +491,11 @@ class OnlineConformalCalibrator:
 
         for i in range(n):
             s_i = float(scale[i])
+            # Evaluate miscoverage against the actual emitted (outward-repaired) interval before updating.
+            offsets_i = self.current_offsets(h)
+            emitted_i = _apply_offsets(
+                preds[i : i + 1], scale[i : i + 1], self.pairs, offsets_i, self.bucket_size, self.median_idx
+            )[0]
             for b in range(num_buckets):
                 start = b * self.bucket_size
                 end = min(h, start + self.bucket_size)
@@ -455,16 +506,16 @@ class OnlineConformalCalibrator:
                 y_v = y_b[valid]
                 for p, (cov, low_idx, high_idx) in enumerate(self.pairs):
                     alpha = 1.0 - cov
-                    q_cur, _ = self._bucket_offset(p, b)
-                    q_low = preds[i, start:end, low_idx][valid]
-                    q_high = preds[i, start:end, high_idx][valid]
-                    lo = q_low - q_cur * s_i
-                    hi = q_high + q_cur * s_i
+                    lo = emitted_i[start:end, low_idx][valid]
+                    hi = emitted_i[start:end, high_idx][valid]
                     err = float(np.mean((y_v < lo) | (y_v > hi)))
                     # ACI update: alpha_t is never clipped (Lemma 4.1).
                     self._alpha_t[p][b] = self._alpha_t[p][b] + self.gamma * (alpha - err)
+                    q_low = preds[i, start:end, low_idx][valid]
+                    q_high = preds[i, start:end, high_idx][valid]
                     new_scores = np.maximum(q_low - y_v, y_v - q_high) / s_i
-                    self._scores[p][b].extend(float(v) for v in new_scores)
+                    for val in new_scores:
+                        self._push_score(p, b, float(val))
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -482,8 +533,11 @@ class OnlineConformalCalibrator:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> OnlineConformalCalibrator:
-        if data.get("kind") != "aci":
-            raise ValueError(f"expected kind='aci', got {data.get('kind')!r}")
+        if not isinstance(data, dict) or data.get("kind") != "aci":
+            raise ValueError(f"expected kind='aci', got {data.get('kind') if isinstance(data, dict) else data!r}")
+        for required in ("coverages", "gamma", "window", "bucket_size", "quantile_levels", "alpha_t", "scores"):
+            if required not in data:
+                raise ValueError(f"missing required key {required!r} in ACI payload")
         cal = cls(
             target_coverage=data["coverages"],
             gamma=data["gamma"],
@@ -491,12 +545,38 @@ class OnlineConformalCalibrator:
             bucket_size=data["bucket_size"],
             quantile_levels=data["quantile_levels"],
         )
-        num_buckets = int(data.get("num_buckets", 0))
+        raw_nb = data.get("num_buckets", 0)
+        if not isinstance(raw_nb, numbers.Integral) or isinstance(raw_nb, bool) or raw_nb < 0:
+            raise ValueError(f"num_buckets must be a non-negative integer, got {raw_nb!r}")
+        num_buckets = int(raw_nb)
+        alpha_t = data["alpha_t"]
+        scores = data["scores"]
+        if not isinstance(alpha_t, list) or len(alpha_t) != len(cal.pairs):
+            got = len(alpha_t) if isinstance(alpha_t, list) else type(alpha_t).__name__
+            raise ValueError(f"alpha_t must have {len(cal.pairs)} rows, got {got}")
+        if not isinstance(scores, list) or len(scores) != len(cal.pairs):
+            got = len(scores) if isinstance(scores, list) else type(scores).__name__
+            raise ValueError(f"scores must have {len(cal.pairs)} rows, got {got}")
+
         cal._ensure_buckets(num_buckets)
         for p in range(len(cal.pairs)):
+            if not isinstance(alpha_t[p], list) or len(alpha_t[p]) != num_buckets:
+                raise ValueError(f"alpha_t[{p}] must have length {num_buckets}")
+            if not isinstance(scores[p], list) or len(scores[p]) != num_buckets:
+                raise ValueError(f"scores[{p}] must have length {num_buckets}")
             for b in range(num_buckets):
-                cal._alpha_t[p][b] = float(data["alpha_t"][p][b])
-                cal._scores[p][b] = deque((float(v) for v in data["scores"][p][b]), maxlen=cal.window)
+                val = float(alpha_t[p][b])
+                if not math.isfinite(val):
+                    raise ValueError(f"alpha_t[{p}][{b}] must be finite, got {val!r}")
+                cal._alpha_t[p][b] = val
+                bucket_scores = scores[p][b]
+                if not isinstance(bucket_scores, list):
+                    raise ValueError(f"scores[{p}][{b}] must be a list")
+                for s in bucket_scores[-cal.window :]:
+                    sf = float(s)
+                    if not math.isfinite(sf):
+                        raise ValueError(f"non-finite score {s!r} in scores[{p}][{b}]")
+                    cal._push_score(p, b, sf)
         return cal
 
     def save(self, path: str | Path) -> Path:
