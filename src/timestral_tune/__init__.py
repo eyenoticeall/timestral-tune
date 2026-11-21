@@ -7,8 +7,16 @@ fine-tuning, conformal calibration and export are not built yet. See `README.md`
 """
 
 from .config import LoraConfig, TrainingConfig
+from .models.conformal import ConformalCalibrator, OnlineConformalCalibrator
 from .trainer import TimestralTrainer
 
 __version__ = "0.1.0.dev0"
 
-__all__ = ["LoraConfig", "TimestralTrainer", "TrainingConfig", "__version__"]
+__all__ = [
+    "ConformalCalibrator",
+    "LoraConfig",
+    "OnlineConformalCalibrator",
+    "TimestralTrainer",
+    "TrainingConfig",
+    "__version__",
+]

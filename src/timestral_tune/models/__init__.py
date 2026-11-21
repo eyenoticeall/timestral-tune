@@ -14,6 +14,7 @@ from .adapter import (
     unmerge_lora,
     validate_lora_for_rows,
 )
+from .conformal import DEFAULT_QUANTILE_LEVELS, ConformalCalibrator, OnlineConformalCalibrator
 from .device import MIN_TORCH_FOR_MPS, TuneTimestralForecaster, TuneTimestralModel, mps_is_usable, supports_float64
 from .forward import (
     ForwardOutput,
@@ -26,10 +27,13 @@ from .forward import (
 from .loader import PINNED_REVISIONS, load_forecaster, load_model, resolve_device, resolve_revision
 
 __all__ = [
+    "DEFAULT_QUANTILE_LEVELS",
     "MIN_TORCH_FOR_MPS",
     "PINNED_REVISIONS",
+    "ConformalCalibrator",
     "ForwardOutput",
     "LoRASliceLinear",
+    "OnlineConformalCalibrator",
     "TargetFrame",
     "TuneTimestralForecaster",
     "TuneTimestralModel",
