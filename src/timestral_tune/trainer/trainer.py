@@ -12,9 +12,10 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -23,7 +24,9 @@ from torch.utils.data import DataLoader, Dataset
 from ..config import LoraConfig, TrainingConfig
 from ..data.batch import TrainingBatch
 from ..data.dataset import TimeSeriesDataset
+from ..export import dataset_fingerprint, export_checkpoint
 from ..models.adapter import inject_lora, lora_parameters
+from ..models.conformal import ConformalCalibrator, OnlineConformalCalibrator
 from ..models.device import TuneTimestralModel, supports_float64
 from ..models.forward import context_welford_state, normalise_targets, target_frames, training_forward
 from ..models.loader import load_model, resolve_device
@@ -633,8 +636,40 @@ class TimestralTrainer:
             raise ValueError("the dataset has no scored position to evaluate")
         return EvalResult(loss=total / scored, scored_positions=scored, batches=count)
 
-    def export(self, output_dir: str | Path | None = None) -> None:
-        """Write an upstream-loadable checkpoint (spec §7.4). Not implemented yet: roadmap Phase 2."""
-        raise NotImplementedError(
-            "export() is not implemented yet (roadmap Phase 2). The trained model is available as trainer.model"
+    def export(
+        self,
+        output_dir: str | Path | None = None,
+        *,
+        calibrator: ConformalCalibrator | OnlineConformalCalibrator | None = None,
+        metrics: Mapping[str, Any] | None = None,
+        data_fingerprint: str | None = None,
+        license_path: str | Path | None = None,
+    ) -> Path:
+        """Write an upstream-loadable checkpoint directory (spec §7.4, acceptance test T11).
+
+        Args:
+            output_dir: Destination directory. Defaults to `config.output_dir`.
+            calibrator: Optional fitted `ConformalCalibrator` or `OnlineConformalCalibrator` to
+                write as `conformal.json`.
+            metrics: Optional evaluation metrics recorded in `tune_metadata.json`.
+            data_fingerprint: Optional dataset fingerprint; defaults to a SHA-256 structural
+                summary of `train_dataset`.
+            license_path: Optional explicit path to the base weights' `LICENSE` file.
+        """
+        target = output_dir if output_dir is not None else self.config.output_dir
+        if target is None:
+            raise ValueError("no output directory: pass output_dir to export() or set TrainingConfig.output_dir")
+        fingerprint = data_fingerprint if data_fingerprint is not None else dataset_fingerprint(self.train_dataset)
+        return export_checkpoint(
+            self.model,
+            target,
+            base_repo_or_path=self.config.model_name_or_path,
+            base_revision=self.config.revision,
+            mode=self.config.mode,
+            training_config=self.config,
+            lora_config=self.lora_config,
+            calibrator=calibrator,
+            metrics=metrics,
+            data_fingerprint=fingerprint,
+            license_path=license_path,
         )

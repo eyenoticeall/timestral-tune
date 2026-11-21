@@ -442,13 +442,6 @@ def test_a_non_finite_loss_stops_training_with_an_explanation(tiny_forecaster, m
     assert not trainer.model.training, "the model is left in eval mode even when training fails"
 
 
-def test_features_of_later_phases_raise_not_implemented(tiny_forecaster):
-    dataset = make_toy_dataset(tiny_forecaster.patch_size)
-    model = fresh_model(tiny_forecaster)
-    with pytest.raises(NotImplementedError, match="Phase 2"):
-        TimestralTrainer(config_for(), dataset, model=model).export()
-
-
 def test_trainer_mode_precision_and_compile_validation(tiny_forecaster):
     dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
     uni = make_toy_dataset(tiny_forecaster.patch_size, covariates=False)
