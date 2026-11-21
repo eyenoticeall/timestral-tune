@@ -49,6 +49,7 @@ class BenchmarkSplits:
     license: str
     source: str
     contamination_note: str
+    test_date_range: str
     seasonality: int
     train: TimeSeriesDataset
     val: TimeSeriesDataset
@@ -89,6 +90,7 @@ def load_realised_volatility(
     test_cutoff_ns = int(np.datetime64("2026-10-28T00:00:00", "ns").astype(np.int64))
 
     series_list: list[SeriesData] = []
+    dt_by_series: list[np.ndarray] = []
     for sym, grp in df.group_by("symbol", maintain_order=True):
         sym_name = str(sym[0] if isinstance(sym, tuple) else sym)
         n = grp.height
@@ -97,6 +99,7 @@ def load_realised_volatility(
         test_pos = int(np.searchsorted(dt_ns, test_cutoff_ns))
         if val_pos < context_length + forecast_horizon or (n - test_pos) < forecast_horizon:
             continue
+        dt_by_series.append(grp["dt_utc"].to_numpy())
 
         # Align every symbol on the exact same bar coordinate relative to the post-Oct-28 cutoff
         # so global `split_by_time` cutoffs correspond to exact calendar dates across all 51 symbols.
@@ -158,14 +161,23 @@ def load_realised_volatility(
     pre_test, test_ds = full_eval.split_by_time(cutoff=0)
     _, val_ds = pre_test.split_by_time(cutoff=val_start_bar)
 
+    # Record the exact scored target calendar span across all test windows (never approximate).
+    scored_starts = [dt_by_series[int(test_ds._series_index[i])][int(test_ds._origins[i])] for i in range(len(test_ds))]
+    scored_ends = [
+        dt_by_series[int(test_ds._series_index[i])][int(test_ds._origins[i]) + forecast_horizon - 1]
+        for i in range(len(test_ds))
+    ]
+    test_range = f"{str(min(scored_starts))[:10]} to {str(max(scored_ends))[:10]}"
+
     return BenchmarkSplits(
         name="realised_volatility",
         license="MIT",
         source=f"{TWELVEDATA_REPO}@{TWELVEDATA_REV} (bars_1h)",
         contamination_note=(
-            "Test window covers 2026-10-28 to 2026-11-20 (strictly after Timestral's 2026-10-27 release; "
+            f"Scored test targets span {test_range} (strictly after Timestral's 2026-10-27 release; "
             "no pretraining contamination on test targets). Training/validation bars precede release."
         ),
+        test_date_range=test_range,
         seasonality=7,  # 7 hourly trading bars per US equity session
         train=train_ds,
         val=val_ds,
@@ -200,19 +212,25 @@ def load_retail_demand(
     df_tr = pl.read_parquet(p_train, columns=cols)
     df_ev = pl.read_parquet(p_eval, columns=cols)
 
-    # Deterministically select `num_series` store-SKU pairs with full day coverage in both splits
-    # and highest active-hour sales volume (sorted cleanly by volume desc, then (store_id, product_id)).
-    tr_days = df_tr["dt"].n_unique()
+    # Deterministically select `num_series` store-SKU pairs with full calendar presence using
+    # ONLY training-period sales (first 70 days, strictly before val/test) so zero test-period
+    # sales influence series selection.
+    tr_dates = sorted(df_tr["dt"].unique().to_list())
+    train_days_cutoff_dt = tr_dates[69]
+    tr_days = len(tr_dates)
     ev_days = df_ev["dt"].n_unique()
     tr_ok = (
         df_tr.group_by(["store_id", "product_id"])
-        .agg(pl.len().alias("n_tr"), pl.col("sale_amount").sum().alias("tot_sale"))
+        .agg(
+            pl.len().alias("n_tr"),
+            pl.col("sale_amount").filter(pl.col("dt") <= train_days_cutoff_dt).sum().alias("train_only_sale"),
+        )
         .filter(pl.col("n_tr") == tr_days)
     )
     ev_ok = df_ev.group_by(["store_id", "product_id"]).agg(pl.len().alias("n_ev")).filter(pl.col("n_ev") == ev_days)
     chosen = (
         tr_ok.join(ev_ok, on=["store_id", "product_id"], how="inner")
-        .sort(["tot_sale", "store_id", "product_id"], descending=[True, False, False])
+        .sort(["train_only_sale", "store_id", "product_id"], descending=[True, False, False])
         .head(num_series)
         .select(["store_id", "product_id"])
     )
@@ -287,14 +305,20 @@ def load_retail_demand(
     pre_test, test_ds = full_eval.split_by_time(cutoff=test_cutoff)
     _, val_ds = pre_test.split_by_time(cutoff=val_cutoff)
 
+    all_dates = sorted(df["dt"].unique().to_list())
+    test_start_day = min(int(test_ds._origins[i]) // 24 for i in range(len(test_ds)))
+    test_end_day = max((int(test_ds._origins[i]) + forecast_horizon - 1) // 24 for i in range(len(test_ds)))
+    test_range = f"{all_dates[test_start_day]} to {all_dates[test_end_day]}"
+
     return BenchmarkSplits(
         name="retail_demand",
         license="CC BY 4.0",
-        source=f"{FRESHRETAIL_REPO}@{FRESHRETAIL_REV} (top {len(series_list)} active store-SKU hourly series)",
+        source=f"{FRESHRETAIL_REPO}@{FRESHRETAIL_REV} (top {len(series_list)} train-period active store-SKU series)",
         contamination_note=(
-            "FreshRetailNet-50K (2024 dates) was published before Timestral's October 2026 release and may "
-            "have been seen during Mistral's post-training."
+            f"FreshRetailNet-50K (scored test targets {test_range}) was published before Timestral's "
+            "October 2026 release and may have been seen during Mistral's post-training."
         ),
+        test_date_range=test_range,
         seasonality=24,  # 24-hour daily retail cycle
         train=train_ds,
         val=val_ds,
@@ -302,20 +326,21 @@ def load_retail_demand(
     )
 
 
-def load_general_forgetting(
+def load_general_forgetting_by_domain(
     *,
     context_length: int = 256,
     forecast_horizon: int = 64,
     stride: int = 64,
     tail_steps: int = 512,
     max_traffic_series: int = 20,
-) -> TimeSeriesDataset:
-    """Load a multi-domain non-finance, non-retail forgetting set from GIFT-Eval (Apache-2.0).
+) -> dict[str, TimeSeriesDataset]:
+    """Load per-domain non-finance, non-retail forgetting datasets from GIFT-Eval (Apache-2.0).
 
-    Combines hourly series from energy (`ett1/H`), weather (`jena_weather/H`), and highway traffic
-    (`LOOP_SEATTLE/H`), using the final `tail_steps` hours of each series.
+    Returns `{"ett1": ..., "jena_weather": ..., "loop_seattle": ...}` so forgetting can be
+    reported per domain and as an equal-weighted macro average (preventing high-magnitude channels
+    such as Jena atmospheric pressure from dominating the pooled wQL denominator).
     """
-    series_list: list[SeriesData] = []
+    out: dict[str, TimeSeriesDataset] = {}
     sources = (
         ("ett1", "ett1/H/data-00000-of-00001.arrow", 7),
         ("jena_weather", "jena_weather/H/data-00000-of-00001.arrow", 21),
@@ -325,17 +350,14 @@ def load_general_forgetting(
         local = hf_hub_download(GIFTEVAL_REPO, rel_path, repo_type="dataset", revision=GIFTEVAL_REV)
         with open(local, "rb") as fh:
             tbl = ipc.open_stream(fh).read_all()
-        extracted = 0
+        domain_series: list[SeriesData] = []
         for row_idx in range(tbl.num_rows):
-            if extracted >= max_count:
+            if len(domain_series) >= max_count:
                 break
             raw = tbl["target"][row_idx].as_py()
-            if isinstance(raw[0], list):
-                channels = raw
-            else:
-                channels = [raw]
+            channels = raw if isinstance(raw[0], list) else [raw]
             for ch_idx, ch in enumerate(channels):
-                if extracted >= max_count:
+                if len(domain_series) >= max_count:
                     break
                 arr = np.asarray(ch[-tail_steps:], dtype=np.float32)
                 if arr.shape[0] < context_length + forecast_horizon or not np.isfinite(arr).all():
@@ -343,7 +365,7 @@ def load_general_forgetting(
                 if float(np.std(arr)) <= 1e-6:
                     continue
                 n = arr.shape[0]
-                series_list.append(
+                domain_series.append(
                     SeriesData(
                         series_id=f"{domain}_{row_idx}_{ch_idx}",
                         timestamps=np.arange(n, dtype=np.int64),
@@ -354,10 +376,36 @@ def load_general_forgetting(
                         categorical_known=np.empty((0, n), dtype=np.float64),
                     )
                 )
-                extracted += 1
+        out[domain] = TimeSeriesDataset(
+            domain_series,
+            context_length=context_length,
+            forecast_horizon=forecast_horizon,
+            stride=stride,
+            min_context=context_length,
+            roles=ColumnRoles(targets=("value",)),
+        )
+    return out
 
+
+def load_general_forgetting(
+    *,
+    context_length: int = 256,
+    forecast_horizon: int = 64,
+    stride: int = 64,
+    tail_steps: int = 512,
+    max_traffic_series: int = 20,
+) -> TimeSeriesDataset:
+    """Pooled multi-domain GIFT-Eval forgetting dataset (union of `load_general_forgetting_by_domain`)."""
+    by_dom = load_general_forgetting_by_domain(
+        context_length=context_length,
+        forecast_horizon=forecast_horizon,
+        stride=stride,
+        tail_steps=tail_steps,
+        max_traffic_series=max_traffic_series,
+    )
+    all_series = [s for ds in by_dom.values() for s in ds.series]
     return TimeSeriesDataset(
-        series_list,
+        all_series,
         context_length=context_length,
         forecast_horizon=forecast_horizon,
         stride=stride,

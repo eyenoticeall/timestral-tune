@@ -153,9 +153,11 @@ def load_realised_volatility_2026_holdout(
         license="MIT",
         source=f"{TWELVEDATA_REPO}@{TWELVEDATA_REV} (bars_1h, full 2026 holdout)",
         contamination_note=(
-            "Trained strictly on 2024-2025. Test spans Jan-Nov 2026 (Jan-Oct precedes release; "
-            "Oct 28-Nov 20 is post-release). Used for multi-regime statistical power."
+            "Trained strictly on 2024-2025. Test spans Jan-Nov 2026 (mostly pre-release: Jan-Oct "
+            "precedes Timestral's 2026-10-27 release; only Nov 3-20 is strictly post-release). "
+            "Used for multi-regime statistical power."
         ),
+        test_date_range="2026-01 to 2026-11-20",
         seasonality=7,
         train=train_ds,
         val=val_ds,
