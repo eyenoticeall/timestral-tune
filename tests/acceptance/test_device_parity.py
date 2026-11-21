@@ -37,6 +37,7 @@ from timestral_tune.trainer import compute_loss
 
 from ..conftest import available_accelerators
 from ..helpers import (
+    as_double,
     explicit_attention,
     forecaster_on,
     l2_rel,
@@ -103,6 +104,10 @@ def test_t14_device_parity_gradients(forecaster, raw, device, is_released_checkp
     relative = l2_rel(gradient, reference)
     cosine = torch.nn.functional.cosine_similarity(gradient, reference, dim=0).item()
     print(f"gradient on {device}: relative L2 error {relative:.2e}, 1 - cosine {1 - cosine:.1e}")  # `pytest -s`
+    if device == "cpu":
+        # Why the reference computes RMSNorm in float64: how far it moves if upstream's float32 one is kept.
+        _, float32_norm = loss_gradient(copy.deepcopy(forecaster.model).double(), as_double(batch))
+        print(f"reference with upstream's float32 RMSNorm: relative L2 distance {l2_rel(float32_norm, reference):.2e}")
     assert relative < bound, f"relative L2 {relative:.2e}"
 
 

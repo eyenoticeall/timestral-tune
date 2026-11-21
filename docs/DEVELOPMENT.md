@@ -73,7 +73,8 @@ a batch with upstream's own input assembly as ground truth).
 - **Three models per test.** Most acceptance tests take the `forecaster` fixture, which runs them on a tiny
   random model (network-free, so CI covers the logic) and on the released 5M and 28M checkpoints (marked
   `network`). The roadmap's exit criteria are about the released checkpoints, so run the full suite locally
-  before claiming an item done: `uv run pytest`.
+  before claiming an item done: `uv run pytest`. Without network access, or with a broken loader, those tests
+  error; they are never skipped silently. Use `uv run pytest -m "not network"` to leave them out.
 - **Acceptance tests** (`tests/acceptance/`) are the definition of done and carry the `acceptance` marker.
 - **Ground truth is upstream.** Compare with the vendored forecaster on the same inputs
   (`tests/helpers.py::upstream_batch`, `forecast()`), not with hand-computed expectations.

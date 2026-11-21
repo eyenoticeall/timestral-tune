@@ -160,8 +160,12 @@ sources are identified:
 1. The float32 backward pass of upstream's attention call, on CUDA (§13) and CPU. On the Apple GPU the swap
    changes little.
 2. Upstream's RMSNorm, which computes in float32 whatever the model's dtype. On T14's 5M scenario with
-   past-only covariates this moved the float64-weights reference itself by 3.8e-3 (§11), enough to fail a
-   check whose bound is 5e-3. All references now compute RMSNorm in float64 (`tests/helpers.py` and
+   past-only covariates the float64-weights reference with that RMSNorm is 3.8e-3 away from the one with
+   float64 RMSNorm; the next largest case is 1.4e-4 (28M, covariates) and the rest are at 5e-5 or less
+   (`uv run pytest tests/acceptance/test_device_parity.py -k "device_parity_gradients and cpu" -s` prints
+   each). That was enough to fail a check whose bound is 5e-3: against the old reference the two float32
+   runs were at 2.6e-3 (CPU) and 5.9e-3 (Apple GPU), against the new one at 1.2e-3 and 2.1e-3, on either
+   side of it. All references now compute RMSNorm in float64 (`tests/helpers.py` and
    `scripts/probes/_common.py`, by replacing the method while the reference runs; vendored files are not
    edited). Numbers in this section were re-measured with that reference on 2026-11-21. The CUDA numbers in
    §13 were not: they used the earlier reference.
@@ -311,7 +315,6 @@ Re-measure before relying on them.
 | Autocast speed on MPS, 28M covariate batch | fp32 1,778 ms; `bfloat16` 1,731 ms; `float16` 1,732 ms (no speed-up) |
 | Training step at context 4,096, univariate, batch 16 | 5M: CPU 138 ms, MPS 93 ms. 28M: CPU 526 ms, MPS 347 ms |
 | RMSNorm via `sqrt` instead of `rsqrt` (5M) | CPU fp32 gradient error moved from 3.9e-3 to 1.5e-3 |
-| Float64-weights reference with upstream's float32 RMSNorm against the same with float64 RMSNorm, on T14's scenarios | 5M past-only covariates 3.8e-3; 28M covariates 1.4e-4; 5M univariate 1.5e-5 |
 | The 5M past-only-covariates case with explicit attention, against the earlier (float32-RMSNorm) reference | CPU 2.6e-3, Apple GPU 5.9e-3; the error sat in layers 0 to 4 and the patch embedding, with the same distribution on both devices |
 
 ## 12. Facts read from sources, not measured
