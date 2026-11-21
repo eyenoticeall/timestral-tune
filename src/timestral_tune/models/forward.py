@@ -27,6 +27,9 @@ The loss compares predictions with targets normalised in a per-patch *frame* `(l
 
 from __future__ import annotations
 
+import contextlib
+import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Literal, get_args
 
@@ -54,16 +57,76 @@ from ..data.batch import TrainingBatch
 from .device import supports_float64
 
 __all__ = [
+    "AttentionBackend",
     "ForwardOutput",
     "TargetFrame",
+    "attention_context",
     "denormalise_quantiles",
     "normalise_targets",
     "target_frames",
     "training_forward",
 ]
 
+AttentionBackend = Literal["default", "math"]
+ATTENTION_BACKENDS: tuple[str, ...] = get_args(AttentionBackend)
 TargetFrame = Literal["median_folded", "true_values"]
 TARGET_FRAMES: tuple[str, ...] = get_args(TargetFrame)
+
+_SDPA_BACKENDS = ("math", "flash", "mem_efficient", "cudnn")
+_MATH_SDPA_LOCK = threading.Lock()
+_MATH_SDPA_DEPTH = 0
+_MATH_SDPA_SAVED: dict[str, bool] | None = None
+
+
+def _snapshot_sdpa_flags() -> dict[str, bool]:
+    return {name: getattr(torch.backends.cuda, f"{name}_sdp_enabled")() for name in _SDPA_BACKENDS}
+
+
+def _apply_sdpa_flags(flags: dict[str, bool]) -> None:
+    for name, enabled in flags.items():
+        getattr(torch.backends.cuda, f"enable_{name}_sdp")(enabled)
+
+
+@contextlib.contextmanager
+def attention_context(backend: AttentionBackend = "default") -> Iterator[None]:
+    """Experimental: select the PyTorch attention kernel for calls inside the block.
+
+    This is a measurement tool, used by acceptance test T14 and the gradient-accuracy probe. It is
+    not part of the public API and no training code path uses it; whether training should is a
+    Phase 2 question (spec §11, D15).
+
+    `"default"` leaves PyTorch's dispatch alone, matching upstream inference. `"math"` disables the
+    fused scaled-dot-product-attention kernels (flash, memory-efficient, cuDNN) so PyTorch runs its
+    unfused one. On typical CPU batches that avoids the float32 backward error of the fused kernel,
+    at the cost of materialising the O(S^2) attention matrix. It can still be less accurate than
+    `"default"` on individual batches with near-tied large logits (spec §12), is identical to
+    `"default"` on the Apple GPU, and is untested on CUDA.
+
+    PyTorch's flags are process-global, so other threads also see math-only attention while any
+    `"math"` block is active. Overlapping or nested blocks are reference-counted, so the original
+    flags are restored when the last one exits.
+    """
+    if backend not in ATTENTION_BACKENDS:
+        raise ValueError(f"unknown attention backend {backend!r}; expected one of {ATTENTION_BACKENDS}")
+    if backend != "math":
+        yield
+        return
+
+    global _MATH_SDPA_DEPTH, _MATH_SDPA_SAVED
+    with _MATH_SDPA_LOCK:
+        if _MATH_SDPA_DEPTH == 0:
+            _MATH_SDPA_SAVED = _snapshot_sdpa_flags()
+            _apply_sdpa_flags({name: name == "math" for name in _SDPA_BACKENDS})
+        _MATH_SDPA_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _MATH_SDPA_LOCK:
+            _MATH_SDPA_DEPTH -= 1
+            if _MATH_SDPA_DEPTH == 0 and _MATH_SDPA_SAVED is not None:
+                saved = _MATH_SDPA_SAVED
+                _MATH_SDPA_SAVED = None
+                _apply_sdpa_flags(saved)
 
 
 @dataclass(frozen=True)
