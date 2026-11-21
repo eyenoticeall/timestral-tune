@@ -89,6 +89,9 @@ stub's docstring. Commit in small logical steps.
 - **Branches are reserved** for three things: a roadmap phase (`phase-1`), a new version (`v0.2`), or a
   large adaptation that will take many commits and may not land (`adapt/tiled-training`). One branch per
   such effort, not one per task within it. Keep the number of open branches small.
+- **The maintainer can ask for any other branch.** A branch outside those three, including one stacked on
+  another branch (a `fix/...` branch on top of `phase-1`), is fine when the maintainer requests it. Do not
+  open one on your own initiative, and do not flag one the maintainer asked for as a policy problem.
 - **Close branches out.** When a branch's work is merged, fast-forward `main` where possible and delete the
   branch. Do not leave merged branches around.
 - **One logical change per commit.** Do not mix a feature with unrelated formatting or docs. Tests for a
