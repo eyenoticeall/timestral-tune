@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -288,3 +289,19 @@ def make_toy_dataset(patch_size: int, *, series: int = 6, seed: int = 0, covaria
         stride=2 * patch_size,
         min_context=8 * patch_size,
     )
+
+
+def explicit_attention(query, key, value, mask, is_causal=False):
+    """Drop-in for the vendored `layers._sdpa`: the same maths as `F.scaled_dot_product_attention`, written out.
+
+    Used to separate the accuracy of that call's float32 backward pass from the rest of the training path.
+    """
+    batch, seq, _, _ = query.shape
+    q, k, v = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+    scores = (q @ k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+    elif is_causal:
+        causal = torch.ones(q.shape[-2], k.shape[-2], dtype=torch.bool, device=q.device).tril()
+        scores = scores.masked_fill(~causal, float("-inf"))
+    return (scores.softmax(-1) @ v).transpose(1, 2).contiguous().view(batch, seq, -1)

@@ -6,13 +6,15 @@
 Observation being tracked: gradients of the training loss computed in float32 differ from a
 float64-weights reference by far more than float32 round-off on the released checkpoints, while
 forward outputs agree to about 3e-7. A randomly initialised model of the same architecture does
-not show this. CPU is usually 10 to 100 times worse than the Apple GPU. No cause is identified.
+not show this. Most of it comes from the float32 backward pass of upstream's attention call:
+with attention written out explicitly the error falls to 1e-4 or less (largest on CUDA: 1.2e-2 to
+2e-5). A smaller, scenario-specific remainder is unexplained.
 
 Three experiments, so the investigation can continue from evidence:
 
 1. Matrix: relative L2 error of the float32 gradient, per model (a tiny random model and the
    released sizes), per input layout, on CPU and on the accelerator.
-2. In-model attention swap: the CPU error after replacing upstream's attention call
+2. In-model attention swap: the error on each device after replacing upstream's attention call
    (`F.scaled_dot_product_attention`) with an explicit matmul-and-softmax.
 3. Standalone attention: float32 against float64 gradients of the stock and the explicit attention
    call, outside the model, as the attention logits are scaled up.
@@ -93,20 +95,23 @@ def main() -> None:
                 line += f" | {args.device} {rel(accelerated, reference):.1e}"
             print(line)
 
-    print("\n[2] CPU error with upstream's attention call replaced by an explicit matmul and softmax")
+    print("\n[2] error with upstream's attention call replaced by an explicit matmul and softmax")
     stock = layers._sdpa
     for size in args.sizes:
-        model = forecasters[size].model
         batch = make_batch(2, 5, 10, 3, True, seed=args.seed)
-        _, reference = reference_gradient(model, batch)
-        _, with_stock = loss_gradient(model, batch)
-        layers._sdpa = manual_sdpa
-        try:
-            _, with_manual = loss_gradient(model, batch)
-        finally:
-            layers._sdpa = stock
-        stock_error, explicit_error = rel(with_stock, reference), rel(with_manual, reference)
-        print(f"    {size:4s} covariates  stock {stock_error:.1e} | explicit {explicit_error:.1e}")
+        _, reference = reference_gradient(forecasters[size].model, batch)
+        models = {"cpu": forecasters[size].model}
+        if args.device:
+            models[args.device] = on_device(forecasters[size], args.device).model
+        for device, model in models.items():
+            _, with_stock = loss_gradient(model, batch.to(device))
+            layers._sdpa = manual_sdpa
+            try:
+                _, with_manual = loss_gradient(model, batch.to(device))
+            finally:
+                layers._sdpa = stock
+            stock_error, explicit_error = rel(with_stock, reference), rel(with_manual, reference)
+            print(f"    {size:4s} covariates  {device:4s} stock {stock_error:.1e} | explicit {explicit_error:.1e}")
 
     print("\n[3] standalone attention on CPU: float32 vs float64 gradient, by attention-logit scale")
     torch.manual_seed(1)
