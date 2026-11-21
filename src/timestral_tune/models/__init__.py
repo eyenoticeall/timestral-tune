@@ -3,7 +3,7 @@
 See spec §3 (model facts), §4.3 (normalised space) and §5 (adaptation modes).
 """
 
-from .device import TuneTimestralForecaster, TuneTimestralModel, supports_float64
+from .device import MIN_TORCH_FOR_MPS, TuneTimestralForecaster, TuneTimestralModel, mps_is_usable, supports_float64
 from .forward import (
     ForwardOutput,
     TargetFrame,
@@ -15,6 +15,7 @@ from .forward import (
 from .loader import PINNED_REVISIONS, load_forecaster, load_model, resolve_device, resolve_revision
 
 __all__ = [
+    "MIN_TORCH_FOR_MPS",
     "PINNED_REVISIONS",
     "ForwardOutput",
     "TargetFrame",
@@ -23,6 +24,7 @@ __all__ = [
     "denormalise_quantiles",
     "load_forecaster",
     "load_model",
+    "mps_is_usable",
     "normalise_targets",
     "resolve_device",
     "resolve_revision",

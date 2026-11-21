@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from timestral_tune.models import TuneTimestralForecaster, load_forecaster
+from timestral_tune.models import TuneTimestralForecaster, load_forecaster, mps_is_usable
 
 from .helpers import RawSeries, make_raw, make_tiny_forecaster
 
@@ -80,6 +80,6 @@ def available_accelerators() -> list[str]:
     devices = []
     if torch.cuda.is_available():
         devices.append("cuda")
-    if torch.backends.mps.is_available():
+    if mps_is_usable():
         devices.append("mps")
     return devices

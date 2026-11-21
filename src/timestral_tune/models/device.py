@@ -28,9 +28,30 @@ from torch import Tensor
 from .._vendor.timestral.forecaster import TimestralForecaster
 from .._vendor.timestral.model import TimestralModel
 
-__all__ = ["TuneTimestralForecaster", "TuneTimestralModel", "supports_float64"]
+__all__ = [
+    "MIN_TORCH_FOR_MPS",
+    "TuneTimestralForecaster",
+    "TuneTimestralModel",
+    "mps_is_usable",
+    "supports_float64",
+]
 
 _CPU = torch.device("cpu")
+
+# Upstream's input assembly uses `cummax`, which the Apple GPU backend implements from PyTorch 2.8.
+# Measured: the operator raises NotImplementedError on 2.4.0, 2.5.1, 2.6.0 and 2.7.1 and works on
+# 2.8.0, where the whole test suite passes on the Apple GPU (docs/VERIFICATION.md).
+MIN_TORCH_FOR_MPS = (2, 8)
+
+
+def _torch_version() -> tuple[int, int]:
+    major, minor = torch.__version__.split(".")[:2]
+    return int(major), int(minor)
+
+
+def mps_is_usable() -> bool:
+    """Whether the Apple GPU backend is present and this PyTorch is new enough to run Timestral on it."""
+    return torch.backends.mps.is_available() and _torch_version() >= MIN_TORCH_FOR_MPS
 
 
 def supports_float64(device: torch.device | str) -> bool:

@@ -78,4 +78,5 @@ def test_t14_device_parity_gradients(forecaster, raw, device, is_released_checkp
     assert torch.isfinite(gradient).all()
     bound = GRADIENT_RTOL_RELEASED_WEIGHTS if is_released_checkpoint else GRADIENT_RTOL_RANDOM_WEIGHTS
     relative = l2_rel(gradient, reference)
+    print(f"gradient relative L2 error on {device}: {relative:.2e}")  # shown with `pytest -s`
     assert relative < bound, f"relative L2 {relative:.2e}"

@@ -24,7 +24,7 @@ from safetensors.torch import load_file
 
 from .._vendor.timestral.config import TimestralConfig
 from .._vendor.timestral.loading import CONFIG_FILE, WEIGHTS_FILE, resolve_checkpoint
-from .device import TuneTimestralForecaster, TuneTimestralModel, supports_float64
+from .device import MIN_TORCH_FOR_MPS, TuneTimestralForecaster, TuneTimestralModel, mps_is_usable, supports_float64
 
 __all__ = ["PINNED_REVISIONS", "load_forecaster", "load_model", "resolve_device", "resolve_revision"]
 
@@ -44,18 +44,28 @@ def resolve_device(device: str | torch.device | None = "auto") -> torch.device:
 
     `"auto"` (or None) picks CUDA, then the Apple GPU, then CPU. An explicit request for a device
     that is not available raises instead of silently falling back.
+
+    The Apple GPU needs PyTorch 2.8 or newer: older versions lack an operator upstream's code uses.
+    On an older PyTorch `"auto"` skips it, and an explicit `"mps"` raises.
     """
     if device is None or device == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
-        if torch.backends.mps.is_available():
+        if mps_is_usable():
             return torch.device("mps")
         return torch.device("cpu")
     resolved = torch.device(device)
     if resolved.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("device 'cuda' was requested but CUDA is not available")
-    if resolved.type == "mps" and not torch.backends.mps.is_available():
-        raise RuntimeError("device 'mps' was requested but the Apple GPU backend is not available")
+    if resolved.type == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("device 'mps' was requested but the Apple GPU backend is not available")
+        if not mps_is_usable():
+            minimum = ".".join(map(str, MIN_TORCH_FOR_MPS))
+            raise RuntimeError(
+                f"the Apple GPU backend needs PyTorch {minimum} or newer to run Timestral; this is "
+                f"{torch.__version__}. Upgrade PyTorch or use device='cpu'"
+            )
     return resolved
 
 

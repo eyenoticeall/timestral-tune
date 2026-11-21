@@ -15,6 +15,7 @@ from timestral_tune.models import (
     TuneTimestralModel,
     load_forecaster,
     load_model,
+    mps_is_usable,
     resolve_device,
     resolve_revision,
     supports_float64,
@@ -23,7 +24,7 @@ from timestral_tune.models import (
 from .conftest import available_accelerators
 from .helpers import make_raw, max_rel
 
-needs_mps = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="the Apple GPU backend is not available")
+needs_mps = pytest.mark.skipif(not mps_is_usable(), reason="no Apple GPU, or PyTorch is older than its minimum for it")
 
 
 @pytest.fixture
@@ -55,8 +56,27 @@ def test_resolve_device():
         with pytest.raises(RuntimeError, match="CUDA is not available"):
             resolve_device("cuda")
     if not torch.backends.mps.is_available():
-        with pytest.raises(RuntimeError, match="Apple GPU"):
+        with pytest.raises(RuntimeError, match="Apple GPU backend is not available"):
             resolve_device("mps")
+
+
+def test_the_apple_gpu_needs_a_recent_pytorch(monkeypatch):
+    """Below PyTorch 2.8 the backend lacks an operator upstream uses: `auto` skips it, `mps` raises."""
+    from timestral_tune.models import MIN_TORCH_FOR_MPS, device
+
+    assert MIN_TORCH_FOR_MPS == (2, 8)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    monkeypatch.setattr(device, "_torch_version", lambda: (2, 7))
+    assert not mps_is_usable()
+    assert resolve_device("auto") == torch.device("cpu")
+    with pytest.raises(RuntimeError, match="needs PyTorch 2.8 or newer"):
+        resolve_device("mps")
+
+    monkeypatch.setattr(device, "_torch_version", lambda: (2, 8))
+    assert mps_is_usable()
+    assert resolve_device("auto") == torch.device("mps") == resolve_device("mps")
 
 
 def test_supports_float64():

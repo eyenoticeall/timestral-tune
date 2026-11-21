@@ -1,9 +1,10 @@
 """Forward and frame parity with upstream inference (spec §9, T1-T3).
 
-The training forward runs the same operations as upstream's `predict_block`, so on CPU the
-denormalised output is expected to be bit-identical, and is asserted to be. The frame tests go
-through upstream's `_refine_block`, which renormalises raw-space values in float32, so they allow
-float32 round-off and no more.
+The training forward runs the same operations as upstream's `predict_block`, so the denormalised
+output must agree to float32 round-off. Measured: bit-identical on PyTorch 2.4.0 and 2.15.0; one
+tiny-model case differs by 8e-10 on 2.8.0, because the head is applied to a different number of
+tokens in the two code paths. The frame tests go through upstream's `_refine_block`, which
+renormalises raw-space values in float32; measured 1e-7 to 2e-7.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ from timestral_tune.models import denormalise_quantiles, target_frames, training
 from ..conftest import SCENARIOS
 from ..helpers import max_rel, upstream_batch
 
-FRAME_RTOL = 1e-5  # measured 1e-7 to 2e-7; upstream's float32 renormalisation round-trip
+FORWARD_RTOL = 1e-6
+FRAME_RTOL = 1e-5
 
 
 def _predict_block(forecaster, batch):
@@ -40,7 +42,7 @@ def _assert_forward_parity(forecaster, raw):
         ours = denormalise_quantiles(model, output.quantiles, output.anchor_loc, output.anchor_scale)
         reference = _predict_block(forecaster, batch)
     assert ours.shape == reference.shape
-    assert torch.equal(ours, reference), f"max relative difference {max_rel(ours, reference):.2e}"
+    assert max_rel(ours, reference) < FORWARD_RTOL
     assert (output.quantiles.diff(dim=-1) >= 0).all(), "normalised quantiles must be non-decreasing"
 
 
