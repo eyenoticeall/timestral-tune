@@ -8,6 +8,7 @@ See `README.md`, `docs/STATUS.md` and `docs/SPEC.md`.
 
 from .config import LoraConfig, TrainingConfig
 from .export import export_checkpoint
+from .models.adapter import load_lora
 from .models.conformal import ConformalCalibrator, OnlineConformalCalibrator
 from .trainer import TimestralTrainer
 
@@ -21,4 +22,5 @@ __all__ = [
     "TrainingConfig",
     "__version__",
     "export_checkpoint",
+    "load_lora",
 ]

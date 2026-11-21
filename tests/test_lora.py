@@ -15,6 +15,8 @@ from timestral_tune.models import (
     extract_lora_state_dict,
     has_lora,
     inject_lora,
+    load_lora,
+    load_lora_state_dict,
     lora_parameters,
     merge_lora,
     merged_state_dict,
@@ -173,3 +175,91 @@ def test_lora_backward_and_dropout_on_device(tiny_forecaster, device):
     with torch.no_grad():
         c = training_forward(model, batch.to(device)).quantiles
     assert max_rel(c, a) < 1e-5
+
+
+def test_k_only_and_gate_only_slice_isolation_and_generic_slice_fallback(tiny_forecaster):
+    """Middle slice (`'k'`), `'gate'`-only, and arbitrary non-QKV slices each modify only their own rows."""
+    model = copy.deepcopy(tiny_forecaster.model)
+    d = model.config.d_model
+    before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    inject_lora(model, LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("k",)))
+    with torch.no_grad():
+        for p in lora_parameters(model):
+            p.normal_(std=0.1)
+    merged = merged_state_dict(model)
+    for name, orig in before.items():
+        if name.endswith(".wQKV.weight") and ".attns.1." in name:
+            assert torch.equal(merged[name][:d], orig[:d]), "Q rows changed under k-only LoRA"
+            assert not torch.equal(merged[name][d : 2 * d], orig[d : 2 * d]), "K rows did not change"
+            assert torch.equal(merged[name][2 * d :], orig[2 * d :]), "V rows changed under k-only LoRA"
+        else:
+            assert torch.equal(merged[name], orig)
+
+    # Gate-only injection adapts only _gate weights.
+    gate_model = copy.deepcopy(tiny_forecaster.model)
+    inject_lora(gate_model, LoraConfig(r=4, lora_alpha=8, axes=("time",), targets=("gate",)))
+    wrapped_names = [n for n, m in gate_model.named_modules() if isinstance(m, LoRASliceLinear)]
+    assert wrapped_names and all(n.endswith("._gate") for n in wrapped_names)
+
+    # Generic fallback path (arbitrary non-QKV slice bounds).
+    lin = torch.nn.Linear(16, 20, bias=False)
+    wrapped = LoRASliceLinear(lin, [("mid", 4, 6)], r=3, lora_alpha=6.0)
+    assert not wrapped._is_full and not wrapped._is_qkv
+    with torch.no_grad():
+        wrapped.lora_B["mid"].normal_(std=0.2)
+    x = torch.randn(2, 5, 16)
+    unmerged = wrapped(x)
+    wrapped.merge()
+    merged_out = wrapped(x)
+    torch.testing.assert_close(merged_out, unmerged, rtol=1e-5, atol=1e-6)
+
+
+def test_unmerge_restores_exact_base_weights_even_after_mutation_and_in_bf16(tiny_forecaster):
+    """Snapshotted pre-merge rows prevent base corruption on merge->mutate->unmerge and bf16 drift."""
+    for dtype in (torch.float32, torch.bfloat16):
+        lin = torch.nn.Linear(32, 96, bias=False).to(dtype)
+        orig_weight = lin.weight.detach().clone()
+        wrapped = LoRASliceLinear(lin, [("q", 0, 32), ("v", 64, 32)], r=4, lora_alpha=8.0)
+        with torch.no_grad():
+            for p in wrapped.lora_B.values():
+                p.normal_(std=0.1)
+        wrapped.merge()
+        # Mutate LoRA parameters while merged: unmerge must still restore original base weights bit-identically.
+        with torch.no_grad():
+            for p in wrapped.lora_B.values():
+                p.add_(1.0)
+        wrapped.unmerge()
+        assert torch.equal(wrapped.base.weight, orig_weight), f"base weight drifted in {dtype}"
+
+
+def test_load_lora_round_trips_exported_adapters_and_rejects_mismatches(tiny_forecaster, tmp_path):
+    from timestral_tune import export_checkpoint
+
+    patch = tiny_forecaster.patch_size
+    raw = make_raw(29, targets=1, past=1, known=1, context_len=6 * patch, horizon=2 * patch)
+    batch, _, _ = upstream_batch(tiny_forecaster, raw)
+
+    source = copy.deepcopy(tiny_forecaster.model).eval()
+    cfg = LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("q", "v", "o"))
+    inject_lora(source, cfg, generator=torch.Generator().manual_seed(7))
+    with torch.no_grad():
+        for p in lora_parameters(source):
+            p.normal_(std=0.05)
+        expected = training_forward(source, batch).quantiles
+
+    out_dir = export_checkpoint(source, tmp_path / "lora-exp", lora_config=cfg)
+    fresh = copy.deepcopy(tiny_forecaster.model).eval()
+    reloaded, reloaded_cfg = load_lora(fresh, out_dir, rows_per_series=3)
+    assert reloaded_cfg == cfg
+    with torch.no_grad():
+        actual = training_forward(reloaded, batch).quantiles
+    assert torch.equal(actual, expected)
+
+    # Strict key/shape validation in load_lora_state_dict.
+    bad_state = extract_lora_state_dict(source)
+    bad_key = next(iter(bad_state))
+    bad_state[bad_key] = bad_state[bad_key][:-1]
+    with pytest.raises(ValueError, match="shape mismatch"):
+        load_lora_state_dict(reloaded, bad_state)
+    with pytest.raises(ValueError, match="key mismatch"):
+        load_lora_state_dict(reloaded, {})
