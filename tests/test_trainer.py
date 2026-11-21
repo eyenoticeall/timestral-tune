@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import math
+import shutil
 
 import numpy as np
 import pytest
@@ -749,8 +750,10 @@ def test_bf16_training_on_cuda(tiny_forecaster, mode):
 def test_compile_model_trains_and_produces_clean_merged_state_dict(tiny_forecaster):
     from timestral_tune._vendor.timestral import TimestralModel
 
-    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu" and shutil.which("g++") is None and shutil.which("clang++") is None:
+        pytest.skip("CPU torch.compile requires a C++ compiler (g++ or clang++)")
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
     model = fresh_model(tiny_forecaster)
     config = fixed_batch_config(
         dataset,

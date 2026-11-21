@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 
 import numpy as np
 import pytest
@@ -94,12 +95,15 @@ def test_export_requires_output_dir_and_rejects_missing_license_path(tiny_foreca
 
 
 def test_export_from_compiled_model_loads_strict(tiny_forecaster, tmp_path):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu" and shutil.which("g++") is None and shutil.which("clang++") is None:
+        pytest.skip("CPU torch.compile requires a C++ compiler (g++ or clang++)")
     dataset = make_toy_dataset(tiny_forecaster.patch_size, series=4, covariates=True)
     model = copy.deepcopy(tiny_forecaster.model)
     cfg = TrainingConfig(
         model_name_or_path="local",
         mode="lora_variate",
-        device="cpu",
+        device=device,
         batch_size=len(dataset),
         max_steps=2,
         learning_rate=1e-2,

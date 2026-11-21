@@ -42,13 +42,22 @@ def test_t09_lora_identity_and_merge(forecaster, raw, axes):
     inject_lora(adapted, config)
     adapted.eval()
 
-    # Step-0 identity: zero-initialised B leaves predictions unchanged (within float32 round-off).
+    # Step-0 identity: zero-initialised B leaves predictions unchanged (float32 BLAS/layout round-off
+    # on 28M's 500k-logit layers reaches 2.8e-6 on x86 CPU; exact identity is also checked in float64 below).
     assert all(p.abs().max().item() == 0.0 for n, p in adapted.named_parameters() if ".lora_B." in n)
     with torch.no_grad():
         fresh_out = training_forward(adapted, batch).quantiles
-    assert max_rel(fresh_out, base_out) < 1e-6, (
+    assert max_rel(fresh_out, base_out) < 1e-5, (
         f"freshly initialised LoRA moved output by {max_rel(fresh_out, base_out):.2e}"
     )
+
+    base64 = copy.deepcopy(base_model).double().eval()
+    fresh64 = copy.deepcopy(adapted).double().eval()
+    batch64 = as_double(batch)
+    with torch.no_grad(), float64_reference():
+        assert (
+            max_rel(training_forward(fresh64, batch64).quantiles, training_forward(base64, batch64).quantiles) < 1e-12
+        )
 
     # Perturb B matrices to simulate training: output must move, and merged/unmerged must agree.
     generator = torch.Generator().manual_seed(9)
