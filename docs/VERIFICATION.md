@@ -210,7 +210,7 @@ norms; this holds on CUDA too (§13). Forward outputs are unaffected (about 3e-7
 
 Consequence: T14 keeps its tight `5e-3` explicit-attention tier alongside the three existing tiers, adds a
 separate check for `attention_context("math")` (spec D12). That helper is experimental and no training
-path uses it; whether to expose a choice of kernel is deferred to Phase 2 (spec D15).
+path uses it; 20-step L4 CUDA trajectories in §13 show default SDPA suffices (spec D15).
 
 ## 7. Training-step timing, CPU against the Apple GPU
 
@@ -311,10 +311,10 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 411 passed, 26 skipped. Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 CUDA-only `bf16` tests; 77 further Apple GPU cases are not generated at all. CPU passes everything else, including all 14 acceptance tests T1–T14 and `torch.compile` |
-| 2.8.0 | 3.12 | 510 passed, 4 skipped (the 4 CUDA-only `bf16` tests), including every Apple GPU test and all 14 acceptance tests |
-| 2.14.1 | 3.10 | 510 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 510 passed, 4 skipped |
+| 2.4.0 | 3.12 | 411 passed, 26 skipped (`3fe5bc9`; network-free post-review-fix pass also verified). Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 CUDA-only `bf16` tests; 77 further Apple GPU cases are not generated at all |
+| 2.8.0 | 3.12 | 510 passed, 4 skipped (`3fe5bc9`; the 4 CUDA-only `bf16` tests), including every Apple GPU test and all 14 acceptance tests |
+| 2.14.1 | 3.10 | 510 passed, 4 skipped (`3fe5bc9`; `uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
+| 2.15.0 | 3.13 | 518 passed, 4 skipped (includes 8 new tests added in the Phase 2 review-fix pass) |
 
 These are the counts on `phase-2` (2026-11-21), all on macOS. Zero acceptance test placeholders remain.
 The CUDA run (§13) used Linux on the same branch (`3fe5bc9`) and passed all 4 `bf16` tests as well.

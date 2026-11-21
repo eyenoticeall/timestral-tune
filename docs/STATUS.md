@@ -17,7 +17,7 @@
 | Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters, `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
-| Test suite | 510 passed, 4 skipped (CUDA-only `bf16`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13, 2.14.1 on 3.10, 2.8.0 on 3.12; 411 passed, 26 skipped on 2.4.0; macOS). On NVIDIA L4 CUDA (Linux): **512 passed, 2 skipped** |
+| Test suite | 518 passed, 4 skipped (CUDA-only `bf16`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; prior to review-fix tests: 510/4 on 2.14.1 and 2.8.0, 411/26 on 2.4.0; macOS). On NVIDIA L4 CUDA (Linux, `3fe5bc9`): **512 passed, 2 skipped** |
 | CI | Green on Phase 1 (PR #1, Python 3.10–3.13 on Linux); `phase-2` has not been pushed yet |
 
 ## What does not exist yet

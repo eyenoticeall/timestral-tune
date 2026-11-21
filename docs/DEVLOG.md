@@ -432,4 +432,23 @@ All 14/14 acceptance tests pass (zero placeholders). Local macOS: **510 passed, 
 2.4.0 (3.12). NVIDIA L4 CUDA (`3fe5bc9`): **512 passed, 2 skipped** (only Apple GPU tests skipped), plus
 verbatim 1,687-byte Hub `LICENSE` export + upstream `strict=True` reload on `mistralai/Timestral-5M`.
 
+**Review-fix pass (same session).** Deployed a four-agent parallel read-only review (LoRA/adapter,
+trainer/`bf16`/`compile`, conformal calibration, export/licensing/docs) and resolved all Important findings
+plus clean Minor/perf fixes:
+- LoRA (`4ec2e46`): added `load_lora`/`load_lora_state_dict` (adapter reload round-trip), snapshotted
+  pre-merge base rows so `unmerge()` restores exact bits (including `bf16` and post-merge mutations),
+  added local `torch.Generator` support, warned on gate-less axes, and hardened nested-adapter checks.
+- Conformal (`6a81d79`): rejected `N=0`/`H=0`, switched CQR to exact O(n) order statistic
+  `ceil((n + 1)(1 - alpha))` via `np.partition`, added strict `from_dict` validation, made online
+  `transform()`/`current_offsets()` read-only, scored ACI `err_t` against the actual emitted (repaired)
+  interval, and added a `bisect`-sorted score mirror for O(1) quantile lookup.
+- Trainer (`498851a`): moved `restore_best` snapshots to CPU (avoiding 2× VRAM in `full_ft`), used local
+  RNG for LoRA init, enforced `reduce-overhead` fixed shapes in `evaluate()` and `_build_head_cache`,
+  added `cudagraph_mark_step_begin()`, cached `_val_loader`, and promoted cached quantile levels to fp32.
+- Export (`352f832`): made `dataset_fingerprint` hash actual timestamps/values, unlinked stale conditional
+  artifacts on re-export, rejected unfitted calibrators, warned on fallback `LICENSE` with honest `NOTICE`,
+  and recorded full hyperparameters + `model_provided_directly`.
+- Probe & docs: added `--bf16`/`--compile`/`--mode` to `scripts/probes/step_timing.py` and fixed stale
+  Phase 2 / D15 text. Local suite after fixes: **518 passed, 4 skipped** (PyTorch 2.15.0, Python 3.13).
+
 **Not done / open.** `phase-2` is unmerged and unpushed pending maintainer review. Phase 3 has not started.

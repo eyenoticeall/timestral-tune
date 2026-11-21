@@ -48,7 +48,7 @@ is the project's overview guide and source of truth.
 | Checkpoint export | Done: upstream-loadable `config.json` + merged `model.safetensors`, LoRA adapters, `conformal.json`, sidecar, `LICENSE`, `NOTICE` |
 | Benchmarks, metrics, Lacuna integration | Not built (Phase 3) |
 | Acceptance tests T1–T14 | All 14 of 14 implemented and passing on tiny, 5M and 28M (CPU, Apple GPU, CUDA) |
-| CI | Passing on Python 3.10–3.13 on Linux |
+| CI | Passing on `main` (Python 3.10–3.13 on Linux); `phase-2` pending push |
 
 ## Quick start
 
