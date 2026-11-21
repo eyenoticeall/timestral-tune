@@ -18,6 +18,7 @@ import timestral_tune._vendor.timestral.layers as layers
 from timestral_tune._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET
 from timestral_tune.data import TrainingBatch
 from timestral_tune.models import TuneTimestralForecaster, TuneTimestralModel, load_forecaster
+from timestral_tune.models.forward import attention_context
 from timestral_tune.trainer import compute_loss
 
 SIZES = ("5M", "28M", "123M", "209M")
@@ -89,12 +90,15 @@ def as_double(batch: TrainingBatch) -> TrainingBatch:
     )
 
 
-def loss_gradient(model: TuneTimestralModel, batch: TrainingBatch) -> tuple[float, Tensor]:
+def loss_gradient(
+    model: TuneTimestralModel, batch: TrainingBatch, *, attention_backend: str = "default"
+) -> tuple[float, Tensor]:
     """The training loss (spec §4) and its gradient over all parameters, flattened to float64 on CPU."""
     model.zero_grad()
     for parameter in model.parameters():
         parameter.requires_grad_(True)
-    loss = compute_loss(model, batch).loss
+    with attention_context(attention_backend):
+        loss = compute_loss(model, batch).loss
     loss.backward()
     gradient = torch.cat([p.grad.detach().cpu().double().flatten() for p in model.parameters()])
     model.zero_grad()
