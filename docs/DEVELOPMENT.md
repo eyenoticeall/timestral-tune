@@ -32,18 +32,17 @@ uv build                               # build wheel and sdist
 ```
 src/timestral_tune/
   _vendor/timestral/     Official inference package at a pinned commit (generated; do not edit)
-  config.py              Configuration dataclasses
-  data/                  Dataset, collator, categorical encoders
-  models/                Loader, device shims, training forward, LoRA adapter, conformal calibrators
+  config.py              TrainingConfig
+  data/                  Batch layout, dataset, collator, categorical encoders
+  models/                Loader, device shims, training forward (built); LoRA adapter, conformal (stubs)
   losses/                Pinball loss
-  trainer/               Training loop and callbacks
-  replay/                Replay generators and distillation (stretch)
-  export.py              Checkpoint export
-  integrations/          Optional integrations (Lacuna)
-  utils/                 Metrics and verifiers
+  trainer/               Loss step, training loop, callbacks
+  utils/                 Verifiers (built); metrics (stub)
+  replay/, export.py, integrations/    Stubs for later phases
 tests/
-  test_scaffold.py       Network-free checks of the scaffold itself
-  acceptance/            T1–T14 from spec §9
+  conftest.py, helpers.py   Fixtures and builders shared by all tests
+  test_*.py                 Unit tests per module
+  acceptance/               T1–T14 from spec §9
 scripts/
   vendor_upstream.py     Regenerates _vendor/timestral
   check_upstream_drift.py
@@ -64,28 +63,37 @@ names. Start there when implementing a module.
    `timestral_tune/__init__.py`.
 5. Update the stub's "Status" line, then follow the end-of-session steps in `AGENTS.md`.
 
-`scripts/probes/_common.py` contains working prototypes worth reading before writing the real thing:
-`norm_forward` and `real_loss` (the training forward and loss) and `install_cpu_offload` (the device
-shims). They are prototypes: the library versions must not monkeypatch the vendored modules.
+Shared building blocks to reuse rather than re-derive: `trainer/step.py::compute_loss` (the training loss),
+`models/forward.py` (forward and frames), `utils/validation.py` (the acceptance checks as functions), and
+`tests/helpers.py` (a tiny random model, synthetic raw series and frames, and `upstream_batch`, which builds
+a batch with upstream's own input assembly as ground truth).
 
 ## Testing strategy
 
-- **Scaffold tests** (`tests/test_scaffold.py`) need no network. They build a tiny random model in code.
-- **Acceptance tests** (`tests/acceptance/`) are the definition of done. Each carries the `acceptance`
-  marker. Most need released checkpoints; mark those `network` so CI can exclude them.
-- **Tests that need a checkpoint** should use the smallest one that proves the point (5M), at its pinned
-  Hub revision, and repeat on 28M where the spec asks for it.
-- **Tolerance.** Compare forward results with a relative tolerance, and gradients against the
-  float64-weights reference, not against CPU fp32 (see `docs/VERIFICATION.md` §6).
+- **Three models per test.** Most acceptance tests take the `forecaster` fixture, which runs them on a tiny
+  random model (network-free, so CI covers the logic) and on the released 5M and 28M checkpoints (marked
+  `network`). The roadmap's exit criteria are about the released checkpoints, so run the full suite locally
+  before claiming an item done: `uv run pytest`.
+- **Acceptance tests** (`tests/acceptance/`) are the definition of done and carry the `acceptance` marker.
+- **Ground truth is upstream.** Compare with the vendored forecaster on the same inputs
+  (`tests/helpers.py::upstream_batch`, `forecast()`), not with hand-computed expectations.
+- **Tolerances.** Forward results agree with upstream at float32 round-off (1e-6); do not assert
+  bit-identity, which does not hold across PyTorch versions. Compare gradients with the float64-weights
+  reference, never with CPU float32 (`docs/VERIFICATION.md` §6).
 - **Perturbation tests** must use non-constant noise. A constant offset is absorbed by the normalisation
   and makes leakage tests pass vacuously.
-- **Device tests** skip cleanly when the device is absent.
+- **Device tests** take their device list from `tests/conftest.py::available_accelerators` and skip
+  cleanly when a device is absent or the PyTorch version is too old for it.
+- **Older PyTorch.** `uv run --isolated --python 3.12 --with "torch==2.4.0" pytest` runs the suite on the
+  floor without touching the project environment.
+- **Training tests** copy the model first (`copy.deepcopy`); the fixtures are shared across tests.
 
 ## Devices
 
-- CPU works everywhere.
-- The Apple GPU needs the float64 statistics to run on CPU and supports fp32 only (spec §5.4).
-- CUDA is planned as the main training target but has not been exercised yet.
+- CPU works everywhere, from PyTorch 2.4.
+- The Apple GPU needs PyTorch 2.8 or newer, runs float32 only, and has no float64: move tensors to CPU
+  before converting them to float64. `models/device.py` does this for upstream's code.
+- CUDA is the intended main training target and has never been run in this project.
 
 ## Probes
 

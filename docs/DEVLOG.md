@@ -83,3 +83,60 @@ required a branch per unit of work), and the two merged branches were deleted.
 - The CPU gradient gap is unexplained.
 - Nothing has run on CUDA or on the PyTorch 2.4 floor. Linux has run only the scaffold tests, in CI.
 - The weekly drift job has not had its first scheduled run.
+
+---
+
+## 2026-11-21 (second session) — README banner; Phase 0 remainder and Phase 1
+
+**Banner.** A subagent drew a pixel-art README banner in code (`scripts/make_banner.py`, `assets/banner.png`).
+The first version's zoomed crop read as disconnected blocks; the maintainer asked for a redo with QA loops,
+and the second version (a plain framed hourglass whose sand settles into rising bars) replaced it. Both
+commits are on `main`, unpushed.
+
+**Phase 0 remainder.** `models/loader.py` and `models/device.py`: pinned loading and two subclasses that
+run upstream's four float64 sites on CPU where the device has no float64. No vendored file is touched.
+
+**Phase 1, in the order built.**
+
+1. `models/forward.py`, `data/batch.py`: the normalised-space training forward for both layouts, the two
+   target frames, and the packed batch layout. T1–T3.
+2. `losses/pinball.py`, `trainer/step.py`: the loss and the one function that composes forward, frame and
+   loss. T8.
+3. Target-frame check (`scripts/probes/target_frame_check.py`), before any trainer existed.
+4. `data/`: encoders, collator, dataset. T4–T7, T12.
+5. `utils/validation.py`: the acceptance checks as reusable verifiers.
+6. `config.py`, `trainer/`: `head_only` training end to end.
+7. PyTorch floor runs; probes moved onto the library.
+
+**Findings.**
+
+- **D2 confirmed.** The checkpoints are calibrated in the median-folded frame: near-nominal coverage there,
+  heavy over-coverage in the true-values frame. The decision rule written before the run also compared
+  pinball loss and, by its letter, came out "inconclusive"; that criterion was ill-posed (each frame's loss
+  is in its own units) and is recorded as such rather than rewritten.
+- **The "CPU gradient gap" is not CPU-specific.** Float32 gradients through the released weights are off
+  by up to 3.4e-3 on CPU and 1.1e-3 on the Apple GPU; a random model is at 3e-7 on both. Still unexplained.
+  T14's single 1e-3 gradient bound was replaced by two tiers (decision D12). An earlier statement in this
+  project that Apple GPU gradients sit within 8e-5 of the reference is superseded: that was one batch.
+- **The Apple GPU needs PyTorch 2.8.** Older versions lack `cummax` on that backend. The library now
+  refuses it below 2.8 (decision in spec §5.4); before that, the suite on 2.4.0 failed and then hung.
+- **Bit-identity is not a safe assertion across PyTorch versions.** T1/T2 are bit-identical on 2.4.0 and
+  2.15.0 but one case differs by 8e-10 on 2.8.0. The bound is now 1e-6.
+- **`split_by_time` semantics were tightened** (decision D11): training gets nothing at or after the
+  cutoff, so labels cannot overlap even without an embargo. The spec's rule 5 was reworded.
+
+**Bugs the tests caught during development.** Three float64 conversions executed on the Apple GPU before
+moving to CPU (in the frame computation, the device-order of a `.to()`, and the evaluation loop's
+accumulator). All three were found by running on the device, none by reading.
+
+**Evidence.** 262 passed, 4 skipped on PyTorch 2.15.0 (Python 3.13); 262 passed on 2.8.0 and 227 passed,
+21 skipped on 2.4.0 (Python 3.12). T1–T8 and T12 pass on 5M and 28M, which is Phase 1's exit criterion.
+Numbers: `docs/VERIFICATION.md`.
+
+**Left open.**
+
+- T14 on CUDA: no hardware. One command when there is.
+- `phase-1` is not merged or pushed; CI has not run on it.
+- The gradient-accuracy cause.
+- The target-frame evidence is synthetic only.
+- Phase 2 has not started. There is no export, so a tuned model cannot be saved in the upstream layout yet.

@@ -1,65 +1,69 @@
 # Project Status
 
 **Last updated:** 2026-11-21
-**Stage:** pre-alpha scaffold. No library functionality is implemented.
-**Active phase:** Phase 0 (Foundations), partly done. See spec §10.
+**Stage:** pre-alpha. Phase 0 and Phase 1 are built; one Phase 1 verification item (CUDA) is open.
+**Next phase:** Phase 2 (Adaptation & Calibration). See spec §10.
 
-## What exists
+## What works today
 
 | Area | State |
 |---|---|
-| Specification (`docs/SPEC.md`, revision 4) | Complete for v0.1; verified against the paper, upstream code and the 5M / 28M checkpoints |
-| Vendored upstream (`src/timestral_tune/_vendor/timestral/`) | Done at commit `a534bdb`; manifest and drift check in place; no drift as of 2026-11-21 |
-| Package skeleton | 18 documented stub modules in 7 subpackages; only `__version__` is exported |
-| Packaging | `pyproject.toml` (hatchling), `uv.lock`; wheel builds and contains the vendored licence |
-| Scaffold tests | 6 pass (Python 3.10 and 3.13, macOS) |
-| Acceptance tests T1–T14 | **0 of 14 implemented.** All 14 are skipped placeholders in `tests/acceptance/` |
-| Verification probes | 4 working probes in `scripts/probes/`; results in `docs/VERIFICATION.md` |
-| CI | Green on the first run (2026-11-21): lint, build, network-free tests on Python 3.10–3.13, Linux. The weekly drift job is enabled; its first scheduled run is pending |
-| Process docs | `AGENTS.md`, this folder |
+| Loading | `load_model` / `load_forecaster`: pinned Hub revisions, config from the checkpoint, any device |
+| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32). CUDA is supported in code and never run |
+| Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator`; per-window categorical encoding |
+| Training forward and loss | Normalised-space forward for both layouts, both target frames, pinball loss, `compute_loss` |
+| Training | `TimestralTrainer` in `head_only` mode, fp32: AdamW, warm-up, cosine or constant schedule, clipping, evaluation, early stopping, best-state restore |
+| Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
+| Acceptance tests | **10 of 14 implemented and passing**: T1–T8, T12, T14. T9, T10, T11, T13 are Phase 2 placeholders |
+| Test suite | 262 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0, Python 3.13, macOS) |
+| CI | Green on the last push (scaffold only). The Phase 1 work has not been pushed, so CI has not run on it |
+
+## What does not exist yet
+
+- LoRA modes and `full_ft` (the trainer raises `NotImplementedError`).
+- `bf16` autocast and `torch.compile`.
+- `export()`: there is no way to save a tuned model in the upstream layout yet.
+- Conformal calibration, metrics, replay, the Lacuna integration.
 
 ## What has been verified, and where
 
-Only on one machine (Apple M4, PyTorch 2.15.0, macOS). See `docs/VERIFICATION.md`.
+All on one machine (Apple M4, macOS); details in `docs/VERIFICATION.md`.
 
-- Model structure facts the LoRA design depends on.
-- Role firewall and gradient behaviour.
-- Apple GPU forward and gradient parity, with the float64 statistics on CPU.
-- A prototype of the full training step (normalised forward, median-folded frame, pinball loss) runs and
-  differentiates on CPU and the Apple GPU.
+- Training inputs and forward equal upstream inference (T1–T3, collator and dataset parity tests).
+- No leakage on the training path (T4–T7, T12) and an exact loss mask (T8).
+- The released checkpoints are calibrated in the median-folded target frame (decision D2 confirmed).
+- Apple GPU parity with CPU, and gradient accuracy on both (T14).
+- PyTorch floors: CPU on 2.4.0; Apple GPU from 2.8.0.
+- `head_only` training lowers the loss and changes nothing outside the head, on CPU and the Apple GPU.
 
-Linux has only run the network-free scaffold tests (in CI). Not verified anywhere yet: CUDA, the PyTorch
-2.4 floor, the 123M and 209M checkpoints.
+Not verified anywhere: CUDA, the 123M and 209M checkpoints, real datasets. Linux has run only the scaffold
+tests, in CI.
 
 ## Next steps
 
-In order. Details and exit criteria are in spec §10.
-
-1. **Finish Phase 0.**
-   - `models/loader.py`: load at pinned Hub revisions, config always from `config.json`.
-   - `models/device.py`: the float64-on-CPU shims as subclasses (prototype: `install_cpu_offload` in
-     `scripts/probes/_common.py`).
-   - Implement acceptance test T14 (prototype: `scripts/probes/device_parity.py`).
-2. **Start Phase 1.** `models/forward.py` and tests T1–T3 first (prototype: `norm_forward` in
-   `scripts/probes/_common.py`), then the loss (T8), then the data layer (T4–T7, T12).
-3. **Run the target-frame check** (spec §4.3 and §12): pretrained loss and coverage under
-   `median_folded` against `true_values`, horizons longer than one patch.
+1. **Run T14 on CUDA** when hardware is available: `uv run pytest tests/acceptance/test_device_parity.py`.
+   This closes Phase 1's last box.
+2. **Push `phase-1` and let CI run** on the new tests (it has only ever run on the scaffold).
+3. **Start Phase 2** (spec §10): the slice LoRA adapter (T9, T10), `full_ft`, the conformal calibrators
+   (T13), export (T11), `bf16` on CUDA.
 
 ## Open questions and known issues
 
-Full list in spec §12. The ones that affect the next steps:
+Full list in spec §12. The ones that matter next:
 
-- **Target frame (decision D2)** rests on a reading of one paper sentence. Unconfirmed until step 3 above.
-- **CPU fp32 gradient gap**, cause unknown (`docs/VERIFICATION.md` §6). Compare gradients against the
-  float64-weights reference.
+- **CUDA has never been run.** Phase 2 adds `bf16`, which is CUDA-only, so this becomes blocking there.
+- **Float32 gradients through released weights are not at round-off**, cause unknown
+  (`docs/VERIFICATION.md` §6). Training is not expected to be affected; T14 has two tiers because of it.
+- **The target-frame evidence is synthetic** (univariate, fully observed, one seed, 5M and 28M).
 - **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
+- **No export yet**, so a trained model lives only in memory (`trainer.model`).
 - **CI actions use a deprecated Node.js version.** GitHub warns that `actions/checkout@v4` and
-  `astral-sh/setup-uv@v5` target Node.js 20. They still run; bump them when newer majors are confirmed.
-- **PyTorch floor.** The spec says 2.4+; everything so far ran on 2.15.0.
+  `astral-sh/setup-uv@v5` target Node.js 20. They still run.
 
 ## Branch state
 
-See `git log` and `git branch`. `main` is the only branch. The scaffold and the spec rename were merged by
-fast-forward and pushed to the private `origin` on 2026-11-21, and their branches were deleted. Branch
-policy is in `AGENTS.md` §6: work on `main`; branches only for a phase, a new version or a large
-adaptation. The rest of Phase 0 (loader, device shims, T14) is phase work.
+- `main`: the scaffold, the spec rename and the README banner. Two banner commits are ahead of `origin`
+  and not pushed.
+- `phase-1`: Phase 0's remainder and all of Phase 1, rebased on `main`. Not merged, not pushed.
+
+Branch policy is in `AGENTS.md` §6.

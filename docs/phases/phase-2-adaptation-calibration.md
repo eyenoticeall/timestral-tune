@@ -18,6 +18,13 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - **Conformal formulas** are quoted from the papers in spec §5.2; the PDFs are in `papers/` locally.
 - **`config.json` must stay byte-compatible** with upstream; metadata goes in `tune_metadata.json`.
 
+- **Where modes plug in.** `TimestralTrainer._select_trainable` freezes everything and unfreezes the head;
+  extend it per mode. The trainer already raises `NotImplementedError` for the other modes, `bf16`,
+  `lora_config` and `export()`, and `tests/test_trainer.py` asserts that; update those tests as each lands.
+- **Use `compute_loss`** (`trainer/step.py`) for anything that needs the training loss.
+- **The Apple GPU has no float64**: move tensors to CPU before widening (see the Phase 1 notes).
+- **`bf16` needs CUDA**, which has never been run in this project. Budget for surprises.
+
 ## Open questions
 
 - Default LoRA rank and which slices to enable by default (settled by Phase 3 sweeps).

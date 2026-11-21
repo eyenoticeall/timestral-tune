@@ -62,8 +62,10 @@ Last checked 2026-11-21: no drift (upstream `main` was still the pinned commit).
 ## Re-vendoring procedure
 
 1. Read the upstream diff between the old and new commit. Look for changed function signatures, changed
-   private functions used by our code (`_run_two_stream`, `_assemble_rows`, `_refine_block`,
-   `_cap_quantiles`, `_encode_categorical`, `advancing_block_frames`, the mask builders), and new files
+   upstream internals our code calls. `models/forward.py` uses `model.scale`, `_known_cov_scaling`,
+   `representation`, `forecast_tokens`, `transformer`, `head`, `TwoStreamMask`, the mask builders and the
+   scaler functions. `models/device.py` overrides `scale`, `_cap_quantiles`, `_refine_block` and
+   `_encode_categorical`. `data/` uses `ffill_with_mask` and `target_encode`, and mirrors `_assemble_rows`, and new files
    (add them to `SOURCE_FILES` in the script).
 2. Update `PINNED_COMMIT` in `scripts/vendor_upstream.py` and run it.
 3. Run the full test suite. Forward-parity tests (T1–T3) and the export round-trip (T11) are the ones

@@ -1,31 +1,51 @@
 # Phase 1 — Core Mechanics & Verification
 
-**Status:** Not started
+**Status:** Built and passing. One verification item is open: T14 has never run on CUDA.
 **Goal:** A training forward pass and loss that provably match upstream inference, a leak-free data layer, and the first end-to-end `head_only` run.
 **Spec sections:** `docs/SPEC.md` §3.3, §3.4, §4, §6.2, §6.3, §9 (T1–T8, T12), §10
 
 The task checklist and exit criteria are in the spec, §10. This file holds working notes for whoever
-implements the phase. Add to it as you learn things; do not copy the checklist here.
+maintains or extends the phase.
 
-## Notes for the implementer
+## How the pieces fit
 
-- **Start with `models/forward.py` and T1–T3.** `norm_forward` in `scripts/probes/_common.py` is a
-  working prototype for both layouts; `real_loss` shows the median-folded frame.
-- **Parity target.** `sinh(normalised output) * anchor_scale + anchor_loc` must equal `predict_block`.
-  For T3, build the forecaster with `quantile_real_cap_k=0`, or its output clamp will interfere.
-- **Collator.** Mirror vendored `_assemble_rows`: forward-fill targets while keeping the mask, zero-fill
-  covariate NaNs as unobserved, truncate to the context cap, left-pad to a patch multiple.
-- **Frame statistics** run on CPU in float64 without gradients, also on GPU devices.
-- **Perturbation tests** need non-constant noise (see `docs/DEVELOPMENT.md`).
-- **Target-frame check.** Compare the pretrained model's normalised pinball loss and interval coverage
-  under `median_folded` and `true_values` on horizons longer than one patch. Record the outcome in
-  spec §4.3 and §12, and revise decision D2 if `true_values` is clearly better.
+- `data/dataset.py` yields raw `Window`s (views). `data/collator.py` turns a list of them into a
+  `TrainingBatch` (`data/batch.py`), the packed row layout upstream uses.
+- `models/forward.py::training_forward` returns normalised quantiles; `target_frames` returns the per-patch
+  frames; `trainer/step.py::compute_loss` composes forward, frame, normalised targets and pinball loss.
+  Trainer, tests and probes all go through `compute_loss`, so they cannot drift apart.
+- `utils/validation.py` holds the acceptance checks as functions; the acceptance tests call them.
+- `trainer/trainer.py` is the loop. `_select_trainable` is where Phase 2 adds modes.
+
+## Things worth knowing before changing this code
+
+- **Parity is the safety net.** T1–T3 and `tests/test_collator.py` compare against upstream's own code on
+  the same inputs. If you change the forward or the collator, run them on 5M and 28M, not only the tiny
+  model. Expect agreement at float32 round-off; investigate anything looser.
+- **Do not assert bit-identity across PyTorch versions.** T1/T2 are bit-identical on 2.4.0 and 2.15.0 but
+  one case differs by 8e-10 on 2.8.0.
+- **The Apple GPU has no float64.** Every bug found on that device in this phase was a float64 conversion
+  executed before moving to CPU: `.to(device, torch.float64)` in one call, `.double()` before `.cpu()`,
+  `loss.double().item()`. Move first, then widen. Only running on the device catches these.
+- **Batches are padded further than upstream pads** (to one context length per dataset). That is safe
+  because leading unobserved patches are never attended to; `test_extra_left_padding_does_not_change_the_forecast`
+  guards it.
+- **Values at unobserved positions do not matter to the model** (they are zeroed after scaling and carry
+  zero weight in the statistics), which is why forward-filling inside a truncated window matches upstream.
+- **Pinball losses are not comparable between the two target frames.** Each is in its own units.
+- **The tiny random model** (`tests/helpers.py`) makes structural tests network-free. It does not show the
+  float32 gradient inaccuracy the released weights do, so gradient tests need both.
+- **`split_by_time`**: training gets nothing at or after the cutoff; the embargo is an extra gap.
 
 ## Open questions
 
-- Decision D2 (target frame) is unconfirmed.
-- Which dataframe libraries to support first, and their version floors.
+- T14 on CUDA (no hardware so far).
+- The cause of the float32 gradient inaccuracy on released weights (`docs/VERIFICATION.md` §6).
+- The target-frame evidence is synthetic, univariate and fully observed. A check on real data with
+  covariates would strengthen decision D2.
 
 ## Log of what was done
 
-Add dated bullets here as work lands, with the evidence (which tests pass, on what).
+- 2026-11-21: All Phase 1 items built. Evidence: 262 passed, 4 skipped on PyTorch 2.15.0; 262 passed on
+  2.8.0; 227 passed, 21 skipped on 2.4.0. T1–T8 and T12 pass on 5M and 28M. Target-frame check run and
+  recorded; D2 confirmed. Not done: CUDA.

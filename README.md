@@ -7,9 +7,9 @@
 
 Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
 
-> **Status: pre-alpha scaffold. Nothing here trains, adapts or calibrates a model yet.**
-> The repository currently holds the specification, a vendored copy of the official inference code,
-> an empty package skeleton, verification probes, and placeholder tests. See [docs/STATUS.md](docs/STATUS.md).
+> **Status: pre-alpha.** Loading, the data pipeline and `head_only` training work and are tested against
+> the official code. LoRA, full fine-tuning, conformal calibration and checkpoint export are not built yet,
+> so a tuned model cannot be saved yet. See [docs/STATUS.md](docs/STATUS.md).
 
 ## What this will be
 
@@ -37,12 +37,55 @@ is the project's overview guide and source of truth.
 | Piece | State |
 |---|---|
 | Specification | Written and verified against the paper, the official code and the released checkpoints |
-| Vendored upstream code | Done, at a pinned commit, with a manifest and a drift check |
-| Package `timestral_tune` | Skeleton only: every module is a documented stub |
-| Acceptance tests T1–T14 | 0 of 14 implemented; all are skipped placeholders |
-| Scaffold tests | 6 passing (imports, vendoring integrity, a tiny random model) |
-| Verification probes | Working; they reproduce the measurements the specification cites |
-| CI | Passing: lint, build, and the network-free tests on Python 3.10–3.13 |
+| Loading on any device | Done: CPU, Apple GPU (PyTorch 2.8+), CUDA (untested) |
+| Data pipeline | Done: polars / pandas / pyarrow frames, point-in-time windows, time splits, collation |
+| Training forward and loss | Done; equal to official inference at float32 round-off |
+| `head_only` training | Done, fp32 |
+| LoRA, full fine-tuning, `bf16` | Not built (Phase 2) |
+| Conformal calibration, export | Not built (Phase 2) |
+| Benchmarks, metrics, Lacuna integration | Not built (Phase 3) |
+| Acceptance tests T1–T14 | 10 of 14 implemented and passing on 5M and 28M; 4 are Phase 2 placeholders |
+| CI | Passing on Python 3.10–3.13 as of the last push |
+
+## What works today: `head_only` training
+
+```python
+from timestral_tune import TimestralTrainer, TrainingConfig
+from timestral_tune.data import TimeSeriesDataset
+
+# A long-format frame: one row per (series, timestamp). polars, pandas and pyarrow all work.
+dataset = TimeSeriesDataset.from_polars(
+    df,
+    id_col="symbol",
+    time_col="timestamp",
+    target_cols=["load"],
+    past_covariates=["temperature"],     # known up to the forecast origin only
+    known_covariates=["is_holiday"],     # known in advance over the horizon
+    context_length=512,
+    forecast_horizon=96,
+    stride=96,
+)
+train, validation = dataset.split_by_time("2024-02-15")   # training sees nothing from this date on
+
+config = TrainingConfig(model_name_or_path="mistralai/Timestral-5M", mode="head_only", batch_size=8, epochs=3)
+trainer = TimestralTrainer(config, train, validation)
+print(trainer.evaluate().loss)   # zero-shot validation loss
+result = trainer.fit()           # trains the quantile head only; everything else stays frozen
+print(result.best_eval_loss)
+```
+
+The tuned model is `trainer.model`. There is no `export()` yet, so it cannot be saved in the official
+checkpoint layout until Phase 2. Learning-rate defaults are placeholders that have not been tuned.
+
+To check your own data for leakage and parity with the official inference path:
+
+```python
+from timestral_tune.utils import run_checks
+
+batch = dataset.collator(trainer.model.config)([dataset[i] for i in range(8)]).to(trainer.device)
+for check in run_checks(trainer.model, batch):
+    print(check)
+```
 
 ## Repository layout
 
@@ -64,7 +107,8 @@ Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                      # create the environment
-uv run pytest                # scaffold tests pass; acceptance placeholders are skipped
+uv run pytest                # downloads the 5M and 28M checkpoints on first run
+uv run pytest -m "not network"   # no downloads; what CI runs
 uv run ruff check . && uv run ruff format --check .
 ```
 

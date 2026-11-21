@@ -3,9 +3,9 @@
 > **Repository Name:** `timestral-tune`
 > **Tagline:** Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
 > **License:** Apache 2.0 (software) | Weights governed by Mistral's Modified MIT License, which carries a revenue cap (see §8)
-> **Target Python Version:** 3.10+ (PyTorch 2.4+), matching upstream. The optional Lacuna integration needs 3.11+.
-> **Devices (v0.1):** CUDA, CPU, and Apple GPU (MPS, fp32 only; see §5.4).
-> **Spec revision:** 4, dated 2026-11-21, describing library release v0.1. The original draft is kept at `archive/timestral_tune_handoff_document.v0.md`.
+> **Target Python Version:** 3.10+ with PyTorch 2.4+, matching upstream; the Apple GPU needs PyTorch 2.8+. The optional Lacuna integration needs Python 3.11+.
+> **Devices (v0.1):** CPU, Apple GPU (MPS, fp32 only, PyTorch 2.8+; see §5.4), and CUDA. CUDA is supported in code but has never been run.
+> **Spec revision:** 5, dated 2026-11-21, describing library release v0.1. The original draft is kept at `archive/timestral_tune_handoff_document.v0.md`.
 > **File name:** this document was `timestral_tune_handoff_document.md` at the repository root until 2026-11-21; older commit messages use that name.
 > **Working in this repo:** start with `AGENTS.md`; current state is in `docs/STATUS.md`.
 
@@ -218,9 +218,13 @@ Because this map is increasing for a fixed frame $(\mu_j, \sigma_j)$, quantiles 
 
 We read that as: training folds the model's own predicted medians into the statistics. The upstream forecaster always denormalises later patches this way, in `_refine_block` and `advancing_block_frames` **[U forecaster.py:458-483]**, **[U scaler.py:165-208]**.
 
-**Decision [D]:** train in the **median-folded frame** with stop-gradient on the statistics, reusing `advancing_block_frames` unchanged. Whatever pretraining did, this makes the tuned model's training frame identical to its deployment frame. This reading is our inference, not an explicit statement in the paper.
+**Decision [D]:** train in the **median-folded frame** with stop-gradient on the statistics, reusing `advancing_block_frames` unchanged. Whatever pretraining did, this makes the tuned model's training frame identical to its deployment frame.
 
-An alternative frame, `true_values` (statistics from the true series up to the preceding patch), is available as a config option for ablation. Phase 1 includes a check that compares the pretrained model's loss and coverage under both frames on horizons longer than one patch, to confirm the choice.
+**Evidence [V].** The released checkpoints are calibrated in this frame. On synthetic series with short contexts and a 16-patch horizon, the 5M and 28M models' 80% interval covers 76–85% of targets normalised in the median-folded frame on horizon patches 1–15, against 88–100% of targets normalised in the true-values frame. Patch 0, which is identical under both frames, sits at 80–83%. A model trained against true-values targets would be calibrated under that frame instead of over-covering, so pretraining is consistent with the median-folded frame and not with the other. This supports the reading above by measurement, not only by the paper's wording.
+
+Limits of that evidence: synthetic, univariate, fully observed series; one seed; two model sizes. Under the median-folded frame the 50% interval under-covers at long lead times (0.40–0.44 on patches 4–15). Numbers and the probe are in `docs/VERIFICATION.md`.
+
+An alternative frame, `true_values` (statistics from the true series up to the preceding patch), is available as `target_frame="true_values"` for ablation. Pinball losses are not comparable between the two frames: each is measured in its own normalised units, and true-values frames have larger scales on drifting series, so they score lower whatever the model predicts.
 
 Reported metrics (§5.5) are always computed in raw space.
 
@@ -308,11 +312,11 @@ Stretch scope, Phase 4. All of this is our design **[D]**; Mistral has not relea
 - **Dropout.** The base model has none **[P §3.3]**. LoRA dropout applies to the adapter path only.
 - **Apple GPU (MPS).** Supported in v0.1 by running the four float64 statistics sites of §3.5 on CPU and moving their float32 results to the device **[D]**. The statistics carry no gradients, so this changes nothing in the maths. Measured **[V]**:
   - *Forward parity with CPU:* relative difference of 2e-7 to 3e-6 for `predict_block` in both layouts, 1e-7 for a 96-step forecast, up to 2e-5 for a 2,100-step block-autoregressive forecast, and 1e-7 with numeric and categorical covariates.
-  - *Gradients of the full training loss:* within 1.3e-5 (5M) and 8e-5 (28M) of a float64-weights reference.
-  - *Speed of the full training step* (normalised forward, median-folded frame with its CPU round trip, pinball loss, AdamW; context 1,024, horizon 96, batch 32): between 1.4× and 2.7× faster than CPU across three runs, for both univariate batches and batches with five rows per series. Timings vary from run to run.
+  - *Gradients of the training loss:* within 2e-7 to 1.1e-3 of a float64-weights reference across the T14 scenarios, against 2e-7 to 3.4e-3 for CPU float32. §12 explains why released weights are not at round-off on either device.
+  - *Speed of the full training step* (normalised forward, median-folded frame with its CPU round trip, pinball loss, AdamW; context 1,024, horizon 96, batch 32): between 1.4× and 3.2× faster than CPU across four runs, for both univariate batches and batches with five rows per series. Timings vary from run to run.
   - *Memory:* about 7 GiB allocated for 28M with five rows per series at batch 32.
   - *Mixed precision:* no speed-up from `bf16` or `fp16` autocast, and `bf16` moved outputs by 1e-2 to 6e-2, so MPS runs fp32 only and `mixed_precision` other than `"fp32"` raises there.
-  - *Scope:* verified on torch 2.15.0 only; 123M, 209M and contexts above 4,096 steps are untested on MPS.
+  - *Requirements and scope:* PyTorch 2.8 or newer. Older versions lack the `cummax` operator on this backend, which upstream's input assembly uses; `resolve_device` skips the Apple GPU under `"auto"` and raises for an explicit `"mps"`. Verified on 2.8.0 and 2.15.0, on one machine. 123M, 209M and contexts above 4,096 steps are untested on MPS.
 - **Device shims.** The offload is implemented as subclasses outside `_vendor/` that move tensors to CPU and call the parent: a model subclass overriding `scale`, and a forecaster subclass overriding `_cap_quantiles`, `_refine_block` and `_encode_categorical`. The training forward calls `advancing_block_frames` on CPU directly. No vendored file is edited for this (§6.1).
 - **Memory.** With covariates the token count is `2n` per row (§3.4), about double the no-covariate layout.
 
@@ -381,10 +385,11 @@ src/timestral_tune/
 
 - **Input.** A long-format frame with one row per (series, timestamp), an id column and a time column. Each series must be regularly sampled; gaps become missing values.
 - **Roles.** `target_cols`, `past_covariates`, `known_covariates`, and their categorical counterparts. The name `known_covariates` follows upstream.
-- **Windows.** A window is a forecast origin plus `context_length` steps before it and `forecast_horizon` steps after. Origins advance by `stride`.
+- **Windows.** A window is a forecast origin plus up to `context_length` steps before it and `forecast_horizon` steps from it. Origins are anchored at the end of each series and step back by `stride`, so the most recent data is always used. A window is dropped, and counted, when no target is observed in its context or in its horizon.
 - **Shape rules.** The context is truncated to at most 32,768 steps and left-padded to a multiple of 32 with unobserved zeros **[U forecaster.py:70-77]**. The horizon is rounded up to whole patches; padded steps get zero loss weight. `forecast_horizon` must be at most 1,024 for training.
 - **Preprocessing parity.** Target rows are forward-filled with the observation mask preserved; covariate NaNs become unobserved zeros. This mirrors `_assemble_rows` exactly.
-- **Arrow-backed.** Columns are converted once to contiguous float32 arrays; windows are views into them.
+- **Storage.** Frames from polars, pandas or pyarrow are converted once to contiguous float32 arrays per series; none of the three is a runtime dependency. Windows are views into those arrays, and the collator makes the padded copies.
+- **Validation.** Null ids or timestamps, duplicate (series, timestamp) pairs, timestamps off the regular grid, non-numeric or infinite values and time-zone-aware timestamps raise. `regularize=False` treats consecutive rows as consecutive steps, for calendar-irregular data such as monthly series.
 
 ### 6.3 Point-in-time rules
 
@@ -392,7 +397,7 @@ src/timestral_tune/
 2. Past-only covariates are cut at the origin. The user is responsible for supplying values as they were known at each timestamp; a per-column `available_lag` shifts a covariate that is published late.
 3. Known-future covariates must be genuinely known in advance over the horizon.
 4. Categorical covariates are target-encoded **per window, using the context only**, with horizon codes looked up in the context's table. This matches upstream inference exactly **[U covariate_encoding.py]**, **[U forecaster.py:246-276]**. Series with several target variates receive raw codes, as upstream does.
-5. Time splits use a cutoff plus an embargo of at least `forecast_horizon` steps, so no validation label overlaps a training window.
+5. `split_by_time(cutoff, embargo)` gives training windows nothing at or after the cutoff, context and horizon alike. Validation origins start `embargo` steps after it, and windows that straddle the cutoff are dropped. No validation label can appear in a training window even with `embargo=0`; the embargo adds a gap for strongly dependent data.
 
 ---
 
@@ -534,7 +539,7 @@ These replace the original "assert zero gradients on non-target covariate positi
 
 | # | Test | Passes when |
 |---|---|---|
-| T1 | Forward parity, no covariates | `sinh(training_forward) · σ₀ + μ₀` equals `predict_block` output within tolerance |
+| T1 | Forward parity, no covariates | `sinh(training_forward) · σ₀ + μ₀` equals `predict_block` output within 1e-6 relative, i.e. float32 round-off |
 | T2 | Forward parity, with covariates | Same, for the `2n`-token layout with all three roles |
 | T3 | Frame parity | Applying the median-folded frame reproduces `_refine_block`, and the full pipeline matches `forecast(symmetric_averaging=False, clip_nonnegative=False)` on a forecaster built with `quantile_real_cap_k=0`, which disables its output clamp |
 | T4 | Label isolation | Replacing horizon target values with noise leaves predictions bit-identical |
@@ -547,7 +552,7 @@ These replace the original "assert zero gradients on non-target covariate positi
 | T11 | Export round-trip | The exported directory loads in the vendored upstream loader with `strict=True` and reproduces the trainer's forecasts |
 | T12 | Encoding causality | A window's categorical encodings are unchanged when data after its origin changes |
 | T13 | Conformal | On synthetic exchangeable data, calibrated coverage meets the nominal level; output quantiles are non-decreasing |
-| T14 | Device parity | On each available device, forecasts match CPU within 1e-4 relative, and training-loss gradients match a float64-weights reference within 1e-3 relative. Skipped where the device is absent |
+| T14 | Device parity | On each available accelerator, forecasts match CPU within 1e-4 relative. On every device including CPU, float32 training-loss gradients match a float64-weights reference within 1e-5 relative on a randomly initialised model and within 1e-2 on released checkpoints (§12 explains the two tiers). Skipped where a device is absent |
 
 Perturbation tests use non-constant noise. A constant offset is absorbed by the normalisation and would make a firewall test pass vacuously.
 
@@ -561,18 +566,19 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
 - [x] Verification probes in `scripts/probes/`, with results in `docs/VERIFICATION.md`.
 - [x] CI green on Python 3.10–3.13 (first run 2026-11-21, Linux runners).
 - [ ] Weekly drift job: enabled, but its first scheduled run has not happened yet.
-- [ ] Checkpoint loader with pinned Hub revisions; config always read from `config.json`.
-- [ ] Device shims for the float64 statistics (§5.4); test T14 on CPU and MPS.
+- [x] Checkpoint loader with pinned Hub revisions; config always read from `config.json`.
+- [x] Device shims for the float64 statistics (§5.4); T14 passes on CPU and the Apple GPU, on the tiny model, 5M and 28M.
 
 ### Phase 1: Core mechanics & verification
-- [ ] Training forward for both layouts; tests T1–T3.
-- [ ] `PinballLoss` with the weight mask of §4.2; test T8.
-- [ ] Dataset, windowing, collator and per-window encoders; tests T4–T7 and T12.
-- [ ] Target-frame check: pretrained loss and coverage under `median_folded` versus `true_values` on horizons longer than one patch. Record the result in this document.
-- [ ] `head_only` training end to end on a toy dataset, on CPU and MPS.
-- [ ] Repeat the gradient check of T14 on CUDA, and on the torch 2.4 floor.
+- [x] Training forward for both layouts; T1–T3 pass (agreement with upstream at float32 round-off).
+- [x] `PinballLoss` with the weight mask of §4.2; T8 passes under both target frames.
+- [x] Dataset, windowing, collator and per-window encoders; T4–T7 and T12 pass. Collated batches equal upstream's own input assembly tensor for tensor.
+- [x] Target-frame check on horizons longer than one patch. Result: the checkpoints are calibrated in the median-folded frame, which confirms D2 (§4.3).
+- [x] `head_only` training end to end on a toy dataset, on CPU and the Apple GPU, on the tiny model, 5M and 28M: the loss falls and no weight outside the head changes.
+- [x] T14's gradient check on the PyTorch 2.4 floor: passes on CPU. The Apple GPU does not work below PyTorch 2.8, which is now its stated floor.
+- [ ] T14 on CUDA. **Not done: no CUDA hardware was available.** It is one command once there is: `uv run pytest tests/acceptance/test_device_parity.py`.
 
-**Exit:** T1–T8 and T12 pass on 5M and 28M; the frame decision is confirmed or revised.
+**Exit:** T1–T8 and T12 pass on 5M and 28M; the frame decision is confirmed or revised. **Met on 2026-11-21.** The one open item is the CUDA run.
 
 ### Phase 2: Adaptation & calibration
 - [ ] Slice LoRA adapter, mode presets, single-row guard; tests T9 and T10.
@@ -606,25 +612,29 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
 | # | Decision | Why |
 |---|---|---|
 | D1 | Default training scheme is a single context-plus-horizon split that mirrors upstream inference | Provably equal to deployment (T1–T3); keeps per-window encodings identical to inference; the paper's block-length distribution is unpublished |
-| D2 | Train in the median-folded target frame, stop-gradient | Matches the frame the upstream forecaster always uses; our reading of **[P §3.3]** |
+| D2 | Train in the median-folded target frame, stop-gradient | Matches the frame the upstream forecaster always uses; our reading of **[P §3.3]**; confirmed by calibration measurements on 5M and 28M (§4.3) |
 | D3 | Vendor upstream at a pinned commit | Not on PyPI; training needs private functions; avoids a dependency-confusion risk |
 | D4 | Custom slice LoRA on the fused `wQKV` | No separate Q or V modules exist |
 | D5 | `lora_variate` refuses single-row data by default | Query and key adapters are provably inert there |
 | D6 | CQR as the static conformal method, ACI as the online one | CQR works directly on the model's quantile pairs; ACI needs no exchangeability |
 | D7 | Replay uses user data or simple generators, with optional distillation | Mistral's corpus is unreleased |
 | D8 | Lacuna integration is optional and writes trial records and signal frames only | Lacuna consumes those and emits its own bundle; it needs Python 3.11+ |
-| D9 | Apple GPU supported in v0.1, fp32 only, by running float64 statistics on CPU in subclasses outside the vendored code | Measured parity with CPU and a 1.4–2.7× faster training step; mixed precision gave no gain there |
+| D9 | Apple GPU supported in v0.1, fp32 only, PyTorch 2.8+, by running float64 statistics on CPU in subclasses outside the vendored code | Measured parity with CPU and a 1.4–3.2× faster training step; mixed precision gave no gain there |
 | D10 | Exports are merged, upstream-loadable, with a sidecar for metadata | `config.json` rejects unknown keys; users can deploy with the official package |
+| D11 | `split_by_time` gives training nothing at or after the cutoff; the embargo is an optional extra gap | Stronger and simpler than relying on an embargo of one horizon to separate labels |
+| D12 | T14's gradient criterion has two tiers: 1e-5 on a randomly initialised model, 1e-2 on released checkpoints, on every device | Float32 gradients through the released weights are off by up to 3.4e-3 on CPU and 1.1e-3 on the Apple GPU, while a random model is at 3e-7 on both; a single 1e-3 bound separated nothing about device correctness |
+| D13 | Phase 1 trains `head_only` in fp32 only; other modes, `bf16` and `export()` raise `NotImplementedError` | No interim behaviour to unlearn later; each arrives with its own acceptance tests in Phase 2 |
 
 ## 12. Open Questions & Risks
 
-- **Target frame (D2).** Our reading of the paper is plausible but not confirmed by Mistral. The Phase 1 check is the mitigation.
+- **Target frame (D2).** Confirmed by calibration measurements on synthetic data for 5M and 28M (§4.3). Still not confirmed by Mistral, and not checked on real data, with covariates, or on 123M and 209M.
 - **Hyperparameters.** No published optimiser settings exist. All defaults are provisional until the Phase 3 sweeps.
 - **Benchmark contamination.** The paper says the models were post-trained on "a mixture of real and synthetic data" and does not list the real datasets. Any public benchmark dataset may have been seen. Results must say so, and should favour data published after October 2026 or private data where possible.
 - **Upstream drift.** Upstream is a first release with no stability promise. The drift-check job detects changes; re-vendoring requires re-running T1–T3 and T11.
 - **Benchmark dataset choice.** The realised-volatility and retail-demand datasets are not yet selected; licences must be checked first.
-- **CPU fp32 gradients are less accurate than expected, cause unknown.** Against a float64-weights reference (upstream's RMSNorm and RoPE still compute in float32 internally), CPU fp32 gradients of the training loss differed by 4.0e-3 relative on 5M and 9.4e-4 on 28M, while MPS fp32 differed by 1.3e-5 and 8e-5 **[V]**. Forward outputs agreed to about 3e-7 on both. Replacing the attention call with an explicit matmul-and-softmax removed the CPU gap on both sizes, yet a standalone attention call showed accurate fp32 gradients, so no single cause is established (`scripts/probes/cpu_gradient_gap.py`). The whole-gradient cosine with MPS was 0.99999, so training should be unaffected, but T14 compares against the float64-weights reference rather than CPU fp32 for this reason. CUDA is untested.
-- **Apple GPU scope.** Verified on one machine and one torch version (2.15.0); the stated floor is 2.4. The Phase 1 floor test may raise the minimum torch version for MPS.
+- **Float32 gradients through the released weights are not at round-off, cause unknown.** Against a float64-weights reference (upstream's RMSNorm and RoPE still compute in float32 internally), float32 gradients of the training loss differ by up to 3.4e-3 on CPU and 1.1e-3 on the Apple GPU **[V]**, while forward outputs agree to about 3e-7. It depends on the weights, not the architecture: a randomly initialised model is at 3e-7 on both devices. CPU is usually 10 to 100 times worse than the Apple GPU. Replacing upstream's attention call with an explicit matmul-and-softmax shrinks the CPU error inside the model (1.2e-3 to 3.9e-5 on 5M), yet the same call is accurate in isolation at every attention-logit scale tried, so no single cause is established (`scripts/probes/gradient_accuracy.py`). The gradient direction is essentially unaffected (cosine above 0.999999), so training should be too, but this is why T14 has two tiers and compares against the reference rather than CPU float32. CUDA is untested.
+- **Apple GPU scope.** Needs PyTorch 2.8 or newer. Verified on one machine, on 2.8.0 and 2.15.0.
+- **CUDA has never been run.** The code paths are the upstream ones plus device-agnostic logic, and CI covers CPU on Linux, but no test has executed on a CUDA device.
 - **Licence reach.** Whether adapter-only files count as derivatives is a legal question. The library takes the cautious position (§8).
 
 ## 13. References
