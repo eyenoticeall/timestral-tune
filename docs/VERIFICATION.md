@@ -139,8 +139,13 @@ What narrows it down, and what does not:
 | Same, max logit 1,409 | stock 5.0e-5, explicit 4.8e-5 |
 
 Reading: the error depends on the weights (a random model shows none) and appears on every device. CUDA
-measurements (§13) then located most of it in the float32 backward pass of upstream's attention call. A
-smaller remainder in one scenario is unexplained. Forward outputs are unaffected (about 3e-7 from the
+measurements (§13) then located most of it, on CUDA and CPU, in the float32 backward pass of upstream's
+attention call. On the Apple GPU the swap changes nothing (5M: 5.6e-5 → 5.5e-5; 28M: 4.5e-5 → 9.6e-5). A
+smaller remainder in one scenario (28M with covariates) is unexplained on all three.
+
+`head_only` is not affected. With everything but the head frozen, head gradients match the reference within
+1.9e-6 on CPU and 2.6e-6 on the Apple GPU across T14's scenarios, on the tiny model, 5M and 28M
+(`uv run pytest tests/acceptance/test_device_parity.py -k head_only -s`). Not yet run on CUDA. Forward outputs are unaffected (about 3e-7 from the
 reference, §11).
 
 Consequence: T14 compares gradients with the reference on every device, in three tiers (spec D12).
@@ -231,10 +236,12 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 231 passed, 22 skipped. Skipped: 17 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 19 further Apple GPU cases of the trainer and verifier tests are not generated at all. CPU passes everything else, including T14's gradient check and the tests on 5M and 28M |
-| 2.8.0 | 3.12 | 268 passed, 4 skipped, including every Apple GPU test |
-| 2.14.1 | 3.10 | 268 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 268 passed, 4 skipped |
+| 2.4.0 | 3.12 | 255 passed, 22 skipped. Skipped: 17 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 43 further Apple GPU cases are not generated at all. CPU passes everything else, including all of T14's gradient checks and the tests on 5M and 28M |
+| 2.8.0 | 3.12 | 316 passed, 4 skipped, including every Apple GPU test |
+| 2.14.1 | 3.10 | 316 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
+| 2.15.0 | 3.13 | 316 passed, 4 skipped |
+
+These are the counts for the final Phase 1 code, all on macOS. The CUDA run (§13) used Linux.
 
 The 4 skips common to every row are the Phase 2 acceptance placeholders.
 
@@ -280,7 +287,8 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 ## 13. CUDA
 
 Run: `bash scripts/cuda_check.sh` on the VM described at the top, at commit `ecbab9d`. It runs the
-device-parametrised tests, the whole suite and the device probes.
+device-parametrised tests, the whole suite and the device probes. The 24 `head_only` gradient cases of T14
+were added after this run and have not run on CUDA.
 
 | Check | Result |
 |---|---|

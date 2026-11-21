@@ -55,4 +55,6 @@ maintains or extends the phase.
   (Python 3.10) and 2.8.0; 231 passed, 22 skipped on 2.4.0. T1–T8 and T12 pass on 5M and 28M. Target-frame check run and
   recorded; D2 confirmed.
 - 2026-11-21 (later): T14 and the whole suite passed on CUDA (NVIDIA L4): 290 passed, 6 skipped. T14's
-  gradient check became three tiers after that run. Local suite: 292 passed, 4 skipped.
+  gradient check became three tiers after that run, and a `head_only` gradient check was added (not yet
+  run on CUDA). Final local suite: 316 passed, 4 skipped on PyTorch 2.15.0, 2.14.1 and 2.8.0; 255 passed,
+  22 skipped on 2.4.0.

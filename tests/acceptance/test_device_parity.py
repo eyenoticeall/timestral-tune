@@ -1,7 +1,7 @@
 """Device parity (spec §9, T14).
 
 Forecasts on an accelerator are compared with CPU. Gradients are compared with a float64-weights
-reference on CPU, on every device including CPU float32, in three tiers:
+reference on CPU, on every device including CPU float32. Over all parameters there are three tiers:
 
 - Tiny random model: CPU, Apple GPU and CUDA gradients agree with the reference to about 3e-7.
   Held to 1e-5. This is the structural check.
@@ -10,9 +10,14 @@ reference on CPU, on every device including CPU float32, in three tiers:
   1.2e-3 on the Apple GPU), which is unexplained. Held to 5e-3. This shows the library's own
   forward, frames, loss and device handling are accurate on real weights.
 - Released checkpoints as shipped, with upstream's `F.scaled_dot_product_attention`: off by up to
-  3.4e-3 on CPU, 1.1e-3 on the Apple GPU and 1.2e-2 on CUDA. The float32 backward pass of that
-  call loses accuracy with these weights (spec §12, docs/VERIFICATION.md §6). Held to 5e-2, which
-  still catches a wrong gradient; one minus the cosine similarity stays below 1e-4.
+  3.4e-3 on CPU, 1.1e-3 on the Apple GPU and 1.2e-2 on CUDA. On CUDA and CPU the float32 backward
+  pass of that call loses accuracy with these weights; on the Apple GPU the swap changes nothing
+  and its worst case is the unexplained scenario above (spec §12, docs/VERIFICATION.md §6, §13).
+  Held to 5e-2, which still catches a wrong gradient; one minus the cosine stays below 1e-4.
+
+With everything but the head frozen (`head_only`, the one mode the trainer implements so far), the
+backward pass never enters attention, and gradients match the reference within 1e-5 on released
+weights too (measured at most 2.6e-6 on CPU and the Apple GPU; not yet run on CUDA).
 
 The reference uses float64 weights and inputs; upstream's RMSNorm and RoPE still compute in float32
 internally, so it is not a pure float64 computation.
@@ -26,6 +31,7 @@ import pytest
 import torch
 
 import timestral_tune._vendor.timestral.layers as upstream_layers
+from timestral_tune.trainer import compute_loss
 
 from ..conftest import available_accelerators
 from ..helpers import (
@@ -118,3 +124,30 @@ def test_t14_gradients_with_explicit_attention(forecaster, raw, device, is_relea
     relative = l2_rel(gradient, reference)
     print(f"gradient on {device}, explicit attention: relative L2 error {relative:.2e}")  # `pytest -s`
     assert relative < bound, f"relative L2 {relative:.2e}"
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("device", ["cpu", *ACCELERATORS])
+def test_t14_head_only_gradients(forecaster, raw, device):
+    """T14 (gradients, `head_only`). Passes when: with everything but the head frozen, float32 gradients
+    match the float64-weights reference within 1e-5 on every model and device.
+
+    With the body frozen, the backward pass stops at the head and never enters attention, so the
+    inaccuracy of the tiers above does not reach the one mode the trainer implements so far.
+    """
+
+    def head_gradient(model, batch):
+        model.zero_grad()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in model.head.parameters():
+            parameter.requires_grad_(True)
+        compute_loss(model, batch).loss.backward()
+        return torch.cat([p.grad.detach().cpu().double().flatten() for p in model.head.parameters()])
+
+    batch, _, _ = upstream_batch(forecaster, raw)
+    reference = head_gradient(copy.deepcopy(forecaster.model).double(), as_double(batch))
+    model = copy.deepcopy(forecaster.model) if device == "cpu" else forecaster_on(forecaster, device).model
+    relative = l2_rel(head_gradient(model, batch.to(device)), reference)
+    print(f"head-only gradient on {device}: relative L2 error {relative:.2e}")  # `pytest -s`
+    assert relative < GRADIENT_RTOL_RANDOM_WEIGHTS, f"relative L2 {relative:.2e}"

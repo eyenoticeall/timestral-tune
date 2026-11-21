@@ -15,7 +15,7 @@
 | Training | `TimestralTrainer` in `head_only` mode, fp32: AdamW, warm-up, cosine or constant schedule, clipping, evaluation, early stopping, best-state restore |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **10 of 14 implemented and passing**: T1–T8, T12, T14. T9, T10, T11, T13 are Phase 2 placeholders |
-| Test suite | 292 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; macOS). On CUDA: 290 passed, 6 skipped |
+| Test suite | 316 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; macOS). On CUDA, before the last 24 tests were added: 290 passed, 6 skipped |
 | CI | Green on the last push (scaffold only). The Phase 1 work has not been pushed, so CI has not run on it |
 
 ## What does not exist yet
@@ -36,7 +36,8 @@ All on one machine (Apple M4, macOS); details in `docs/VERIFICATION.md`.
 - PyTorch floors: CPU on 2.4.0; Apple GPU from 2.8.0.
 - `head_only` training lowers the loss and changes nothing outside the head, on CPU and the Apple GPU.
 
-Not verified anywhere: the 123M and 209M checkpoints, real datasets, `bf16`. CI has run only the scaffold.
+Not verified anywhere: the 123M and 209M checkpoints, real datasets, `bf16`. T14's `head_only` gradient
+test was added after the CUDA run and has run on CPU and the Apple GPU only. CI has run only the scaffold.
 
 ## Next steps
 
@@ -51,8 +52,8 @@ Full list in spec §12. The ones that matter next:
 - **CUDA needs a C compiler and Python headers** with recent PyTorch (spec §12). `scripts/cuda_check.sh`
   checks for them.
 - **Float32 gradients through released weights are not at round-off**, worst on CUDA (up to 1.2e-2).
-  Mostly the backward pass of upstream's attention call (`docs/VERIFICATION.md` §6, §13). Training is not
-  expected to be affected, but that is untested; T14 has three tiers because of it.
+  Mostly the backward pass of upstream's attention call (`docs/VERIFICATION.md` §6, §13). `head_only` is not
+  affected (its backward pass never enters attention); it matters from Phase 2 on.
 - **The target-frame evidence is synthetic** (univariate, fully observed, one seed, 5M and 28M).
 - **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
 - **No export yet**, so a trained model lives only in memory (`trainer.model`).

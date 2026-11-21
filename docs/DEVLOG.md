@@ -176,6 +176,17 @@ commit `ecbab9d` (PyTorch 2.15.0+cu132, Python 3.12). Forecasts match CPU to 1e-
   a helper on first use. The first run, on the VM's system Python 3.10, failed every CUDA test for that
   reason. The script now checks first.
 
+**After the run.** A `head_only` gradient test was added: with the body frozen the backward pass never
+enters attention, and head gradients match the reference within 2.6e-6 on CPU and the Apple GPU. So the
+inaccuracy does not touch the one mode built so far. That test has not run on CUDA (the VM was gone). The
+attention explanation holds for CUDA and CPU only; on the Apple GPU the swap changes nothing.
+
+Connecting with `gcloud compute ssh` had added a login key to the cloud project's shared metadata. It was
+removed after the VM was deleted.
+
+**Final counts** (macOS): 316 passed, 4 skipped on PyTorch 2.15.0 (Python 3.13), 2.14.1 (Python 3.10) and
+2.8.0 (Python 3.12); 255 passed, 22 skipped on 2.4.0.
+
 **Not done / open.** The library still trains with upstream's attention call. Whether explicit attention
 changes training results is untested; if it matters, it belongs with Phase 2's attention wrapping for LoRA.
 `bf16` on CUDA is untested. `phase-1` is still unmerged and unpushed.
