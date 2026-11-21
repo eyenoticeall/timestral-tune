@@ -249,7 +249,10 @@ def test_load_lora_round_trips_exported_adapters_and_rejects_mismatches(tiny_for
 
     out_dir = export_checkpoint(source, tmp_path / "lora-exp", lora_config=cfg)
     fresh = copy.deepcopy(tiny_forecaster.model).eval()
+    torch.manual_seed(555)
+    rng_before = torch.get_rng_state()
     reloaded, reloaded_cfg = load_lora(fresh, out_dir, rows_per_series=3)
+    assert torch.equal(torch.get_rng_state(), rng_before), "load_lora must not mutate global PyTorch RNG"
     assert reloaded_cfg == cfg
     with torch.no_grad():
         actual = training_forward(reloaded, batch).quantiles

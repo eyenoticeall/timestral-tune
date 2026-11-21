@@ -9,10 +9,13 @@ Writes:
 - `conformal.json`: serialised fitted `ConformalCalibrator` or `OnlineConformalCalibrator`
   (stale file removed if omitted).
 - `tune_metadata.json`: sidecar recording base model, revision, mode, hyperparameters, content
-  data fingerprint, metrics, library version, and vendored upstream commit.
+  and window-aware data fingerprint, metrics, library version, and vendored upstream commit.
 - `LICENSE` and `NOTICE`: base weights licence and derivative notice (spec §8).
 
-Exporting is non-destructive: a live LoRA model stays unmerged and ready for further training.
+All JSON payloads and licence/notice artefacts are validated and serialised in memory before any
+file is written, so a serialisation failure never leaves partial weights without `LICENSE` or
+`NOTICE`. Exporting is non-destructive: a live LoRA model stays unmerged and ready for further
+training.
 
 - Spec: `docs/SPEC.md` §7.4, §8, §11 (D10)
 - Acceptance tests: T11
@@ -50,6 +53,8 @@ METADATA_FILE = "tune_metadata.json"
 LICENSE_FILE = "LICENSE"
 NOTICE_FILE = "NOTICE"
 
+_FALLBACK_LICENSE_MARKER = b"No verbatim LICENSE file was found at the base checkpoint location during export."
+
 
 def _vendored_upstream_commit() -> str | None:
     manifest = Path(__file__).resolve().parent / "_vendor" / "timestral" / "VENDOR_MANIFEST.json"
@@ -68,8 +73,23 @@ def _library_version() -> str:
     return __version__
 
 
+def _normalise_json(value: Any) -> Any:
+    """Convert NumPy scalars to Python primitives while leaving non-JSON types to fail strictly."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {str(k): _normalise_json(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_normalise_json(v) for v in value]
+    return value
+
+
+def _dumps_json(payload: Any) -> str:
+    return json.dumps(_normalise_json(payload), indent=2, allow_nan=False) + "\n"
+
+
 def dataset_fingerprint(dataset: TimeSeriesDataset) -> str:
-    """Deterministic SHA-256 content digest over a `TimeSeriesDataset`'s structure, timestamps, and values."""
+    """Deterministic SHA-256 content digest over a `TimeSeriesDataset`'s windows, timestamps, and values."""
     h = hashlib.sha256()
     header = {
         "num_series": len(dataset.series),
@@ -81,6 +101,11 @@ def dataset_fingerprint(dataset: TimeSeriesDataset) -> str:
         "layout": list(dataset.series[0].layout),
     }
     h.update(json.dumps(header, sort_keys=True).encode("utf-8"))
+    # Include the active window selection so train and validation splits sharing `series` hash distinctly.
+    for index_arr in (dataset._series_index, dataset._origins):
+        contig = np.ascontiguousarray(index_arr, dtype=np.int64)
+        h.update(str((contig.shape, contig.dtype.str)).encode("utf-8"))
+        h.update(contig.tobytes())
     for series in dataset.series:
         h.update(repr(series.series_id).encode("utf-8"))
         for arr in (
@@ -107,14 +132,25 @@ def _resolve_license_bytes(
         src = Path(license_path)
         if not src.is_file():
             raise FileNotFoundError(f"license_path {str(src)!r} does not exist")
-        return src.read_bytes(), True
+        raw = src.read_bytes()
+        is_verbatim = _FALLBACK_LICENSE_MARKER not in raw
+        if not is_verbatim:
+            logger.warning("license_path %r contains a fallback pointer, not a verbatim base LICENSE", str(src))
+        return raw, is_verbatim
 
     if base_repo_or_path is not None:
         local = Path(base_repo_or_path).expanduser()
         if local.is_dir():
             candidate = local / LICENSE_FILE
             if candidate.is_file():
-                return candidate.read_bytes(), True
+                raw = candidate.read_bytes()
+                if _FALLBACK_LICENSE_MARKER not in raw:
+                    return raw, True
+                logger.warning(
+                    "base directory %r holds a fallback %s pointer rather than a verbatim licence",
+                    str(local),
+                    LICENSE_FILE,
+                )
         elif "/" in str(base_repo_or_path):
             try:
                 downloaded = hf_hub_download(
@@ -135,7 +171,7 @@ def _resolve_license_bytes(
     )
     fallback = (
         f"This checkpoint is derived from {base_label}.\n"
-        "No verbatim LICENSE file was found at the base checkpoint location during export.\n"
+        f"{_FALLBACK_LICENSE_MARKER.decode('utf-8')}\n"
         "Derivatives of Mistral Timestral checkpoints are governed by Mistral AI's Modified MIT License\n"
         "(obtain the verbatim licence text from the base checkpoint repository on Hugging Face Hub).\n"
     )
@@ -220,22 +256,26 @@ def export_checkpoint(
     """Export `model` to `output_dir` in the upstream-loadable layout of spec §7.4.
 
     Does not mutate `model`: LoRA weights are merged into a copy for `model.safetensors` while
-    unmerged adapter matrices are written to `adapter.safetensors`. Stale conditional files
-    (`adapter.safetensors`, `adapter_config.json`, `conformal.json`) from a previous export in
-    `output_dir` are removed when not part of this export.
+    unmerged adapter matrices are written to `adapter.safetensors`. All metadata, JSON payloads,
+    and licence files are validated and serialised before writing anything to disk, so errors
+    never leave a partial export without `LICENSE` or `NOTICE`. Stale conditional files from a
+    previous export in `output_dir` are removed when not part of this export.
     """
     if isinstance(calibrator, ConformalCalibrator) and not calibrator.is_fitted:
         raise ValueError("cannot export an unfitted ConformalCalibrator; call fit() first")
 
     model_has_lora = has_lora(model)
-    effective_lora = (
-        (lora_config if lora_config is not None else getattr(model, "_lora_config", None)) if model_has_lora else None
-    )
-    if model_has_lora and effective_lora is None:
-        raise ValueError("cannot export LoRA adapters without a LoraConfig; pass lora_config=")
-
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    injected_lora = getattr(model, "_lora_config", None)
+    if model_has_lora:
+        if injected_lora is not None and lora_config is not None and lora_config != injected_lora:
+            raise ValueError(
+                f"passed lora_config={lora_config!r} does not match the model's injected {injected_lora!r}"
+            )
+        effective_lora = lora_config if lora_config is not None else injected_lora
+        if effective_lora is None:
+            raise ValueError("cannot export LoRA adapters without a LoraConfig; pass lora_config=")
+    else:
+        effective_lora = None
 
     resolved_base = (
         base_repo_or_path
@@ -247,26 +287,10 @@ def export_checkpoint(
         explicit_rev = training_config.revision if training_config is not None else None
         resolved_revision = resolve_revision(resolved_base, explicit_rev)
 
-    # 1. Exact upstream config.json (zero extra keys) and merged model.safetensors.
-    model.config.save(out / CONFIG_FILE)
-    save_file(merged_state_dict(model), str(out / WEIGHTS_FILE))
-
-    # 2. Adapter files (LoRA only); remove stale files when exporting a non-LoRA checkpoint.
-    if model_has_lora:
-        assert effective_lora is not None
-        save_file(extract_lora_state_dict(model), str(out / ADAPTER_WEIGHTS_FILE))
-        (out / ADAPTER_CONFIG_FILE).write_text(json.dumps(effective_lora.to_dict(), indent=2) + "\n", encoding="utf-8")
-    else:
-        (out / ADAPTER_WEIGHTS_FILE).unlink(missing_ok=True)
-        (out / ADAPTER_CONFIG_FILE).unlink(missing_ok=True)
-
-    # 3. Conformal offsets (if provided); remove stale file when absent.
-    if calibrator is not None:
-        calibrator.save(out / CONFORMAL_FILE)
-    else:
-        (out / CONFORMAL_FILE).unlink(missing_ok=True)
-
-    # 4. Sidecar metadata (never inside config.json).
+    # Prepare and validate all serialised payloads in memory BEFORE touching `output_dir`.
+    config_json = json.dumps(model.config.to_dict(), indent=2) + "\n"
+    adapter_config_json = _dumps_json(effective_lora.to_dict()) if effective_lora is not None else None
+    conformal_json = _dumps_json(calibrator.to_dict()) if calibrator is not None else None
     metadata: dict[str, Any] = {
         "base_model": None if resolved_base is None else str(resolved_base),
         "base_revision": resolved_revision,
@@ -280,13 +304,38 @@ def export_checkpoint(
         "library_version": _library_version(),
         "vendored_upstream_commit": _vendored_upstream_commit(),
     }
-    (out / METADATA_FILE).write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-
-    # 5. Licence and derivative notice (spec §8).
+    metadata_json = _dumps_json(metadata)
     license_bytes, is_verbatim = _resolve_license_bytes(resolved_base, resolved_revision, license_path)
-    (out / LICENSE_FILE).write_bytes(license_bytes)
-    (out / NOTICE_FILE).write_text(
-        _notice_text(resolved_base, resolved_revision, has_adapters=model_has_lora, verbatim_license=is_verbatim),
-        encoding="utf-8",
+    notice_text = _notice_text(
+        resolved_base, resolved_revision, has_adapters=model_has_lora, verbatim_license=is_verbatim
     )
+    merged_weights = merged_state_dict(model)
+    adapter_weights = extract_lora_state_dict(model) if model_has_lora else None
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # 1. Exact upstream config.json (zero extra keys) and merged model.safetensors.
+    (out / CONFIG_FILE).write_text(config_json, encoding="utf-8")
+    save_file(merged_weights, str(out / WEIGHTS_FILE))
+
+    # 2. Adapter files (LoRA only); remove stale files when exporting a non-LoRA checkpoint.
+    if model_has_lora:
+        assert adapter_weights is not None and adapter_config_json is not None
+        save_file(adapter_weights, str(out / ADAPTER_WEIGHTS_FILE))
+        (out / ADAPTER_CONFIG_FILE).write_text(adapter_config_json, encoding="utf-8")
+    else:
+        (out / ADAPTER_WEIGHTS_FILE).unlink(missing_ok=True)
+        (out / ADAPTER_CONFIG_FILE).unlink(missing_ok=True)
+
+    # 3. Conformal offsets (if provided); remove stale file when absent.
+    if conformal_json is not None:
+        (out / CONFORMAL_FILE).write_text(conformal_json, encoding="utf-8")
+    else:
+        (out / CONFORMAL_FILE).unlink(missing_ok=True)
+
+    # 4. Sidecar metadata, licence and derivative notice (spec §8).
+    (out / METADATA_FILE).write_text(metadata_json, encoding="utf-8")
+    (out / LICENSE_FILE).write_bytes(license_bytes)
+    (out / NOTICE_FILE).write_text(notice_text, encoding="utf-8")
     return out

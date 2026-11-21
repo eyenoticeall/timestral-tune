@@ -154,3 +154,52 @@ def test_export_content_fingerprint_dirty_dir_cleanup_and_guards(tiny_forecaster
     assert any("no verbatim LICENSE" in record.getMessage() for record in caplog.records)
     notice = (out_dir / "NOTICE").read_text(encoding="utf-8")
     assert "no verbatim LICENSE was found" in notice
+
+
+def test_export_fingerprint_splits_mismatched_lora_atomic_metrics_and_chained_license(
+    tiny_forecaster, tmp_path, caplog
+):
+    from timestral_tune.export import dataset_fingerprint
+    from timestral_tune.models import inject_lora
+
+    # 1. Train and validation splits sharing `series` with identical window counts get distinct fingerprints.
+    full = make_toy_dataset(tiny_forecaster.patch_size, series=4, seed=3, covariates=True)
+    train, val = full.split_by_time(12 * tiny_forecaster.patch_size)
+    # Match window counts explicitly by slicing if needed.
+    n = min(len(train), len(val))
+    keep_t = np.zeros(len(train), dtype=bool)
+    keep_t[:n] = True
+    keep_v = np.zeros(len(val), dtype=bool)
+    keep_v[:n] = True
+    train_eq = train._with_windows(keep_t)
+    val_eq = val._with_windows(keep_v)
+    assert len(train_eq) == len(val_eq) and dataset_fingerprint(train_eq) != dataset_fingerprint(val_eq)
+
+    # 2. Mismatched lora_config against model._lora_config raises ValueError before writing anything.
+    adapted = copy.deepcopy(tiny_forecaster.model)
+    inject_lora(adapted, LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("q", "v")))
+    bad_dir = tmp_path / "bad-lora"
+    with pytest.raises(ValueError, match="does not match"):
+        export_checkpoint(adapted, bad_dir, lora_config=LoraConfig(r=8, lora_alpha=16, axes=("variate",)))
+    assert not bad_dir.exists()
+
+    # 3. Non-JSON metrics fail BEFORE writing any files (no partial export); NumPy scalars serialise cleanly.
+    fail_dir = tmp_path / "fail-metrics"
+    with pytest.raises(TypeError):
+        export_checkpoint(tiny_forecaster.model, fail_dir, metrics={"bad": object()})
+    assert not fail_dir.exists(), "failed export must not leave partial weights without LICENSE/NOTICE"
+
+    ok_dir = export_checkpoint(
+        tiny_forecaster.model, tmp_path / "np-metrics", metrics={"val_loss": np.float32(0.25), "steps": np.int64(3)}
+    )
+    meta = json.loads((ok_dir / "tune_metadata.json").read_text(encoding="utf-8"))
+    assert meta["metrics"]["val_loss"] == pytest.approx(0.25) and meta["metrics"]["steps"] == 3
+
+    # 4. Chained export whose base dir holds our fallback LICENSE pointer does NOT claim verbatim LICENSE.
+    chained_dir = tmp_path / "chained"
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="timestral_tune.export"):
+        export_checkpoint(tiny_forecaster.model, chained_dir, base_repo_or_path=ok_dir)
+    chained_notice = (chained_dir / "NOTICE").read_text(encoding="utf-8")
+    assert "no verbatim LICENSE was found" in chained_notice
+    assert any("fallback LICENSE pointer" in r.getMessage() for r in caplog.records)

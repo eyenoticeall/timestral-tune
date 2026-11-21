@@ -457,7 +457,8 @@ def load_lora(
         raise FileNotFoundError(f"adapter config not found at {str(config_file)!r}")
 
     lora_config = LoraConfig.from_dict(json.loads(config_file.read_text(encoding="utf-8")))
-    inject_lora(model, lora_config, rows_per_series=rows_per_series)
+    # Use a local generator so reloading adapters never mutates PyTorch's global RNG.
+    inject_lora(model, lora_config, rows_per_series=rows_per_series, generator=torch.Generator().manual_seed(0))
     load_lora_state_dict(model, load_file(str(weights_file), device="cpu"))
     return model, lora_config
 
