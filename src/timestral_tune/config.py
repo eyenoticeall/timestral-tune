@@ -157,7 +157,10 @@ class TrainingConfig:
             horizon representations on CPU (up to 256 MiB per dataset) so multi-epoch training and
             repeated evaluations skip re-running the frozen body. Ignored in other modes, and falls
             back to streaming when the estimated cache exceeds the memory cap.
-        output_dir: Where `export()` will write (roadmap Phase 2). Nothing is written before then.
+        compile_model: Compile the transformer with `torch.compile`.
+        compile_mode: Compilation mode when `compile_model=True`. `"reduce-overhead"` uses CUDA
+            graphs and requires fixed batch shapes (dataset size divisible by batch size).
+        output_dir: Default directory for `trainer.export()`.
     """
 
     model_name_or_path: str | Path
@@ -183,6 +186,8 @@ class TrainingConfig:
     log_every: int = 50
     shuffle: bool = True
     cache_frozen_features: bool = True
+    compile_model: bool = False
+    compile_mode: CompileMode = "default"
     output_dir: str | Path | None = None
 
     def __post_init__(self) -> None:
@@ -190,8 +195,10 @@ class TrainingConfig:
         _one_of("mixed_precision", self.mixed_precision, get_args(MixedPrecision))
         _one_of("lr_schedule", self.lr_schedule, get_args(LearningRateSchedule))
         _one_of("target_frame", self.target_frame, TARGET_FRAMES)
-        if not isinstance(self.cache_frozen_features, bool):
-            raise ValueError(f"cache_frozen_features must be a bool, got {self.cache_frozen_features!r}")
+        _one_of("compile_mode", self.compile_mode, get_args(CompileMode))
+        for flag in ("cache_frozen_features", "compile_model", "restore_best", "shuffle"):
+            if not isinstance(getattr(self, flag), bool):
+                raise ValueError(f"{flag} must be a bool, got {getattr(self, flag)!r}")
         if self.learning_rate is not None and not (math.isfinite(self.learning_rate) and self.learning_rate > 0):
             raise ValueError(f"learning_rate must be positive and finite, got {self.learning_rate}")
         if not (math.isfinite(self.weight_decay) and self.weight_decay >= 0):

@@ -310,34 +310,44 @@ def unmerge_lora(model: nn.Module) -> None:
             module.unmerge()
 
 
+def _clean_compiled_key(key: str) -> str:
+    """Strip `_orig_mod.` segments inserted when a submodule is wrapped by `torch.compile`."""
+    return key.replace("._orig_mod.", ".").removeprefix("_orig_mod.")
+
+
 def extract_lora_state_dict(model: nn.Module) -> dict[str, Tensor]:
     """Unmerged LoRA `A` and `B` tensors on CPU, keyed by `<module>.lora_A.<slice>` / `lora_B.<slice>`."""
     tensors: dict[str, Tensor] = {}
     for module_name, module in model.named_modules():
         if isinstance(module, LoRASliceLinear):
+            clean = _clean_compiled_key(module_name)
             for slice_name, param in module.lora_A.items():
-                tensors[f"{module_name}.lora_A.{slice_name}"] = param.detach().cpu().contiguous()
+                tensors[f"{clean}.lora_A.{slice_name}"] = param.detach().cpu().contiguous()
             for slice_name, param in module.lora_B.items():
-                tensors[f"{module_name}.lora_B.{slice_name}"] = param.detach().cpu().contiguous()
+                tensors[f"{clean}.lora_B.{slice_name}"] = param.detach().cpu().contiguous()
     return tensors
 
 
 def merged_state_dict(model: nn.Module) -> dict[str, Tensor]:
     """Upstream-compatible state dict on CPU with all LoRA adapters merged, without mutating `model`.
 
-    Parameter names match upstream `TimestralModel` exactly so the result loads with `strict=True`
-    in the official package (spec §7.4, acceptance test T11).
+    Parameter names match upstream `TimestralModel` exactly (including when a submodule has been
+    wrapped with `torch.compile`) so the result loads with `strict=True` in the official package
+    (spec §7.4, acceptance test T11).
     """
     lora_prefixes: dict[str, LoRASliceLinear] = {
-        name: module for name, module in model.named_modules() if isinstance(module, LoRASliceLinear)
+        _clean_compiled_key(name): module
+        for name, module in model.named_modules()
+        if isinstance(module, LoRASliceLinear)
     }
     raw = model.state_dict()
     if not lora_prefixes:
-        return {name: tensor.detach().cpu().contiguous() for name, tensor in raw.items()}
+        return {_clean_compiled_key(name): tensor.detach().cpu().contiguous() for name, tensor in raw.items()}
 
     out: dict[str, Tensor] = {}
     emitted: set[str] = set()
-    for key, tensor in raw.items():
+    for raw_key, tensor in raw.items():
+        key = _clean_compiled_key(raw_key)
         matched_prefix: str | None = None
         for prefix in lora_prefixes:
             if key.startswith(prefix + "."):

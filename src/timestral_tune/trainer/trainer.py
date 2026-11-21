@@ -1,17 +1,15 @@
 """The training loop.
 
 `TimestralTrainer` loads a checkpoint, freezes everything the chosen adaptation mode does not
-train, and minimises the pinball loss of spec §4 over the windows of a `TimeSeriesDataset`.
+train (`head_only`, `lora_variate`, `lora_temporal`, `full_ft`), and minimises the pinball loss
+of spec §4 over the windows of a `TimeSeriesDataset`.
 
-Scope in this release (roadmap Phase 1): the `head_only` mode in float32, on CPU, CUDA or the Apple
-GPU. The LoRA modes, full fine-tuning, `bf16` autocast, `torch.compile` and `export()` arrive in
-Phase 2; asking for them raises `NotImplementedError` rather than doing something else.
-
-- Spec: `docs/SPEC.md` §4, §5, §5.4, §7.1
+- Spec: `docs/SPEC.md` §4, §5, §5.1, §5.4, §7.1
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from collections.abc import Iterable, Sequence
@@ -22,9 +20,10 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-from ..config import TrainingConfig
+from ..config import LoraConfig, TrainingConfig
 from ..data.batch import TrainingBatch
 from ..data.dataset import TimeSeriesDataset
+from ..models.adapter import inject_lora, lora_parameters
 from ..models.device import TuneTimestralModel, supports_float64
 from ..models.forward import context_welford_state, normalise_targets, target_frames, training_forward
 from ..models.loader import load_model, resolve_device
@@ -170,21 +169,24 @@ class TimestralTrainer:
         train_dataset: TimeSeriesDataset,
         val_dataset: TimeSeriesDataset | None = None,
         *,
-        lora_config: object | None = None,
+        lora_config: LoraConfig | None = None,
         callbacks: Sequence[Callback] = (),
         model: TuneTimestralModel | None = None,
     ) -> None:
-        if config.mode != "head_only":
-            raise NotImplementedError(
-                f"mode {config.mode!r} is not implemented yet; only 'head_only' is (the others are roadmap Phase 2)"
-            )
-        if lora_config is not None:
-            raise NotImplementedError("LoRA is not implemented yet (roadmap Phase 2); pass lora_config=None")
-        if config.mixed_precision != "fp32":
-            raise NotImplementedError("mixed precision is not implemented yet (roadmap Phase 2); use 'fp32'")
-
         self.config = config
         self.device = resolve_device(config.device)
+        if config.mixed_precision == "bf16":
+            if self.device.type != "cuda":
+                raise ValueError(
+                    f"mixed_precision='bf16' is supported on CUDA only (MPS runs fp32 only); got {self.device.type!r}"
+                )
+            if not torch.cuda.is_bf16_supported():
+                raise ValueError("mixed_precision='bf16' requested, but this CUDA device does not support bfloat16")
+
+        if lora_config is not None and not isinstance(lora_config, LoraConfig):
+            raise TypeError(f"lora_config must be a LoraConfig or None, got {type(lora_config).__name__}")
+        self.lora_config = self._resolve_lora_config(config.mode, lora_config)
+
         if model is None:
             model = load_model(config.model_name_or_path, device=self.device, revision=config.revision)
         elif not isinstance(model, TuneTimestralModel):
@@ -210,10 +212,24 @@ class TimestralTrainer:
                     "val_dataset must have the same columns per role and forecast horizon as train_dataset"
                 )
 
+        if config.compile_model and config.compile_mode == "reduce-overhead":
+            self._check_fixed_batch_shapes(train_dataset, config.batch_size, "train_dataset")
+            if val_dataset is not None:
+                eval_bs = config.eval_batch_size or config.batch_size
+                self._check_fixed_batch_shapes(val_dataset, eval_bs, "val_dataset")
+
         self._trainable = self._select_trainable()
-        self.optimizer = torch.optim.AdamW(
-            self._trainable, lr=config.resolved_learning_rate, weight_decay=config.weight_decay
-        )
+        if config.compile_model:
+            self.model.transformer = torch.compile(self.model.transformer, mode=config.compile_mode)
+
+        use_fused = self.device.type == "cuda" and all(p.is_cuda and p.is_floating_point() for p in self._trainable)
+        adamw_kwargs: dict[str, object] = {
+            "lr": config.resolved_learning_rate,
+            "weight_decay": config.weight_decay,
+        }
+        if use_fused:
+            adamw_kwargs["fused"] = True
+        self.optimizer = torch.optim.AdamW(self._trainable, **adamw_kwargs)
         steps_per_epoch = math.ceil(len(train_dataset) / config.batch_size)
         self.total_steps = config.max_steps if config.max_steps is not None else config.epochs * steps_per_epoch
         self.scheduler = self._new_schedule()
@@ -235,6 +251,32 @@ class TimestralTrainer:
 
     # ----------------------------------------------------------------- setup
 
+    @staticmethod
+    def _resolve_lora_config(mode: str, lora_config: LoraConfig | None) -> LoraConfig | None:
+        if mode in ("head_only", "full_ft"):
+            if lora_config is not None:
+                raise ValueError(f"lora_config is only valid for LoRA modes, not mode={mode!r}")
+            return None
+        required_axis = "variate" if mode == "lora_variate" else "time"
+        if lora_config is None:
+            return LoraConfig(axes=(required_axis,))
+        if required_axis not in lora_config.axes:
+            raise ValueError(f"mode={mode!r} requires {required_axis!r} in lora_config.axes, got {lora_config.axes!r}")
+        return lora_config
+
+    @staticmethod
+    def _check_fixed_batch_shapes(dataset: TimeSeriesDataset, batch_size: int, name: str) -> None:
+        if len(dataset) > batch_size and len(dataset) % batch_size != 0:
+            raise ValueError(
+                f"compile_mode='reduce-overhead' requires fixed batch shapes, but {name} has {len(dataset)} windows "
+                f"which is not divisible by batch_size={batch_size}; use compile_mode='default' or bucket batches"
+            )
+
+    def _autocast(self):
+        if self.config.mixed_precision == "bf16":
+            return torch.amp.autocast("cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
+
     def _check_dataset(self, dataset: TimeSeriesDataset, name: str) -> None:
         """Fail at construction, not at the first batch, if the dataset cannot be used with this model."""
         model_config = self.model.config
@@ -252,10 +294,28 @@ class TimestralTrainer:
             raise ValueError(f"{name} has known-future covariates, which this checkpoint cannot condition on")
 
     def _select_trainable(self) -> list[Tensor]:
-        """Freeze everything, then unfreeze what `config.mode` trains. Returns the trainable parameters."""
+        """Freeze everything, then unfreeze (or inject) what `config.mode` trains. Returns trainable parameters."""
+        mode = self.config.mode
+        if mode == "full_ft":
+            trainable = list(self.model.parameters())
+            for parameter in trainable:
+                parameter.requires_grad_(True)
+            return trainable
+
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
-        trainable = list(self.model.head.parameters())  # head_only: the quantile output projection
+
+        if mode == "head_only":
+            trainable = list(self.model.head.parameters())
+            for parameter in trainable:
+                parameter.requires_grad_(True)
+            return trainable
+
+        assert self.lora_config is not None
+        rows_per_series = sum(self.train_dataset.series[0].layout)
+        torch.manual_seed(self.config.seed)
+        inject_lora(self.model, self.lora_config, rows_per_series=rows_per_series)
+        trainable = list(lora_parameters(self.model))
         for parameter in trainable:
             parameter.requires_grad_(True)
         return trainable
@@ -421,7 +481,8 @@ class TimestralTrainer:
     def training_step(self, batch: TrainingBatch | CachedHeadBatch, *, validate: bool = True) -> float:
         """One optimiser step on `batch` (already on the device). Returns the loss."""
         self.optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(self.model, batch, self.config.target_frame, validate=validate).loss
+        with self._autocast():
+            loss = compute_loss(self.model, batch, self.config.target_frame, validate=validate).loss
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError(
                 f"the training loss became {loss.item()} at step {self.global_step + 1}. Lower the learning rate, "
@@ -558,12 +619,13 @@ class TimestralTrainer:
                 continue
             if isinstance(batch, TrainingBatch):
                 batch.validate(patch)
-            loss = compute_loss(
-                self.model,
-                batch.to(self.device, non_blocking=non_blocking),
-                self.config.target_frame,
-                validate=False,
-            ).loss
+            with self._autocast():
+                loss = compute_loss(
+                    self.model,
+                    batch.to(self.device, non_blocking=non_blocking),
+                    self.config.target_frame,
+                    validate=False,
+                ).loss
             # Weight each batch by its scored positions, so the result is the mean over the dataset.
             total += loss.item() * positions  # .item() is a Python float, so the sum accumulates in float64
             scored += positions

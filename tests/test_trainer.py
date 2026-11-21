@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 import torch
 
-from timestral_tune import TimestralTrainer, TrainingConfig
+from timestral_tune import LoraConfig, TimestralTrainer, TrainingConfig
 from timestral_tune.config import DEFAULT_LEARNING_RATES
+from timestral_tune.models import merged_state_dict
 from timestral_tune.trainer import Callback, EarlyStopping, EvalResult, compute_loss
 from timestral_tune.trainer import trainer as trainer_module
 from timestral_tune.trainer.trainer import _learning_rate_factor
@@ -444,13 +445,65 @@ def test_a_non_finite_loss_stops_training_with_an_explanation(tiny_forecaster, m
 def test_features_of_later_phases_raise_not_implemented(tiny_forecaster):
     dataset = make_toy_dataset(tiny_forecaster.patch_size)
     model = fresh_model(tiny_forecaster)
-    for overrides in ({"mode": "lora_variate"}, {"mode": "full_ft"}, {"mixed_precision": "bf16"}):
-        with pytest.raises(NotImplementedError, match="Phase 2"):
-            TimestralTrainer(config_for(**overrides), dataset, model=model)
-    with pytest.raises(NotImplementedError, match="Phase 2"):
-        TimestralTrainer(config_for(), dataset, lora_config=object(), model=model)
     with pytest.raises(NotImplementedError, match="Phase 2"):
         TimestralTrainer(config_for(), dataset, model=model).export()
+
+
+def test_trainer_mode_precision_and_compile_validation(tiny_forecaster):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    uni = make_toy_dataset(tiny_forecaster.patch_size, covariates=False)
+
+    # bf16 raises on non-CUDA devices (CPU and MPS).
+    for device in [d for d in DEVICES if d != "cuda"]:
+        with pytest.raises(ValueError, match="CUDA only"):
+            TimestralTrainer(config_for(device, mixed_precision="bf16"), dataset, model=fresh_model(tiny_forecaster))
+
+    # lora_config rejected for non-LoRA modes and wrong type.
+    for mode in ("head_only", "full_ft"):
+        with pytest.raises(ValueError, match="LoRA modes"):
+            TimestralTrainer(
+                config_for(mode=mode), dataset, lora_config=LoraConfig(), model=fresh_model(tiny_forecaster)
+            )
+    with pytest.raises(TypeError, match="LoraConfig"):
+        TimestralTrainer(
+            config_for(mode="lora_variate"), dataset, lora_config=object(), model=fresh_model(tiny_forecaster)
+        )  # type: ignore[arg-type]
+
+    # Mode vs LoraConfig axis mismatch rejected.
+    with pytest.raises(ValueError, match="requires 'variate'"):
+        TimestralTrainer(
+            config_for(mode="lora_variate"),
+            dataset,
+            lora_config=LoraConfig(axes=("time",)),
+            model=fresh_model(tiny_forecaster),
+        )
+    with pytest.raises(ValueError, match="requires 'time'"):
+        TimestralTrainer(
+            config_for(mode="lora_temporal"),
+            dataset,
+            lora_config=LoraConfig(axes=("variate",)),
+            model=fresh_model(tiny_forecaster),
+        )
+
+    # Single-row guard enforced by TimestralTrainer (T10 end-to-end).
+    with pytest.raises(ValueError, match="single-row"):
+        TimestralTrainer(config_for(mode="lora_variate"), uni, model=fresh_model(tiny_forecaster))
+    with pytest.raises(ValueError, match="inert"):
+        TimestralTrainer(
+            config_for(mode="lora_variate"),
+            uni,
+            lora_config=LoraConfig(axes=("variate",), targets=("q", "v"), allow_single_row=True),
+            model=fresh_model(tiny_forecaster),
+        )
+
+    # compile_mode="reduce-overhead" rejects non-divisible dataset sizes.
+    assert len(dataset) % 5 != 0
+    with pytest.raises(ValueError, match="fixed batch shapes"):
+        TimestralTrainer(
+            config_for(batch_size=5, compile_model=True, compile_mode="reduce-overhead"),
+            dataset,
+            model=fresh_model(tiny_forecaster),
+        )
 
 
 def test_incompatible_datasets_and_models_are_rejected_at_construction(tiny_forecaster):
@@ -506,6 +559,8 @@ def test_incompatible_datasets_and_models_are_rejected_at_construction(tiny_fore
         {"batch_size": np.bool_(True)},
         {"max_steps": np.float64(3.0)},
         {"cache_frozen_features": "yes"},
+        {"compile_model": 1},
+        {"compile_mode": "max-autotune"},
     ],
 )
 def test_config_rejects_invalid_values(overrides):
@@ -621,3 +676,105 @@ def test_head_only_cache_falls_back_when_over_memory_cap(tiny_forecaster, monkey
     finally:
         handle.remove()
     assert calls == 4, "expected streaming fallback to run the body on every step"
+
+
+# ------------------------------------ LoRA, full_ft, bf16 and torch.compile
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("mode", ["lora_variate", "lora_temporal", "full_ft"])
+def test_lora_and_full_ft_overfit_and_touch_only_selected_parameters(tiny_forecaster, device, mode):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    model = fresh_model(tiny_forecaster)
+    lr = 5e-3 if mode == "full_ft" else 2e-2
+    config = fixed_batch_config(dataset, device, mode=mode, max_steps=15, learning_rate=lr, lr_schedule="constant")
+    lora_cfg = (
+        None
+        if mode == "full_ft"
+        else LoraConfig(r=4, lora_alpha=8, axes=("variate" if mode == "lora_variate" else "time",))
+    )
+    trainer = TimestralTrainer(config, dataset, lora_config=lora_cfg, model=model)
+
+    before = {name: p.detach().cpu().clone() for name, p in model.named_parameters()}
+    loss_before = trainer.evaluate(dataset).loss
+    result = trainer.fit()
+    loss_after = trainer.evaluate(dataset).loss
+
+    assert result.steps == 15 and loss_after < 0.7 * loss_before, (
+        f"{mode} on {device}: {loss_before:.4f} -> {loss_after:.4f}"
+    )
+    changed = {name for name, p in model.named_parameters() if not torch.equal(p.detach().cpu(), before[name])}
+    if mode == "full_ft":
+        assert any(name.startswith("head.") for name in changed)
+        assert any(name.startswith("transformer.") for name in changed)
+    else:
+        assert changed and all(".lora_" in name for name in changed), f"non-LoRA weights changed: {changed}"
+        assert trainer.num_trainable_parameters == sum(p.numel() for n, p in model.named_parameters() if ".lora_" in n)
+
+
+def test_lora_variate_single_row_override_trains_cleanly(tiny_forecaster):
+    uni = make_toy_dataset(tiny_forecaster.patch_size, covariates=False)
+    model = fresh_model(tiny_forecaster)
+    cfg = fixed_batch_config(uni, "cpu", mode="lora_variate", max_steps=10, learning_rate=2e-2, lr_schedule="constant")
+    lora_cfg = LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("v", "o"), allow_single_row=True)
+    trainer = TimestralTrainer(cfg, uni, lora_config=lora_cfg, model=model)
+    loss_before = trainer.evaluate(uni).loss
+    trainer.fit()
+    assert trainer.evaluate(uni).loss < loss_before
+
+
+@pytest.mark.parametrize("mode", ["lora_variate", "lora_temporal", "full_ft"])
+def test_lora_and_full_ft_are_deterministic_for_a_seed(tiny_forecaster, mode):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    weights = []
+    for _ in range(2):
+        model = fresh_model(tiny_forecaster)
+        config = config_for("cpu", mode=mode, batch_size=4, max_steps=6, learning_rate=1e-3, seed=11)
+        trainer = TimestralTrainer(config, dataset, model=model)
+        trainer.fit()
+        weights.append(merged_state_dict(model))
+    for k in weights[0]:
+        assert torch.equal(weights[0][k], weights[1][k]), f"{mode} diverged on {k}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(), reason="requires bf16 CUDA")
+@pytest.mark.parametrize("mode", ["head_only", "lora_variate", "lora_temporal", "full_ft"])
+def test_bf16_training_on_cuda(tiny_forecaster, mode):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    model = fresh_model(tiny_forecaster)
+    lr = 5e-3 if mode == "full_ft" else 2e-2
+    config = fixed_batch_config(
+        dataset, "cuda", mode=mode, mixed_precision="bf16", max_steps=10, learning_rate=lr, lr_schedule="constant"
+    )
+    trainer = TimestralTrainer(config, dataset, model=model)
+    loss_before = trainer.evaluate(dataset).loss
+    result = trainer.fit()
+    loss_after = trainer.evaluate(dataset).loss
+    assert result.steps == 10 and math.isfinite(loss_after) and loss_after < loss_before
+
+
+def test_compile_model_trains_and_produces_clean_merged_state_dict(tiny_forecaster):
+    from timestral_tune._vendor.timestral import TimestralModel
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = fresh_model(tiny_forecaster)
+    config = fixed_batch_config(
+        dataset,
+        device,
+        mode="lora_variate",
+        max_steps=4,
+        learning_rate=2e-2,
+        lr_schedule="constant",
+        compile_model=True,
+        compile_mode="default",
+    )
+    trainer = TimestralTrainer(config, dataset, model=model)
+    loss_before = trainer.evaluate(dataset).loss
+    result = trainer.fit()
+    loss_after = trainer.evaluate(dataset).loss
+    assert result.steps == 4 and loss_after < loss_before
+    state = merged_state_dict(model)
+    assert all("_orig_mod" not in k for k in state)
+    reloaded = TimestralModel(model.config)
+    reloaded.load_state_dict(state, strict=True)
