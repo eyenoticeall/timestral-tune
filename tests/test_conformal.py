@@ -191,6 +191,10 @@ def test_from_dict_rejects_corrupted_cqr_and_aci_payloads():
     for mutate in (
         lambda d: d.update(alpha_t=[[0.2]]),  # truncated bucket row
         lambda d: d.update(alpha_t=[[float("nan"), 0.2]]),
+        lambda d: d.update(alpha_t=[[True, 0.2]]),
+        lambda d: d.update(alpha_t=[["0.2", 0.2]]),
+        lambda d: d.update(alpha_t=[[None, 0.2]]),
+        lambda d: d.update(scores=[[[True], [0.1]]]),
         lambda d: d.update(scores=[]),
         lambda d: d.update(num_buckets=-1),
     ):

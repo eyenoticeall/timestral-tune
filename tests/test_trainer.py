@@ -808,3 +808,33 @@ def test_lora_trainer_init_does_not_mutate_global_rng_and_evaluate_validates_inp
     assert len(dataset) % 5 != 0
     with pytest.raises(ValueError, match="fixed batch shapes"):
         compiled_trainer.evaluate(dataset)
+
+
+def test_trainer_resumes_from_load_lora_and_rejects_mismatched_pre_injected_model(tiny_forecaster, tmp_path):
+    from timestral_tune import load_lora
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    cfg = fixed_batch_config(
+        dataset, "cpu", mode="lora_variate", max_steps=4, learning_rate=2e-2, lr_schedule="constant"
+    )
+    lora_cfg = LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("q", "v"))
+
+    trainer1 = TimestralTrainer(cfg, dataset, lora_config=lora_cfg, model=fresh_model(tiny_forecaster))
+    trainer1.fit()
+    loss_after_1 = trainer1.evaluate(dataset).loss
+    out_dir = trainer1.export(tmp_path / "resume-exp")
+
+    # Reload adapters onto a fresh base model and resume training in a new TimestralTrainer.
+    resumed_model, reloaded_cfg = load_lora(fresh_model(tiny_forecaster), out_dir)
+    trainer2 = TimestralTrainer(cfg, dataset, lora_config=reloaded_cfg, model=resumed_model)
+    assert trainer2.evaluate(dataset).loss == pytest.approx(loss_after_1, rel=1e-6)
+    trainer2.fit()
+    assert trainer2.evaluate(dataset).loss < loss_after_1
+
+    # Passing a pre-injected LoRA model with a conflicting config or into head_only raises cleanly.
+    with pytest.raises(ValueError, match="does not match"):
+        TimestralTrainer(cfg, dataset, lora_config=LoraConfig(r=2, axes=("variate",)), model=resumed_model)
+    with pytest.raises(ValueError, match="already has LoRA"):
+        TimestralTrainer(
+            fixed_batch_config(dataset, "cpu", mode="head_only", max_steps=1), dataset, model=resumed_model
+        )

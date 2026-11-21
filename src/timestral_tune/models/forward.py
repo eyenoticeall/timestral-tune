@@ -93,8 +93,8 @@ def attention_context(backend: AttentionBackend = "default") -> Iterator[None]:
     """Experimental: select the PyTorch attention kernel for calls inside the block.
 
     This is a measurement tool, used by acceptance test T14 and the gradient-accuracy probe. It is
-    not part of the public API and no training code path uses it; whether training should is a
-    Phase 2 question (spec §11, D15).
+    not part of the public API and no training code path uses it (decision D15 keeps PyTorch's
+    default attention kernel for training).
 
     `"default"` leaves PyTorch's dispatch alone, matching upstream inference. `"math"` disables the
     fused scaled-dot-product-attention kernels (flash, memory-efficient, cuDNN) so PyTorch runs its

@@ -313,7 +313,7 @@ Stretch scope, Phase 4. All of this is our design **[D]**; Mistral has not relea
 - **Dropout.** The base model has none **[P §3.3]**. LoRA dropout applies to the adapter path only.
 - **CUDA.** Verified **[V]** on an NVIDIA L4 (PyTorch 2.15.0, fp32 and bf16): forecasts match CPU to 1e-7 to 1.5e-5 relative, T1–T14 and the whole suite pass (512 passed, 2 skipped), `AdamW` runs `fused=True`, and `bf16 + torch.compile` speeds up 28M covariate steps 3.3× over fp32. Float32 gradients through the default attention kernel are less accurate than on the other devices (up to 1.1e-2; §12), though 20-step training trajectories match unfused math closely (D15). The environment needs a C compiler and Python headers (§12).
 - **Apple GPU (MPS).** Supported in v0.1 by running the four float64 statistics sites of §3.5 on CPU and moving their float32 results to the device **[D]**. The statistics carry no gradients, so this changes nothing in the maths. Measured **[V]**:
-  - *Forward parity with CPU:* relative difference of 2e-7 to 3e-6 for `predict_block` in both layouts, 1e-7 for a 96-step forecast, up to 2e-5 for a 2,100-step block-autoregressive forecast, and 1e-7 with numeric and categorical covariates.
+  - *Forward parity with CPU:* relative difference of 1.9e-7 to 3.4e-6 for `predict_block` in both layouts, 1e-7 for a 96-step forecast, up to 2e-5 for a 2,100-step block-autoregressive forecast, and 1e-7 with numeric and categorical covariates.
   - *Gradients of the training loss:* within 2e-7 to 2.1e-3 of a float64 reference across the T14 scenarios, against 2e-7 to 3.4e-3 for CPU float32. §12 explains why released weights are not at round-off on any device.
   - *Speed of the full training step* (normalised forward, median-folded frame with its CPU round trip, pinball loss, AdamW; context 1,024, horizon 96, batch 32): between 1.4× and 3.2× faster than CPU across four runs, for both univariate batches and batches with five rows per series. Timings vary from run to run.
   - *Memory:* about 4.5 GiB allocated for 28M with five rows per series at batch 32 (down from 7.3 GiB before D16).
@@ -337,7 +337,7 @@ Metrics, in raw space: MASE, mean weighted quantile loss over the 21 levels, pin
 src/timestral_tune/
 │
 ├── __init__.py
-├── config.py                 # TrainingConfig (built); LoraConfig, ReplayConfig (later phases)
+├── config.py                 # TrainingConfig, LoraConfig (built); ReplayConfig (Phase 4)
 ├── _vendor/
 │   └── timestral/            # Upstream code at the pinned commit (imports made relative), LICENSE, manifest
 │
@@ -363,7 +363,7 @@ src/timestral_tune/
 │
 ├── trainer/
 │   ├── step.py               # compute_loss: forward, target frame and pinball loss in one place
-│   ├── trainer.py            # Training loop (clipping, evaluation, early stopping; AMP and compile in Phase 2)
+│   ├── trainer.py            # Training loop (all modes, clipping, eval, early stopping, bf16, compile)
 │   └── callbacks.py          # Progress logging, early stopping
 │
 ├── export.py                 # Upstream-loadable checkpoint, adapter, metadata sidecar
@@ -445,7 +445,7 @@ train_config = TrainingConfig(
     learning_rate=3e-4,
     batch_size=32,
     epochs=5,
-    mixed_precision="bf16",
+    mixed_precision="bf16",  # CUDA only; use "fp32" on CPU and Apple GPU
     gradient_clip_val=1.0,
     target_frame="median_folded",
     output_dir="./checkpoints/timestral-28m-vol",
@@ -504,12 +504,15 @@ checkpoints/timestral-28m-vol/
 ├── model.safetensors      # Merged weights under upstream parameter names
 ├── adapter.safetensors    # LoRA modes only: the unmerged A and B matrices
 ├── adapter_config.json    # LoRA modes only
-├── conformal.json         # If a calibrator was fitted
-├── tune_metadata.json     # Base repo and revision, mode, hyperparameters, data fingerprint,
-│                          # metrics, library version, vendored upstream commit
+├── conformal.json         # If a fitted calibrator was passed (unfitted CQR raises)
+├── tune_metadata.json     # Base repo, revision, model_provided_directly, mode, hyperparameters,
+│                          # lora_config, has_conformal, content data fingerprint, metrics,
+│                          # library version, vendored upstream commit
 ├── LICENSE                # Mistral's Modified MIT License, copied from the base repo
 └── NOTICE                 # States that the weights are a derivative of the named base model
 ```
+
+Saved LoRA adapters can be re-attached to a base model (and resumed in `TimestralTrainer`) with `load_lora(base_model, export_dir)`.
 
 ### 7.5 Optional Lacuna integration
 

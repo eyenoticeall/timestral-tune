@@ -565,18 +565,17 @@ class OnlineConformalCalibrator:
             if not isinstance(scores[p], list) or len(scores[p]) != num_buckets:
                 raise ValueError(f"scores[{p}] must have length {num_buckets}")
             for b in range(num_buckets):
-                val = float(alpha_t[p][b])
-                if not math.isfinite(val):
-                    raise ValueError(f"alpha_t[{p}][{b}] must be finite, got {val!r}")
-                cal._alpha_t[p][b] = val
+                raw_a = alpha_t[p][b]
+                if isinstance(raw_a, bool) or not isinstance(raw_a, numbers.Real) or not math.isfinite(float(raw_a)):
+                    raise ValueError(f"alpha_t[{p}][{b}] must be a finite real number, got {raw_a!r}")
+                cal._alpha_t[p][b] = float(raw_a)
                 bucket_scores = scores[p][b]
                 if not isinstance(bucket_scores, list):
                     raise ValueError(f"scores[{p}][{b}] must be a list")
                 for s in bucket_scores[-cal.window :]:
-                    sf = float(s)
-                    if not math.isfinite(sf):
-                        raise ValueError(f"non-finite score {s!r} in scores[{p}][{b}]")
-                    cal._push_score(p, b, sf)
+                    if isinstance(s, bool) or not isinstance(s, numbers.Real) or not math.isfinite(float(s)):
+                        raise ValueError(f"score {s!r} in scores[{p}][{b}] must be a finite real number")
+                    cal._push_score(p, b, float(s))
         return cal
 
     def save(self, path: str | Path) -> Path:

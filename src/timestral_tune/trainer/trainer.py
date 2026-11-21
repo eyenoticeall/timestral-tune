@@ -25,7 +25,7 @@ from ..config import LoraConfig, TrainingConfig
 from ..data.batch import TrainingBatch
 from ..data.dataset import TimeSeriesDataset
 from ..export import dataset_fingerprint, export_checkpoint
-from ..models.adapter import inject_lora, lora_parameters
+from ..models.adapter import has_lora, inject_lora, lora_parameters, unmerge_lora, validate_lora_for_rows
 from ..models.conformal import ConformalCalibrator, OnlineConformalCalibrator
 from ..models.device import TuneTimestralModel, supports_float64
 from ..models.forward import context_welford_state, normalise_targets, target_frames, training_forward
@@ -160,10 +160,12 @@ class TimestralTrainer:
         train_dataset: Windows to train on.
         val_dataset: Optional windows to evaluate on; enables early stopping and best-state
             restoration.
-        lora_config: Reserved for the LoRA modes (roadmap Phase 2).
+        lora_config: Optional `LoraConfig` for `lora_variate` and `lora_temporal` (defaults to a
+            mode-appropriate config when omitted; rejected for `head_only` and `full_ft`).
         callbacks: Extra `Callback` instances, run after the built-in progress logger and early stopping.
         model: An already loaded model to train, instead of loading `config.model_name_or_path`.
-            It is moved to the configured device and modified in place.
+            It is moved to the configured device and modified in place. For LoRA modes, a model
+            already adapted via `load_lora()` is resumed in place.
     """
 
     def __init__(
@@ -188,7 +190,9 @@ class TimestralTrainer:
 
         if lora_config is not None and not isinstance(lora_config, LoraConfig):
             raise TypeError(f"lora_config must be a LoraConfig or None, got {type(lora_config).__name__}")
+        explicit_lora_config = lora_config is not None
         self.lora_config = self._resolve_lora_config(config.mode, lora_config)
+        self._explicit_lora_config = explicit_lora_config
 
         self._model_provided_directly = model is not None
         if model is None:
@@ -304,6 +308,11 @@ class TimestralTrainer:
     def _select_trainable(self) -> list[Tensor]:
         """Freeze everything, then unfreeze (or inject) what `config.mode` trains. Returns trainable parameters."""
         mode = self.config.mode
+        if mode in ("head_only", "full_ft") and has_lora(self.model):
+            raise ValueError(
+                f"cannot run mode={mode!r} on a model that already has LoRA adapters; "
+                "use a LoRA mode or load the merged weights into a base model"
+            )
         if mode == "full_ft":
             trainable = list(self.model.parameters())
             for parameter in trainable:
@@ -321,8 +330,20 @@ class TimestralTrainer:
 
         assert self.lora_config is not None
         rows_per_series = sum(self.train_dataset.series[0].layout)
-        generator = torch.Generator().manual_seed(self.config.seed)
-        inject_lora(self.model, self.lora_config, rows_per_series=rows_per_series, generator=generator)
+        if has_lora(self.model):
+            existing = getattr(self.model, "_lora_config", None)
+            if existing is not None:
+                if self._explicit_lora_config and existing != self.lora_config:
+                    raise ValueError(
+                        f"pre-injected model has {existing!r}, "
+                        f"which does not match passed lora_config={self.lora_config!r}"
+                    )
+                self.lora_config = self._resolve_lora_config(mode, existing)
+            validate_lora_for_rows(self.lora_config, rows_per_series)
+            unmerge_lora(self.model)
+        else:
+            generator = torch.Generator().manual_seed(self.config.seed)
+            inject_lora(self.model, self.lora_config, rows_per_series=rows_per_series, generator=generator)
         trainable = list(lora_parameters(self.model))
         for parameter in trainable:
             parameter.requires_grad_(True)

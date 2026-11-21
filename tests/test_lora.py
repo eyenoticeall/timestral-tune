@@ -263,3 +263,5 @@ def test_load_lora_round_trips_exported_adapters_and_rejects_mismatches(tiny_for
         load_lora_state_dict(reloaded, bad_state)
     with pytest.raises(ValueError, match="key mismatch"):
         load_lora_state_dict(reloaded, {})
+    with pytest.raises(ValueError, match="duplicate slice name"):
+        LoRASliceLinear(torch.nn.Linear(16, 48, bias=False), [("q", 0, 16), ("q", 16, 16)], r=2, lora_alpha=4.0)

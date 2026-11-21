@@ -86,7 +86,11 @@ class LoRASliceLinear(nn.Module):
         if len(slices) == 0:
             raise ValueError("at least one slice is required")
         out_features, in_features = base.weight.shape
+        seen_names: set[str] = set()
         for name, start, dim in slices:
+            if name in seen_names:
+                raise ValueError(f"duplicate slice name {name!r}")
+            seen_names.add(name)
             if start < 0 or dim <= 0 or start + dim > out_features:
                 raise ValueError(
                     f"slice {name!r} [{start}, {start + dim}) is out of bounds for out_features={out_features}"
@@ -139,7 +143,9 @@ class LoRASliceLinear(nn.Module):
         """Add every slice's low-rank update into `base.weight` in place. Idempotent.
 
         Snapshots the pre-merge base rows so `unmerge()` restores them bit-identically regardless
-        of dtype (including `bf16`) or later changes to `lora_A`/`lora_B`.
+        of dtype (including `bf16`) or later changes to `lora_A`/`lora_B`. Note that raw
+        `state_dict()` does not persist the `merged` flag; use `merged_state_dict()` to serialise
+        merged weights.
         """
         if self.merged:
             return

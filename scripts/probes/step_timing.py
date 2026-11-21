@@ -59,7 +59,16 @@ def median_step_seconds(
     )
     warmup = 3 if compile_mode is not None else 1
 
+    mark_step = (
+        compile_mode == "reduce-overhead"
+        and device == "cuda"
+        and hasattr(torch, "compiler")
+        and hasattr(torch.compiler, "cudagraph_mark_step_begin")
+    )
+
     def run_one() -> None:
+        if mark_step:
+            torch.compiler.cudagraph_mark_step_begin()
         optimiser.zero_grad(set_to_none=True)
         with amp_ctx:
             loss = compute_loss(model, batch, validate=False).loss
