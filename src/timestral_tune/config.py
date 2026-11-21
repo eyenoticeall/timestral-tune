@@ -56,7 +56,8 @@ class TrainingConfig:
         target_frame: Frame the loss targets are normalised in (spec §4.3).
         device: `"auto"`, `"cpu"`, `"cuda"` or `"mps"`.
         seed: Seeds weight-independent randomness: batch order and any sampling.
-        num_workers: DataLoader worker processes.
+        num_workers: DataLoader worker processes. On macOS with PyTorch 2.4.0, any worker leaves
+            the process hanging at exit (a PyTorch issue; `docs/VERIFICATION.md` §10).
         eval_every: Evaluate on the validation set every this many steps. None evaluates at the
             end of each epoch.
         eval_batch_size: Batch size for evaluation. None uses `batch_size`.

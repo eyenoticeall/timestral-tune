@@ -7,9 +7,10 @@ the released checkpoints are not accurate to float32 round-off on any device:
 - On the tiny random model, CPU and Apple GPU gradients agree with the reference to about 3e-7.
   That is the structural check, and it is held to 1e-5.
 - On the released 5M and 28M checkpoints the same code is off by up to 3.4e-3 (CPU) and 1.1e-3
-  (Apple GPU), with cosine similarity above 0.999999. The cause inside the network is not
-  identified (spec §12, docs/VERIFICATION.md §6). These are held to a looser bound that still
-  catches a wrong gradient: relative L2 below 1e-2, which implies cosine similarity above 0.99995.
+  (Apple GPU); one minus the cosine similarity is at most 5.7e-6 and 6.4e-7. The cause inside the
+  network is not identified (spec §12, docs/VERIFICATION.md §6). These are held to a looser bound
+  that still catches a wrong gradient: relative L2 below 1e-2, which implies cosine similarity
+  above 0.99995.
 
 The reference uses float64 weights and inputs; upstream's RMSNorm and RoPE still compute in float32
 internally, so it is not a pure float64 computation.
@@ -78,5 +79,6 @@ def test_t14_device_parity_gradients(forecaster, raw, device, is_released_checkp
     assert torch.isfinite(gradient).all()
     bound = GRADIENT_RTOL_RELEASED_WEIGHTS if is_released_checkpoint else GRADIENT_RTOL_RANDOM_WEIGHTS
     relative = l2_rel(gradient, reference)
-    print(f"gradient relative L2 error on {device}: {relative:.2e}")  # shown with `pytest -s`
+    cosine = torch.nn.functional.cosine_similarity(gradient, reference, dim=0).item()
+    print(f"gradient on {device}: relative L2 error {relative:.2e}, 1 - cosine {1 - cosine:.1e}")  # `pytest -s`
     assert relative < bound, f"relative L2 {relative:.2e}"

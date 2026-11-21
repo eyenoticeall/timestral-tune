@@ -24,7 +24,7 @@ from timestral_tune.utils import (
     check_label_isolation,
 )
 
-from ..helpers import make_columns, role_kwargs, to_frame
+from ..helpers import make_columns, role_kwargs, to_frame, upstream_batch
 
 INPUT_FIELDS = ("context", "context_mask", "group_ids", "role_ids", "known_future", "known_future_mask")
 ROLES = {"targets": 1, "past": 1, "known": 1, "categorical_past": 1, "categorical_known": 1}
@@ -113,8 +113,6 @@ def test_t05_past_covariate_cut(forecaster, columns):
 @pytest.mark.parametrize("scenario", ["covariates", "multi_target_covariates"], indirect=True)
 def test_t06_firewall(forecaster, raw):
     """T6. Passes when: Noise on a target's context changes no covariate row's hidden state or output."""
-    from ..helpers import upstream_batch
-
     batch, _, _ = upstream_batch(forecaster, raw)
     result = check_firewall(forecaster.model, batch)
     assert not result.skipped
@@ -125,8 +123,6 @@ def test_t06_firewall(forecaster, raw):
 @pytest.mark.parametrize("scenario", ["covariates", "multi_target_covariates"], indirect=True)
 def test_t07_known_future_positive_control(forecaster, raw):
     """T7. Passes when: Noise on a known-future covariate in the horizon does change the target forecast."""
-    from ..helpers import upstream_batch
-
     batch, _, _ = upstream_batch(forecaster, raw)
     result = check_known_future_sensitivity(forecaster.model, batch)
     assert not result.skipped

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import pickle
+import sys
 
 import numpy as np
 import pytest
@@ -207,7 +208,7 @@ def test_missing_columns_wrong_frame_types_and_bad_roles_raise():
     import polars
 
     with pytest.raises(TypeError, match="collect"):
-        build(columns, context_length=8, forecast_horizon=4, kind="polars").from_frame(
+        TimeSeriesDataset.from_frame(
             polars.DataFrame({"time": [1], "y0": [1.0]}).lazy(),
             time_col="time",
             target_cols=["y0"],
@@ -382,6 +383,12 @@ def test_split_accepts_strings_datetimes_and_integers_and_rejects_empty_sides():
 # ------------------------------------------------- loaders and end to end
 
 
+# A DataLoader worker on macOS with PyTorch 2.4.0 leaves the interpreter hanging at exit, with or without
+# this library (scripts/probes/worker_exit_hang.py). Not reproduced on 2.8.0 or newer; 2.5 to 2.7 are untested.
+WORKERS_HANG_AT_EXIT = sys.platform == "darwin" and tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
+
+
+@pytest.mark.skipif(WORKERS_HANG_AT_EXIT, reason="PyTorch below 2.8 on macOS: a DataLoader worker hangs the exit")
 def test_dataset_pickles_and_works_in_a_worker_process(tiny_forecaster):
     columns = make_columns(15, **FULL)
     dataset = build(columns, context_length=16, forecast_horizon=6, stride=4)
