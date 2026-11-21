@@ -380,6 +380,47 @@ def test_split_by_time_keeps_training_strictly_before_the_cutoff(embargo):
     assert train.stats.kept == len(train) and validation.stats.kept == len(validation)
 
 
+def staggered_series(start: int, steps: int, seed: int) -> SeriesData:
+    empty = np.empty((0, steps), dtype=np.float32)
+    return SeriesData(
+        series_id=f"from{start}",
+        timestamps=np.arange(start, start + steps, dtype=np.int64),
+        targets=np.random.default_rng(seed).standard_normal((1, steps)).astype(np.float32),
+        past=empty,
+        known=empty,
+        categorical_past=empty.astype(np.float64),
+        categorical_known=empty.astype(np.float64),
+    )
+
+
+@pytest.mark.parametrize("embargo", [0, 4])
+def test_split_by_time_uses_each_series_own_timeline(embargo):
+    """Series that start and end at different times: the cutoff is a point in time, so it falls at a
+    different index in each series. Checked on timestamps, not indices.
+    """
+    series = [staggered_series(0, 60, 1), staggered_series(10, 60, 2), staggered_series(25, 70, 3)]
+    dataset = TimeSeriesDataset(series, context_length=12, forecast_horizon=5, stride=3)
+    cutoff = 40
+    train, validation = dataset.split_by_time(cutoff, embargo=embargo)
+
+    def times(split, index):
+        window = split[index]
+        stamps = split.series[window.series_index].timestamps
+        return stamps[window.origin - window.context_steps], stamps[window.origin], stamps[window.origin + 4]
+
+    assert {train[i].series_index for i in range(len(train))} == {0, 1, 2}, "every series contributes"
+    assert {validation[i].series_index for i in range(len(validation))} == {0, 1, 2}
+    for i in range(len(train)):
+        _, _, last_label = times(train, i)
+        assert last_label < cutoff, "a training window holds a step at or after the cutoff"
+    for i in range(len(validation)):
+        _, origin, _ = times(validation, i)
+        assert origin >= cutoff + embargo
+    latest_training_label = max(times(train, i)[2] for i in range(len(train)))
+    earliest_validation_label = min(times(validation, i)[1] for i in range(len(validation)))
+    assert latest_training_label < earliest_validation_label, "a validation label is inside a training window"
+
+
 def test_split_accepts_strings_datetimes_and_integers_and_rejects_empty_sides():
     columns = make_columns(14, series=1, steps=60, missing=0.0)
     dataset = build(columns, context_length=16, forecast_horizon=6)

@@ -32,11 +32,10 @@ SCENARIOS = {
 def _load(name: str) -> TuneTimestralForecaster:
     if name == "tiny":
         return make_tiny_forecaster()
-    try:
-        # quantile_real_cap_k=0 disables upstream's output clamp, as acceptance test T3 requires.
-        return load_forecaster(f"mistralai/Timestral-{name}", quantile_real_cap_k=0)
-    except Exception as error:  # noqa: BLE001 - any download or cache failure means "cannot run here"
-        pytest.skip(f"released checkpoint {name} is unavailable: {type(error).__name__}: {error}")
+    # No try/except here on purpose: these tests carry the `network` marker, which is the way to opt out
+    # (`-m "not network"`). A loader failure of any kind, a wrong pinned revision included, must fail them.
+    # quantile_real_cap_k=0 disables upstream's output clamp, as acceptance test T3 requires.
+    return load_forecaster(f"mistralai/Timestral-{name}", quantile_real_cap_k=0)
 
 
 @pytest.fixture(scope="session", params=MODEL_PARAMS)

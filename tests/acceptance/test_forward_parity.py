@@ -115,3 +115,32 @@ def test_t03_first_patch_frame_is_the_anchor(forecaster, raw):
         assert torch.equal(loc[:, 0], output.anchor_loc)
         assert torch.equal(scale[:, 0], output.anchor_scale)
         assert torch.isfinite(loc).all() and (scale > 0).all()
+
+
+@pytest.mark.acceptance
+def test_t03_true_values_frame_is_the_causal_frame_of_the_true_series(forecaster, raw):
+    """The `true_values` frame of horizon patch j is the frame an origin j patches later would use: the
+    causal statistics of the context followed by the true values of horizon patches 0..j-1, and nothing
+    from patch j on.
+
+    The reference is computed a different way from `target_frames`: by extending the context with the true
+    values and asking upstream's `model.scale` for the frame of the last patch.
+    """
+    model, patch = forecaster.model, forecaster.patch_size
+    batch, _, _ = upstream_batch(forecaster, raw)
+    horizon_patches = batch.horizon_steps // patch
+    assert horizon_patches >= 3, "the scenario must have patches beyond the first"
+    with torch.no_grad():
+        output = training_forward(model, batch)
+        loc, scale = target_frames(model, batch, output, "true_values")
+        folded_loc, _ = target_frames(model, batch, output, "median_folded")
+    rows = batch.target_rows
+    for j in range(1, horizon_patches):
+        steps = j * patch
+        extended = torch.cat([batch.context, batch.targets[:, :steps]], dim=-1)
+        observed = torch.cat([batch.context_mask, batch.loss_weight[:, :steps]], dim=-1)
+        _, reference_loc, reference_scale = model.scale(extended, observed)
+        assert max_rel(loc[rows, j], reference_loc[rows, -1]) < FORWARD_RTOL, f"location of patch {j}"
+        assert max_rel(scale[rows, j], reference_scale[rows, -1]) < FORWARD_RTOL, f"scale of patch {j}"
+    # The two frame definitions are genuinely different from patch 1 on, so the check above is not vacuous.
+    assert not torch.allclose(loc[rows, 1:], folded_loc[rows, 1:], rtol=1e-3)
