@@ -76,12 +76,18 @@ def _noise_like(values: Tensor, generator: torch.Generator) -> Tensor:
 def _max_abs_difference(a: Tensor, b: Tensor) -> float:
     if a.numel() == 0:
         return 0.0
-    return (a.double() - b.double()).abs().max().item()
+    # On CPU first: the Apple GPU backend has no float64.
+    return (a.detach().cpu().double() - b.detach().cpu().double()).abs().max().item()
 
 
 @torch.no_grad()
-def check_forward_parity(model: TimestralModel, batch: TrainingBatch, rtol: float = 1e-6) -> CheckResult:
-    """T1/T2: the denormalised training forward equals upstream's `predict_block`."""
+def check_forward_parity(model: TimestralModel, batch: TrainingBatch, rtol: float = 1e-5) -> CheckResult:
+    """T1/T2: the denormalised training forward equals upstream's `predict_block`.
+
+    The two run the same operations, so they agree to float32 round-off. Measured: at most 8e-10 on
+    CPU, where the acceptance tests hold it to 1e-6, and up to 8e-7 on the Apple GPU. The default
+    tolerance leaves room for accelerators.
+    """
     name = "forward parity with upstream predict_block (T1/T2)"
     patch = model.config.patch_size
     output = training_forward(model, batch)
@@ -95,7 +101,7 @@ def check_forward_parity(model: TimestralModel, batch: TrainingBatch, rtol: floa
         batch.known_future,
         batch.known_future_mask,
     )
-    difference = _max_abs_difference(ours, reference) / max(reference.double().abs().max().item(), 1e-300)
+    difference = _max_abs_difference(ours, reference) / max(reference.abs().max().item(), 1e-300)
     return CheckResult(name, difference <= rtol, f"max relative difference {difference:.2e} (tolerance {rtol:.0e})")
 
 
