@@ -570,10 +570,10 @@ def test_config_defaults_follow_the_spec():
     assert config.mode == "head_only" and config.target_frame == "median_folded" and config.mixed_precision == "fp32"
     assert config.cache_frozen_features is True and config.sign_flip is False
     assert config.gradient_clip_val == 1.0 and config.lr_schedule == "cosine"
-    assert config.resolved_learning_rate == 3e-4
-    assert dataclasses.replace(config, mode="lora_variate").resolved_learning_rate == 1e-3
-    assert dataclasses.replace(config, mode="lora_temporal").resolved_learning_rate == 1e-3
-    assert dataclasses.replace(config, mode="full_ft").resolved_learning_rate == 5e-5
+    assert config.resolved_learning_rate == 3e-3
+    assert dataclasses.replace(config, mode="lora_variate").resolved_learning_rate == 3e-3
+    assert dataclasses.replace(config, mode="lora_temporal").resolved_learning_rate == 3e-3
+    assert dataclasses.replace(config, mode="full_ft").resolved_learning_rate == 3e-4
     assert dataclasses.replace(config, mode="full_ft", learning_rate=5e-6).resolved_learning_rate == 5e-6
     assert LoraConfig().r == 8 and LoraConfig().targets == ("q", "k", "v", "o")
     assert TrainingConfig(model_name_or_path="x", gradient_clip_val=None).gradient_clip_val is None

@@ -497,11 +497,13 @@ def main() -> None:
 
         # 3. Multi-seed runs for lora_variate, lora_temporal, full_ft
         modes_data: dict[str, Any] = {}
-        mode_list = (
-            [("lora_variate", 1e-3), ("lora_temporal", 1e-3), ("full_ft", 5e-5)]
-            if splits is not vol_10m
-            else [("lora_variate", 1e-3), ("lora_temporal", 1e-3), ("full_ft", 5e-5)]
-        )
+        from timestral_tune.config import DEFAULT_LEARNING_RATES
+
+        mode_list = [
+            ("lora_variate", DEFAULT_LEARNING_RATES["lora_variate"]),
+            ("lora_temporal", DEFAULT_LEARNING_RATES["lora_temporal"]),
+            ("full_ft", DEFAULT_LEARNING_RATES["full_ft"]),
+        ]
         run_seeds = args.seeds if splits is not vol_10m else [0]
         for mode, lr in mode_list:
             seed_rows = []

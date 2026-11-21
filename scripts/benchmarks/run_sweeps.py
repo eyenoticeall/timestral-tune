@@ -30,7 +30,7 @@ from timestral_tune.utils import compute_forgetting, evaluate_forecaster
 
 # Wide grids so every mode's validation optimum is bracketed strictly inside the grid.
 LR_GRID: dict[str, tuple[float, ...]] = {
-    "head_only": (3e-5, 1e-4, 3e-4, 1e-3, 3e-3),
+    "head_only": (3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2),
     "lora_variate": (3e-4, 1e-3, 3e-3, 1e-2, 3e-2),
     "lora_temporal": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
     "full_ft": (1e-5, 3e-5, 1e-4, 3e-4, 1e-3),

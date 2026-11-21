@@ -40,13 +40,13 @@ LORA_AXES: tuple[str, ...] = get_args(LoraAxis)
 LORA_TARGETS: tuple[str, ...] = get_args(LoraTarget)
 SINGLE_ROW_ALLOWED_TARGETS: tuple[str, ...] = ("v", "o", "gate")
 
-# Sweep-backed default learning rates (Phase 3 sweeps on 5M and 28M across realised volatility
-# and retail demand; see `docs/BENCHMARKS.md` and `docs/SPEC.md` §5.4).
+# Sweep-backed default learning rates (bracketed Phase 3 validation sweeps on 5M, 28M, and 123M
+# across realised volatility and retail demand; see `docs/BENCHMARKS.md` §2 and `docs/SPEC.md` D19).
 DEFAULT_LEARNING_RATES: dict[AdaptationMode, float] = {
-    "head_only": 3e-4,
-    "lora_variate": 1e-3,
-    "lora_temporal": 1e-3,
-    "full_ft": 5e-5,
+    "head_only": 3e-3,
+    "lora_variate": 3e-3,
+    "lora_temporal": 3e-3,
+    "full_ft": 3e-4,
 }
 
 
