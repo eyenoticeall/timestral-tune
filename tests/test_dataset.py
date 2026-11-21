@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from timestral_tune.data import SeriesData, TimeSeriesDataset, window_category_codes
 from timestral_tune.models import denormalise_quantiles, target_frames, training_forward
+from timestral_tune.utils import check_forward_parity
 
 from .helpers import FRAME_KINDS, make_columns, max_rel, role_kwargs, to_frame
 
@@ -485,6 +486,20 @@ def test_a_category_first_seen_after_the_cutoff_changes_no_training_window(tiny_
     assert train.categories["ck0"].tolist() != changed_train.categories["ck0"].tolist()
     for name in ("context", "context_mask", "known_future", "known_future_mask", "targets", "loss_weight"):
         assert torch.equal(getattr(batch, name), getattr(changed_batch, name)), name
+
+
+def test_covariates_with_none_known_in_advance_collate_and_match_upstream(tiny_forecaster):
+    """Past-only covariates and no known-future ones: the batch carries no known-future values at all, and
+    the training forward still reproduces upstream's `predict_block`.
+    """
+    columns = make_columns(18, series=2, steps=60, targets=1, past=2, categorical_past=1)
+    patch = tiny_forecaster.patch_size
+    dataset = build(columns, context_length=8 * patch, forecast_horizon=2 * patch, stride=7)
+    batch = dataset.collator(tiny_forecaster.config)([dataset[i] for i in range(4)])
+    assert batch.role_ids.tolist()[:4] == [0, 1, 1, 1], "target, two numeric and one categorical past covariate"
+    assert batch.known_future is None and batch.known_future_mask is None
+    result = check_forward_parity(tiny_forecaster.model, batch)
+    assert result.passed, str(result)
 
 
 def test_frame_to_forecast_matches_upstream_with_several_targets(tiny_forecaster):

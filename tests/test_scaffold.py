@@ -36,6 +36,19 @@ def test_vendored_files_match_manifest():
         assert digest == meta["vendored_sha256"], f"{name} differs from the vendored manifest"
 
 
+def test_pinned_revisions_agree_between_the_loader_and_the_documents():
+    """The Hub pins live in `models/loader.py`; `docs/UPSTREAM.md` and the spec header repeat them."""
+    from timestral_tune.models import PINNED_REVISIONS
+
+    root = Path(__file__).resolve().parents[1]
+    upstream = (root / "docs" / "UPSTREAM.md").read_text(encoding="utf-8")
+    manifest = json.loads((Path(vendored.__file__).parent / "VENDOR_MANIFEST.json").read_text(encoding="utf-8"))
+    assert len(PINNED_REVISIONS) == 4
+    for repo_id, revision in PINNED_REVISIONS.items():
+        assert f"| `{repo_id}` | `{revision}` |" in upstream, f"{repo_id} is pinned differently in docs/UPSTREAM.md"
+    assert manifest["commit"] in upstream, "the vendored commit is not the one docs/UPSTREAM.md names"
+
+
 def test_vendored_license_is_shipped():
     assert "Apache License" in (VENDOR_DIR / "LICENSE").read_text(encoding="utf-8")
 
