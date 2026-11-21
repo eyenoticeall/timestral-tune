@@ -472,6 +472,7 @@ class TimeSeriesDataset(Dataset[Window]):
         _require_columns(
             frame, kind, [*([id_col] if id_col else []), time_col, *roles.value_columns, *roles.categorical_columns]
         )
+        _reject_time_zone(frame, kind, time_col)
         times = _time_column(_column(frame, kind, time_col), time_col)
         rows = times.shape[0]
         if rows == 0:
@@ -539,6 +540,29 @@ def _require_columns(frame: Any, kind: str, names: Sequence[str]) -> None:
         raise ValueError(f"columns not found in the frame: {missing}")
 
 
+_TIME_ZONE_MESSAGE = (
+    "time column {name!r} is time-zone aware; convert it to naive timestamps first (in UTC, or in the local time "
+    "your cutoffs are written in)"
+)
+
+
+def _reject_time_zone(frame: Any, kind: str, name: str) -> None:
+    """Raise if the time column's type carries a time zone.
+
+    This has to be checked on the frame: polars and pyarrow convert zoned timestamps to UTC on the way to
+    NumPy, which would silently move every `split_by_time` cutoff written in local time.
+    """
+    if kind == "polars":
+        zone = getattr(frame.schema[name], "time_zone", None)
+    elif kind == "pyarrow":
+        zone = getattr(frame.schema.field(name).type, "tz", None)
+    else:
+        dtype = frame[name].dtype
+        zone = getattr(dtype, "tz", None) or getattr(getattr(dtype, "pyarrow_dtype", None), "tz", None)
+    if zone is not None:
+        raise ValueError(_TIME_ZONE_MESSAGE.format(name=name))
+
+
 def _column(frame: Any, kind: str, name: str) -> np.ndarray:
     if kind == "polars":
         return frame.get_column(name).to_numpy()
@@ -601,10 +625,8 @@ def _time_column(array: np.ndarray, name: str) -> np.ndarray:
     if array.dtype.kind == "O":
         if _is_missing(array).any():
             raise ValueError(f"time column {name!r} holds null values")
-        if any(getattr(v, "tzinfo", None) is not None for v in array[:1]):
-            raise ValueError(
-                f"time column {name!r} is time-zone aware; convert it to naive timestamps (e.g. UTC) first"
-            )
+        if any(getattr(v, "tzinfo", None) is not None for v in array):
+            raise ValueError(_TIME_ZONE_MESSAGE.format(name=name))
         try:
             array = array.astype("datetime64[ns]")
         except (TypeError, ValueError) as error:

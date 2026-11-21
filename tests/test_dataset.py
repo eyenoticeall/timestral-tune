@@ -223,14 +223,35 @@ def test_missing_columns_wrong_frame_types_and_bad_roles_raise():
         build(dict(columns, time=np.linspace(0, 1, 20)), context_length=8, forecast_horizon=4)
 
 
-def test_time_zone_aware_timestamps_raise():
+@pytest.mark.parametrize("kind", [*FRAME_KINDS, "pandas-arrow", "pandas-objects"])
+def test_time_zone_aware_timestamps_raise(kind):
+    """Every frame library, not only pandas: polars and pyarrow would otherwise convert to UTC silently and
+    move a `split_by_time` cutoff written in local time by the zone's offset.
+    """
     import pandas
 
-    frame = pandas.DataFrame(
-        {"time": pandas.date_range("2024-01-01", periods=20, freq="h", tz="Europe/Paris"), "y0": np.arange(20.0)}
-    )
+    times = pandas.date_range("2024-01-01", periods=20, freq="h", tz="Asia/Tokyo")
+    frame = pandas.DataFrame({"time": times, "y0": np.arange(20.0)})
+    if kind == "polars":
+        import polars
+
+        frame = polars.from_pandas(frame)
+        assert frame.schema["time"].time_zone == "Asia/Tokyo"
+    elif kind == "arrow":
+        import pyarrow
+
+        frame = pyarrow.Table.from_pandas(frame)
+    elif kind == "pandas-arrow":
+        import pyarrow
+
+        frame["time"] = frame["time"].astype(pandas.ArrowDtype(pyarrow.timestamp("us", tz="Asia/Tokyo")))
+    elif kind == "pandas-objects":
+        # Naive first, zoned later: every element is checked, not only the first.
+        values = [t.to_pydatetime() for t in times]
+        values[0] = values[0].replace(tzinfo=None)
+        frame["time"] = pandas.Series(values, dtype=object)
     with pytest.raises(ValueError, match="time-zone aware"):
-        TimeSeriesDataset.from_pandas(frame, time_col="time", target_cols=["y0"], context_length=8, forecast_horizon=4)
+        TimeSeriesDataset.from_frame(frame, time_col="time", target_cols=["y0"], context_length=8, forecast_horizon=4)
 
 
 def test_pandas_nullable_dtypes_are_supported():
