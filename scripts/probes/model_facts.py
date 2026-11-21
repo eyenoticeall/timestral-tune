@@ -14,12 +14,12 @@ import argparse
 import copy
 
 import torch
-from _common import PATCH, ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET, load
+from _common import PATCH, ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET, SIZES, load
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--size", default="5M", choices=["5M", "28M", "123M", "209M"])
+    parser.add_argument("--size", default="5M", choices=SIZES)
     args = parser.parse_args()
     torch.manual_seed(0)
     model = load(args.size).model
