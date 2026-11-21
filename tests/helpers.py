@@ -21,6 +21,7 @@ import timestral_tune._vendor.timestral.layers as upstream_layers
 from timestral_tune._vendor.timestral import TimestralConfig, TimestralForecaster
 from timestral_tune.data.batch import TrainingBatch
 from timestral_tune.models import TuneTimestralForecaster, TuneTimestralModel
+from timestral_tune.models.forward import attention_context
 from timestral_tune.trainer.step import compute_loss
 
 QUANTILE_LEVELS = (0.01, *(round(0.05 * i, 2) for i in range(1, 20)), 0.99)
@@ -178,13 +179,18 @@ def reference_gradient(model: TuneTimestralModel, batch: TrainingBatch, gradient
 
 
 def loss_gradient(
-    model: TuneTimestralModel, batch: TrainingBatch, frame: str = "median_folded"
+    model: TuneTimestralModel,
+    batch: TrainingBatch,
+    frame: str = "median_folded",
+    *,
+    attention_backend: str = "default",
 ) -> tuple[float, Tensor]:
     """The training loss and its gradient with respect to all parameters, flattened to float64 on CPU."""
     was_training = model.training
     model.train()
     model.zero_grad()
-    loss = compute_loss(model, batch, frame).loss
+    with attention_context(attention_backend):
+        loss = compute_loss(model, batch, frame).loss
     loss.backward()
     gradient = torch.cat([p.grad.detach().cpu().double().flatten() for p in model.parameters()])
     model.zero_grad()

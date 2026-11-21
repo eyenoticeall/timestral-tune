@@ -1,18 +1,25 @@
 """Device parity (spec §9, T14).
 
 Forecasts on an accelerator are compared with CPU. Gradients are compared with a float64 reference
-on CPU, on every device including CPU float32. Over all parameters there are three tiers:
+on CPU, on every device including CPU float32. Over all parameters there are three tiers, plus a
+check of the optional `attention_context("math")` path:
 
 - Tiny random model: gradients agree with the reference to about 4e-7 on every device. Held to
   1e-5. This is the structural check.
 - Released 5M and 28M checkpoints, attention written out as matmul and softmax: at most 1.2e-3 on
   CPU and 2.1e-3 on the Apple GPU. Held to 5e-3. This shows the library's own forward, frames,
   loss and device handling are accurate on real weights.
-- Released checkpoints as shipped, with upstream's `F.scaled_dot_product_attention`: off by up to
-  3.4e-3 on CPU and 2.1e-3 on the Apple GPU, and by up to 1.2e-2 on CUDA (measured against an
-  earlier reference). On CUDA and CPU the float32 backward pass of that call loses accuracy with
-  these weights (spec §12, docs/VERIFICATION.md §6, §13). Held to 5e-2, which still catches a
-  wrong gradient; one minus the cosine stays below 1e-4.
+- Released checkpoints as shipped, with PyTorch's default SDPA dispatch: off by up to 3.4e-3 on
+  CPU and 2.1e-3 on the Apple GPU, and by up to 1.2e-2 on CUDA (measured against an earlier
+  reference). On CUDA and CPU the float32 backward pass of fused SDPA loses accuracy on Timestral's
+  large-logit layers (spec §12, docs/VERIFICATION.md §6, §13). Held to 5e-2 relative L2 and 1e-4
+  on `1 - cosine`.
+- Released checkpoints with `attention_context("math")` (toggling PyTorch's SDPA flags to math-only,
+  no vendored edits): drops 9 of 10 scenarios to 4.0e-6..3.7e-4 on CPU (identical to default on the
+  Apple GPU), but regresses on 5M `past_only_covariates` to 9.0e-3 on CPU (vs 2.2e-3 default,
+  1.2e-3 explicit; a one-off trace attributes this to 2-ULP float32 gap rounding on one large-logit
+  near-tie query, `docs/VERIFICATION.md` §11) while keeping `1 - cosine = 3.7e-5`. Held to 2e-2
+  relative L2 and 1e-4 on `1 - cosine` (1e-5 on the tiny random model).
 
 With everything but the head frozen (`head_only`, the one mode the trainer implements so far), the
 backward pass never enters attention or the body's norms, and gradients match the reference within
@@ -52,6 +59,8 @@ FORECAST_RTOL = 1e-4
 GRADIENT_RTOL_RANDOM_WEIGHTS = 1e-5
 GRADIENT_RTOL_RELEASED_WEIGHTS = 5e-2
 GRADIENT_RTOL_EXPLICIT_ATTENTION = 5e-3
+GRADIENT_RTOL_MATH_ATTENTION = 2e-2
+GRADIENT_COSINE_RTOL = 1e-4
 
 ACCELERATORS = available_accelerators()
 accelerator = pytest.mark.parametrize(
@@ -109,6 +118,7 @@ def test_t14_device_parity_gradients(forecaster, raw, device, is_released_checkp
         _, float32_norm = loss_gradient(copy.deepcopy(forecaster.model).double(), as_double(batch))
         print(f"reference with upstream's float32 RMSNorm: relative L2 distance {l2_rel(float32_norm, reference):.2e}")
     assert relative < bound, f"relative L2 {relative:.2e}"
+    assert 1 - cosine < GRADIENT_COSINE_RTOL, f"1 - cosine {1 - cosine:.2e}"
 
 
 @pytest.mark.acceptance
@@ -131,6 +141,31 @@ def test_t14_gradients_with_explicit_attention(forecaster, raw, device, is_relea
     relative = l2_rel(gradient, reference)
     print(f"gradient on {device}, explicit attention: relative L2 error {relative:.2e}")  # `pytest -s`
     assert relative < bound, f"relative L2 {relative:.2e}"
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("device", ["cpu", *ACCELERATORS])
+def test_t14_gradients_with_math_sdpa(forecaster, raw, device, is_released_checkpoint):
+    """T14 (gradients, `attention_context("math")`). Passes when: with `attention_context("math")`,
+    float32 gradients match the reference within 2e-2 relative L2 and 1e-4 on `1 - cosine` on
+    released checkpoints (1e-5 relative L2 on the tiny random model), on every device.
+
+    This characterises PyTorch's unfused kernel (experimental, spec D15) alongside, not replacing, the tighter `5e-3`
+    explicit-attention tier above.
+    """
+    batch, _, _ = upstream_batch(forecaster, raw)
+    _, reference = reference_gradient(forecaster.model, batch)
+
+    on_device = forecaster if device == "cpu" else forecaster_on(forecaster, device)
+    _, gradient = loss_gradient(on_device.model, batch.to(device), attention_backend="math")
+    bound = GRADIENT_RTOL_MATH_ATTENTION if is_released_checkpoint else GRADIENT_RTOL_RANDOM_WEIGHTS
+    relative = l2_rel(gradient, reference)
+    cosine = torch.nn.functional.cosine_similarity(gradient, reference, dim=0).item()
+    print(
+        f"gradient on {device}, math SDPA: relative L2 error {relative:.2e}, 1 - cosine {1 - cosine:.1e}"
+    )  # `pytest -s`
+    assert relative < bound, f"relative L2 {relative:.2e}"
+    assert 1 - cosine < GRADIENT_COSINE_RTOL, f"1 - cosine {1 - cosine:.2e}"
 
 
 @pytest.mark.acceptance
