@@ -58,11 +58,10 @@ Full list in spec §12. The ones that matter next:
 ## Branch state
 
 - `main`: Phases 0 and 1 (including the trimmed covariate layout and `head_only` caching), pushed to
-  `origin/main` (`fc26d03`). `perf/phase1-kernels` was deleted locally and on `origin` after fast-forward.
+  `origin/main` (`fc26d03`). `perf/phase1-kernels` (merged into `main`) and `fix/math-sdpa-backend`
+  (closed by D15) have been deleted locally and on `origin`.
 - `phase-2`: all of Phase 2 (LoRA, `full_ft`, CQR/ACI conformal calibration, upstream-loadable export,
   `bf16` + `torch.compile` on CUDA, T9–T11 & T13 passing), verified locally and on NVIDIA L4; pushed to
   `origin/phase-2`, not yet merged into `main`.
-- `fix/math-sdpa-backend`: historical held branch (`e06d313`, pushed); D15 CUDA training-trajectory
-  results show default SDPA suffices, kept until you decide to close/delete it.
 
 Branch policy is in `AGENTS.md` §6.
