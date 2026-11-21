@@ -517,3 +517,45 @@ difference vs `fp32`) and shape-bucketed `compile_mode="reduce-overhead"` on CUD
 **Not done / open.** Phase 2 fast-forwarded into `main` at `38d4ace`, pushed to `origin/main` (CI run
 `44936917337` green across Python 3.10–3.13), and `phase-2` deleted locally and on `origin`. Phase 3 has
 not started.
+
+---
+
+## 2026-11-22 (ninth session) — Phase 3 built: metrics, sign-flip, Lacuna, sweeps & 5M/28M benchmarks
+
+**What.** Created branch `phase-3` off `main` (`1b3dec1`) and built all Phase 3 deliverables (spec §10):
+
+- **Raw-space evaluation & forgetting (`0dc3f1a`, `utils/metrics.py`):** implemented `pinball_loss_raw`,
+  `weighted_quantile_loss`, `mase`, `coverage`, `interval_width`, `MetricsSummary`, `evaluate_predictions`,
+  `evaluate_forecaster` (through vendored upstream `TimestralForecaster.forecast()` with its defaults, plus
+  optional CQR/ACI calibrators), `ForgettingSummary`, `compute_forgetting`, and `evaluate_forgetting`.
+- **Sign-flip augmentation (`8cbb7b2`):** added `TrainingConfig.sign_flip: bool = False`, `flip_batch_signs`
+  (coherent per-series negation of targets + covariates), and training head-cache bypass when enabled.
+- **Optional Lacuna integration (`f8b9c9c`, `integrations/lacuna.py`):** implemented `LacunaExporter`
+  (wrapping `lacuna.ExperimentRegistry.record` and `record_selection` using `AttemptRecord.trial_id`) and
+  `write_signal_frame` (long `time`/`instrument`/`signal` frame for `lacuna.SignalStudy`), lazy-imported and
+  verified live against `lacuna-quant==0.14.1`.
+- **Reproducible sweeps & 5M/28M benchmarks (`604d8d5`, `scripts/benchmarks/`, `docs/BENCHMARKS.md`):**
+  - Pinned three permissively licensed Hugging Face datasets: `twelvedata/financial-world-model@da186e5fd362`
+    (MIT; 51 US equities, 1h realised volatility `rv_20`, **post-Oct 27, 2026 test split** — zero contamination
+    on test targets), `Dingdong-Inc/FreshRetailNet-50K@c374e85975c8` (CC BY 4.0; top-64 active store-SKU
+    hourly series, 9 rows/series), and `Salesforce/GiftEval@30841734ac5c` (Apache-2.0; 48 hourly energy,
+    weather, and traffic series for the forgetting metric).
+  - Ran LR, LoRA rank/targets, and sign-flip sweeps on 5M and 28M plus the full 5M + 28M 7-mode benchmark
+    matrix and 200-step 28M `bf16` vs `fp32` check on a short-lived NVIDIA L4 VM (`asia-northeast3-a`, deleted
+    and verified gone immediately afterwards).
+  - Updated `DEFAULT_LEARNING_RATES` (`head_only=3e-4`, `lora_*=1e-3`, `full_ft=5e-5`) and `LoraConfig`
+    default `targets=("q", "k", "v", "o")` (`r=8, alpha=16`) in `config.py` and `SPEC.md` §5.4 from sweep
+    evidence.
+
+**Key findings (`docs/BENCHMARKS.md`):**
+- Every mode beat zero-shot on both datasets and both sizes (`4.6%–10.7%` wQL reduction).
+- `lora_variate` (0.26% of 28M params) matched `full_ft` on post-release equity volatility (`0.2187` vs
+  `0.2188` wQL) with negative forgetting (`ΔwQL = -0.0005`); `lora_temporal` beat `full_ft` on both 5M and
+  28M retail demand (`0.1957` vs `0.1963` on 28M).
+- Online ACI lifted 80% coverage on the post-Oct 2026 volatility shift from `66.3% → 76.5%` (5M) and
+  `70.2% → 76.6%` (28M) with zero weight changes or forgetting.
+- `sign_flip=True` reduced retail `full_ft` validation wQL by 4.0% (`0.2230 → 0.2141`).
+- 200-step 28M `bf16` vs `fp32` full fine-tuning matched within `0.35%` raw test wQL (`0.1963` vs `0.1956`).
+
+**Not done / open.** `phase-3` is unpushed and unmerged pending review; PyPI release awaits maintainer
+approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.

@@ -38,8 +38,9 @@ src/timestral_tune/
   losses/                Pinball loss
   trainer/               Loss step, training loop, callbacks
   export.py              Upstream-loadable checkpoint export, adapters, conformal, sidecar, LICENSE/NOTICE
-  utils/                 Verifiers (built); metrics (stub)
-  replay/, integrations/ Stubs for Phases 3–4
+  utils/                 Verifiers and raw-space evaluation / forgetting metrics
+  integrations/          Optional Lacuna integration (`timestral-tune[lacuna]`, Python 3.11+)
+  replay/                Stub for Phase 4 (stretch)
 tests/
   conftest.py, helpers.py   Fixtures and builders shared by all tests
   test_*.py                 Unit tests per module

@@ -1,8 +1,8 @@
 # Project Status
 
 **Last updated:** 2026-11-22
-**Stage:** pre-alpha. Phases 0, 1, and 2 are built, verified, and merged into `main`.
-**Next phase:** Phase 3 (Benchmarks, metrics, Lacuna integration, sweeps). See spec §10.
+**Stage:** pre-alpha. Phases 0, 1, 2, and 3 are built and verified (`phase-3` branch off `main`; PyPI publish pending maintainer action).
+**Next phase:** Phase 4 (Stretch: replay mixing, distillation, tiled training) or v0.1.0 PyPI release. See spec §10.
 
 ## What works today
 
@@ -10,20 +10,23 @@
 |---|---|
 | Loading | `load_model` / `load_forecaster`: pinned Hub revisions, config from the checkpoint, any device |
 | Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32), CUDA (verified on NVIDIA L4, PyTorch 2.15.0, fp32 and `bf16`; commit `6880061`) |
-| Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator`; per-window categorical encoding |
+| Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator` (with power-of-two shape bucketing); per-window categorical encoding; `flip_batch_signs` |
 | Training forward and loss | Normalised-space forward (trimmed `L + 2h` covariate layout), both target frames, pinball loss, `compute_loss` |
-| Adaptation & training | `TimestralTrainer` across `head_only` (with frozen-feature caching), `lora_variate` (with single-row guard), `lora_temporal`, and `full_ft`; fp32 everywhere, `bf16` + fused AdamW on CUDA, optional `torch.compile`, early stopping, best-state restore |
+| Adaptation & training | `TimestralTrainer` across `head_only` (with frozen-feature caching), `lora_variate` (with single-row guard), `lora_temporal`, and `full_ft`; sweep-backed LR & LoRA defaults; `sign_flip` augmentation; fp32 everywhere, `bf16` + fused AdamW + `torch.compile` on CUDA; early stopping, CPU best-state restore |
 | Conformal calibration | `ConformalCalibrator` (static split CQR), `OnlineConformalCalibrator` (online ACI, forecast-count rolling window, Lemma 4.1 anti-windup), and `collect_conformal_data` helper, with anchor-aware monotonicity repair and JSON persistence |
-| Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters, `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
+| Evaluation & metrics | `utils/metrics.py`: raw-space `pinball_loss_raw`, `weighted_quantile_loss`, `mase`, `coverage`, `interval_width`, `evaluate_forecaster`, and `evaluate_forgetting` |
+| Benchmarks & sweeps | `scripts/benchmarks/` + `docs/BENCHMARKS.md`: 5M & 28M tables across all 7 modes + forgetting metrics on realised volatility (post-Oct 27, 2026), retail demand, and GIFT-Eval |
+| Optional Lacuna integration | `integrations/lacuna.py` (`timestral-tune[lacuna]`, Python 3.11+): `LacunaExporter` (`ExperimentRegistry`) and `write_signal_frame` (`SignalStudy`), verified live against `lacuna-quant==0.14.1` |
+| Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters (`load_lora`), `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
-| Test suite | 526 passed, 4 skipped (CUDA-only `bf16`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; earlier commit `3fe5bc9`: 510/4 on 2.14.1 and 2.8.0, 411/26 on 2.4.0; macOS). On NVIDIA L4 CUDA (Linux, `6880061`): **528 passed, 2 skipped** |
-| CI | Green on `main` (run `44936917337`, Python 3.10–3.13 on Linux: lint, build, and network-free tests) |
+| Test suite | 534 passed, 5 skipped (4 CUDA-only `bf16`, 1 optional `lacuna`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; live `lacuna-quant==0.14.1`: 4/4 passed; NVIDIA L4 CUDA at `6880061`: 528/2) |
+| CI | Green on `main` (run `44936917337`, Python 3.10–3.13 on Linux); `phase-3` pending PR/merge |
 
 ## What does not exist yet
 
-- Phase 3 raw-space evaluation metrics (`utils/metrics.py`), benchmark scripts, LR/rank sweeps, and Lacuna integration (`integrations/lacuna.py`).
-- Phase 4 replay mixing, built-in generators, distillation (`replay/`), and tiled training.
+- Phase 4 stretch features: replay mixing, built-in generators, distillation (`replay/`), tiled training, and 123M/209M Apple GPU coverage.
+- PyPI release (packaged and audited via `uv build`; publishing requires maintainer approval).
 
 ## What has been verified, and where
 
@@ -37,25 +40,27 @@ All locally on Apple M4 (macOS, PyTorch 2.4/2.8/2.14/2.15) and on an NVIDIA L4 (
 - Device parity and gradients on CPU, Apple GPU, and CUDA (T14), plus `bf16` autocast and `torch.compile` on L4 CUDA (3.3× faster 28M steps, 45% less VRAM).
 - Decision D15 resolved on CUDA: 20-step training trajectories under `fp32` default SDPA, `fp32` unfused math, and `bf16` match closely in validation loss across `lora_variate`, `lora_temporal`, and `full_ft`.
 
-Not verified anywhere: the 123M and 209M checkpoints, real datasets, multi-GPU.
+- Real-dataset benchmarks and sweeps on 5M and 28M across realised volatility (post-Oct 27, 2026), retail demand, and GIFT-Eval forgetting (`docs/BENCHMARKS.md`), plus live `lacuna-quant==0.14.1` integration.
+
+Not verified anywhere: the 123M and 209M checkpoints, multi-GPU.
 
 ## Next steps
 
-1. **Start Phase 3** (spec §10): raw-space evaluation metrics (`utils/metrics.py`), real-dataset benchmarks (realised volatility + retail demand), forgetting metric, LR/rank sweeps to replace placeholder defaults, and Lacuna integration.
+1. **Review & merge `phase-3` into `main`**, then publish v0.1.0 to PyPI when ready.
+2. **Optional Phase 4** (spec §10): replay mixing, built-in generators, distillation, tiled training.
 
 ## Open questions and known issues
 
 Full list in spec §12. The ones that matter next:
 
 - **CUDA needs a C compiler and Python headers** with recent PyTorch (spec §12). `scripts/cuda_check.sh` checks for them.
-- **The target-frame evidence is synthetic** (univariate, fully observed, one seed, 5M and 28M).
-- **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
+- **123M and 209M checkpoints** have not been swept or benchmarked yet.
 - **PyTorch 2.4.0 on macOS hangs at exit when a DataLoader uses worker processes.** Gone by 2.8.0 (`docs/VERIFICATION.md` §10). `num_workers` defaults to 0.
-- **Validation loss under `median_folded` is in units that move with the model** (spec §12). Use it as a training signal, not for model selection across runs, until Phase 3 raw-space metrics exist.
 - **CI actions use a deprecated Node.js version.** GitHub warns that `actions/checkout@v4` and `astral-sh/setup-uv@v5` target Node.js 20. They still run.
 
 ## Branch state
 
-- `main`: Phases 0, 1, and 2 (fast-forwarded from `phase-2` at `38d4ace` on 2026-11-22). All prior branches (`phase-1`, `perf/phase1-kernels`, `fix/math-sdpa-backend`, `phase-2`) are closed and deleted locally and on `origin`.
+- `main`: Phases 0, 1, and 2 (`1b3dec1`, CI green).
+- `phase-3`: Phase 3 (raw-space metrics, forgetting metric, sign-flip augmentation, Lacuna integration, reproducible sweeps & 5M/28M benchmarks, sweep-backed defaults, `docs/BENCHMARKS.md`), open off `main`, unpushed.
 
 Branch policy is in `AGENTS.md` §6.

@@ -7,11 +7,11 @@
 
 Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
 
-> **Status: pre-alpha (Phases 0–2).** Loading, the data pipeline, all five adaptation modes (`conformal`,
-> `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), `bf16` + `torch.compile` on CUDA, and
-> upstream-loadable checkpoint export are built and tested against the official code (14/14 acceptance
-> tests passing). Phase 3 benchmarks, metrics and hyperparameter sweeps are next. See
-> [docs/STATUS.md](docs/STATUS.md).
+> **Status: pre-alpha (Phases 0–3).** Loading, the data pipeline, all five adaptation modes (`conformal`,
+> `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), `bf16` + `torch.compile` on CUDA,
+> upstream-loadable checkpoint export, raw-space evaluation & forgetting metrics, optional Lacuna
+> integration, and real-dataset benchmarks (5M & 28M) are built and verified (14/14 acceptance tests
+> passing). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/STATUS.md](docs/STATUS.md).
 
 ## What this will be
 
@@ -46,7 +46,7 @@ is the project's overview guide and source of truth.
 | CUDA acceleration | Done: `bf16` autocast, fused `AdamW`, optional `torch.compile` (verified on NVIDIA L4) |
 | Conformal calibration | Done: `ConformalCalibrator` (CQR) and `OnlineConformalCalibrator` (ACI) |
 | Checkpoint export | Done: upstream-loadable `config.json` + merged `model.safetensors`, LoRA adapters, `conformal.json`, sidecar, `LICENSE`, `NOTICE` |
-| Benchmarks, metrics, Lacuna integration | Not built (Phase 3) |
+| Benchmarks, metrics, Lacuna integration | Done: `utils/metrics.py`, `integrations/lacuna.py`, sweep-backed defaults, 5M & 28M tables in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) |
 | Acceptance tests T1–T14 | All 14 of 14 implemented and passing on tiny, 5M and 28M (CPU, Apple GPU, CUDA) |
 | CI | Passing on `main` (Python 3.10–3.13 on Linux) |
 
@@ -85,7 +85,9 @@ print(result.best_eval_loss)
 trainer.export()                 # writes upstream-loadable merged checkpoint + adapters + NOTICE/LICENSE
 ```
 
-Learning-rate and LoRA rank defaults are placeholders until the Phase 3 sweeps.
+Default learning rates (`head_only=3e-4`, `lora_*=1e-3`, `full_ft=5e-5`) and LoRA defaults
+(`r=8, targets=("q","k","v","o")`) are backed by Phase 3 sweeps in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Set `sign_flip=True` when fine-tuning on strictly non-negative targets.
 
 To check your own data for leakage and parity with the official inference path:
 
@@ -103,7 +105,7 @@ for check in run_checks(trainer.model, batch):
 docs/SPEC.md                         Specification and overview guide (start here)
 AGENTS.md                            How to work in this repo: rules, commands, commit conventions
 docs/                                Also: status, development log, verification record, upstream and phase notes
-src/timestral_tune/                  The package (Phases 0-2 built, Phases 3-4 stubbed) and the vendored upstream code in _vendor/
+src/timestral_tune/                  The package (Phases 0-3 built, Phase 4 replay stubbed) and the vendored upstream code in _vendor/
 tests/                               Unit tests and the acceptance tests of spec §9
 scripts/                             Vendoring, drift check, and verification probes
 papers/                              Reference papers (only the CC BY Timestral paper is tracked)
