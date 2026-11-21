@@ -22,7 +22,7 @@ from timestral_tune.models import (
 )
 
 from .conftest import available_accelerators
-from .helpers import make_raw, max_rel
+from .helpers import TINY_CONFIG, make_raw, max_rel
 
 needs_mps = pytest.mark.skipif(not mps_is_usable(), reason="no Apple GPU, or PyTorch is older than its minimum for it")
 
@@ -168,3 +168,20 @@ def test_every_float64_site_runs_on_the_device(checkpoint_dir, device):
     ours = forecaster.forecast(raw.context, raw.horizon, **kwargs).quantiles
     expected = reference.forecast(raw.context, raw.horizon, **kwargs).quantiles
     assert max_rel(ours, expected) < 1e-4
+
+
+def test_from_upstream_copies_float64_weights_exactly():
+    """A float64 model must come back with the same float64 weights, not ones rounded through float32."""
+    torch.manual_seed(3)
+    source = vendored.TimestralModel(TINY_CONFIG).double()
+    with torch.no_grad():
+        for parameter in source.parameters():  # give the weights digits that float32 cannot hold
+            parameter.add_(torch.randn_like(parameter) * 1e-9)
+    tuned = TuneTimestralModel.from_upstream(source)
+    assert next(tuned.parameters()).dtype == torch.float64
+    rounded = 0
+    for name, value in source.state_dict().items():
+        assert torch.equal(tuned.state_dict()[name], value), name
+        rounded += int((value.float().double() != value).sum()) if value.is_floating_point() else 0
+    assert rounded > 0, "the source weights must not be exactly representable in float32"
+    assert TuneTimestralModel.from_upstream(tuned) is tuned

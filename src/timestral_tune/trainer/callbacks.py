@@ -1,8 +1,12 @@
 """Trainer callbacks: progress logging and early stopping.
 
-A callback is an object with any of the four hooks below; `Callback` provides no-op defaults. Hooks
+A callback subclasses `Callback` and overrides any of its four hooks; the rest are no-ops. Hooks
 receive the trainer, so a callback can read its state or ask it to stop by setting
-`trainer.should_stop = True`.
+`trainer.should_stop = True`, from any hook including `on_fit_start`.
+
+Steps are the trainer's global step: it counts optimiser steps from 1 and keeps counting across
+`fit` calls. `trainer.fit_start_step` is its value when the current `fit` began, and
+`trainer.total_steps` the number of steps one `fit` plans.
 
 - Spec: `docs/SPEC.md` §5.4
 """
@@ -28,7 +32,7 @@ class Callback:
         """Called once, before the first step."""
 
     def on_step_end(self, trainer: TimestralTrainer, step: int, loss: float, learning_rate: float) -> None:
-        """Called after every optimiser step. `step` counts from 1."""
+        """Called after every optimiser step. `step` is the global step, counting from 1 across `fit` calls."""
 
     def on_evaluate(self, trainer: TimestralTrainer, step: int, result: EvalResult) -> None:
         """Called after every evaluation on the validation set."""
@@ -55,8 +59,9 @@ class ProgressLogger(Callback):
         )
 
     def on_step_end(self, trainer: TimestralTrainer, step: int, loss: float, learning_rate: float) -> None:
-        if step % self.every == 0 or step == trainer.total_steps:
-            logger.info("step %d/%d  loss %.5f  lr %.3g", step, trainer.total_steps, loss, learning_rate)
+        done = step - trainer.fit_start_step  # steps of this `fit` call
+        if done % self.every == 0 or done == trainer.total_steps:
+            logger.info("step %d/%d  loss %.5f  lr %.3g", done, trainer.total_steps, loss, learning_rate)
 
     def on_evaluate(self, trainer: TimestralTrainer, step: int, result: EvalResult) -> None:
         logger.info(

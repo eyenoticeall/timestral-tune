@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -195,6 +196,31 @@ def test_a_callback_can_stop_training(tiny_forecaster):
     assert result.steps == 3 and result.stopped_early and trainer.global_step == 3
 
 
+def test_a_callback_can_stop_training_before_the_first_step(tiny_forecaster):
+    class StopAtOnce(Recorder):
+        def on_fit_start(self, trainer):
+            super().on_fit_start(trainer)
+            trainer.should_stop = True
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    callback = StopAtOnce()
+    model = fresh_model(tiny_forecaster)
+    before = snapshot(model)
+    result = TimestralTrainer(config_for(batch_size=4, max_steps=5), dataset, callbacks=[callback], model=model).fit()
+    assert result.steps == 0 and result.stopped_early and result.final_train_loss is None
+    assert result.train_history == [] and callback.steps == [] and callback.ended == 1
+    assert all(torch.equal(value, before[name]) for name, value in snapshot(model).items())
+
+
+def test_callbacks_must_be_callback_instances(tiny_forecaster):
+    class OnlyOneHook:
+        def on_step_end(self, trainer, step, loss, learning_rate): ...
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    with pytest.raises(TypeError, match="Callback instances, got OnlyOneHook"):
+        TimestralTrainer(config_for(), dataset, callbacks=[OnlyOneHook()], model=fresh_model(tiny_forecaster))
+
+
 def test_early_stopping_counts_evaluations_without_improvement():
     class Stub:
         should_stop = False
@@ -249,6 +275,115 @@ def test_fit_can_be_called_again_with_a_fresh_schedule(tiny_forecaster):
     assert recorder.steps == list(range(1, 11))
     assert recorder.rates[5] == pytest.approx(1e-2), "the second run starts again at the peak learning rate"
     assert recorder.rates[:5] == pytest.approx(recorder.rates[5:])
+
+
+def test_progress_is_logged_per_fit_call(tiny_forecaster, caplog):
+    """The global step keeps counting across `fit` calls; the progress line counts within one call."""
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    trainer = TimestralTrainer(
+        config_for(batch_size=4, max_steps=3, log_every=2), dataset, model=fresh_model(tiny_forecaster)
+    )
+    with caplog.at_level("INFO", logger="timestral_tune.trainer"):
+        trainer.fit()
+        trainer.fit()
+    progress = [record.getMessage().split("  ")[0] for record in caplog.records if "/3  loss" in record.getMessage()]
+    assert progress == ["step 2/3", "step 3/3", "step 2/3", "step 3/3"]
+    assert trainer.global_step == 6 and trainer.fit_start_step == 3
+
+
+# ------------------------------------------------- optimisation settings
+
+
+def grad_norm(trainer) -> float:
+    return torch.cat([p.grad.flatten() for p in trainer.model.head.parameters()]).norm().item()
+
+
+class GradNorms(Callback):
+    def __init__(self) -> None:
+        self.norms: list[float] = []
+
+    def on_step_end(self, trainer, step, loss, learning_rate):
+        self.norms.append(grad_norm(trainer))
+
+
+def test_gradients_are_clipped_to_the_configured_norm(tiny_forecaster):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    norms = {}
+    for clip in (None, 1e-3):
+        recorder = GradNorms()
+        config = fixed_batch_config(dataset, "cpu", max_steps=3, gradient_clip_val=clip)
+        TimestralTrainer(config, dataset, callbacks=[recorder], model=fresh_model(tiny_forecaster)).fit()
+        norms[clip] = recorder.norms
+    assert min(norms[None]) > 1e-2, "unclipped gradients must exceed the clip value for the test to mean anything"
+    assert norms[1e-3] == pytest.approx([1e-3] * 3, rel=1e-4)
+
+
+def test_weight_decay_reaches_the_optimiser_and_shrinks_the_head(tiny_forecaster):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    norms = {}
+    for decay in (0.0, 0.5):
+        model = fresh_model(tiny_forecaster)
+        config = fixed_batch_config(dataset, "cpu", max_steps=8, learning_rate=1e-2, weight_decay=decay)
+        trainer = TimestralTrainer(config, dataset, model=model)
+        assert trainer.optimizer.param_groups[0]["weight_decay"] == decay
+        trainer.fit()
+        norms[decay] = torch.cat([p.detach().flatten() for p in model.head.parameters()]).norm().item()
+    assert norms[0.5] < norms[0.0]
+
+
+@pytest.mark.parametrize("schedule", ["cosine", "constant"])
+def test_the_learning_rate_the_optimiser_uses_follows_the_schedule(tiny_forecaster, schedule):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    recorder = Recorder()
+    config = config_for(batch_size=4, max_steps=12, warmup_steps=2, learning_rate=1e-2, lr_schedule=schedule)
+    TimestralTrainer(config, dataset, callbacks=[recorder], model=fresh_model(tiny_forecaster)).fit()
+    rates = recorder.rates
+    assert rates[:3] == pytest.approx([1e-2 / 3, 2e-2 / 3, 1e-2]), "linear warm-up to the peak"
+    if schedule == "constant":
+        assert rates[2:] == pytest.approx([1e-2] * 10)
+    else:
+        assert all(a > b for a, b in zip(rates[2:], rates[3:], strict=False)), "decays after the peak"
+        assert 0 < rates[-1] < 1e-3, "close to zero, but still positive, on the last step"
+
+
+def test_shuffle_changes_the_batch_order_and_the_seed_fixes_it(tiny_forecaster):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, series=8)
+    collate = dataset.collator(tiny_forecaster.model.config)
+    in_order = [
+        collate([dataset[i] for i in range(start, start + 4)]).targets for start in range(0, len(dataset) - 3, 4)
+    ]
+
+    def first_epoch(**overrides) -> list[torch.Tensor]:
+        trainer = TimestralTrainer(config_for(batch_size=4, **overrides), dataset, model=fresh_model(tiny_forecaster))
+        return [batch.targets for batch in trainer._loader(dataset, training=True)][: len(in_order)]
+
+    def same(a, b) -> bool:
+        return all(torch.equal(x, y) for x, y in zip(a, b, strict=True))
+
+    assert same(first_epoch(shuffle=False), in_order)
+    shuffled = first_epoch(shuffle=True, seed=1)
+    assert not same(shuffled, in_order)
+    assert same(shuffled, first_epoch(shuffle=True, seed=1)) and not same(shuffled, first_epoch(shuffle=True, seed=2))
+
+
+def test_the_configured_target_frame_is_the_one_trained_and_evaluated_in(tiny_forecaster, monkeypatch):
+    patch = tiny_forecaster.patch_size
+    dataset = make_toy_dataset(patch)
+    model = fresh_model(tiny_forecaster)
+    whole = dataset.collator(model.config)([dataset[i] for i in range(len(dataset))])
+    with torch.no_grad():
+        expected = {frame: compute_loss(model, whole, frame).loss.item() for frame in ("median_folded", "true_values")}
+    assert expected["median_folded"] != pytest.approx(expected["true_values"], rel=1e-3), "the frames must differ here"
+
+    seen = []
+    real = trainer_module.compute_loss
+    monkeypatch.setattr(trainer_module, "compute_loss", lambda m, b, frame: seen.append(frame) or real(m, b, frame))
+    for frame in ("median_folded", "true_values"):
+        config = fixed_batch_config(dataset, "cpu", max_steps=1, target_frame=frame)
+        trainer = TimestralTrainer(config, dataset, model=fresh_model(tiny_forecaster))
+        assert trainer.evaluate(dataset).loss == pytest.approx(expected[frame], rel=1e-5)
+        assert trainer.fit().train_history[0][1] == pytest.approx(expected[frame], rel=1e-5)
+    assert set(seen[:2]) == {"median_folded"} and set(seen[2:]) == {"true_values"}
 
 
 # ---------------------------------------------------------- learning rate
@@ -364,11 +499,24 @@ def test_incompatible_datasets_and_models_are_rejected_at_construction(tiny_fore
         {"num_workers": -1},
         {"batch_size": 2.5},
         {"seed": True},
+        {"batch_size": np.bool_(True)},
+        {"max_steps": np.float64(3.0)},
     ],
 )
 def test_config_rejects_invalid_values(overrides):
     with pytest.raises(ValueError):
         config_for(**overrides)
+
+
+def test_config_accepts_numpy_integers_and_stores_python_ints(tiny_forecaster):
+    """Values often come from an array or a sweep. They are validated, then stored as plain `int`."""
+    config = config_for(batch_size=np.int64(4), max_steps=np.int32(2), seed=np.uint8(3), warmup_steps=np.int64(0))
+    for name in ("batch_size", "max_steps", "seed", "warmup_steps"):
+        assert type(getattr(config, name)) is int
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    assert TimestralTrainer(config, dataset, model=fresh_model(tiny_forecaster)).fit().steps == 2
+    with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+        config_for(batch_size=np.int64(0))
 
 
 def test_config_defaults_follow_the_spec():

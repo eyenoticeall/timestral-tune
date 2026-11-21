@@ -95,3 +95,20 @@ def test_forward_parity_fails_on_a_wrong_forward(tiny_forecaster, monkeypatch):
 
     monkeypatch.setattr("timestral_tune.utils.validation.training_forward", shifted)
     assert not check_forward_parity(model, batch).passed
+
+
+@pytest.mark.parametrize("trainable", ["nothing", "head", "everything"])
+def test_checks_run_whatever_is_frozen_and_leave_the_flags_alone(tiny_forecaster, trainable):
+    """`check_loss_mask` differentiates with respect to the predictions, so it needs no trainable parameter
+    and must not change which parameters are trainable.
+    """
+    import copy
+
+    model = copy.deepcopy(tiny_forecaster.model)
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(trainable == "everything" or (trainable == "head" and name.startswith("head.")))
+    flags = {name: parameter.requires_grad for name, parameter in model.named_parameters()}
+    results = run_checks(model, covariate_batch(tiny_forecaster))
+    assert len(results) == 6 and all(result.passed for result in results), "\n".join(map(str, results))
+    assert flags == {name: parameter.requires_grad for name, parameter in model.named_parameters()}
+    assert all(parameter.grad is None for parameter in model.parameters())

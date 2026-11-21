@@ -58,7 +58,8 @@ class TrainingResult:
     Attributes:
         steps: Optimiser steps taken.
         epochs: Passes over the training set started.
-        final_train_loss: Training loss of the last step taken.
+        final_train_loss: Training loss of the last step taken, or None if no step was taken (a
+            callback stopped training before the first one).
         best_eval_loss: Lowest validation loss seen, or None without a validation set.
         best_step: Step of that evaluation, or None.
         stopped_early: Whether a callback stopped training before the planned number of steps.
@@ -70,7 +71,7 @@ class TrainingResult:
 
     steps: int
     epochs: int
-    final_train_loss: float
+    final_train_loss: float | None
     best_eval_loss: float | None
     best_step: int | None
     stopped_early: bool
@@ -99,7 +100,7 @@ class TimestralTrainer:
         val_dataset: Optional windows to evaluate on; enables early stopping and best-state
             restoration.
         lora_config: Reserved for the LoRA modes (roadmap Phase 2).
-        callbacks: Extra callbacks, run after the built-in progress logger and early stopping.
+        callbacks: Extra `Callback` instances, run after the built-in progress logger and early stopping.
         model: An already loaded model to train, instead of loading `config.model_name_or_path`.
             It is moved to the configured device and modified in place.
     """
@@ -163,9 +164,13 @@ class TimestralTrainer:
             if val_dataset is None:
                 raise ValueError("early_stopping_patience needs a val_dataset")
             self.callbacks.append(EarlyStopping(config.early_stopping_patience))
+        for callback in callbacks:
+            if not isinstance(callback, Callback):
+                raise TypeError(f"callbacks must be Callback instances, got {type(callback).__name__}")
         self.callbacks.extend(callbacks)
 
         self.global_step = 0
+        self.fit_start_step = 0
         self.should_stop = False
 
     # ----------------------------------------------------------------- setup
@@ -263,7 +268,7 @@ class TimestralTrainer:
         skipped = epochs = 0
         last_evaluated_step = -1
         self.should_stop = False
-        start_step = self.global_step
+        start_step = self.fit_start_step = self.global_step
         final_step = start_step + self.total_steps
 
         def evaluate_now() -> None:
@@ -323,7 +328,7 @@ class TimestralTrainer:
         result = TrainingResult(
             steps=self.global_step - start_step,
             epochs=epochs,
-            final_train_loss=train_history[-1][1],
+            final_train_loss=train_history[-1][1] if train_history else None,
             best_eval_loss=best_loss,
             best_step=best_step,
             stopped_early=self.global_step < final_step,

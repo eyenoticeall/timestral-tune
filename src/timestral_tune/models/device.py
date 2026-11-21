@@ -76,9 +76,9 @@ class TuneTimestralModel(TimestralModel):
         if isinstance(model, cls):
             return model
         parameter = next(model.parameters())
-        tuned = cls(model.config)
+        # Cast before loading: loading float64 weights into float32 parameters would round them.
+        tuned = cls(model.config).to(device=parameter.device, dtype=parameter.dtype)
         tuned.load_state_dict(model.state_dict(), strict=True)
-        tuned.to(device=parameter.device, dtype=parameter.dtype)
         tuned.transformer.rope.rebuild_inv_freq()
         return tuned.train(model.training)
 

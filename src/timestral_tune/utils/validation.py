@@ -27,6 +27,7 @@ from torch import Tensor
 
 from .._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, TimestralModel
 from ..data.batch import TrainingBatch
+from ..losses.pinball import pinball_loss
 from ..models.forward import TargetFrame, denormalise_quantiles, training_forward
 from ..trainer.step import compute_loss
 
@@ -185,14 +186,20 @@ def check_loss_mask(model: TimestralModel, batch: TrainingBatch, frame: TargetFr
     name = f"loss mask, {frame} frame (T8)"
     if batch.num_scored == 0:
         return _skip(name, "the batch has no scored position")
-    with torch.enable_grad():
+    with torch.no_grad():
         result = compute_loss(model, batch, frame)
-        # Differentiate with respect to the predictions only; no parameter gradient is touched.
-        (gradient,) = torch.autograd.grad(result.loss, result.forward.quantiles)
+    # Differentiate the loss with respect to the predictions themselves, as a leaf. This needs no gradient
+    # through the model, so it works whatever is frozen and leaves every `requires_grad` flag alone. The
+    # target frame is a constant of the loss under both definitions, so nothing is lost.
+    predictions = result.forward.quantiles.detach().requires_grad_(True)
+    levels = predictions.new_tensor(model.config.quantile_knots)
+    with torch.enable_grad():
+        loss = pinball_loss(predictions, result.normalised_targets, levels, batch.loss_weight)
+        (gradient,) = torch.autograd.grad(loss, predictions)
     weight = batch.loss_weight
     leaked = int((gradient[~weight] != 0).sum())
     missing = int((gradient[weight].abs().sum(dim=-1) == 0).sum())
-    finite = bool(torch.isfinite(gradient).all()) and bool(torch.isfinite(result.loss))
+    finite = bool(torch.isfinite(gradient).all()) and bool(torch.isfinite(loss))
     passed = finite and leaked == 0 and missing == 0
     detail = (
         f"{leaked} unscored positions with a gradient, {missing} scored positions without one, "

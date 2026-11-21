@@ -12,6 +12,7 @@ valid; the trainer raises a clear `NotImplementedError` for the ones that are no
 from __future__ import annotations
 
 import math
+import numbers
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
@@ -108,14 +109,25 @@ class TrainingConfig:
         ):
             raise ValueError(f"gradient_clip_val must be positive and finite or None, got {self.gradient_clip_val}")
         for name in ("batch_size", "epochs", "log_every"):
-            _positive_int(name, getattr(self, name))
+            self._set_integer(name, minimum=1)
         for name in ("max_steps", "eval_every", "eval_batch_size", "early_stopping_patience"):
             if getattr(self, name) is not None:
-                _positive_int(name, getattr(self, name))
+                self._set_integer(name, minimum=1)
         for name in ("warmup_steps", "num_workers", "seed"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+            self._set_integer(name, minimum=0)
+
+    def _set_integer(self, name: str, *, minimum: int) -> None:
+        """Validate an integer field and store it as a Python `int`.
+
+        NumPy integers are accepted (values often come from an array or a sweep) and converted, so
+        that code downstream which insists on `int`, such as the DataLoader, is not surprised.
+        Booleans are rejected: `True` is an `int` to Python, and never what was meant here.
+        """
+        value = getattr(self, name)
+        if not isinstance(value, numbers.Integral) or isinstance(value, bool) or value < minimum:
+            kind = "a positive integer" if minimum == 1 else "a non-negative integer"
+            raise ValueError(f"{name} must be {kind}, got {value!r}")
+        object.__setattr__(self, name, int(value))
 
     @property
     def resolved_learning_rate(self) -> float:
@@ -126,8 +138,3 @@ class TrainingConfig:
 def _one_of(name: str, value: object, allowed: tuple[str, ...]) -> None:
     if value not in allowed:
         raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
-
-
-def _positive_int(name: str, value: object) -> None:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
