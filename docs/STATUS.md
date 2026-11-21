@@ -18,7 +18,7 @@
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
 | Test suite | 526 passed, 4 skipped (CUDA-only `bf16`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; earlier commit `3fe5bc9`: 510/4 on 2.14.1 and 2.8.0, 411/26 on 2.4.0; macOS). On NVIDIA L4 CUDA (Linux, `6880061`): **528 passed, 2 skipped** |
-| CI | Running/passing on `main` (Python 3.10–3.13 on Linux) |
+| CI | Green on `main` (run `44936917337`, Python 3.10–3.13 on Linux: lint, build, and network-free tests) |
 
 ## What does not exist yet
 
@@ -41,8 +41,7 @@ Not verified anywhere: the 123M and 209M checkpoints, real datasets, multi-GPU.
 
 ## Next steps
 
-1. **Delete the merged `phase-2` branch** locally and on `origin` once confirmed (`AGENTS.md` §6).
-2. **Start Phase 3** (spec §10): raw-space evaluation metrics (`utils/metrics.py`), real-dataset benchmarks (realised volatility + retail demand), forgetting metric, LR/rank sweeps to replace placeholder defaults, and Lacuna integration.
+1. **Start Phase 3** (spec §10): raw-space evaluation metrics (`utils/metrics.py`), real-dataset benchmarks (realised volatility + retail demand), forgetting metric, LR/rank sweeps to replace placeholder defaults, and Lacuna integration.
 
 ## Open questions and known issues
 
@@ -57,8 +56,6 @@ Full list in spec §12. The ones that matter next:
 
 ## Branch state
 
-- `main`: Phases 0, 1, and 2 (fast-forwarded from `phase-2` at `38d4ace` on 2026-11-22).
-- `phase-2`: merged into `main` at `38d4ace`, ready to delete per `AGENTS.md` §6.
-- `perf/phase1-kernels` (merged) and `fix/math-sdpa-backend` (closed by D15) have been deleted locally and on `origin`.
+- `main`: Phases 0, 1, and 2 (fast-forwarded from `phase-2` at `38d4ace` on 2026-11-22). All prior branches (`phase-1`, `perf/phase1-kernels`, `fix/math-sdpa-backend`, `phase-2`) are closed and deleted locally and on `origin`.
 
 Branch policy is in `AGENTS.md` §6.

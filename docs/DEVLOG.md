@@ -514,5 +514,6 @@ deleted immediately after): **253 passed, 2 skipped** on device tests and **528 
 overall (exit 0), exercising all 4 `bf16` CUDA modes (including `bf16` head-cache parity vs streaming and
 difference vs `fp32`) and shape-bucketed `compile_mode="reduce-overhead"` on CUDA graphs.
 
-**Not done / open.** Phase 2 fast-forwarded into `main` at `38d4ace` and pushed to `origin/main`;
-`phase-2` awaits branch deletion (`AGENTS.md` §6). Phase 3 has not started.
+**Not done / open.** Phase 2 fast-forwarded into `main` at `38d4ace`, pushed to `origin/main` (CI run
+`44936917337` green across Python 3.10–3.13), and `phase-2` deleted locally and on `origin`. Phase 3 has
+not started.
