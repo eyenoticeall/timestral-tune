@@ -7,12 +7,14 @@ access to the Hugging Face Hub the first time. Results are recorded in docs/VERI
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 
 import torch
 from torch import Tensor
 
+import timestral_tune._vendor.timestral.layers as layers
 from timestral_tune._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET
 from timestral_tune.data import TrainingBatch
 from timestral_tune.models import TuneTimestralForecaster, TuneTimestralModel, load_forecaster
@@ -34,12 +36,20 @@ def rel(a: Tensor, b: Tensor) -> float:
 
 
 def make_batch(
-    series: int, rows_per_series: int, context_patches: int, horizon_patches: int, covariates: bool, seed: int
+    series: int,
+    rows_per_series: int,
+    context_patches: int,
+    horizon_patches: int,
+    covariates: bool,
+    seed: int,
+    *,
+    known_future_row: bool = True,
 ) -> TrainingBatch:
     """A synthetic batch on CPU: random-walk rows around a level of 100, about 2% of context values missing.
 
-    With `covariates`, each series has one target, `rows_per_series - 2` past-only covariates and one
-    known-future covariate; otherwise every row is a target.
+    With `covariates`, each series has one target and `rows_per_series - 1` covariates: all past-only
+    but the last, which is known in advance unless `known_future_row` is False. Otherwise every row is
+    a target.
     """
     g = torch.Generator().manual_seed(seed)
     rows = series * rows_per_series
@@ -49,11 +59,13 @@ def make_batch(
     role_ids = known_future = known_mask = None
     target_rows = torch.ones(rows, dtype=torch.bool)
     if covariates:
-        role_ids = torch.tensor(([ROLE_TARGET] + [ROLE_PAST_COV] * (rows_per_series - 2) + [ROLE_KNOWN_COV]) * series)
+        last = ROLE_KNOWN_COV if known_future_row else ROLE_PAST_COV
+        role_ids = torch.tensor(([ROLE_TARGET] + [ROLE_PAST_COV] * (rows_per_series - 2) + [last]) * series)
         target_rows = role_ids == ROLE_TARGET
-        known = (role_ids == ROLE_KNOWN_COV)[:, None]
-        known_future = torch.randn(rows, horizon_patches * PATCH, generator=g) * known
-        known_mask = known.expand(rows, horizon_patches * PATCH).clone()
+        if known_future_row:
+            known = (role_ids == ROLE_KNOWN_COV)[:, None]
+            known_future = torch.randn(rows, horizon_patches * PATCH, generator=g) * known
+            known_mask = known.expand(rows, horizon_patches * PATCH).clone()
     weight = target_rows[:, None].expand(rows, horizon_patches * PATCH).clone()
     return TrainingBatch(
         context=torch.where(mask, context, torch.zeros_like(context)),
@@ -89,14 +101,40 @@ def loss_gradient(model: TuneTimestralModel, batch: TrainingBatch) -> tuple[floa
     return loss.item(), gradient
 
 
-def reference_gradient(model: TuneTimestralModel, batch: TrainingBatch) -> tuple[float, Tensor]:
-    """`loss_gradient` of a float64-weights copy of `model` on CPU.
+@contextlib.contextmanager
+def float64_reference():
+    """While active, upstream's RMSNorm computes in its input's own dtype instead of always in float32.
 
-    Upstream's RMSNorm and RoPE still compute in float32 internally, so this is not a pure float64
-    computation; it is the most accurate reference available without editing vendored code.
+    Upstream's RMSNorm casts to float32 internally, even in a float64 model, so its backward pass is only
+    float32-accurate. With the released weights that alone moves a "float64" gradient by up to 4e-3, so
+    reference computations run inside this context. The formula is upstream's, unchanged.
+    """
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.scale
+
+    original = layers.RMSNorm.forward
+    layers.RMSNorm.forward = forward
+    try:
+        yield
+    finally:
+        layers.RMSNorm.forward = original
+
+
+def reference_gradient(
+    model: TuneTimestralModel, batch: TrainingBatch, *, float64_norm: bool = True
+) -> tuple[float, Tensor]:
+    """`loss_gradient` of a float64-weights copy of `model` on CPU, with float64 RMSNorm.
+
+    RoPE still builds its rotation table in float32, so this is not a pure float64 computation; it is the
+    most accurate reference available without editing vendored code. `float64_norm=False` gives the
+    reference used before 2026-11-21, with upstream's float32 RMSNorm, for comparison.
     """
     reference = copy.deepcopy(model).to("cpu").double()
-    return loss_gradient(reference, as_double(batch.to("cpu")))
+    if not float64_norm:
+        return loss_gradient(reference, as_double(batch.to("cpu")))
+    with float64_reference():
+        return loss_gradient(reference, as_double(batch.to("cpu")))
 
 
 def on_device(forecaster: TuneTimestralForecaster, device: str) -> TuneTimestralForecaster:

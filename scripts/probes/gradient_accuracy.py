@@ -10,7 +10,7 @@ not show this. Most of it comes from the float32 backward pass of upstream's att
 with attention written out explicitly the error falls to 1e-4 or less (largest on CUDA: 1.2e-2 to
 2e-5). A smaller, scenario-specific remainder is unexplained.
 
-Three experiments, so the investigation can continue from evidence:
+Four experiments, so the investigation can continue from evidence:
 
 1. Matrix: relative L2 error of the float32 gradient, per model (a tiny random model and the
    released sizes), per input layout, on CPU and on the accelerator.
@@ -18,6 +18,9 @@ Three experiments, so the investigation can continue from evidence:
    (`F.scaled_dot_product_attention`) with an explicit matmul-and-softmax.
 3. Standalone attention: float32 against float64 gradients of the stock and the explicit attention
    call, outside the model, as the attention logits are scaled up.
+4. The reference itself: how far a float64-weights reference moves when upstream's RMSNorm is left
+   computing in float32, as it does by default. All other experiments use float64 RMSNorm in the
+   reference (`_common.reference_gradient`).
 
 Results are recorded in docs/VERIFICATION.md.
 """
@@ -35,7 +38,13 @@ import timestral_tune._vendor.timestral.layers as layers
 from timestral_tune._vendor.timestral import TimestralConfig
 from timestral_tune.models import TuneTimestralForecaster, TuneTimestralModel
 
-LAYOUTS = (("univariate", 1, False), ("multivariate", 3, False), ("covariates", 5, True))
+# (label, rows per series, covariates, a known-future row among them)
+LAYOUTS = (
+    ("univariate", 1, False, True),
+    ("multivariate", 3, False, True),
+    ("covariates", 5, True, True),
+    ("past-only", 3, True, False),
+)
 
 
 def tiny_random_forecaster() -> TuneTimestralForecaster:
@@ -85,8 +94,8 @@ def main() -> None:
     forecasters.update({size: load(size) for size in args.sizes})
     for name, forecaster in forecasters.items():
         device_model = on_device(forecaster, args.device).model if args.device else None
-        for label, rows_per_series, covariates in LAYOUTS:
-            batch = make_batch(2, rows_per_series, 10, 3, covariates, seed=args.seed)
+        for label, rows_per_series, covariates, known in LAYOUTS:
+            batch = make_batch(2, rows_per_series, 10, 3, covariates, seed=args.seed, known_future_row=known)
             _, reference = reference_gradient(forecaster.model, batch)
             _, cpu = loss_gradient(forecaster.model, batch)
             line = f"    {name:12s} {label:13s} cpu {rel(cpu, reference):.1e}"
@@ -135,6 +144,14 @@ def main() -> None:
         stock_error = rel(gradient(torch.float32, stock_call, scale), reference)
         explicit_error = rel(gradient(torch.float32, explicit_call, scale), reference)
         print(f"    max |logit| {max_logit:7.1f}  stock {stock_error:.1e} | explicit {explicit_error:.1e}")
+
+    print("\n[4] how much upstream's float32 RMSNorm moves the float64-weights reference itself")
+    for name, forecaster in forecasters.items():
+        for label, rows_per_series, covariates, known in LAYOUTS:
+            batch = make_batch(2, rows_per_series, 10, 3, covariates, seed=args.seed, known_future_row=known)
+            _, reference = reference_gradient(forecaster.model, batch)
+            _, float32_norm = reference_gradient(forecaster.model, batch, float64_norm=False)
+            print(f"    {name:12s} {label:13s} {rel(float32_norm, reference):.1e}")
 
 
 if __name__ == "__main__":
