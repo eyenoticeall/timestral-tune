@@ -1,6 +1,6 @@
 # Project Status
 
-**Last updated:** 2026-11-21
+**Last updated:** 2026-11-22
 **Stage:** pre-alpha. Phases 0, 1, and 2 are built and verified (`phase-2` branch off `main`).
 **Next phase:** Phase 3 (Benchmarks, metrics, Lacuna integration, sweeps). See spec §10.
 

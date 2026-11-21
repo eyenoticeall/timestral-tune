@@ -45,9 +45,17 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - 2026-11-21 (`3fe5bc9`): verified across PyTorch 2.4/2.8/2.14/2.15 locally (510 passed, 4 skipped; 411/26
   on 2.4.0) and on NVIDIA L4 CUDA (**512 passed, 2 skipped**), resolved D15 via 20-step CUDA trajectories,
   and verified verbatim Hub `LICENSE` export on `mistralai/Timestral-5M`.
-- 2026-11-22 (`d0077ea`..`5292b43`): resolved independent review findings — anchor-aware monotonicity
-  repair (default `0.80` narrows over-wide intervals cleanly), Lemma 4.1 `[-gamma, 1 + gamma]` ACI
-  anti-windup, forecast-count rolling window + `collect_conformal_data`, power-of-two shape bucketing
-  for `compile_mode="reduce-overhead"`, `bf16` head-cache autocast, window-aware `dataset_fingerprint`,
-  atomic export pre-serialisation, chained fallback `LICENSE` detection, local `load_lora` RNG, all
-  3 mutation-test gaps, and isolated external `mistralai/timestral@a534bdb` 5M LoRA reload (`max_abs = 0.0`).
+- 2026-11-21 (review-fix passes & L4 CUDA run, `4ec2e46`..`b0980cb`): addressed findings from two subagent
+  review passes (`load_lora` + trainer resume, exact pre-merge snapshot in `unmerge`, exact O(n) CQR order
+  statistic, repaired-interval ACI `err_t` + `bisect`-sorted window, strict `from_dict`, CPU `best_state`,
+  local LoRA RNG, content `dataset_fingerprint`, dirty-dir cleanup, unfitted-calibrator guard, fallback
+  `LICENSE` warning, `--bf16`/`--compile` flags on `step_timing.py`). Verified on NVIDIA L4 CUDA (`b0980cb`):
+  **521 passed, 2 skipped** (exit 0) and `step_timing.py --bf16 --compile` reproduced 28M cov5 at `62 ms`
+  (`full_ft`) / `43 ms` (`lora_variate`).
+- 2026-11-22 (`d0077ea`..`2d79832`): resolved independent review findings — anchor-aware monotonicity
+  repair (D17; default `0.80` narrows over-wide intervals cleanly), Lemma 4.1 `[-gamma, 1 + gamma]` ACI
+  anti-windup + forecast-count rolling window (D18), `collect_conformal_data` with scale-invariant std floor
+  (preserving ~`3e-6` realised-variance scales), power-of-two shape bucketing for `compile_mode="reduce-overhead"`,
+  `bf16` head-cache autocast, window-aware `dataset_fingerprint`, atomic export pre-serialisation, chained
+  fallback `LICENSE` detection, local `load_lora` RNG, closed all mutation-test gaps, and verified isolated
+  external `mistralai/timestral@a534bdb` 5M LoRA reload (`max_abs = 0.0`). Local suite: **526 passed, 4 skipped**.

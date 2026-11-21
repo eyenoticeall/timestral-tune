@@ -494,6 +494,13 @@ mutation-test gaps) and verified a 5M LoRA export inside a standalone isolated i
     all JSON/licence artefacts (coercing NumPy scalars) before writing any file (no partial exports),
     detected fallback `LICENSE` pointers on chained exports, and used a local `torch.Generator` in `load_lora`.
 
+- **Follow-up review fixes (`2d79832`):** replaced `collect_conformal_data`'s absolute `1e-5` std cutoff
+  with scale-invariant `std > 0 and std > 1e-12 * max(|obs|)` (preserving realised-variance scales around
+  `3e-6`), closed all 12 mutation-test gaps (single-window `forecast` parity, actuals/scales/`symmetric_averaging`,
+  forecast-vs-step ACI window, median clamp, upper `1 + gamma` bound, wired trainer bucketing & head-cache
+  trimming, CUDA `bf16` cache dtype, `_series_index` fingerprint, fallback `license_path`), fixed `SPEC.md`
+  §5.2's repair guarantee wording, added D17/D18 to §11, and restored the `b0980cb` L4 log line in Phase 2 notes.
+
 **Evidence.** Ruff check & format clean; `uv build` clean; `check_upstream_drift.py` reports no drift.
 Local macOS suite: **526 passed, 4 skipped** (PyTorch 2.15.0, Python 3.13); PyTorch 2.4.0 floor
 network-free pass green.
