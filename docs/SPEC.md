@@ -598,7 +598,7 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
 - [x] Export layout and metadata sidecar; test T11.
 - [x] `bf16` on CUDA and optional `torch.compile` with shape bucketing.
 
-**Exit:** all tests T1–T14 pass; an exported LoRA checkpoint loads in the official package. **Met on 2026-11-21 (branch `phase-2`).**
+**Exit:** all tests T1–T14 pass; an exported LoRA checkpoint loads in the official package. **Met on 2026-11-21; merged into `main` on 2026-11-22.**
 
 ### Phase 3: Benchmarks & documentation
 - [ ] Benchmark **zero-shot vs. conformal vs. head-only vs. LoRA (variate, temporal) vs. full FT** on a realised-volatility dataset and a retail-demand dataset, across at least two model sizes.
