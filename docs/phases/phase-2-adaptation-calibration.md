@@ -52,10 +52,12 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
   `LICENSE` warning, `--bf16`/`--compile` flags on `step_timing.py`). Verified on NVIDIA L4 CUDA (`b0980cb`):
   **521 passed, 2 skipped** (exit 0) and `step_timing.py --bf16 --compile` reproduced 28M cov5 at `62 ms`
   (`full_ft`) / `43 ms` (`lora_variate`).
-- 2026-11-22 (`d0077ea`..`2d79832`): resolved independent review findings — anchor-aware monotonicity
+- 2026-11-22 (`d0077ea`..`6880061`): resolved independent review findings — anchor-aware monotonicity
   repair (D17; default `0.80` narrows over-wide intervals cleanly), Lemma 4.1 `[-gamma, 1 + gamma]` ACI
   anti-windup + forecast-count rolling window (D18), `collect_conformal_data` with scale-invariant std floor
-  (preserving ~`3e-6` realised-variance scales), power-of-two shape bucketing for `compile_mode="reduce-overhead"`,
-  `bf16` head-cache autocast, window-aware `dataset_fingerprint`, atomic export pre-serialisation, chained
-  fallback `LICENSE` detection, local `load_lora` RNG, closed all mutation-test gaps, and verified isolated
-  external `mistralai/timestral@a534bdb` 5M LoRA reload (`max_abs = 0.0`). Local suite: **526 passed, 4 skipped**.
+  and flat-context magnitude fallback (preserving ~`3e-6` realised-variance scales), power-of-two shape
+  bucketing for `compile_mode="reduce-overhead"`, `bf16` head-cache autocast, window-aware
+  `dataset_fingerprint`, atomic export pre-serialisation, chained fallback `LICENSE` detection, local
+  `load_lora` RNG, closed all mutation-test gaps, verified isolated external `mistralai/timestral@a534bdb`
+  5M LoRA reload (`max_abs = 0.0`), and verified on NVIDIA L4 CUDA (`6880061`): **528 passed, 2 skipped**
+  (exit 0; local macOS: **526 passed, 4 skipped**).
