@@ -706,4 +706,5 @@ class TimestralTrainer:
             metrics=metrics,
             data_fingerprint=fingerprint,
             license_path=license_path,
+            model_provided_directly=self._model_provided_directly,
         )

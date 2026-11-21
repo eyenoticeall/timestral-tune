@@ -115,3 +115,42 @@ def test_export_from_compiled_model_loads_strict(tiny_forecaster, tmp_path):
     out = trainer.export(tmp_path / "compiled-export")
     reloaded = upstream_load_model(out, device="cpu")
     assert all(torch.isfinite(p).all() for p in reloaded.parameters())
+
+
+def test_export_content_fingerprint_dirty_dir_cleanup_and_guards(tiny_forecaster, tmp_path, caplog):
+    from timestral_tune.export import dataset_fingerprint
+
+    # dataset_fingerprint hashes data content, not just shapes/lengths.
+    ds_a = make_toy_dataset(tiny_forecaster.patch_size, series=4, seed=1, covariates=True)
+    ds_b = make_toy_dataset(tiny_forecaster.patch_size, series=4, seed=2, covariates=True)
+    assert len(ds_a) == len(ds_b) and dataset_fingerprint(ds_a) != dataset_fingerprint(ds_b)
+
+    # Unfitted CQR calibrator is rejected at export.
+    with pytest.raises(ValueError, match="unfitted"):
+        export_checkpoint(tiny_forecaster.model, tmp_path / "unfitted", calibrator=ConformalCalibrator(0.80))
+
+    # Re-exporting a non-LoRA, non-conformal model into a dirty directory removes stale conditional files.
+    out_dir = tmp_path / "reused"
+    lora_model = copy.deepcopy(tiny_forecaster.model)
+    cfg = TrainingConfig(
+        model_name_or_path="local-test",
+        mode="lora_variate",
+        device="cpu",
+        batch_size=len(ds_a),
+        max_steps=1,
+        learning_rate=1e-2,
+    )
+    rng = np.random.default_rng(0)
+    preds = np.linspace(-1.0, 1.0, len(DEFAULT_QUANTILE_LEVELS))[None, None, :] + rng.normal(size=(10, 8, 1))
+    cal = ConformalCalibrator(0.80, bucket_size=4).fit(preds, rng.normal(size=(10, 8)), np.ones(10))
+    TimestralTrainer(cfg, ds_a, model=lora_model).export(out_dir, calibrator=cal)
+    assert (out_dir / "adapter.safetensors").is_file() and (out_dir / "conformal.json").is_file()
+
+    with caplog.at_level("WARNING", logger="timestral_tune.export"):
+        export_checkpoint(tiny_forecaster.model, out_dir, base_repo_or_path="local-missing")
+    assert not (out_dir / "adapter.safetensors").exists()
+    assert not (out_dir / "adapter_config.json").exists()
+    assert not (out_dir / "conformal.json").exists()
+    assert any("no verbatim LICENSE" in record.getMessage() for record in caplog.records)
+    notice = (out_dir / "NOTICE").read_text(encoding="utf-8")
+    assert "no verbatim LICENSE was found" in notice
