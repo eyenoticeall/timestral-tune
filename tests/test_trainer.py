@@ -856,9 +856,10 @@ def test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_o
     assert len(ds13) == 13
 
     # Verify trainer._raw_loader actually buckets the 3-window tail to 4 series, and head cache keeps 13 (not 14).
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     head_bucket_trainer = TimestralTrainer(
         config_for(
-            "cpu",
+            device,
             mode="head_only",
             batch_size=5,
             eval_batch_size=5,
@@ -877,7 +878,6 @@ def test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_o
     )
 
     # Non-divisible dataset (13 windows, batch 5) runs cleanly under compile_mode="reduce-overhead" when supported.
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu" and shutil.which("g++") is None and shutil.which("clang++") is None:
         return
     cache13 = head_bucket_trainer._get_head_cache(ds13)
