@@ -40,13 +40,13 @@ LORA_AXES: tuple[str, ...] = get_args(LoraAxis)
 LORA_TARGETS: tuple[str, ...] = get_args(LoraTarget)
 SINGLE_ROW_ALLOWED_TARGETS: tuple[str, ...] = ("v", "o", "gate")
 
-# Starting points only. The paper publishes no optimiser settings; these are placeholders until the
-# Phase 3 sweeps (spec §5.4, §12).
-DEFAULT_LEARNING_RATES: dict[str, float] = {
-    "head_only": 1e-4,
-    "lora_variate": 3e-4,
-    "lora_temporal": 3e-4,
-    "full_ft": 1e-5,
+# Sweep-backed default learning rates (Phase 3 sweeps on 5M and 28M across realised volatility
+# and retail demand; see `docs/BENCHMARKS.md` and `docs/SPEC.md` §5.4).
+DEFAULT_LEARNING_RATES: dict[AdaptationMode, float] = {
+    "head_only": 3e-4,
+    "lora_variate": 1e-3,
+    "lora_temporal": 1e-3,
+    "full_ft": 5e-5,
 }
 
 
@@ -70,7 +70,7 @@ class LoraConfig:
     r: int = 8
     lora_alpha: float = 16.0
     axes: tuple[LoraAxis, ...] = ("variate",)
-    targets: tuple[LoraTarget, ...] = ("q", "v")
+    targets: tuple[LoraTarget, ...] = ("q", "k", "v", "o")
     dropout: float = 0.0
     allow_single_row: bool = False
 
