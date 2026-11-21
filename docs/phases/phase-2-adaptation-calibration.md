@@ -23,7 +23,9 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
   `lora_config` and `export()`, and `tests/test_trainer.py` asserts that; update those tests as each lands.
 - **Use `compute_loss`** (`trainer/step.py`) for anything that needs the training loss.
 - **The Apple GPU has no float64**: move tensors to CPU before widening (see the Phase 1 notes).
-- **`bf16` needs CUDA**, which has never been run in this project. Budget for surprises.
+- **`bf16` needs CUDA.** fp32 on CUDA is verified (`docs/VERIFICATION.md` §13); autocast is not, and a first
+  look showed `bfloat16` moving forecasts by 1.5e-2 to 5.7e-2. There is no CUDA machine in CI:
+  `scripts/cuda_check.sh` is the way to test on one.
 
 ## Open questions
 

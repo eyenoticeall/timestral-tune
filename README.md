@@ -37,7 +37,7 @@ is the project's overview guide and source of truth.
 | Piece | State |
 |---|---|
 | Specification | Written and verified against the paper, the official code and the released checkpoints |
-| Loading on any device | Done: CPU, Apple GPU (PyTorch 2.8+), CUDA (untested) |
+| Loading on any device | Done: CUDA, CPU, Apple GPU (PyTorch 2.8+) |
 | Data pipeline | Done: polars / pandas / pyarrow frames, point-in-time windows, time splits, collation |
 | Training forward and loss | Done; equal to official inference at float32 round-off |
 | `head_only` training | Done, fp32 |

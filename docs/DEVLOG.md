@@ -149,3 +149,33 @@ Numbers: `docs/VERIFICATION.md`.
 - The gradient-accuracy cause.
 - The target-frame evidence is synthetic only.
 - Phase 2 has not started. There is no export, so a tuned model cannot be saved in the upstream layout yet.
+
+---
+
+## 2026-11-21 (third session) — T14 on CUDA
+
+**What.** The maintainer approved a short-lived Google Cloud GPU VM. T4s were out of stock in every zone
+tried; a watcher loop got an NVIDIA L4 after a few minutes. The VM ran for about half an hour and was
+deleted. `scripts/cuda_check.sh` is the whole procedure.
+
+**Results.** T14 and the whole suite pass on CUDA: 127 device tests, then 290 passed, 6 skipped overall, at
+commit `ecbab9d` (PyTorch 2.15.0+cu132, Python 3.12). Forecasts match CPU to 1e-7 to 1.5e-5. Numbers are in
+`docs/VERIFICATION.md` §13. Phase 1's last roadmap box is ticked.
+
+**Findings.**
+
+- **CUDA float32 gradients on released weights are the least accurate of the three devices**: up to 7.4e-3
+  on T14's scenarios and 1.2e-2 on the probe's, against a bound of 1e-2. T14 passed, but with no margin.
+- **Most of the gradient inaccuracy is the float32 backward pass of upstream's attention call.** With
+  attention written out explicitly, CUDA drops from 1.2e-2 to 2e-5 and CPU improves likewise; float64
+  weights on CUDA give 1e-5; TF32 and Triton FP fusion do nothing. This replaces "cause unknown" in spec §12
+  with a located cause and a smaller unexplained remainder (one scenario, 28M with covariates).
+- **Decision D12 revised** to three tiers: random model 1e-5, released weights with explicit attention
+  5e-3, released weights as shipped 5e-2. The middle tier is the meaningful one for our own code.
+- **CUDA needs a C compiler and Python headers** with recent PyTorch, because its Triton component compiles
+  a helper on first use. The first run, on the VM's system Python 3.10, failed every CUDA test for that
+  reason. The script now checks first.
+
+**Not done / open.** The library still trains with upstream's attention call. Whether explicit attention
+changes training results is untested; if it matters, it belongs with Phase 2's attention wrapping for LoRA.
+`bf16` on CUDA is untested. `phase-1` is still unmerged and unpushed.

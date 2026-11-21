@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Run everything that has never been run on CUDA (spec §10, Phase 1; spec §12).
+# Run the device-parametrised tests, the whole suite and the device probes on CUDA (spec §9 T14, §12).
 #
 #   bash scripts/cuda_check.sh            # on a machine with an NVIDIA GPU, from the repository root
 #
-# Needs uv and network access to the Hugging Face Hub (it downloads the 5M and 28M checkpoints).
-# Writes cuda_check.log next to the repository's README. Record its numbers in docs/VERIFICATION.md,
-# then tick the T14-on-CUDA box in docs/SPEC.md §10.
+# There is no CUDA machine in CI, so run this after changing anything device-related. It needs uv, a C
+# compiler, Python headers, and network access to the Hugging Face Hub (it downloads the 5M and 28M
+# checkpoints). It writes cuda_check.log in the repository root; record new numbers in
+# docs/VERIFICATION.md §13.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

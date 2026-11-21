@@ -1,6 +1,6 @@
 # Phase 1 — Core Mechanics & Verification
 
-**Status:** Built and passing. One verification item is open: T14 has never run on CUDA.
+**Status:** Done. Every roadmap item ran and passed.
 **Goal:** A training forward pass and loss that provably match upstream inference, a leak-free data layer, and the first end-to-end `head_only` run.
 **Spec sections:** `docs/SPEC.md` §3.3, §3.4, §4, §6.2, §6.3, §9 (T1–T8, T12), §10
 
@@ -43,7 +43,8 @@ maintains or extends the phase.
 
 ## Open questions
 
-- T14 on CUDA (no hardware so far).
+- Why the float32 backward pass of upstream's attention call loses accuracy with the released weights, and
+  whether training with explicit attention would change results.
 - The cause of the float32 gradient inaccuracy on released weights (`docs/VERIFICATION.md` §6).
 - The target-frame evidence is synthetic, univariate and fully observed. A check on real data with
   covariates would strengthen decision D2.
@@ -52,4 +53,6 @@ maintains or extends the phase.
 
 - 2026-11-21: All Phase 1 items built. Evidence: 268 passed, 4 skipped on PyTorch 2.15.0, 2.14.1
   (Python 3.10) and 2.8.0; 231 passed, 22 skipped on 2.4.0. T1–T8 and T12 pass on 5M and 28M. Target-frame check run and
-  recorded; D2 confirmed. Not done: CUDA.
+  recorded; D2 confirmed.
+- 2026-11-21 (later): T14 and the whole suite passed on CUDA (NVIDIA L4): 290 passed, 6 skipped. T14's
+  gradient check became three tiers after that run. Local suite: 292 passed, 4 skipped.

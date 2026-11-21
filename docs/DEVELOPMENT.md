@@ -94,7 +94,10 @@ a batch with upstream's own input assembly as ground truth).
 - CPU works everywhere, from PyTorch 2.4.
 - The Apple GPU needs PyTorch 2.8 or newer, runs float32 only, and has no float64: move tensors to CPU
   before converting them to float64. `models/device.py` does this for upstream's code.
-- CUDA is the intended main training target and has never been run in this project.
+- CUDA is the intended main training target. It has been verified once, on a rented GPU
+  (`docs/VERIFICATION.md` §13); there is no CUDA machine in CI. After changing anything device-related, run
+  `bash scripts/cuda_check.sh` on a GPU machine. It needs a C compiler and Python headers; a uv-managed
+  Python has them.
 
 ## Probes
 

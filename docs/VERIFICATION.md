@@ -15,8 +15,10 @@ When you add a `[V]` claim to the spec, add its probe or test and a row here in 
 | Python | 3.13 for the probes; 3.10, 3.12 and 3.13 for the test suite |
 | Checkpoints | Timestral-5M and Timestral-28M at the Hub revisions pinned in `docs/UPSTREAM.md` |
 
-Not verified anywhere: CUDA, and the 123M and 209M checkpoints. Linux has run only the network-free tests,
-in CI.
+CUDA results (§13) come from a second machine: a Google Cloud VM with one NVIDIA L4 (23 GB), 4 CPU threads,
+Ubuntu 22.04, PyTorch 2.15.0+cu132, Python 3.12.16.
+
+Not verified anywhere: the 123M and 209M checkpoints.
 
 ## 1. Model structure
 
@@ -101,7 +103,7 @@ Autocast on MPS, forward relative difference from CPU fp32:
 | `bfloat16` | 1.4e-2 | 5.9e-2 |
 | `float16` | 2.2e-3 | 7.5e-3 |
 
-## 6. Float32 gradient accuracy (cause unexplained)
+## 6. Float32 gradient accuracy
 
 Probe: `uv run python scripts/probes/gradient_accuracy.py --device mps`.
 
@@ -136,12 +138,12 @@ What narrows it down, and what does not:
 | Same, max logit 88 | stock 4.0e-6, explicit 3.7e-6 |
 | Same, max logit 1,409 | stock 5.0e-5, explicit 4.8e-5 |
 
-Reading: the error depends on the weights (a random model shows none), appears on both devices, and is
-usually 10 to 100 times larger on CPU. Swapping the attention implementation changes it inside the model,
-but the same call is accurate in isolation at every logit scale tried, so no single cause is established.
-Forward outputs are unaffected (about 3e-7 from the reference, §11).
+Reading: the error depends on the weights (a random model shows none) and appears on every device. CUDA
+measurements (§13) then located most of it in the float32 backward pass of upstream's attention call. A
+smaller remainder in one scenario is unexplained. Forward outputs are unaffected (about 3e-7 from the
+reference, §11).
 
-Consequence: T14 compares gradients with the reference on every device, with two tiers (spec D12).
+Consequence: T14 compares gradients with the reference on every device, in three tiers (spec D12).
 
 ## 7. Training-step timing, CPU against the Apple GPU
 
@@ -274,3 +276,79 @@ Re-measure before relying on them.
 
 These `[H]` and `[U]` facts were read, not run: the four checkpoints' `config.json` values (spec §3.1), and
 that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
+
+## 13. CUDA
+
+Run: `bash scripts/cuda_check.sh` on the VM described at the top, at commit `ecbab9d`. It runs the
+device-parametrised tests, the whole suite and the device probes.
+
+| Check | Result |
+|---|---|
+| T14 and all other device-parametrised tests | 127 passed, 2 skipped (the Apple GPU tests) |
+| Whole suite | 290 passed, 6 skipped (4 Phase 2 placeholders, 2 Apple GPU tests) |
+| `head_only` training on CUDA: loss falls, nothing outside the head changes | Pass (part of the suite) |
+| Verifiers (`run_checks`) on CUDA | Pass (part of the suite) |
+
+Forward, relative L2 difference from CPU (`device_parity.py --device cuda`):
+
+| Case | 5M | 28M |
+|---|---|---|
+| `predict_block`, no covariates | 2.2e-7 | 3.0e-7 |
+| `predict_block`, with covariates | 1.4e-6 | 2.2e-6 |
+| `forecast`, horizon 96 | 1.4e-7 | 1.4e-7 |
+| `forecast`, horizon 2,100 | 1.5e-5 | 1.8e-6 |
+| `forecast`, numeric and categorical covariates | 1.2e-7 | 1.0e-7 |
+| Autocast `bfloat16` (not a supported mode yet) | 1.5e-2 | 5.7e-2 |
+| Autocast `float16` | 2.0e-3 | 5.9e-3 |
+
+Float32 training-loss gradients against the float64-weights reference (`gradient_accuracy.py --device cuda`;
+the CPU column is that VM's CPU):
+
+| Model | Layout | CPU | CUDA |
+|---|---|---|---|
+| Tiny random | univariate / multivariate / covariates | 3.4e-7 / 3.0e-7 / 2.3e-7 | 3.2e-7 / 2.4e-7 / 1.8e-7 |
+| 5M | univariate | 2.0e-3 | 1.2e-2 |
+| 5M | multivariate | 1.2e-3 | 1.2e-2 |
+| 5M | covariates | 9.2e-4 | 3.2e-3 |
+| 28M | univariate | 5.9e-4 | 1.4e-3 |
+| 28M | multivariate | 9.6e-4 | 2.3e-3 |
+| 28M | covariates | 1.1e-3 | 1.5e-3 |
+
+Across T14's scenarios on that VM: CUDA 2.2e-7 to 7.4e-3 as shipped (one minus the cosine at most 2.7e-5),
+and at most 1.1e-4 with explicit attention; CPU at most 1.4e-3 as shipped and 1.2e-4 with explicit attention.
+On the Mac, explicit attention gives at most 5.4e-4 on CPU and 1.2e-3 on the Apple GPU; both maxima are the
+28M covariates scenario, and every other case is at 6e-5 or less.
+
+Where the CUDA error comes from:
+
+| Experiment | 5M | 28M |
+|---|---|---|
+| CUDA float32, as shipped (covariates batch) | 3.2e-3 | 1.5e-3 |
+| CUDA float32, attention written out as matmul and softmax (same batch) | 7.1e-5 | 7.7e-5 |
+| CPU float32, as shipped / explicit attention (same batch) | 9.2e-4 / 1.8e-4 | 1.1e-3 / 9.5e-5 |
+
+The next four rows were measured once in a throwaway script on the VM (univariate batch) and are not
+reproduced by a probe:
+
+| Experiment | 5M | 28M |
+|---|---|---|
+| CUDA float32, as shipped | 1.2e-2 | 1.4e-3 |
+| CUDA float32, explicit attention | 2.3e-5 | 4.1e-6 |
+| CUDA with float64 weights | 1.2e-5 | 1.2e-5 |
+| CUDA float32 with TF32 disabled; and with `TRITON_DEFAULT_FP_FUSION=0` | 1.2e-2 (unchanged) | 1.4e-3 (unchanged) |
+
+Training-step timing (`step_timing.py --device cuda`; the CPU has only 4 threads, so the ratios flatter the
+GPU compared with a workstation CPU):
+
+| Model | Batch | CPU | CUDA | Speed-up | GPU memory allocated |
+|---|---|---|---|---|---|
+| 5M | univariate | 309 ms | 52 ms | 5.9× | 0.3 GiB |
+| 5M | 5 rows per series, with covariates | 2,644 ms | 94 ms | 28× | 1.9 GiB |
+| 28M | univariate | 1,163 ms | 79 ms | 15× | 1.9 GiB |
+| 28M | 5 rows per series, with covariates | 10,833 ms | 380 ms | 29× | 5.7 GiB |
+
+Environment requirement found on the way. With the VM's system Python 3.10 (PyTorch 2.14.1+cu130), every
+CUDA test failed: PyTorch routed an operation in upstream's attention layer through a Triton kernel, and
+Triton compiles a C helper on first use, which stopped at `fatal error: Python.h: No such file or directory`.
+With a uv-managed Python 3.12, which ships its headers, everything passed. `scripts/cuda_check.sh` now
+checks for the headers and a compiler first and stops with advice (verified on the VM: exit code 4).

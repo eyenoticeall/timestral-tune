@@ -1,7 +1,7 @@
 # Project Status
 
 **Last updated:** 2026-11-21
-**Stage:** pre-alpha. Phase 0 and Phase 1 are built; one Phase 1 verification item (CUDA) is open.
+**Stage:** pre-alpha. Phase 0 and Phase 1 are built and verified.
 **Next phase:** Phase 2 (Adaptation & Calibration). See spec §10.
 
 ## What works today
@@ -9,13 +9,13 @@
 | Area | State |
 |---|---|
 | Loading | `load_model` / `load_forecaster`: pinned Hub revisions, config from the checkpoint, any device |
-| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32). CUDA is supported in code and never run |
+| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32), CUDA (verified once: NVIDIA L4, PyTorch 2.15.0, fp32) |
 | Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator`; per-window categorical encoding |
 | Training forward and loss | Normalised-space forward for both layouts, both target frames, pinball loss, `compute_loss` |
 | Training | `TimestralTrainer` in `head_only` mode, fp32: AdamW, warm-up, cosine or constant schedule, clipping, evaluation, early stopping, best-state restore |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **10 of 14 implemented and passing**: T1–T8, T12, T14. T9, T10, T11, T13 are Phase 2 placeholders |
-| Test suite | 268 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; macOS) |
+| Test suite | 292 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; macOS). On CUDA: 290 passed, 6 skipped |
 | CI | Green on the last push (scaffold only). The Phase 1 work has not been pushed, so CI has not run on it |
 
 ## What does not exist yet
@@ -36,25 +36,23 @@ All on one machine (Apple M4, macOS); details in `docs/VERIFICATION.md`.
 - PyTorch floors: CPU on 2.4.0; Apple GPU from 2.8.0.
 - `head_only` training lowers the loss and changes nothing outside the head, on CPU and the Apple GPU.
 
-Not verified anywhere: CUDA, the 123M and 209M checkpoints, real datasets. Linux has run only the scaffold
-tests, in CI.
+Not verified anywhere: the 123M and 209M checkpoints, real datasets, `bf16`. CI has run only the scaffold.
 
 ## Next steps
 
-1. **Run T14 on CUDA** when hardware is available: `bash scripts/cuda_check.sh` (it also runs the whole
-   suite and the probes there, and writes `cuda_check.log`).
-   This closes Phase 1's last box.
-2. **Push `phase-1` and let CI run** on the new tests (it has only ever run on the scaffold).
-3. **Start Phase 2** (spec §10): the slice LoRA adapter (T9, T10), `full_ft`, the conformal calibrators
+1. **Push `phase-1` and let CI run** on the new tests (it has only ever run on the scaffold).
+2. **Start Phase 2** (spec §10): the slice LoRA adapter (T9, T10), `full_ft`, the conformal calibrators
    (T13), export (T11), `bf16` on CUDA.
 
 ## Open questions and known issues
 
 Full list in spec §12. The ones that matter next:
 
-- **CUDA has never been run.** Phase 2 adds `bf16`, which is CUDA-only, so this becomes blocking there.
-- **Float32 gradients through released weights are not at round-off**, cause unknown
-  (`docs/VERIFICATION.md` §6). Training is not expected to be affected; T14 has two tiers because of it.
+- **CUDA needs a C compiler and Python headers** with recent PyTorch (spec §12). `scripts/cuda_check.sh`
+  checks for them.
+- **Float32 gradients through released weights are not at round-off**, worst on CUDA (up to 1.2e-2).
+  Mostly the backward pass of upstream's attention call (`docs/VERIFICATION.md` §6, §13). Training is not
+  expected to be affected, but that is untested; T14 has three tiers because of it.
 - **The target-frame evidence is synthetic** (univariate, fully observed, one seed, 5M and 28M).
 - **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
 - **No export yet**, so a trained model lives only in memory (`trainer.model`).
