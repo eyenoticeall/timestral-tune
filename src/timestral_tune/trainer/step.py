@@ -196,7 +196,9 @@ def _compute_cached_head_loss(model: TimestralModel, batch: CachedHeadBatch, fra
                 config.use_asinh,
             )
 
-    levels = _cached_levels(config.quantile_knots, quantiles.device, quantiles.dtype)
+    levels = _cached_levels(
+        config.quantile_knots, quantiles.device, torch.promote_types(quantiles.dtype, torch.float32)
+    )
     loss = pinball_loss(quantiles, normalised, levels, batch.loss_weight)
     return LossOutput(loss=loss, forward=forward, normalised_targets=normalised, frame_loc=loc, frame_scale=scale)
 
@@ -219,6 +221,10 @@ def compute_loss(
     forward = training_forward(model, batch, return_hidden=return_hidden, validate=validate)
     loc, scale = target_frames(model, batch, forward, frame)
     normalised = normalise_targets(model, batch, loc, scale)
-    levels = _cached_levels(model.config.quantile_knots, forward.quantiles.device, forward.quantiles.dtype)
+    levels = _cached_levels(
+        model.config.quantile_knots,
+        forward.quantiles.device,
+        torch.promote_types(forward.quantiles.dtype, torch.float32),
+    )
     loss = pinball_loss(forward.quantiles, normalised, levels, batch.loss_weight)
     return LossOutput(loss=loss, forward=forward, normalised_targets=normalised, frame_loc=loc, frame_scale=scale)

@@ -190,6 +190,7 @@ class TimestralTrainer:
             raise TypeError(f"lora_config must be a LoraConfig or None, got {type(lora_config).__name__}")
         self.lora_config = self._resolve_lora_config(config.mode, lora_config)
 
+        self._model_provided_directly = model is not None
         if model is None:
             model = load_model(config.model_name_or_path, device=self.device, revision=config.revision)
         elif not isinstance(model, TuneTimestralModel):
@@ -217,8 +218,10 @@ class TimestralTrainer:
 
         if config.compile_model and config.compile_mode == "reduce-overhead":
             self._check_fixed_batch_shapes(train_dataset, config.batch_size, "train_dataset")
+            eval_bs = config.eval_batch_size or config.batch_size
+            if config.mode == "head_only" and config.cache_frozen_features and eval_bs != config.batch_size:
+                self._check_fixed_batch_shapes(train_dataset, eval_bs, "train_dataset")
             if val_dataset is not None:
-                eval_bs = config.eval_batch_size or config.batch_size
                 self._check_fixed_batch_shapes(val_dataset, eval_bs, "val_dataset")
 
         self._trainable = self._select_trainable()
@@ -250,7 +253,9 @@ class TimestralTrainer:
         self.global_step = 0
         self.fit_start_step = 0
         self.should_stop = False
-        self._head_cache: dict[int, _CachedHeadDataset] = {}
+        self._train_head_cache: _CachedHeadDataset | None = None
+        self._val_head_cache: _CachedHeadDataset | None = None
+        self._val_loader: DataLoader | None = None
 
     # ----------------------------------------------------------------- setup
 
@@ -316,8 +321,8 @@ class TimestralTrainer:
 
         assert self.lora_config is not None
         rows_per_series = sum(self.train_dataset.series[0].layout)
-        torch.manual_seed(self.config.seed)
-        inject_lora(self.model, self.lora_config, rows_per_series=rows_per_series)
+        generator = torch.Generator().manual_seed(self.config.seed)
+        inject_lora(self.model, self.lora_config, rows_per_series=rows_per_series, generator=generator)
         trainable = list(lora_parameters(self.model))
         for parameter in trainable:
             parameter.requires_grad_(True)
@@ -370,11 +375,15 @@ class TimestralTrainer:
     def _get_head_cache(self, dataset: TimeSeriesDataset) -> _CachedHeadDataset | None:
         if self.config.mode != "head_only" or not self.config.cache_frozen_features:
             return None
-        if dataset is not self.train_dataset and dataset is not self.val_dataset:
+        if dataset is self.train_dataset:
+            if self._train_head_cache is not None:
+                return self._train_head_cache
+        elif dataset is self.val_dataset:
+            if self._val_head_cache is not None:
+                return self._val_head_cache
+        else:
             return None
-        key = id(dataset)
-        if key in self._head_cache:
-            return self._head_cache[key]
+
         estimated = self._estimate_head_cache_bytes(dataset)
         if estimated > _MAX_HEAD_CACHE_BYTES:
             logger.info(
@@ -385,7 +394,10 @@ class TimestralTrainer:
             )
             return None
         cache = self._build_head_cache(dataset)
-        self._head_cache[key] = cache
+        if dataset is self.train_dataset:
+            self._train_head_cache = cache
+        else:
+            self._val_head_cache = cache
         return cache
 
     @torch.no_grad()
@@ -483,6 +495,14 @@ class TimestralTrainer:
 
     def training_step(self, batch: TrainingBatch | CachedHeadBatch, *, validate: bool = True) -> float:
         """One optimiser step on `batch` (already on the device). Returns the loss."""
+        if (
+            self.config.compile_model
+            and self.config.compile_mode == "reduce-overhead"
+            and self.device.type == "cuda"
+            and hasattr(torch, "compiler")
+            and hasattr(torch.compiler, "cudagraph_mark_step_begin")
+        ):
+            torch.compiler.cudagraph_mark_step_begin()
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
             loss = compute_loss(self.model, batch, self.config.target_frame, validate=validate).loss
@@ -530,7 +550,8 @@ class TimestralTrainer:
             if best_loss is None or result.loss < best_loss:
                 best_loss, best_step = result.loss, self.global_step
                 if config.restore_best:
-                    best_state = [parameter.detach().clone() for parameter in self._trainable]
+                    # Keep best-state snapshot on CPU so `full_ft` does not double GPU VRAM.
+                    best_state = [parameter.detach().cpu().clone() for parameter in self._trainable]
             for callback in self.callbacks:
                 callback.on_evaluate(self, self.global_step, result)
 
@@ -543,6 +564,7 @@ class TimestralTrainer:
             while self.global_step < final_step and not self.should_stop:
                 epochs += 1
                 steps_before_epoch = self.global_step
+                skipped_before_epoch = skipped
                 for batch in loader:
                     if batch.num_scored == 0:
                         skipped += 1
@@ -561,8 +583,9 @@ class TimestralTrainer:
                     if self.global_step >= final_step or self.should_stop:
                         break
                 if self.global_step == steps_before_epoch:
+                    epoch_skipped = skipped - skipped_before_epoch
                     raise RuntimeError(
-                        f"an epoch produced no optimiser step: all {skipped} batches had no scored position"
+                        f"an epoch produced no optimiser step: all {epoch_skipped} batches had no scored position"
                     )
                 if self.val_dataset is not None and config.eval_every is None and not self.should_stop:
                     evaluate_now()
@@ -575,7 +598,7 @@ class TimestralTrainer:
         if best_state is not None and best_step != self.global_step:
             with torch.no_grad():
                 for parameter, saved in zip(self._trainable, best_state, strict=True):
-                    parameter.copy_(saved)
+                    parameter.copy_(saved, non_blocking=non_blocking)
             restored = True
         if skipped:
             logger.warning("skipped %d training batches that had no scored position", skipped)
@@ -602,11 +625,22 @@ class TimestralTrainer:
         dataset = self.val_dataset if dataset is None else dataset
         if dataset is None:
             raise ValueError("no dataset to evaluate: pass one, or give the trainer a val_dataset")
+        if not isinstance(dataset, TimeSeriesDataset):
+            raise TypeError(f"dataset must be a TimeSeriesDataset, got {type(dataset).__name__}")
         self._check_dataset(dataset, "dataset")
+        if self.config.compile_model and self.config.compile_mode == "reduce-overhead":
+            eval_bs = self.config.eval_batch_size or self.config.batch_size
+            self._check_fixed_batch_shapes(dataset, eval_bs, "dataset")
         was_training = self.model.training
         self.model.eval()
         try:
-            return self._evaluate(self._loader(dataset, training=False))
+            if dataset is self.val_dataset:
+                if self._val_loader is None:
+                    self._val_loader = self._loader(dataset, training=False)
+                loader = self._val_loader
+            else:
+                loader = self._loader(dataset, training=False)
+            return self._evaluate(loader)
         finally:
             self.model.train(was_training)
 

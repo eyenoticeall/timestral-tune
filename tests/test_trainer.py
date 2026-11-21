@@ -774,3 +774,37 @@ def test_compile_model_trains_and_produces_clean_merged_state_dict(tiny_forecast
     assert all("_orig_mod" not in k for k in state)
     reloaded = TimestralModel(model.config)
     reloaded.load_state_dict(state, strict=True)
+
+
+def test_lora_trainer_init_does_not_mutate_global_rng_and_evaluate_validates_inputs(tiny_forecaster):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    torch.manual_seed(1234)
+    rng_before = torch.get_rng_state()
+    trainer = TimestralTrainer(
+        config_for("cpu", mode="lora_variate", batch_size=len(dataset), max_steps=1, seed=99),
+        dataset,
+        model=fresh_model(tiny_forecaster),
+    )
+    assert torch.equal(torch.get_rng_state(), rng_before), "trainer __init__ mutated global PyTorch RNG"
+
+    with pytest.raises(TypeError, match="TimeSeriesDataset"):
+        trainer.evaluate("not-a-dataset")  # type: ignore[arg-type]
+
+    # evaluate(other_dataset) enforces compile_mode="reduce-overhead" fixed batch shapes too.
+    compiled_trainer = TimestralTrainer(
+        config_for(
+            "cpu",
+            mode="head_only",
+            batch_size=len(dataset),
+            eval_batch_size=5,
+            max_steps=1,
+            compile_model=True,
+            compile_mode="reduce-overhead",
+            cache_frozen_features=False,
+        ),
+        dataset,
+        model=fresh_model(tiny_forecaster),
+    )
+    assert len(dataset) % 5 != 0
+    with pytest.raises(ValueError, match="fixed batch shapes"):
+        compiled_trainer.evaluate(dataset)
