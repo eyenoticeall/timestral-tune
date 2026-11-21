@@ -40,10 +40,9 @@ from .._vendor.timestral.layers import TwoStreamMask
 from .._vendor.timestral.masks import (
     build_forecast_positions,
     build_forecast_time_mask,
-    build_two_stream_positions,
-    build_two_stream_time_mask,
     build_two_stream_variate_mask,
     compute_enc_key_validity,
+    enc_causal_mask,
     group_first_observed_patch,
 )
 from .._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_TARGET, TimestralModel
@@ -51,7 +50,9 @@ from .._vendor.timestral.scaler import (
     advancing_block_frames,
     apply_affine_asinh_masked,
     causal_patch_loc_scale,
+    cumulative_welford,
     denormalize_quantiles,
+    welford_combine,
 )
 from ..data.batch import TrainingBatch
 from .device import supports_float64
@@ -180,7 +181,56 @@ def _uses_covariate_layout(model: TimestralModel, batch: TrainingBatch) -> bool:
     return not bool((batch.role_ids == ROLE_TARGET).all())
 
 
-def training_forward(model: TimestralModel, batch: TrainingBatch, *, return_hidden: bool = False) -> ForwardOutput:
+def _build_covariate_time_mask(
+    context_patches: int,
+    horizon_patches: int,
+    key_valid: Tensor,
+    known_rows: Tensor,
+    *,
+    has_known: bool,
+) -> Tensor:
+    """`(R, 1, wp + hp, wp + hp)` trimmed time mask for single-horizon covariate training.
+
+    Mathematically identical to upstream's `build_two_stream_time_mask` restricted to the `wp`
+    encoder tokens and the `hp` active horizon decoder tokens: the `cp` inactive context-position
+    decoder tokens in upstream's `2 * wp` layout attend only to themselves, are never read by any
+    other token, and are discarded before the head.
+    """
+    rows, window_patches = key_valid.shape
+    device = key_valid.device
+    enc_enc = enc_causal_mask(key_valid)
+    if has_known:
+        eye = torch.eye(window_patches, dtype=torch.bool, device=device)
+        enc_bi = key_valid[:, None, :].expand(rows, window_patches, window_patches) | eye[None]
+        enc_enc = torch.where(known_rows[:, None, None], enc_bi, enc_enc)
+    enc_dec = torch.zeros(rows, window_patches, horizon_patches, dtype=torch.bool, device=device)
+    ctx_valid = torch.cat(
+        [key_valid[:, :context_patches], torch.zeros(rows, horizon_patches, dtype=torch.bool, device=device)], dim=1
+    )
+    dec_enc = ctx_valid[:, None, :].expand(rows, horizon_patches, window_patches)
+    dec_dec = torch.tril(torch.ones(horizon_patches, horizon_patches, dtype=torch.bool, device=device))[None].expand(
+        rows, horizon_patches, horizon_patches
+    )
+    top = torch.cat([enc_enc, enc_dec], dim=2)
+    bottom = torch.cat([dec_enc, dec_dec], dim=2)
+    return torch.cat([top, bottom], dim=1).unsqueeze(1)
+
+
+def _build_covariate_positions(context_patches: int, horizon_patches: int, first_obs: Tensor) -> Tensor:
+    """`(R, wp + hp)` positions matching upstream's `build_two_stream_positions` on the kept tokens."""
+    window_patches = context_patches + horizon_patches
+    p_enc = torch.arange(window_patches, device=first_obs.device)[None, :] - first_obs[:, None]
+    p_dec = torch.arange(context_patches, window_patches, device=first_obs.device)[None, :] - first_obs[:, None]
+    return torch.cat([p_enc, p_dec], dim=-1)
+
+
+def training_forward(
+    model: TimestralModel,
+    batch: TrainingBatch,
+    *,
+    return_hidden: bool = False,
+    validate: bool = True,
+) -> ForwardOutput:
     """Normalised-space quantiles for the horizon of `batch`, with gradients.
 
     Target values over the horizon (`batch.targets`) are never read here: they are labels.
@@ -189,6 +239,8 @@ def training_forward(model: TimestralModel, batch: TrainingBatch, *, return_hidd
         model: The network. Use a `TuneTimestralModel` on devices without float64.
         batch: Inputs in the packed row layout, on the model's device.
         return_hidden: Also return the final transformer states.
+        validate: Run `batch.validate(patch_size)`. Set to False only when the caller has already
+            validated the batch (for example on CPU before moving it to an accelerator).
 
     Raises:
         ValueError: If the batch breaks the layout contract, the horizon exceeds one decode block,
@@ -196,7 +248,8 @@ def training_forward(model: TimestralModel, batch: TrainingBatch, *, return_hidd
     """
     config = model.config
     patch = config.patch_size
-    batch.validate(patch)
+    if validate:
+        batch.validate(patch)
     horizon_patches = batch.horizon_steps // patch
     if horizon_patches > config.block_size:
         raise ValueError(
@@ -226,9 +279,10 @@ def training_forward(model: TimestralModel, batch: TrainingBatch, *, return_hidd
         assert role_ids is not None  # guaranteed by _uses_covariate_layout
         target_rows = role_ids == ROLE_TARGET
         known_rows = role_ids == ROLE_KNOWN_COV
-        if bool(known_rows.any()) and not config.supports_known_covariates:
+        has_known = batch.known_future is not None
+        if not config.supports_known_covariates and bool(known_rows.any()):
             raise ValueError("this checkpoint cannot condition on known-future covariates")
-        if batch.known_future is None:
+        if not has_known:
             known_future = torch.zeros(rows, batch.horizon_steps, device=device, dtype=batch.context.dtype)
             known_future_mask = torch.zeros(rows, batch.horizon_steps, device=device, dtype=torch.bool)
         else:
@@ -239,22 +293,25 @@ def training_forward(model: TimestralModel, batch: TrainingBatch, *, return_hidd
         window_patches = context_patches + horizon_patches
 
         scaled, loc, scale = model.scale(window, window_mask)
-        scaled, loc, scale = model._known_cov_scaling(window, window_mask, scaled, loc, scale, known_rows)
+        if has_known:
+            scaled, loc, scale = model._known_cov_scaling(window, window_mask, scaled, loc, scale, known_rows)
         x_enc = model.representation(scaled, window_mask)
-        x_dec = model.representation.forecast_tokens(rows, window_patches)
+        # Only the `horizon_patches` active decoder tokens are needed; the `context_patches` inactive
+        # decoder slots of upstream's `2 * window_patches` layout are decoupled and discarded.
+        x_dec = model.representation.forecast_tokens(rows, horizon_patches)
         obs_per_patch = window_mask.unflatten(-1, (window_patches, patch)).any(dim=-1)
         key_valid = compute_enc_key_validity(obs_per_patch, config.attend_missing_patches)
-        block_start = torch.full((rows,), context_patches, device=device, dtype=torch.long)
-        time_mask = build_two_stream_time_mask(
-            block_start, window_patches, config.block_size, key_valid, bidirectional_rows=known_rows
+        time_mask = _build_covariate_time_mask(
+            context_patches, horizon_patches, key_valid, known_rows, has_known=has_known
         )
         variate_mask = build_two_stream_variate_mask(
-            batch.group_ids, key_valid, window_patches, target_rows=target_rows, bidirectional_rows=known_rows
+            batch.group_ids, key_valid, horizon_patches, target_rows=target_rows, bidirectional_rows=known_rows
         )
-        positions = build_two_stream_positions(window_patches, _first_observed_patch(obs_per_patch, batch.group_ids))
+        positions = _build_covariate_positions(
+            context_patches, horizon_patches, _first_observed_patch(obs_per_patch, batch.group_ids)
+        )
         hidden = _run_transformer(model, x_enc, x_dec, time_mask, variate_mask, positions)
-        # Prediction tokens exist for every window patch; only the horizon ones are forecasts.
-        quantiles = model.head(hidden[:, window_patches + context_patches :, :])
+        quantiles = model.head(hidden[:, window_patches:, :])
         num_context_tokens = window_patches
 
     per_patch_loc = loc.unflatten(-1, (-1, patch))[..., 0]
@@ -266,6 +323,55 @@ def training_forward(model: TimestralModel, batch: TrainingBatch, *, return_hidd
         hidden=hidden if return_hidden else None,
         num_context_tokens=num_context_tokens,
     )
+
+
+@torch.no_grad()
+def context_welford_state(context: Tensor, observation_mask: Tensor, patch_size: int) -> tuple[Tensor, Tensor, Tensor]:
+    """Float64 Welford summary `(cnt, mean, m2)` of each row's observed context, matching `advancing_block_frames`.
+
+    Each tensor has shape `(R,)` in float64 on `context.device`. Computing this once lets cached
+    `head_only` steps evaluate `advancing_block_frames_from_state` without retaining or rescanning
+    the context.
+    """
+    values = context.unflatten(-1, (-1, patch_size)).to(torch.float64)
+    weights = observation_mask.unflatten(-1, (-1, patch_size)).to(torch.float64)
+    cnt = weights.sum(-1)
+    mean = (values * weights).sum(-1) / cnt.clamp(min=1.0)
+    m2 = (weights * (values - mean.unsqueeze(-1)).square()).sum(-1)
+    is_zero = cnt == 0
+    mean = torch.where(is_zero, torch.zeros_like(mean), mean)
+    m2 = torch.where(is_zero, torch.zeros_like(m2), m2)
+    cnt, mean, m2 = (s[:, -1] for s in cumulative_welford(cnt, mean, m2))
+    return cnt, mean, m2
+
+
+@torch.no_grad()
+def advancing_block_frames_from_state(
+    cnt: Tensor,
+    mean: Tensor,
+    m2: Tensor,
+    sinh_median: Tensor,
+    minimum_scale: float,
+) -> tuple[Tensor, Tensor]:
+    """Per-patch `(loc, scale)` in the advancing refine frame from a precomputed context Welford state.
+
+    Matches upstream's `advancing_block_frames` to float64 round-off without rescanning the context.
+    """
+    _, n_pred, ps = sinh_median.shape
+    offset = mean
+    clip = torch.finfo(torch.float32).max ** 0.5 / 1e3
+    locs, scales = [], []
+    for h in range(n_pred):
+        var = (m2 / (cnt - 1.0).clamp(min=1.0)).clamp(min=0.0)
+        scale = var.sqrt().clamp(min=minimum_scale)
+        locs.append(mean)
+        scales.append(scale)
+        folded = (sinh_median[:, h] * scale[:, None] + mean[:, None] - offset[:, None]).clamp(-clip, clip)
+        folded = folded + offset[:, None]
+        b_mean = folded.mean(-1)
+        b_m2 = (folded - b_mean[:, None]).square().sum(-1)
+        cnt, mean, m2 = welford_combine(cnt, mean, m2, torch.full_like(cnt, ps), b_mean, b_m2)
+    return torch.stack(locs, dim=1), torch.stack(scales, dim=1)
 
 
 @torch.no_grad()
@@ -288,38 +394,59 @@ def target_frames(
     patch = config.patch_size
     horizon_patches = batch.horizon_steps // patch
     device = batch.device
-    stats_device = device if supports_float64(device) else torch.device("cpu")
-    context = batch.context.to(stats_device)
-    context_mask = batch.context_mask.to(stats_device)
+    dtype = batch.context.dtype
+    anchor_loc = output.anchor_loc.detach().to(dtype)
+    anchor_scale = output.anchor_scale.detach().to(dtype)
 
-    if frame == "median_folded":
-        # The block's median in the last context patch's frame with the asinh undone, as upstream's
-        # `_refine_block` passes it to `advancing_block_frames`.
-        # Move first, then widen: converting to float64 on the source device fails where it has none.
-        median = output.quantiles[..., config.median_index].detach().to(stats_device).to(torch.float64)
-        standardised = median.sinh() if config.use_asinh else median
-        loc, scale = advancing_block_frames(
-            context, context_mask, standardised.unflatten(-1, (horizon_patches, patch)), config.minimum_scale
-        )
-    else:
-        # Causal statistics of the context followed by the true horizon values; patch j is framed by
-        # everything observed up to the end of patch j-1.
-        series = torch.cat([context, batch.targets.to(stats_device)], dim=-1)
-        observed = torch.cat([context_mask, batch.loss_weight.to(stats_device)], dim=-1)
+    # Patch 0 is framed by the context alone under both definitions, so a single-patch horizon needs no scan.
+    if horizon_patches == 1:
+        return anchor_loc[:, None], anchor_scale[:, None]
+
+    stats_device = device if supports_float64(device) else torch.device("cpu")
+
+    def compute_for(context: Tensor, context_mask: Tensor, quantiles: Tensor, targets: Tensor, weight: Tensor):
+        ctx = context.to(stats_device)
+        ctx_mask = context_mask.to(stats_device)
+        if frame == "median_folded":
+            # Move first, then widen: converting to float64 on the source device fails where it has none.
+            median = quantiles[..., config.median_index].detach().to(stats_device).to(torch.float64)
+            standardised = median.sinh() if config.use_asinh else median
+            return advancing_block_frames(
+                ctx, ctx_mask, standardised.unflatten(-1, (horizon_patches, patch)), config.minimum_scale
+            )
+        series = torch.cat([ctx, targets.to(stats_device)], dim=-1)
+        observed = torch.cat([ctx_mask, weight.to(stats_device)], dim=-1)
         loc_steps, scale_steps = causal_patch_loc_scale(
             series.unsqueeze(1), observed.unsqueeze(1), patch, config.minimum_scale, config.stabilize_with_global
         )
         context_patches = batch.context_steps // patch
         frame_patches = slice(context_patches - 1, context_patches - 1 + horizon_patches)
-        loc = loc_steps.squeeze(1).unflatten(-1, (-1, patch))[..., 0][:, frame_patches]
-        scale = scale_steps.squeeze(1).unflatten(-1, (-1, patch))[..., 0][:, frame_patches]
+        return (
+            loc_steps.squeeze(1).unflatten(-1, (-1, patch))[..., 0][:, frame_patches],
+            scale_steps.squeeze(1).unflatten(-1, (-1, patch))[..., 0][:, frame_patches],
+        )
 
-    dtype = batch.context.dtype
-    loc, scale = loc.to(device, dtype).clone(), scale.to(device, dtype).clone()
-    # Patch 0 is framed by the context alone under both definitions. Use the forward's own anchor so
-    # that the frame is bit-identical to the one upstream denormalises patch 0 with.
-    loc[:, 0] = output.anchor_loc.detach().to(dtype)
-    scale[:, 0] = output.anchor_scale.detach().to(dtype)
+    if batch.role_ids is None:
+        loc, scale = compute_for(batch.context, batch.context_mask, output.quantiles, batch.targets, batch.loss_weight)
+        loc, scale = loc.to(device, dtype).clone(), scale.to(device, dtype).clone()
+        loc[:, 0] = anchor_loc
+        scale[:, 0] = anchor_scale
+        return loc, scale
+
+    # Covariate rows are never scored; compute frames on target rows only and fill covariate rows with their anchor.
+    loc = anchor_loc[:, None].expand(batch.num_rows, horizon_patches).clone()
+    scale = anchor_scale[:, None].expand(batch.num_rows, horizon_patches).clone()
+    target_rows = batch.role_ids == ROLE_TARGET
+    if bool(target_rows.any()):
+        t_loc, t_scale = compute_for(
+            batch.context[target_rows],
+            batch.context_mask[target_rows],
+            output.quantiles[target_rows],
+            batch.targets[target_rows],
+            batch.loss_weight[target_rows],
+        )
+        loc[target_rows, 1:] = t_loc[:, 1:].to(device, dtype)
+        scale[target_rows, 1:] = t_scale[:, 1:].to(device, dtype)
     return loc, scale
 
 
