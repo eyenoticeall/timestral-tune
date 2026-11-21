@@ -53,9 +53,8 @@ maintains or extends the phase.
 
 ## Open questions
 
-- Why the float32 backward pass of upstream's attention call loses accuracy with the released weights, and
-  whether training with explicit attention would change results.
-- The cause of the float32 gradient inaccuracy on released weights (`docs/VERIFICATION.md` §6).
+- Re-running `scripts/cuda_check.sh` after the review pass, and comparing the default, unfused and explicit
+  attention kernels on CUDA (spec D15).
 - The target-frame evidence is synthetic, univariate and fully observed. A check on real data with
   covariates would strengthen decision D2.
 
@@ -72,3 +71,11 @@ maintains or extends the phase.
   (category numbering with several targets; time zones from polars and pyarrow). Final local suite: 405
   passed, 4 skipped on PyTorch 2.15.0, 2.14.1 (Python 3.10) and 2.8.0; 331 passed, 26 skipped on 2.4.0.
   Not re-run on CUDA.
+- 2026-11-21 (attention-kernel investigation, done on `fix/math-sdpa-backend`): identified the large-logit
+  cause (203k–503k peak attention logits, float32 ULP 0.015625 below 262k and 0.03125 above it); kept T14's
+  strict `5e-3` explicit-attention tier and added a characterisation check for PyTorch's unfused kernel;
+  extended `gradient_accuracy.py` with a three-way kernel comparison, same-row logit and gap reporting and
+  a 15-seed sweep. The measurements, probe and tests were folded into `phase-1`; the public
+  `attention_backend` option stays on that branch until Phase 2 (spec D15). Final local suite: 438 passed,
+  4 skipped on PyTorch 2.15.0 (Python 3.13), 2.14.1 (Python 3.10) and 2.8.0 (Python 3.12); 349 passed, 26
+  skipped on 2.4.0 (Python 3.12). Not yet run on CUDA.

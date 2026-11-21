@@ -135,49 +135,72 @@ Across the five scenarios of acceptance test T14, on 5M and 28M (other data than
 
 | Tier | Bound | CPU, worst case | Apple GPU, worst case |
 |---|---|---|---|
-| Tiny random model, as shipped and with explicit attention | 1e-5 | 4.1e-7 | 4.5e-7 |
-| Released, as shipped | 5e-2 | 3.4e-3 (5M, two targets with covariates) | 2.1e-3 (5M, past-only covariates) |
-| Released, explicit attention | 5e-3 | 1.2e-3 (5M, past-only covariates) | 2.1e-3 (5M, past-only covariates) |
+| Tiny random model (default, explicit, and `attention_context("math")`) | 1e-5 | 4.1e-7 | 4.5e-7 |
+| Released, default SDPA | 5e-2 (`1 - cos < 1e-4`) | 3.4e-3 (5M, two targets with covariates) | 2.1e-3 (5M, past-only covariates) |
+| Released, explicit matmul-and-softmax | 5e-3 | 1.2e-3 (5M, past-only covariates) | 2.1e-3 (5M, past-only covariates) |
+| Released, `attention_context("math")` | 2e-2 (`1 - cos < 1e-4`) | 9.0e-3 (5M, past-only covariates; other 9 scenarios 4.0e-6 to 3.7e-4) | 2.1e-3 (5M, past-only covariates; other 9 scenarios 4.6e-6 to 1.2e-3) |
 | `head_only` (everything but the head frozen), all models | 1e-5 | 2.3e-6 | 2.8e-6 |
 
-One minus the cosine similarity with the reference, as shipped: at most 5.7e-6 on CPU and 2.1e-6 on the
-Apple GPU.
+One minus the cosine similarity with the reference: at most 5.7e-6 (CPU) and 2.1e-6 (Apple GPU) with default
+SDPA, and at most 3.7e-5 (CPU, 5M past-only covariates; all other 9 scenarios at most 6.4e-8) and 2.1e-6
+(Apple GPU) with `attention_context("math")`.
 
-What narrows it down, and what does not (probe, covariates batch unless stated):
+Probe Experiment [2] (`default` vs `attention_context("math")` vs explicit matmul-and-softmax) and Experiment
+[5] (strictly same-row peak logit with its own top-1/top-2 gap, and strictly same-row largest near-tie logit
+with `gap < 10`):
+
+| Model | Layout | CPU `default` / `math` / `explicit` | MPS `default` (= `math`) / `explicit` | Peak `|logit|` (same-row gap) | Max near-tie (same-row gap) |
+|---|---|---|---|---|---|
+| 5M | univariate | 1.1e-3 / 1.4e-5 / 2.6e-5 | 3.1e-5 / 1.9e-5 | 370,272 (4,753.4) at `layers.5.attns.0` | 13,718 (0.14) at `layers.3.attns.0` |
+| 5M | multivariate | 2.1e-3 / 5.4e-5 / 5.4e-5 | 5.4e-5 / 2.2e-5 | 403,726 (2,760.9) at `layers.5.attns.0` | 319,403 (8.82) at `layers.5.attns.0` |
+| 5M | covariates | 1.2e-3 / 2.3e-5 / 5.9e-5 | 7.7e-5 / 7.6e-5 | 378,399 (1,337.4) at `layers.5.attns.0` | 335,379 (6.97) at `layers.5.attns.0` |
+| 5M | past-only | 5.3e-4 / 1.1e-5 / 7.3e-6 | 5.9e-6 / 9.9e-6 | 403,726 (2,760.9) at `layers.5.attns.0` | 13,377 (0.73) at `layers.3.attns.0` |
+| 28M | univariate | 8.2e-4 / 8.3e-5 / 8.3e-5 | 1.8e-5 / 1.8e-5 | 203,146 (24,934.2) at `layers.1.attns.0` | 13,788 (4.04) at `layers.1.attns.0` |
+| 28M | multivariate | 5.0e-4 / 1.2e-5 / 1.3e-5 | 1.4e-5 / 6.5e-6 | 291,241 (54,047.5) at `layers.1.attns.0` | 2,791 (8.11) at `layers.11.attns.1` |
+| 28M | covariates | 9.1e-4 / 3.6e-4 / 3.9e-4 | 1.8e-4 / 3.7e-5 | 503,429 (20,194.0) at `layers.1.attns.0` | 37,548 (4.08) at `layers.1.attns.0` |
+| 28M | past-only | 4.6e-4 / 1.4e-5 / 1.2e-5 | 9.5e-6 / 1.2e-5 | 291,241 (54,047.5) at `layers.1.attns.0` | 2,814 (6.07) at `layers.11.attns.1` |
+
+Peak-layer weight norms, standalone attention, RMSNorm reference sensitivity, and the 15-seed 5M past-only
+CPU sweep (Experiments [3]–[6] of the same probe):
 
 | Experiment | Result |
 |---|---|
-| Upstream's attention call replaced by explicit matmul and softmax, 5M | CPU 1.2e-3 → 5.9e-5; Apple GPU 7.7e-5 → 7.6e-5 |
-| Same, 28M | CPU 9.1e-4 → 3.9e-4; Apple GPU 1.8e-4 → 3.7e-5 |
-| Standalone attention call, fp32 vs fp64 gradient, max logit 5.5 | stock 5.5e-7, explicit 3.5e-7 |
-| Same, max logit 88 | stock 4.0e-6, explicit 3.7e-6 |
-| Same, max logit 1,409 | stock 5.0e-5, explicit 4.8e-5 |
-| A float64-weights reference with upstream's float32 RMSNorm, against the reference with float64 RMSNorm, over the twelve cells above | 6e-8 to 1.3e-4 (largest: 28M covariates) |
+| 5M `transformer.layers.5.attns.0` weight norms | `||norm.scale||_∞ = 5.01`, `||Wq||_2 = 141.6`, `||Wk||_2 = 82.4`, `||Wv||_2 = 17.8` |
+| 28M `transformer.layers.1.attns.0` weight norms | `||norm.scale||_∞ = 2.10`, `||Wq||_2 = 196.1`, `||Wk||_2 = 160.6`, `||Wv||_2 = 16.5` |
+| Standalone attention, CPU fp32 vs fp64, max `|logit|` 4.5 / 71.4 / 1,143 | default 5.5e-7 / 4.0e-6 / 5.0e-5; `math` 3.6e-7 / 3.8e-6 / 4.6e-5; `explicit` 3.5e-7 / 3.7e-6 / 4.8e-5 |
+| Standalone attention, max `|logit|` 401,874 (large gap) | default 1.6e-2, `math` 5.6e-3, `explicit` 1.3e-2 |
+| Standalone attention, max `|logit|` 348,488 (near-tie keys) | default 1.6e-2, `math` 1.5e-2, `explicit` 1.6e-2 |
+| A float64-weights reference with upstream's float32 RMSNorm, against the reference with float64 RMSNorm, over the twelve cells above | 6.0e-8 to 1.3e-4 (largest: 28M covariates) |
+| 5M past-only CPU sweep across 15 seeds (Experiment [6]) | `default` median 1.05e-3 (max 5.36e-3); `math` median 1.24e-5 (max 5.93e-5); `explicit` median 1.11e-5 (max 5.82e-5) |
 
-Reading. The error depends on the weights (a random model shows none) and appears on every device. Two
-sources are identified:
+Reading. The large Q/K weights in the released checkpoints produce peak attention logits of 203k–503k (a
+random model has O(1) logits), where one float32 ULP is `0.015625` below 262k and `0.03125` from 262k to
+524k, causing two effects:
 
-1. The float32 backward pass of upstream's attention call, on CUDA (§13) and CPU. On the Apple GPU the swap
-   changes little.
-2. Upstream's RMSNorm, which computes in float32 whatever the model's dtype. On T14's 5M scenario with
-   past-only covariates the float64-weights reference with that RMSNorm is 3.8e-3 away from the one with
-   float64 RMSNorm; the next largest case is 1.4e-4 (28M, covariates) and the rest are at 5e-5 or less
-   (`uv run pytest tests/acceptance/test_device_parity.py -k "device_parity_gradients and cpu" -s` prints
-   each). That was enough to fail a check whose bound is 5e-3: against the old reference the two float32
-   runs were at 2.6e-3 (CPU) and 5.9e-3 (Apple GPU), against the new one at 1.2e-3 and 2.1e-3, on either
-   side of it. All references now compute RMSNorm in float64 (`tests/helpers.py` and
-   `scripts/probes/_common.py`, by replacing the method while the reference runs; vendored files are not
-   edited). Numbers in this section were re-measured with that reference on 2026-11-21. The CUDA numbers in
-   §13 were not: they used the earlier reference.
+1. **Fused SDPA backward** (CPU `FLASH_ATTENTION`, CUDA fused SDPA) loses accuracy on typical batches (4.6e-4
+   to 2.1e-3 on CPU, up to 1.2e-2 on CUDA §13). Switching to PyTorch's unfused math kernel via
+   `attention_context("math")` (no vendored edits) reduces CPU error by 2.5×–79× across the eight probe
+   layouts (10×–79× on seven, 2.5× on 28M covariates) and cuts the 15-seed 5M past-only median 85×. On the
+   Apple GPU `"math"` is identical to `"default"`.
+2. **Float32 ULP quantization on near-tied large logits** affects every float32 kernel. When two keys in the
+   same query row sit at large logits within an O(1) gap, float32's ULP quantizes the gap by 1–2 ULPs,
+   shifting softmax weights by a few percent. Consequently `"math"` can be *less* accurate than `"default"`
+   on individual batches: on T14's 5M past-only-covariates batch, `"math"` gives 9.0e-3 on CPU against
+   2.2e-3 for `"default"` and 1.2e-3 for explicit matmul-and-softmax (`1 - cosine = 3.7e-5`; a one-off trace
+   attributes this to one near-tie query at ~351k, §11).
 
-What remains with explicit attention and the better reference (at most 1.2e-3 on CPU, 2.1e-3 on the Apple
-GPU) is unexplained beyond being float32 arithmetic through the same layers.
+Separately, upstream's float32 RMSNorm alone moved the old reference by 3.8e-3 on T14's 5M
+past-only-covariates batch (`uv run pytest tests/acceptance/test_device_parity.py -k
+"device_parity_gradients and cpu" -s`), so all references compute RMSNorm in float64 (`tests/helpers.py`
+and `scripts/probes/_common.py`, without editing vendored code). The CUDA numbers in §13 predate both the
+float64-RMSNorm reference and `attention_context("math")`.
 
 `head_only` is not affected: with the body frozen the backward pass never enters attention or the body's
 norms. Not yet run on CUDA. Forward outputs are unaffected (about 3e-7 from the reference, §11).
 
-Consequence: T14 compares gradients with the reference on every device, in three tiers plus the `head_only`
-check (spec D12).
+Consequence: T14 keeps its tight `5e-3` explicit-attention tier alongside the three existing tiers, adds a
+separate check for `attention_context("math")` (spec D12). That helper is experimental and no training
+path uses it; whether to expose a choice of kernel is deferred to Phase 2 (spec D15).
 
 ## 7. Training-step timing, CPU against the Apple GPU
 
@@ -268,15 +291,13 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 331 passed, 26 skipped. Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 52 further Apple GPU cases are not generated at all. CPU passes everything else, including all of T14's gradient checks and the tests on 5M and 28M |
-| 2.8.0 | 3.12 | 405 passed, 4 skipped, including every Apple GPU test |
-| 2.14.1 | 3.10 | 405 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 405 passed, 4 skipped |
+| 2.4.0 | 3.12 | 349 passed, 26 skipped. Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 67 further Apple GPU cases are not generated at all. CPU passes everything else, including all of T14's gradient checks and the tests on 5M and 28M |
+| 2.8.0 | 3.12 | 438 passed, 4 skipped, including every Apple GPU test |
+| 2.14.1 | 3.10 | 438 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
+| 2.15.0 | 3.13 | 438 passed, 4 skipped |
 
-These are the counts after the review fixes of 2026-11-21, all on macOS. The CUDA run (§13) used Linux and
-predates them.
-
-The 4 skips common to every row are the Phase 2 acceptance placeholders.
+These are the counts at the end of Phase 1 on 2026-11-21, all on macOS. The CUDA run (§13) used Linux and
+predates the review fixes and the attention-kernel measurements.
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
@@ -316,6 +337,8 @@ Re-measure before relying on them.
 | Training step at context 4,096, univariate, batch 16 | 5M: CPU 138 ms, MPS 93 ms. 28M: CPU 526 ms, MPS 347 ms |
 | RMSNorm via `sqrt` instead of `rsqrt` (5M) | CPU fp32 gradient error moved from 3.9e-3 to 1.5e-3 |
 | The 5M past-only-covariates case with explicit attention, against the earlier (float32-RMSNorm) reference | CPU 2.6e-3, Apple GPU 5.9e-3; the error sat in layers 0 to 4 and the patch embedding, with the same distribution on both devices |
+| Why `attention_context("math")` regresses on T14's 5M `past_only_covariates` batch on CPU | 100% of layer 5 decoder `dq` squared error sits at one query `(row=3, head=2, query=11)` whose top-2 keys sit at ~351,272 with true float64 gap 3.4577 (float32 ULP 0.03125): `default` quantized the gap to 3.4375 (`p2` +2.0%, grad rel L2 2.24e-3), `explicit` to 3.46875 (`p2` −1.1%, 1.16e-3), and `math` to 3.375 (`p2` +8.3%, 9.02e-3) |
+| 25-seed CPU sweep on T14-shaped 5M `past_only_covariates` batches | `default` median 1.89e-3 (max 3.67e-3); `math` median 2.12e-5 (max 5.38e-3); `explicit` median 2.31e-5 (max 1.40e-2 on seed 8, where `math` gave 9.57e-4) |
 
 ## 12. Facts read from sources, not measured
 

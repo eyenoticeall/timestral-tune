@@ -235,3 +235,69 @@ Hub pins are documented where they live, with a test that keeps the table and th
 predate the improved reference. The earlier claim "no leakage on the training path" was too strong: it
 held for what the tests covered, which did not include several targets with categoricals or zoned
 timestamps. `phase-1` is still unmerged and unpushed.
+
+---
+
+## 2026-11-21 (fifth session) — `attention_backend="math"`, large-logit analysis, and review fixes
+
+**What.** On a new branch `fix/math-sdpa-backend` off `phase-1`, investigated the float32 gradient
+inaccuracy, added an opt-in `attention_backend="math"` option without touching `_vendor/`, and then
+addressed all findings from a review of the branch.
+
+**Measured cause.** The released checkpoints have large Q/K spectral norms (5M layer 5: `||norm.scale||_∞
+= 5.01`, `||Wq||_2 = 141.6`, `||Wk||_2 = 82.4`; 28M layer 1: `||norm.scale||_∞ = 2.10`, `||Wq||_2 = 196.1`,
+`||Wk||_2 = 160.6`), producing peak attention logits of 370k–404k in 5M and 203k–503k in 28M across the
+probe layouts (and same-row near-ties with `gap < 10` up to 335k in 5M and 37.5k in 28M), where one float32
+ULP is `0.015625` below 262k and `0.03125` from 262k to 524k. That produces two effects:
+
+1. Fused SDPA backward (CPU `FLASH_ATTENTION`, CUDA fused SDPA) loses accuracy on typical batches (4.6e-4
+   to 2.1e-3 on CPU, up to 1.2e-2 on CUDA). `attention_backend="math"` cuts CPU probe error 2.5×–79× (to
+   1.1e-5–8.3e-5 on seven layouts and 3.6e-4 on 28M covariates), drops the 15-seed 5M past-only median 85×
+   (1.05e-3 to 1.24e-5), and drops 8 of 10 T14 CPU scenarios to 4.0e-6–3.9e-5. On the Apple GPU `"math"`
+   is identical to `"default"`.
+2. When two keys in the same query row sit at large logits within an O(1) gap, float32's ULP quantizes the
+   gap in *any* float32 attention kernel. Consequently `"math"` can be *less* accurate than `"default"` on
+   individual batches: on T14's 5M `past_only_covariates` batch, `"math"` gives 9.0e-3 on CPU against
+   2.2e-3 for `"default"` and 1.2e-3 for explicit matmul-and-softmax (`1 - cosine = 3.7e-5`). A one-off
+   trace (`docs/VERIFICATION.md` §11) showed 100% of layer 5's decoder `dq` error on that batch sits at one
+   query `(row=3, head=2, query=11)` whose top-2 keys sit at ~351k with true gap 3.4577, where `"math"`
+   quantized the gap 2 ULPs to 3.375 (`+8.3%` on `p2`).
+
+**Review findings fixed on this branch.**
+
+- **Restored T14's strict `5e-3` middle tier** (`test_t14_gradients_with_explicit_attention` using
+  `tests/helpers.py::explicit_attention`, never loosened) and added a separate
+  `test_t14_gradients_with_math_sdpa` (`2e-2` rel L2, `1e-4` on `1 - cosine`).
+- **Restored `manual_sdpa` in `scripts/probes/gradient_accuracy.py`** (preserving the CUDA reproducer in
+  `docs/VERIFICATION.md` §13), fixed Experiment [5] so peak logits and near-tie gaps are strictly
+  **same-row** (correcting the earlier cross-row error that misdescribed 28M covariates' 503k peak as a tie
+  when its own gap is 20.2k), and added Experiment [6] (15-seed 5M past-only CPU sweep).
+- **Moved one-off inspection figures to `docs/VERIFICATION.md` §11** instead of tagging unreproducible
+  figures as `[V]`, reconciled all numbers across probe docstring and docs, and qualified docstrings, spec
+  §5.4, D15 and `STATUS.md` honestly (including that `"math"` has no gradient effect in `head_only`, is a
+  no-op on MPS, and can regress on individual near-tie batches).
+- **Fixed overlapping-thread flag corruption in `attention_context`**: uses a lock-guarded reference counter
+  over `torch.backends.cuda.enable_*_sdp` (avoiding `sdpa_kernel`'s cross-thread `ContextVar` exit failure)
+  with an overlapping-thread unit test, while documenting that PyTorch's SDPA flags remain process-global.
+- **Plumbed `attention_backend` through `utils/validation.py`** (`run_checks` and every individual verifier)
+  with a device-parametrised unit test.
+
+**Evidence.** `uv run ruff check . && uv run ruff format --check .` clean. Full test suite: 444 passed, 4
+skipped on PyTorch 2.15.0 (Python 3.13), 2.14.1 (Python 3.10), and 2.8.0 (Python 3.12); 353 passed, 26
+skipped on PyTorch 2.4.0 (Python 3.12), macOS. Probe numbers recorded in `docs/VERIFICATION.md` §6.
+
+**Not done / open.** `attention_backend="math"` and the updated T14 / probe have not yet been run or timed
+on CUDA. `phase-1` and `fix/math-sdpa-backend` remain unmerged and unpushed.
+
+**Afterwards: the branch was split.** A second review and the advisor agreed the investigation was worth
+landing and the option was not, yet: it changes no gradient that runs today, is unverified on CUDA, and may
+be the wrong mechanism next to explicit attention. At the maintainer's direction:
+
+- `phase-1` took the measurements, the probe, the T14 tiers and `attention_context` as an experimental
+  helper that no training path uses (spec D15 records the deferral and what should reopen it).
+- `fix/math-sdpa-backend` keeps only the public `attention_backend` option and its plumbing through the
+  config, trainer, loss step and verifiers, with their tests, on top of `main`.
+
+Where this entry says the option was "added", read: added on that branch. Suite on `phase-1` after the
+split: 438 passed, 4 skipped on PyTorch 2.15.0, 2.14.1 (Python 3.10) and 2.8.0; 349 passed, 26 skipped on
+2.4.0.

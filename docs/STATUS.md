@@ -15,7 +15,7 @@
 | Training | `TimestralTrainer` in `head_only` mode, fp32: AdamW, warm-up, cosine or constant schedule, clipping, evaluation, early stopping, best-state restore |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **10 of 14 implemented and passing**: T1–T8, T12, T14. T9, T10, T11, T13 are Phase 2 placeholders |
-| Test suite | 405 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; macOS). On CUDA, at an earlier commit: 290 passed, 6 skipped |
+| Test suite | 438 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; 349 passed, 26 skipped on 2.4.0; macOS). On CUDA, at an earlier commit: 290 passed, 6 skipped |
 | CI | Green on the last push (scaffold only). The Phase 1 work has not been pushed, so CI has not run on it |
 
 ## What does not exist yet
@@ -55,10 +55,13 @@ Full list in spec §12. The ones that matter next:
 - **CUDA needs a C compiler and Python headers** with recent PyTorch (spec §12). `scripts/cuda_check.sh`
   checks for them.
 - **Float32 gradients through released weights are not at round-off**, worst on CUDA (up to 1.2e-2).
-  Two sources are known: the backward pass of upstream's attention call, and upstream's float32 RMSNorm
-  (`docs/VERIFICATION.md` §6, §13). `head_only` is not affected; it matters from Phase 2 on.
+  The released checkpoints have peak attention logits of 370k–404k (5M) and 203k–503k (28M), where float32
+  ULP is 0.015625 below 262k and 0.03125 above it, triggering both fused-SDPA backward inaccuracy and ULP
+  quantization on near-tied large-logit rows (`docs/VERIFICATION.md` §6, §13). PyTorch's unfused
+  kernel cuts the CPU error on typical batches (2.5×–79× on the probe layouts) but is worse on one batch,
+  changes nothing in `head_only`, and is untested on CUDA, so no choice of kernel is exposed yet (spec D15).
 - **Re-run `bash scripts/cuda_check.sh` on a GPU machine** before relying on CUDA for Phase 2: the CUDA
-  gradient numbers predate the improved reference and the review fixes.
+  gradient numbers predate the improved reference, the review fixes, and `attention_context("math")`.
 - **The target-frame evidence is synthetic** (univariate, fully observed, one seed, 5M and 28M).
 - **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
 - **No export yet**, so a trained model lives only in memory (`trainer.model`).
@@ -71,8 +74,9 @@ Full list in spec §12. The ones that matter next:
 
 ## Branch state
 
-- `main`: the scaffold, the spec rename and the README banner. Two banner commits are ahead of `origin`
-  and not pushed.
-- `phase-1`: Phase 0's remainder and all of Phase 1, rebased on `main`. Not merged, not pushed.
+- `main`: Phases 0 and 1.
+- `fix/math-sdpa-backend`: a public `attention_backend` option and its plumbing through the config, trainer
+  and verifiers, held until Phase 2 can show whether it is needed (spec D15). Its measurements and probe
+  work are already in `main`.
 
 Branch policy is in `AGENTS.md` §6.
