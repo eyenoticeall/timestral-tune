@@ -8,6 +8,8 @@ import torch
 
 from timestral_tune.losses import PinballLoss, pinball_loss
 
+from .conftest import available_accelerators
+
 LEVELS = torch.tensor([0.1, 0.5, 0.9])
 
 
@@ -95,7 +97,25 @@ def test_module_rejects_invalid_levels(levels):
         PinballLoss(levels)
 
 
-def test_module_follows_its_inputs_device_and_keeps_levels_out_of_the_state_dict():
-    loss = PinballLoss([0.1, 0.5, 0.9])
-    assert loss.state_dict() == {}
+def test_module_keeps_levels_out_of_the_state_dict_and_matches_the_function():
+    levels = [0.1, 0.5, 0.9]
+    loss = PinballLoss(levels)
+    assert loss.state_dict() == {} and loss.levels.dtype == torch.float64
     assert loss(torch.tensor([[1.0, 2.0, 4.0]]), torch.tensor([3.0])).item() == pytest.approx(0.8 / 3)
+    # In float64 the module is bit-identical to the function given float64 levels: no rounding of the levels.
+    generator = torch.Generator().manual_seed(0)
+    quantiles = torch.randn(5, 7, 3, dtype=torch.float64, generator=generator).sort(-1).values
+    targets = torch.randn(5, 7, dtype=torch.float64, generator=generator)
+    reference = pinball_loss(quantiles, targets, torch.tensor(levels, dtype=torch.float64))
+    assert torch.equal(loss(quantiles, targets), reference)
+
+
+@pytest.mark.parametrize("device", available_accelerators())
+def test_module_can_be_moved_to_an_accelerator(device):
+    """The Apple GPU has no float64, so the module must not hold a float64 buffer."""
+    loss = PinballLoss([0.1, 0.5, 0.9]).to(device)
+    parent = torch.nn.ModuleDict({"loss": PinballLoss([0.1, 0.5, 0.9]), "head": torch.nn.Linear(2, 2)}).to(device)
+    quantiles, targets = torch.tensor([[1.0, 2.0, 4.0]], device=device), torch.tensor([3.0], device=device)
+    for module in (loss, parent["loss"]):
+        value = module(quantiles, targets)
+        assert value.device.type == device and value.item() == pytest.approx(0.8 / 3)

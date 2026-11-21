@@ -6,6 +6,8 @@ Ground truth is the vendored forecaster: `_assemble_rows`, `_encoding_target` an
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 import torch
@@ -185,6 +187,20 @@ def test_several_targets_receive_raw_category_codes(tiny_forecaster):
     assert torch.equal(
         batch.known_future[known_rows], torch.as_tensor(codes_known[:, 0, 4 * patch :], dtype=torch.float32)
     )
+
+
+@pytest.mark.parametrize("field", ["context", "targets", "known_future"])
+def test_batches_with_integer_values_are_rejected(tiny_forecaster, field):
+    """Upstream casts its statistics back to the input dtype, so integer inputs would silently truncate them."""
+    patch = tiny_forecaster.patch_size
+    raw = make_raw(8, series=1, targets=1, known=1, context_len=4 * patch, horizon=patch)
+    batch, _, _ = upstream_batch(tiny_forecaster, raw)
+    batch.validate(patch)
+    broken = dataclasses.replace(batch, **{field: getattr(batch, field).round().long()})
+    with pytest.raises(ValueError, match=f"{field} must be a floating-point tensor"):
+        broken.validate(patch)
+    with pytest.raises(ValueError, match="floating-point"):
+        training_forward(tiny_forecaster.model, broken)
 
 
 def test_window_category_codes_rank_what_the_window_can_see():

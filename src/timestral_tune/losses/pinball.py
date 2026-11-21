@@ -107,7 +107,10 @@ class PinballLoss(nn.Module):
         super().__init__()
         levels = torch.as_tensor(list(quantile_levels), dtype=torch.float64)
         _check_levels(levels)
-        self.register_buffer("levels", levels, persistent=False)
+        # A plain attribute, not a buffer: the levels are kept in float64 on CPU for exactness, and a
+        # float64 buffer would make the module impossible to move to a device without float64 (the Apple
+        # GPU). `pinball_loss` converts them to the predictions' device and dtype on every call.
+        self.levels = levels
 
     def forward(
         self,

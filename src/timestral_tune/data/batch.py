@@ -147,5 +147,10 @@ class TrainingBatch:
             raise ValueError("loss_weight may be True on target rows only")
         for name in ("context", "targets", "known_future"):
             value = getattr(self, name)
-            if value is not None and not bool(torch.isfinite(value).all()):
+            if value is None:
+                continue
+            if not value.is_floating_point():
+                # Upstream's statistics are cast back to the input dtype, so integers would truncate them.
+                raise ValueError(f"{name} must be a floating-point tensor, got {value.dtype}")
+            if not bool(torch.isfinite(value).all()):
                 raise ValueError(f"{name} holds non-finite values; missing values must be masked and set to 0")
