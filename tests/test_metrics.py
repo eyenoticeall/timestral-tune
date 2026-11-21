@@ -8,9 +8,11 @@ import numpy as np
 import pytest
 import torch
 
-from timestral_tune import ConformalCalibrator, OnlineConformalCalibrator
+from timestral_tune import ConformalCalibrator, OnlineConformalCalibrator, collect_conformal_data
+from timestral_tune.data import SeriesData, TimeSeriesDataset
 from timestral_tune.models import DEFAULT_QUANTILE_LEVELS, TuneTimestralForecaster
 from timestral_tune.utils import (
+    MetricsSummary,
     compute_forgetting,
     coverage,
     evaluate_forecaster,
@@ -31,7 +33,7 @@ def test_raw_metrics_exact_analytical_values_and_nan_masking():
     # 2 series, horizon 2: actuals = [[10, 12], [20, NaN]]; constant predictions = 10 everywhere except bounds.
     actuals = np.array([[10.0, 12.0], [20.0, np.nan]])
     preds = np.full((2, 2, q_count), 10.0)
-    # Put 0.10/0.90 at [9, 13] (width 4) and 0.05/0.95 at [8, 22] (width 14).
+    # Give 80% and 90% strictly distinct coverages AND widths so swapping 80% <-> 90% always fails.
     lo80, hi80 = levels.index(0.10), levels.index(0.90)
     lo90, hi90 = levels.index(0.05), levels.index(0.95)
     preds[..., lo80] = 9.0
@@ -54,17 +56,22 @@ def test_raw_metrics_exact_analytical_values_and_nan_masking():
     # Pinball loss and wQL check on exact hand-computed values (uniform preds = 10 on all levels).
     flat_preds = np.full((2, 2, q_count), 10.0)
     # Finite residuals y - q: 0, +2, +10 -> sum of positive residuals = 12, mean residual = 4; sum(|y|) = 42.
-    # For diff >= 0, pinball(tau) = tau * diff; mean(levels) = 0.5 exactly by symmetry!
+    # For diff >= 0, pinball(tau) = tau * diff; mean(levels) = 0.5 exactly by symmetry.
     expected_pinball = 4.0 * 0.5
     assert pinball_loss_raw(flat_preds, actuals) == pytest.approx(expected_pinball)
     # wQL = mean_q(2 * tau * 12 / 42) = 2 * 0.5 * 12 / 42 = 12 / 42.
     assert weighted_quantile_loss(flat_preds, actuals) == pytest.approx(12.0 / 42.0)
 
-    # Works cleanly with PyTorch tensors as well.
+    # Assert EVERY single field of MetricsSummary (catching 80%/90% swaps, pinball/wql/mase wiring bugs).
     summary = evaluate_predictions(torch.tensor(preds), torch.tensor(actuals), torch.tensor(context))
     assert summary.num_series == 2 and summary.num_scored == 3
-    assert summary.coverage_80 == pytest.approx(2.0 / 3.0)
+    assert summary.pinball == pytest.approx(pinball_loss_raw(preds, actuals))
+    assert summary.wql == pytest.approx(weighted_quantile_loss(preds, actuals))
     assert summary.mase == pytest.approx(1.25)
+    assert summary.coverage_80 == pytest.approx(2.0 / 3.0)
+    assert summary.width_80 == pytest.approx(4.0)
+    assert summary.coverage_90 == pytest.approx(1.0)
+    assert summary.width_90 == pytest.approx(14.0)
 
 
 def test_metrics_validation_guards():
@@ -85,39 +92,156 @@ def test_metrics_validation_guards():
         mase(preds, y, ctx[:, :2], seasonality=2)
 
 
-def test_evaluate_forecaster_conformal_and_forgetting(tiny_forecaster):
-    dataset = make_toy_dataset(tiny_forecaster.patch_size, series=4, covariates=True)
-    m_base = evaluate_forecaster(tiny_forecaster, dataset, batch_size=3)
-    assert m_base.num_series == len(dataset) and m_base.num_scored > 0
-    assert m_base.pinball > 0 and m_base.wql > 0 and m_base.mase > 0
-    assert 0.0 <= m_base.coverage_80 <= 1.0 and m_base.width_80 >= 0.0
-
-    # Conformal calibrator plugs cleanly into evaluate_forecaster (static and online).
-    from timestral_tune import collect_conformal_data
-
-    preds, actuals, scale = collect_conformal_data(tiny_forecaster, dataset, batch_size=3)
-    cal = ConformalCalibrator(target_coverage="all", bucket_size=tiny_forecaster.patch_size).fit(preds, actuals, scale)
-    m_cal = evaluate_forecaster(tiny_forecaster, dataset, calibrator=cal, batch_size=3)
-    assert m_cal.num_scored == m_base.num_scored
-    assert m_cal.coverage_80 >= 0.70
-
-    online = OnlineConformalCalibrator(
-        target_coverage=0.80, gamma=0.05, window=20, bucket_size=tiny_forecaster.patch_size
+def test_forgetting_sign_convention_exact():
+    zs = MetricsSummary(
+        pinball=0.20,
+        wql=0.10,
+        mase=1.00,
+        coverage_80=0.80,
+        width_80=1.0,
+        coverage_90=0.90,
+        width_90=1.5,
+        num_series=4,
+        num_scored=64,
     )
-    m_online = evaluate_forecaster(tiny_forecaster, dataset, calibrator=online, online_update=True, batch_size=3)
-    assert m_online.num_scored == m_base.num_scored and online.alpha_t.size > 0
+    worse = MetricsSummary(
+        pinball=0.50,
+        wql=0.15,
+        mase=1.40,
+        coverage_80=0.70,
+        width_80=1.2,
+        coverage_90=0.82,
+        width_90=1.8,
+        num_series=4,
+        num_scored=64,
+    )
+    better = MetricsSummary(
+        pinball=0.10,
+        wql=0.08,
+        mase=0.80,
+        coverage_80=0.81,
+        width_80=0.9,
+        coverage_90=0.91,
+        width_90=1.4,
+        num_series=4,
+        num_scored=64,
+    )
+    # Degradation (forgetting) MUST be strictly positive; transfer gain MUST be strictly negative.
+    f_worse = compute_forgetting(worse, zs)
+    assert f_worse.delta_pinball == pytest.approx(+0.30)
+    assert f_worse.relative_delta_pinball == pytest.approx(+1.50)
+    assert f_worse.delta_wql == pytest.approx(+0.05)
+    assert f_worse.relative_delta_wql == pytest.approx(+0.50)
+    assert f_worse.delta_mase == pytest.approx(+0.40)
+    assert f_worse.relative_delta_mase == pytest.approx(+0.40)
 
-    # Forgetting against identical model is identically zero; perturbing weights produces non-zero deltas.
-    same = evaluate_forgetting(tiny_forecaster, tiny_forecaster, dataset, batch_size=3)
+    f_better = compute_forgetting(better, zs)
+    assert f_better.delta_pinball == pytest.approx(-0.10)
+    assert f_better.delta_wql == pytest.approx(-0.02)
+    assert f_better.delta_mase == pytest.approx(-0.20)
+
+
+def test_evaluate_forecaster_window_context_alignment_and_conformal(tiny_forecaster):
+    # Two series with 10,000x different scales so swapping or reversing contexts in MASE fails loudly.
+    patch = tiny_forecaster.patch_size
+    steps = 8 * patch
+    rng = np.random.default_rng(7)
+    s_small = (1.0 + np.cumsum(rng.normal(0.0, 0.01, size=(1, steps)), axis=-1)).astype(np.float32)
+    s_large = (1000.0 + np.cumsum(rng.normal(0.0, 100.0, size=(1, steps)), axis=-1)).astype(np.float32)
+    ds = TimeSeriesDataset(
+        [
+            SeriesData(
+                series_id="small",
+                timestamps=np.arange(steps, dtype=np.int64),
+                targets=s_small,
+                past=np.empty((0, steps), dtype=np.float32),
+                known=np.empty((0, steps), dtype=np.float32),
+                categorical_past=np.empty((0, steps), dtype=np.float64),
+                categorical_known=np.empty((0, steps), dtype=np.float64),
+            ),
+            SeriesData(
+                series_id="large",
+                timestamps=np.arange(steps, dtype=np.int64),
+                targets=s_large,
+                past=np.empty((0, steps), dtype=np.float32),
+                known=np.empty((0, steps), dtype=np.float32),
+                categorical_past=np.empty((0, steps), dtype=np.float64),
+                categorical_known=np.empty((0, steps), dtype=np.float64),
+            ),
+        ],
+        context_length=4 * patch,
+        forecast_horizon=2 * patch,
+        stride=2 * patch,
+        min_context=4 * patch,
+    )
+    preds, actuals, scale = collect_conformal_data(tiny_forecaster, ds, batch_size=2)
+    # Compute exact hand-aligned MASE per window.
+    med_i = list(tiny_forecaster.quantile_levels).index(0.5)
+    expected_mases = []
+    for i in range(len(ds)):
+        ctx_i = ds[i].target_context[0].astype(np.float64)
+        denom = float(np.mean(np.abs(np.diff(ctx_i))))
+        mae_i = float(np.mean(np.abs(actuals[i] - preds[i, :, med_i])))
+        expected_mases.append(mae_i / denom)
+    m_base = evaluate_forecaster(tiny_forecaster, ds, batch_size=2)
+    assert m_base.mase == pytest.approx(float(np.mean(expected_mases)), rel=1e-6)
+
+    # Static CQR calibrator actually changes evaluated forecasts to match cqr.transform(preds, scale).
+    cal = ConformalCalibrator(target_coverage="all", bucket_size=patch).fit(preds, actuals, scale)
+    m_cal = evaluate_forecaster(tiny_forecaster, ds, calibrator=cal, batch_size=2)
+    expected_cal = evaluate_predictions(
+        cal.transform(preds, context_scale=scale),
+        actuals,
+        np.stack([ds[i].target_context[0].astype(np.float64) for i in range(len(ds))], axis=0),
+    )
+    assert m_cal.width_80 == pytest.approx(expected_cal.width_80, rel=1e-6)
+    assert m_cal.width_90 == pytest.approx(expected_cal.width_90, rel=1e-6)
+    assert m_cal.width_80 != pytest.approx(m_base.width_80)
+
+    # Forgetting against identical model is zero; adding large head shift degrades loss strictly (> 0).
+    same = evaluate_forgetting(tiny_forecaster, tiny_forecaster, ds, batch_size=2)
     assert same.delta_pinball == 0.0 and same.delta_mase == 0.0 and same.delta_wql == 0.0
 
     perturbed_model = copy.deepcopy(tiny_forecaster.model)
     with torch.no_grad():
         for p in perturbed_model.head.parameters():
-            p.add_(0.5)
-    perturbed_fc = TuneTimestralForecaster(perturbed_model)
-    diff = evaluate_forgetting(perturbed_fc, tiny_forecaster, dataset, batch_size=3)
-    assert diff.delta_pinball != 0.0 and diff.relative_delta_pinball == pytest.approx(
-        diff.delta_pinball / diff.zero_shot.pinball
-    )
-    assert compute_forgetting(diff.tuned, diff.zero_shot).to_dict()["delta_mase"] == pytest.approx(diff.delta_mase)
+            p.add_(2.0)
+    diff = evaluate_forgetting(TuneTimestralForecaster(perturbed_model), tiny_forecaster, ds, batch_size=2)
+    assert diff.delta_pinball > 0.0 and diff.delta_wql > 0.0 and diff.delta_mase > 0.0
+
+
+def test_evaluate_forecaster_online_aci_is_chronological_and_never_peeks(tiny_forecaster):
+    """Online ACI must run strictly in origin-time order across series and never peek before transform."""
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, series=3, covariates=True)
+    # Dataset stores windows series-by-series: verify we actually have multiple origins per series.
+    origins = [
+        int(dataset.series[dataset._series_index[i]].timestamps[dataset._origins[i]]) for i in range(len(dataset))
+    ]
+    assert len(set(origins)) >= 2 and origins != sorted(origins), "test requires non-chronological dataset ordering"
+
+    class _SpyOnline(OnlineConformalCalibrator):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.events: list[tuple[str, int, float]] = []
+
+        def transform(self, predictions, context_scale=None):
+            h = predictions.shape[1]
+            off_sum = float(np.sum(np.abs(self.current_offsets(h)))) if self.alpha_t.size > 0 else 0.0
+            self.events.append(("transform", int(predictions.shape[0]), off_sum))
+            return super().transform(predictions, context_scale=context_scale)
+
+        def update(self, predictions, actuals, context_scale=None):
+            self.events.append(("update", int(predictions.shape[0]), float(np.mean(actuals))))
+            return super().update(predictions, actuals, context_scale=context_scale)
+
+    spy = _SpyOnline(target_coverage=0.80, gamma=0.05, window=50, bucket_size=tiny_forecaster.patch_size)
+    evaluate_forecaster(tiny_forecaster, dataset, calibrator=spy, online_update=True, batch_size=4)
+
+    # First event MUST be transform with zero offsets (no peeking before first forecast!),
+    # and all series at each unique origin must be transformed together as one chronological block!
+    assert spy.events[0][0] == "transform" and spy.events[0][2] == 0.0
+    transform_counts = [cnt for kind, cnt, _ in spy.events if kind == "transform"]
+    assert len(transform_counts) == len(set(origins))
+    assert sum(transform_counts) == len(dataset)
+    # Later transforms must see non-zero offsets after earlier completed horizons are flushed.
+    assert any(off > 0.0 for kind, _, off in spy.events[1:] if kind == "transform")

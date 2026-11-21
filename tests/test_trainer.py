@@ -1032,7 +1032,18 @@ def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny
     assert trainer._get_head_cache(train) is None
     assert trainer._get_head_cache(val) is not None
 
-    # Training with sign_flip=True is deterministic for a seed in LoRA too.
+    # p=0.0 is a no-op; p=0.5 actually produces BOTH flipped and unflipped series across 16 series;
+    # known_future=None also works cleanly.
+    assert torch.equal(flip_batch_signs(batch, p=0.0).context, batch.context)
+    big_ds = make_toy_dataset(tiny_forecaster.patch_size, series=8, covariates=False)
+    big_batch = big_ds.collator(tiny_forecaster.model.config)([big_ds[i] for i in range(min(16, len(big_ds)))])
+    assert big_batch.known_future is None
+    big_flipped = flip_batch_signs(big_batch, torch.Generator().manual_seed(11), p=0.5)
+    n_neg = sum(torch.equal(big_flipped.context[i], -big_batch.context[i]) for i in range(big_batch.num_rows))
+    assert 0 < n_neg < big_batch.num_rows, f"p=0.5 should flip a subset of series, got {n_neg}/{big_batch.num_rows}"
+
+    # Training with sign_flip=True is deterministic for a seed AND actually changes trained weights vs sign_flip=False
+    # (catches removing the flip call inside TimestralTrainer.fit()).
     states = []
     for _ in range(2):
         m = fresh_model(tiny_forecaster)
@@ -1049,3 +1060,19 @@ def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny
         states.append(merged_state_dict(m))
     for k in states[0]:
         assert torch.equal(states[0][k], states[1][k]), f"sign_flip diverged on {k}"
+
+    m_noflip = fresh_model(tiny_forecaster)
+    c_noflip = config_for(
+        "cpu",
+        mode="lora_variate",
+        batch_size=len(train),
+        max_steps=4,
+        learning_rate=1e-2,
+        sign_flip=False,
+        seed=5,
+    )
+    TimestralTrainer(c_noflip, train, model=m_noflip).fit()
+    noflip_state = merged_state_dict(m_noflip)
+    assert any(not torch.equal(states[0][k], noflip_state[k]) for k in states[0]), (
+        "sign_flip=True produced weights identical to sign_flip=False"
+    )

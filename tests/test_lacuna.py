@@ -29,35 +29,54 @@ def test_core_package_does_not_import_lacuna():
 def test_write_signal_frame_built_ins_callable_and_persistence(tmp_path):
     q = len(DEFAULT_QUANTILE_LEVELS)
     n, h = 6, 4
-    base = np.linspace(-2.0, 2.0, q)[None, None, :]
+    # Non-uniform quantiles and horizon-varying predictions so swapping any signal_fn or horizon_index fails!
+    base = np.array([q_val**2 * 10.0 for q_val in DEFAULT_QUANTILE_LEVELS], dtype=np.float64)[None, None, :]
     preds = np.broadcast_to(base, (n, h, q)).copy()
     preds += np.arange(n, dtype=np.float64)[:, None, None]
+    preds += np.arange(h, dtype=np.float64)[None, :, None] * 0.5
     times = [datetime(2025, 1, i + 1, tzinfo=timezone.utc) for i in range(n)]
     insts = ["AAA", "BBB", "CCC", "AAA", "BBB", "CCC"]
 
-    # Default median at horizon step 0.
+    # Default median at horizon step 0 vs step 2.
     csv_path = tmp_path / "signals.csv"
     pq_path = tmp_path / "signals.parquet"
-    frame_dict = write_signal_frame(
-        preds, timestamps=times, instruments=insts, signal_fn="median", path=csv_path, output_format="dict"
+    frame_h0 = write_signal_frame(
+        preds,
+        timestamps=times,
+        instruments=insts,
+        signal_fn="median",
+        horizon_index=0,
+        path=csv_path,
+        output_format="dict",
     )
-    assert list(frame_dict.keys()) == ["time", "instrument", "signal"]
-    np.testing.assert_allclose(frame_dict["signal"], np.arange(n, dtype=np.float64))
+    frame_h2 = write_signal_frame(
+        preds, timestamps=times, instruments=insts, signal_fn="median", horizon_index=2, output_format="dict"
+    )
+    assert list(frame_h0.keys()) == ["time", "instrument", "signal"]
+    med0 = float(base[0, 0, DEFAULT_QUANTILE_LEVELS.index(0.50)])
+    np.testing.assert_allclose(frame_h0["signal"], med0 + np.arange(n, dtype=np.float64))
+    np.testing.assert_allclose(frame_h2["signal"], med0 + np.arange(n, dtype=np.float64) + 1.0)
     assert csv_path.is_file() and csv_path.read_text(encoding="utf-8").splitlines()[0] == "time,instrument,signal"
 
-    # Interquantile spread and custom callable + Parquet write.
-    spread_tbl = write_signal_frame(
-        preds, timestamps=times, instruments=insts, signal_fn="spread_80", horizon_index=None, path=pq_path
-    )
-    assert pq_path.is_file() and spread_tbl.column_names == ["time", "instrument", "signal"]
-    lo80, hi80 = DEFAULT_QUANTILE_LEVELS.index(0.10), DEFAULT_QUANTILE_LEVELS.index(0.90)
-    expected_spread = float(base[0, 0, hi80] - base[0, 0, lo80])
-    np.testing.assert_allclose(spread_tbl["signal"].to_pylist(), [expected_spread] * n)
+    # All built-in spread reductions (iqr, spread_80, spread_90) give exact distinct values + Parquet write.
+    for name, lo_q, hi_q in [("iqr", 0.25, 0.75), ("spread_80", 0.10, 0.90), ("spread_90", 0.05, 0.95)]:
+        tbl = write_signal_frame(
+            preds,
+            timestamps=times,
+            instruments=insts,
+            signal_fn=name,
+            horizon_index=None,
+            path=pq_path if name == "spread_80" else None,
+        )
+        lo_i, hi_i = DEFAULT_QUANTILE_LEVELS.index(lo_q), DEFAULT_QUANTILE_LEVELS.index(hi_q)
+        expected_spread = float(base[0, 0, hi_i] - base[0, 0, lo_i])
+        np.testing.assert_allclose(tbl["signal"].to_pylist(), [expected_spread] * n)
+    assert pq_path.is_file()
 
     custom = write_signal_frame(
         preds, timestamps=times, instruments=insts, signal_fn=lambda arr: arr[:, -1, -1], output_format="dict"
     )
-    np.testing.assert_allclose(custom["signal"], np.arange(n, dtype=np.float64) + 2.0)
+    np.testing.assert_allclose(custom["signal"], float(base[0, 0, -1]) + np.arange(n, dtype=np.float64) + 1.5)
 
     with pytest.raises(ValueError, match="unsupported signal frame"):
         write_signal_frame(preds, timestamps=times, instruments=insts, path=tmp_path / "bad.json")

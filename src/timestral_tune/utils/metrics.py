@@ -340,6 +340,55 @@ def _collect_contexts(dataset: TimeSeriesDataset) -> np.ndarray:
     return np.concatenate(rows, axis=0)
 
 
+def _apply_online_chronological(
+    calibrator: OnlineConformalCalibrator,
+    dataset: TimeSeriesDataset,
+    preds: np.ndarray,
+    actuals: np.ndarray,
+    scale: np.ndarray,
+) -> np.ndarray:
+    """Apply `calibrator` in strict chronological order across all series with horizon-reveal delay.
+
+    Windows are grouped by their forecast-origin timestamp `t_origin = timestamps[origin]`. Before
+    forecasting at `t_origin`, only prior windows whose entire horizon has completed strictly
+    before `t_origin` (`t_end = timestamps[origin + H - 1] < t_origin`) are passed to
+    `calibrator.update()`. This prevents both peeking at the current outcome and cross-series
+    lookahead from one series's later windows into another series's earlier forecasts.
+    """
+    n_targets = dataset.series[0].targets.shape[0]
+    horizon = dataset.forecast_horizon
+    by_origin: dict[Any, list[tuple[Any, list[int]]]] = {}
+    for w_idx in range(len(dataset)):
+        s_idx = int(dataset._series_index[w_idx])
+        orig = int(dataset._origins[w_idx])
+        ts = dataset.series[s_idx].timestamps
+        t_origin = ts[orig]
+        t_end = ts[orig + horizon - 1]
+        rows = list(range(w_idx * n_targets, (w_idx + 1) * n_targets))
+        by_origin.setdefault(t_origin, []).append((t_end, rows))
+
+    calibrated = np.empty_like(preds)
+    pending: list[tuple[Any, list[int]]] = []
+    for t_origin in sorted(by_origin):
+        ready = [item for item in pending if item[0] < t_origin]
+        if ready:
+            pending = [item for item in pending if item[0] >= t_origin]
+            ready.sort(key=lambda item: item[0])
+            flush_rows = [r for _, rows in ready for r in rows]
+            calibrator.update(preds[flush_rows], actuals[flush_rows], context_scale=scale[flush_rows])
+
+        cur_items = by_origin[t_origin]
+        cur_rows = [r for _, rows in cur_items for r in rows]
+        calibrated[cur_rows] = calibrator.transform(preds[cur_rows], context_scale=scale[cur_rows])
+        pending.extend(cur_items)
+
+    if pending:
+        pending.sort(key=lambda item: item[0])
+        flush_rows = [r for _, rows in pending for r in rows]
+        calibrator.update(preds[flush_rows], actuals[flush_rows], context_scale=scale[flush_rows])
+    return calibrated
+
+
 def evaluate_forecaster(
     forecaster: TimestralForecaster,
     dataset: TimeSeriesDataset,
@@ -354,8 +403,9 @@ def evaluate_forecaster(
     """Evaluate `forecaster` on `dataset` in raw space through upstream `TimestralForecaster.forecast()`.
 
     When `calibrator` is supplied, transforms raw forecasts before scoring. If `calibrator` is an
-    `OnlineConformalCalibrator` and `online_update=True`, evaluates chronologically one window at
-    a time (`transform` then `update`), simulating live deployment.
+    `OnlineConformalCalibrator` and `online_update=True`, evaluates in strict chronological order
+    by origin timestamp across all series, updating the calibrator only after a window's full
+    horizon completes (`t_end < t_origin`) to prevent lookahead leakage.
     """
     preds, actuals, scale = collect_conformal_data(
         forecaster,
@@ -366,11 +416,7 @@ def evaluate_forecaster(
     )
     if calibrator is not None:
         if isinstance(calibrator, OnlineConformalCalibrator) and online_update:
-            calibrated = np.empty_like(preds)
-            for i in range(preds.shape[0]):
-                calibrated[i : i + 1] = calibrator.transform(preds[i : i + 1], context_scale=scale[i : i + 1])
-                calibrator.update(preds[i : i + 1], actuals[i : i + 1], context_scale=scale[i : i + 1])
-            preds = calibrated
+            preds = _apply_online_chronological(calibrator, dataset, preds, actuals, scale)
         else:
             preds = calibrator.transform(preds, context_scale=scale)
     contexts = _collect_contexts(dataset)
