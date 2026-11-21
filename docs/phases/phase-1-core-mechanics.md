@@ -82,3 +82,8 @@ maintains or extends the phase.
 - 2026-11-21 (second CUDA run, commit `50c170a`): 436 passed, 6 skipped on an NVIDIA L4, including the
   `head_only` gradient check and all five scenarios. One near-tie case got its own T14 bound after failing
   on the VM's x86 CPU. On CUDA the unfused attention kernels lower the gradient error 50 to 900 times.
+- 2026-11-21 (`perf/phase1-kernels`): trimmed the `L` dead covariate decoder tokens (`L + 2h` layout), added
+  CPU-side `head_only` frozen-feature caching (256 MiB cap), target-only `target_frames`, CPU-side batch
+  validation, `non_blocking` CUDA transfers, and cached quantile levels (decision D16). Verified locally
+  (457 passed, 4 skipped on 2.15.0/2.14.1/2.8.0; 363 passed, 26 skipped on 2.4.0) and on an NVIDIA L4
+  (455 passed, 6 skipped; 28M covariate step 390 → 208 ms, 5.7 → 3.3 GiB).

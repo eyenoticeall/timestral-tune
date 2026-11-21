@@ -9,13 +9,13 @@
 | Area | State |
 |---|---|
 | Loading | `load_model` / `load_forecaster`: pinned Hub revisions, config from the checkpoint, any device |
-| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32), CUDA (verified on one NVIDIA L4, PyTorch 2.15.0, fp32; last at commit `50c170a`) |
+| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32), CUDA (verified on one NVIDIA L4, PyTorch 2.15.0, fp32; last at commit `9fc6735`) |
 | Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator`; per-window categorical encoding |
-| Training forward and loss | Normalised-space forward for both layouts, both target frames, pinball loss, `compute_loss` |
-| Training | `TimestralTrainer` in `head_only` mode, fp32: AdamW, warm-up, cosine or constant schedule, clipping, evaluation, early stopping, best-state restore |
+| Training forward and loss | Normalised-space forward (trimmed `L + 2h` covariate layout), both target frames, pinball loss, `compute_loss` |
+| Training | `TimestralTrainer` in `head_only` mode, fp32: AdamW, warm-up, cosine or constant schedule, clipping, frozen-feature caching, evaluation, early stopping, best-state restore |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **10 of 14 implemented and passing**: T1–T8, T12, T14. T9, T10, T11, T13 are Phase 2 placeholders |
-| Test suite | 438 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; 349 passed, 26 skipped on 2.4.0; macOS). On CUDA and Linux: 436 passed, 6 skipped |
+| Test suite | 457 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; 363 passed, 26 skipped on 2.4.0; macOS). On CUDA and Linux: 455 passed, 6 skipped |
 | CI | Green on Phase 1 (pull request #1, 2026-11-21): lint, build, and the network-free tests on Python 3.10–3.13, on Linux |
 
 ## What does not exist yet
@@ -76,6 +76,9 @@ Full list in spec §12. The ones that matter next:
 ## Branch state
 
 - `main`: Phases 0 and 1.
+- `perf/phase1-kernels`: Phase 1 kernel and trainer optimisations (trimmed covariate layout, `head_only`
+  frozen-feature caching, CPU-side batch validation, `non_blocking` CUDA transfers, target-only
+  `target_frames`), verified locally and on an NVIDIA L4. Not merged, not pushed.
 - `fix/math-sdpa-backend`: a public `attention_backend` option and its plumbing through the config, trainer
   and verifiers, held until Phase 2 can show whether it is needed (spec D15). Its measurements and probe
   work are already in `main`.

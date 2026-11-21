@@ -336,3 +336,47 @@ attention kernel, and the suite of the held branch `fix/math-sdpa-backend`.
 
 **Not done / open.** A short training run under each kernel (needs a mode that trains body weights), and
 the kernels' cost at long contexts. Phase 2 has not been started.
+
+---
+
+## 2026-11-21 (seventh session) — Phase 1 kernel optimisations and L4 CUDA verification
+
+**What.** After profiling the current Phase 1 hot paths on CPU and Apple GPU, implemented the Phase 1-applicable
+kernel and pipeline optimisations on a new branch `perf/phase1-kernels` off `main`, verified locally across all
+four PyTorch/Python environments, and ran a short-lived NVIDIA L4 CUDA VM (instance-scoped SSH key, deleted
+immediately after) for full `scripts/cuda_check.sh` verification and same-VM A/B timing against `main`.
+
+**Optimisations implemented (decision D16, zero `_vendor/` edits):**
+
+- **Trimmed covariate layout (`models/forward.py`):** dropped the `context_patches` inactive decoder tokens
+  from upstream's `2(L + h)` layout (`x_dec` has `h` tokens instead of `L + h`), building the `(wp + hp, wp + hp)`
+  time mask from upstream's `enc_causal_mask`. Verified mathematically exact in float64 (1.1e-16 to 9.8e-15
+  against `predict_block`) and bit-identical to slicing upstream's `build_two_stream_time_mask` with zero
+  edges to dropped tokens. T2 pairs a `1e-5` float32 bound (measured `6.1e-8`–`5.2e-6` from GEMM tiling) with
+  a `1e-12` float64 parity check and the mask-equivalence check.
+- **Frozen-feature caching in `head_only` (`config.py`, `trainer/step.py`, `trainer/trainer.py`):**
+  `TrainingConfig.cache_frozen_features=True` (256 MiB cap per dataset) caches per-window target-row horizon
+  hidden states, anchors, targets, and 3-scalar float64 context Welford summaries (`context_welford_state` /
+  `advancing_block_frames_from_state`) or pre-normalised targets/frames for `true_values` on CPU, skipping
+  re-running the frozen transformer body across epochs and repeated evaluations.
+- **Pipeline cleanups (`models/forward.py`, `trainer/step.py`, `trainer/trainer.py`):** short-circuited
+  `target_frames` on single-patch horizons and computed multi-patch frames on target rows only; skipped
+  `_known_cov_scaling` when `known_future` is None and short-circuited `supports_known_covariates` before the
+  GPU sync; cached `quantile_knots` per `(knots, device, dtype)`; moved `TrainingBatch.validate` to CPU before
+  `batch.to(device, non_blocking=self.device.type == "cuda")` and passed `validate=False` inside the loop.
+
+**Measured results (same-machine before vs after):**
+
+- **CUDA (NVIDIA L4, `step_timing.py`, batch 32, ctx 1,024, horizon 96):** 5M covariates `94 → 56 ms` (1.68×,
+  VRAM `1.9 → 1.1 GiB`, −42%); 28M covariates `390 → 208 ms` (1.88×, VRAM `5.7 → 3.3 GiB`, −42%); univariate
+  unchanged (`47 ms` 5M, `74 → 73 ms` 28M). Warmed-up 5-epoch `head_only` run with per-epoch validation on 28M
+  covariates: `850 → 273 ms` (3.1×).
+- **Apple M4 (`step_timing.py`):** 5M covariates `907 → 492 ms` CPU (1.84×), `474 → 276 ms` MPS (1.72×);
+  28M covariates `6,216 → 1,845 ms` CPU (3.37×), `1,957 → 986 ms` MPS (1.98×, MPS memory `7.3 → 4.5 GiB`,
+  −38%). 5-epoch `head_only` (24 covariate series, batch 16): 3.5×–4.3× faster across 5M/28M and CPU/MPS.
+
+**Suite evidence.** Lint and format clean. Local macOS: 457 passed, 4 skipped on PyTorch 2.15.0 (3.13),
+2.14.1 (3.10), and 2.8.0 (3.12); 363 passed, 26 skipped on PyTorch 2.4.0 (3.12). CUDA (L4, commit `9fc6735`):
+230 passed, 2 skipped on device tests; 455 passed, 6 skipped overall (`head_only` gradients <= 1.7e-6).
+
+**Not done / open.** `perf/phase1-kernels` is not merged or pushed yet. Phase 2 has not been started.

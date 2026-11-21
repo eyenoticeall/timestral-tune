@@ -73,7 +73,8 @@ The last column says which models each claim ran on; "all" means the tiny random
 
 | Claim | Measured | Models |
 |---|---|---|
-| T1/T2: denormalised training forward against `predict_block`, both layouts, including covariates with none known in advance | Bit-identical on PyTorch 2.4.0 and 2.15.0. One tiny-model case differs by 8e-10 on 2.8.0. Bound: 1e-6 | all |
+| T1: denormalised training forward against `predict_block`, no covariates | Bit-identical on PyTorch 2.4.0 and 2.15.0; 8e-10 on 2.8.0. Bound: 1e-6 | all |
+| T2: denormalised training forward against `predict_block`, trimmed `(L + 2h)` covariate layout (including past-only covariates) | Float32: 6.1e-8 to 5.2e-6 (bound 1e-5). Float64: 1.1e-16 to 9.8e-15 (bound 1e-12). Trimmed mask bit-identical to sliced `build_two_stream_time_mask` with zero edges to dropped tokens | all |
 | T3: median-folded frame against `_refine_block`, and the full pipeline against `forecast()` | 1e-7 to 2e-7 relative. Bound: 1e-5 | all |
 | T3: `true_values` frame of every horizon patch after the first, against upstream's `model.scale` on the context extended by the true values | Within 1e-6 | all |
 | Collated batch against upstream's `_assemble_rows` and `_encoding_target` | Every tensor exactly equal, including missing values, a partial final patch and several targets | all |
@@ -219,13 +220,18 @@ steps, horizon 96, batch of 32 series, fp32. Median of five steps after a warm-u
 
 | Model | Batch | CPU | Apple GPU | Speed-up | GPU memory allocated |
 |---|---|---|---|---|---|
-| 5M | univariate | 104 ms | 53 ms | 1.9× | 0.3 GiB |
-| 5M | 5 rows per series, with covariates | 907 ms | 474 ms | 1.9× | 2.3 GiB |
-| 28M | univariate | 317 ms | 192 ms | 1.6× | 2.3 GiB |
-| 28M | 5 rows per series, with covariates | 6,216 ms | 1,957 ms | 3.2× | 7.3 GiB |
+| 5M | univariate | 124 ms | 56 ms | 2.2× | 0.3 GiB |
+| 5M | 5 rows per series, with covariates | 492 ms | 276 ms | 1.8× | 2.3 GiB |
+| 28M | univariate | 334 ms | 194 ms | 1.7× | 2.3 GiB |
+| 28M | 5 rows per series, with covariates | 1,845 ms | 986 ms | 1.9× | 4.5 GiB |
 
-Timings vary between runs. Across four runs on this machine the speed-up ranged from 1.4× to 3.2×. Memory
+Before trimming the `L` dead covariate decoder tokens (decision D16), the two covariate rows measured 907 ms
+CPU / 474 ms MPS (5M) and 6,216 ms CPU / 1,957 ms MPS / 7.3 GiB (28M). Timings vary between runs. Memory
 is the driver allocation after the step, cumulative over the script, not a per-configuration peak.
+
+One-off 5-epoch `head_only` timing with per-epoch validation (24 covariate series, 72 windows, batch 16,
+including epoch 1 cache build): 5M 615 → 151 ms on CPU (4.1×) and 1,002 → 290 ms on MPS (3.5×); 28M
+1,705 → 393 ms on CPU (4.3×) and 1,384 → 385 ms on MPS (3.6×).
 
 ## 8. Leakage, loss mask and training
 
@@ -300,13 +306,13 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 349 passed, 26 skipped. Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 67 further Apple GPU cases are not generated at all. CPU passes everything else, including all of T14's gradient checks and the tests on 5M and 28M |
-| 2.8.0 | 3.12 | 438 passed, 4 skipped, including every Apple GPU test |
-| 2.14.1 | 3.10 | 438 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 438 passed, 4 skipped |
+| 2.4.0 | 3.12 | 363 passed, 26 skipped. Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 72 further Apple GPU cases are not generated at all. CPU passes everything else, including all of T14's gradient checks and the tests on 5M and 28M |
+| 2.8.0 | 3.12 | 457 passed, 4 skipped, including every Apple GPU test |
+| 2.14.1 | 3.10 | 457 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
+| 2.15.0 | 3.13 | 457 passed, 4 skipped |
 
-These are the counts at the end of Phase 1 on 2026-11-21, all on macOS. The CUDA run (§13) used Linux and
-ran at commit `50c170a`, after the review fixes and the attention-kernel measurements.
+These are the counts on `perf/phase1-kernels` (2026-11-21), all on macOS. The CUDA run (§13) used Linux and
+ran on the same branch (`9fc6735`).
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
@@ -356,19 +362,18 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 
 ## 13. CUDA
 
-Run: `bash scripts/cuda_check.sh` on the VM described at the top, at commit `50c170a` (2026-11-21). It runs
-the device-parametrised tests, the whole suite and the device probes. All gradient numbers here use the
-float64-RMSNorm reference of §6. An earlier run at `ecbab9d` used the previous reference; its numbers were
-within 1.4e-4 of these wherever both exist.
+Run: `bash scripts/cuda_check.sh` on the VM described at the top, on `perf/phase1-kernels` at commit
+`9fc6735` (2026-11-21; previous `main` run was at `50c170a`). It runs the device-parametrised tests, the
+whole suite and the device probes. All gradient numbers here use the float64-RMSNorm reference of §6.
 
 | Check | Result |
 |---|---|
-| T14 and all other device-parametrised tests | 218 passed, 2 skipped (the Apple GPU tests) |
-| Whole suite | 436 passed, 6 skipped (4 Phase 2 placeholders, 2 Apple GPU tests) |
+| T14 and all other device-parametrised tests | 230 passed, 2 skipped (the Apple GPU tests) |
+| Whole suite | 455 passed, 6 skipped (4 Phase 2 placeholders, 2 Apple GPU tests) |
 | `head_only` training on CUDA: loss falls, nothing outside the head changes | Pass (part of the suite) |
-| `head_only` gradients on CUDA against the reference | At most 2.2e-6 (bound 1e-5) |
+| `head_only` gradients on CUDA against the reference | At most 1.7e-6 (bound 1e-5) |
 | Verifiers (`run_checks`) on CUDA | Pass (part of the suite) |
-| The held branch `fix/math-sdpa-backend` (the `attention_backend` option), whole suite | 443 passed, 6 skipped |
+| The held branch `fix/math-sdpa-backend` (earlier run at `50c170a`), whole suite | 443 passed, 6 skipped |
 
 The first attempt at this run, one commit earlier, failed a single case on the VM's x86 CPU, not on CUDA:
 explicit attention on 5M with past-only covariates gave 5.3e-3 against a 5e-3 bound. That is the near-tie
@@ -429,15 +434,19 @@ reference) and are not reproduced by a probe:
 | CUDA with float64 weights | 1.2e-5 | 1.2e-5 |
 | CUDA float32 with TF32 disabled; and with `TRITON_DEFAULT_FP_FUSION=0` | 1.2e-2 (unchanged) | 1.4e-3 (unchanged) |
 
-Training-step timing against the VM's CPU (`step_timing.py --device cuda`; the CPU has only 4 threads, so the
-ratios flatter the GPU compared with a workstation CPU):
+Training-step timing against the VM's CPU (`step_timing.py --device cuda` on the same L4 VM, comparing
+baseline `main` with `perf/phase1-kernels` at `9fc6735`; the CPU has only 4 threads, so CPU/CUDA ratios
+flatter the GPU compared with a workstation CPU):
 
-| Model | Batch | CPU | CUDA | Speed-up | GPU memory allocated |
+| Model | Batch | CPU (`main` → `perf`) | CUDA (`main` → `perf`) | CUDA speed-up vs `main` | CUDA memory (`main` → `perf`) |
 |---|---|---|---|---|---|
-| 5M | univariate | 300 ms | 48 ms | 6.2× | 0.3 GiB |
-| 5M | 5 rows per series, with covariates | 2,607 ms | 93 ms | 28× | 1.9 GiB |
-| 28M | univariate | 1,140 ms | 75 ms | 15× | 1.9 GiB |
-| 28M | 5 rows per series, with covariates | 10,681 ms | 389 ms | 28× | 5.7 GiB |
+| 5M | univariate | 298 → 296 ms | 47 → 47 ms | 1.00× | 0.3 → 0.3 GiB |
+| 5M | 5 rows per series, with covariates | 2,591 → 1,426 ms | 94 → 56 ms | **1.68×** | 1.9 → 1.1 GiB (−42%) |
+| 28M | univariate | 1,132 → 1,130 ms | 74 → 73 ms | 1.01× | 1.9 → 1.1 GiB |
+| 28M | 5 rows per series, with covariates | 10,837 → 5,993 ms | 390 → 208 ms | **1.88×** | 5.7 → 3.3 GiB (−42%) |
+
+On the same VM, a warmed-up 5-epoch `head_only` run with per-epoch validation on 28M (24 covariate series,
+batch 16, including epoch 1 cache build) dropped from 850 ms uncached to 273 ms cached (3.1× faster).
 
 Environment requirement found on the way. With the VM's system Python 3.10 (PyTorch 2.14.1+cu130), every
 CUDA test failed: PyTorch routed an operation in upstream's attention layer through a Triton kernel, and
