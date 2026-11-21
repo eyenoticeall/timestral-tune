@@ -21,7 +21,7 @@ from torch import Tensor
 
 from .._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET
 
-__all__ = ["TrainingBatch"]
+__all__ = ["TrainingBatch", "bucket_series_count", "pad_batch_to_series"]
 
 _VALID_ROLES = (ROLE_TARGET, ROLE_PAST_COV, ROLE_KNOWN_COV)
 
@@ -154,3 +154,75 @@ class TrainingBatch:
                 raise ValueError(f"{name} must be a floating-point tensor, got {value.dtype}")
             if not bool(torch.isfinite(value).all()):
                 raise ValueError(f"{name} holds non-finite values; missing values must be masked and set to 0")
+
+
+def bucket_series_count(actual: int, max_batch: int) -> int:
+    """Round `actual` up to the next power-of-two shape bucket, capped at `max_batch`.
+
+    Bounds the number of distinct compiled batch shapes under `torch.compile(mode='reduce-overhead')`
+    to at most `ceil(log2(max_batch)) + 1` while limiting tail-batch padding overhead to < 2x.
+    """
+    if actual < 1 or max_batch < 1:
+        raise ValueError(f"actual ({actual}) and max_batch ({max_batch}) must be positive")
+    if actual >= max_batch:
+        return actual
+    return min(max_batch, 1 << (actual - 1).bit_length())
+
+
+def pad_batch_to_series(batch: TrainingBatch, target_series: int) -> TrainingBatch:
+    """Pad `batch` up to `target_series` series using zero-weighted, group-isolated dummy series.
+
+    Padded series copy series 0's valid context/role layout with fresh disjoint `group_ids` (so no
+    real series can attend to a padded one) and `loss_weight=False` everywhere (so loss and
+    gradients are mathematically unchanged; spec §9 T8).
+    """
+    if batch.num_rows == 0:
+        raise ValueError("cannot pad an empty batch")
+    first_gid = batch.group_ids[0]
+    rows_per_series = int((batch.group_ids == first_gid).sum())
+    if rows_per_series == 0 or batch.num_rows % rows_per_series != 0:
+        raise ValueError("pad_batch_to_series requires uniform rows per series")
+    actual_series = batch.num_rows // rows_per_series
+    if target_series <= actual_series:
+        return batch
+
+    pad_series = target_series - actual_series
+    pad_rows = pad_series * rows_per_series
+    device = batch.device
+
+    ctx_pad = batch.context[:rows_per_series].repeat(pad_series, 1)
+    mask_pad = batch.context_mask[:rows_per_series].repeat(pad_series, 1)
+    start_gid = int(batch.group_ids.max()) + 1
+    gid_pad = torch.arange(start_gid, start_gid + pad_series, device=device, dtype=batch.group_ids.dtype)
+    gid_pad = gid_pad.repeat_interleave(rows_per_series)
+
+    role_ids = (
+        None
+        if batch.role_ids is None
+        else torch.cat([batch.role_ids, batch.role_ids[:rows_per_series].repeat(pad_series)], dim=0)
+    )
+    known_future = (
+        None
+        if batch.known_future is None
+        else torch.cat([batch.known_future, batch.known_future[:rows_per_series].repeat(pad_series, 1)], dim=0)
+    )
+    known_future_mask = (
+        None
+        if batch.known_future_mask is None
+        else torch.cat(
+            [batch.known_future_mask, batch.known_future_mask[:rows_per_series].repeat(pad_series, 1)], dim=0
+        )
+    )
+    targets_pad = torch.zeros((pad_rows, batch.horizon_steps), device=device, dtype=batch.targets.dtype)
+    weight_pad = torch.zeros((pad_rows, batch.horizon_steps), device=device, dtype=batch.loss_weight.dtype)
+
+    return TrainingBatch(
+        context=torch.cat([batch.context, ctx_pad], dim=0),
+        context_mask=torch.cat([batch.context_mask, mask_pad], dim=0),
+        group_ids=torch.cat([batch.group_ids, gid_pad], dim=0),
+        role_ids=role_ids,
+        known_future=known_future,
+        known_future_mask=known_future_mask,
+        targets=torch.cat([batch.targets, targets_pad], dim=0),
+        loss_weight=torch.cat([batch.loss_weight, weight_pad], dim=0),
+    )

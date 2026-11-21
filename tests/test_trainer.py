@@ -490,15 +490,6 @@ def test_trainer_mode_precision_and_compile_validation(tiny_forecaster):
             model=fresh_model(tiny_forecaster),
         )
 
-    # compile_mode="reduce-overhead" rejects non-divisible dataset sizes.
-    assert len(dataset) % 5 != 0
-    with pytest.raises(ValueError, match="fixed batch shapes"):
-        TimestralTrainer(
-            config_for(batch_size=5, compile_model=True, compile_mode="reduce-overhead"),
-            dataset,
-            model=fresh_model(tiny_forecaster),
-        )
-
 
 def test_incompatible_datasets_and_models_are_rejected_at_construction(tiny_forecaster):
     import timestral_tune._vendor.timestral as vendored
@@ -790,24 +781,116 @@ def test_lora_trainer_init_does_not_mutate_global_rng_and_evaluate_validates_inp
     with pytest.raises(TypeError, match="TimeSeriesDataset"):
         trainer.evaluate("not-a-dataset")  # type: ignore[arg-type]
 
-    # evaluate(other_dataset) enforces compile_mode="reduce-overhead" fixed batch shapes too.
-    compiled_trainer = TimestralTrainer(
+
+def test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_overhead(tiny_forecaster):
+    """Shape bucketing pads partial tail batches with zero-weighted, group-isolated dummy series:
+    loss and gradients match the unpadded batch, and non-divisible datasets train/evaluate cleanly
+    under `compile_mode='reduce-overhead'`.
+    """
+    from timestral_tune.data import DHFDataCollator, bucket_series_count, pad_batch_to_series
+
+    from .helpers import as_double, float64_reference
+
+    assert [bucket_series_count(k, 32) for k in (1, 2, 3, 5, 9, 17, 32)] == [1, 2, 4, 8, 16, 32, 32]
+    assert bucket_series_count(3, 5) == 4 and bucket_series_count(5, 5) == 5
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, series=4, covariates=True)
+    # 3 windows padded to power-of-two bucket 4 must give identical loss & gradients in float64.
+    unpadded = dataset.collator(tiny_forecaster.model.config)([dataset[0], dataset[1], dataset[2]])
+    padded = pad_batch_to_series(unpadded, 4)
+    padded.validate(tiny_forecaster.patch_size)
+    assert padded.num_rows == 4 * dataset.rows_per_series and padded.num_scored == unpadded.num_scored
+
+    m1 = copy.deepcopy(tiny_forecaster.model).double().train()
+    m2 = copy.deepcopy(tiny_forecaster.model).double().train()
+    with float64_reference():
+        loss1 = compute_loss(m1, as_double(unpadded)).loss
+        loss1.backward()
+        loss2 = compute_loss(m2, as_double(padded)).loss
+        loss2.backward()
+    assert abs(loss1.item() - loss2.item()) < 1e-12
+    for (n, p1), (_, p2) in zip(m1.named_parameters(), m2.named_parameters(), strict=True):
+        assert p1.grad is not None and p2.grad is not None
+        torch.testing.assert_close(p1.grad, p2.grad, rtol=1e-11, atol=1e-12, msg=f"grad mismatch on {n}")
+
+    # Collator with bucket_to_max pads a 3-window tail to 4 series automatically.
+    bucketed_collator = DHFDataCollator.for_model(tiny_forecaster.model.config, dataset.context_length, bucket_to_max=5)
+    assert bucketed_collator([dataset[0], dataset[1], dataset[2]]).num_rows == 4 * dataset.rows_per_series
+
+    # Non-divisible dataset (len % 5 != 0) runs cleanly under compile_mode="reduce-overhead" when supported.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu" and shutil.which("g++") is None and shutil.which("clang++") is None:
+        return
+    assert len(dataset) % 5 != 0
+    uncomp_eval = TimestralTrainer(
+        config_for(device, mode="lora_variate", batch_size=5, eval_batch_size=5, max_steps=2, shuffle=False),
+        dataset,
+        model=fresh_model(tiny_forecaster),
+    ).evaluate(dataset)
+    comp_trainer = TimestralTrainer(
         config_for(
-            "cpu",
-            mode="head_only",
-            batch_size=len(dataset),
+            device,
+            mode="lora_variate",
+            batch_size=5,
             eval_batch_size=5,
-            max_steps=1,
+            max_steps=2,
+            shuffle=False,
             compile_model=True,
             compile_mode="reduce-overhead",
-            cache_frozen_features=False,
         ),
         dataset,
         model=fresh_model(tiny_forecaster),
     )
-    assert len(dataset) % 5 != 0
-    with pytest.raises(ValueError, match="fixed batch shapes"):
-        compiled_trainer.evaluate(dataset)
+    comp_eval = comp_trainer.evaluate(dataset)
+    assert comp_eval.loss == pytest.approx(uncomp_eval.loss, rel=1e-5)
+    assert comp_eval.scored_positions == uncomp_eval.scored_positions
+    res = comp_trainer.fit()
+    assert res.steps == 2
+
+
+@pytest.mark.parametrize("mode", ["lora_variate", "full_ft"])
+def test_gradient_clipping_bounds_updates_in_lora_and_full_ft(tiny_forecaster, mode):
+    """Mutation guard: `gradient_clip_val` actually clips trainable gradients in LoRA and `full_ft`."""
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    batch = dataset.collator(tiny_forecaster.model.config)([dataset[i] for i in range(len(dataset))])
+    norms = []
+    for clip in (None, 1e-4):
+        model = fresh_model(tiny_forecaster)
+        cfg = fixed_batch_config(
+            dataset, "cpu", mode=mode, max_steps=1, learning_rate=1e-2, lr_schedule="constant", gradient_clip_val=clip
+        )
+        trainer = TimestralTrainer(cfg, dataset, model=model)
+        trainer.model.train()
+        trainer.training_step(batch)
+        grad_norm = math.sqrt(
+            sum(float(p.grad.detach().pow(2).sum()) for p in trainer._trainable if p.grad is not None)
+        )
+        norms.append(grad_norm)
+    assert norms[0] > 1e-2, f"{mode}: expected unclipped grad norm > 1e-2, got {norms[0]:.3e}"
+    assert norms[1] <= 1e-4 + 1e-7, f"{mode}: clipped grad norm {norms[1]:.3e} exceeded 1e-4"
+
+
+def test_restore_best_restores_body_and_head_weights_in_full_ft(tiny_forecaster):
+    """Mutation guard: `restore_best=True` restores body + head parameters from CPU snapshot in `full_ft`."""
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, series=6, covariates=True)
+    train, val = dataset.split_by_time(12 * tiny_forecaster.patch_size)
+    model = fresh_model(tiny_forecaster)
+    # Huge learning rate makes step 1+ overshoot validation loss so step 0 (or an earlier step) must be restored.
+    cfg = config_for(
+        "cpu",
+        mode="full_ft",
+        batch_size=len(train),
+        max_steps=4,
+        eval_every=1,
+        learning_rate=5e-1,
+        lr_schedule="constant",
+        restore_best=True,
+        shuffle=False,
+    )
+    trainer = TimestralTrainer(cfg, train, val, model=model)
+    result = trainer.fit()
+    assert result.restored_best, "expected overshooting full_ft run to restore an earlier best checkpoint"
+    assert trainer.evaluate(val).loss == pytest.approx(result.best_eval_loss, rel=1e-6)
 
 
 def test_trainer_resumes_from_load_lora_and_rejects_mismatched_pre_injected_model(tiny_forecaster, tmp_path):

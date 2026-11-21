@@ -159,7 +159,8 @@ class TrainingConfig:
             back to streaming when the estimated cache exceeds the memory cap.
         compile_model: Compile the transformer with `torch.compile`.
         compile_mode: Compilation mode when `compile_model=True`. `"reduce-overhead"` uses CUDA
-            graphs and requires fixed batch shapes (dataset size divisible by batch size).
+            graphs and automatically pads partial tail batches into power-of-two shape buckets with
+            zero-weighted, group-isolated dummy series so no data is dropped.
         output_dir: Default directory for `trainer.export()`.
     """
 

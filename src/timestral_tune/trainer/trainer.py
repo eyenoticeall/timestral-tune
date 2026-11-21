@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from ..config import LoraConfig, TrainingConfig
 from ..data.batch import TrainingBatch
+from ..data.collator import DHFDataCollator
 from ..data.dataset import TimeSeriesDataset
 from ..export import dataset_fingerprint, export_checkpoint
 from ..models.adapter import has_lora, inject_lora, lora_parameters, unmerge_lora, validate_lora_for_rows
@@ -220,14 +221,6 @@ class TimestralTrainer:
                     "val_dataset must have the same columns per role and forecast horizon as train_dataset"
                 )
 
-        if config.compile_model and config.compile_mode == "reduce-overhead":
-            self._check_fixed_batch_shapes(train_dataset, config.batch_size, "train_dataset")
-            eval_bs = config.eval_batch_size or config.batch_size
-            if config.mode == "head_only" and config.cache_frozen_features and eval_bs != config.batch_size:
-                self._check_fixed_batch_shapes(train_dataset, eval_bs, "train_dataset")
-            if val_dataset is not None:
-                self._check_fixed_batch_shapes(val_dataset, eval_bs, "val_dataset")
-
         self._trainable = self._select_trainable()
         if config.compile_model:
             self.model.transformer = torch.compile(self.model.transformer, mode=config.compile_mode)
@@ -275,14 +268,6 @@ class TimestralTrainer:
         if required_axis not in lora_config.axes:
             raise ValueError(f"mode={mode!r} requires {required_axis!r} in lora_config.axes, got {lora_config.axes!r}")
         return lora_config
-
-    @staticmethod
-    def _check_fixed_batch_shapes(dataset: TimeSeriesDataset, batch_size: int, name: str) -> None:
-        if len(dataset) > batch_size and len(dataset) % batch_size != 0:
-            raise ValueError(
-                f"compile_mode='reduce-overhead' requires fixed batch shapes, but {name} has {len(dataset)} windows "
-                f"which is not divisible by batch_size={batch_size}; use compile_mode='default' or bucket batches"
-            )
 
     def _autocast(self):
         if self.config.mixed_precision == "bf16":
@@ -367,11 +352,13 @@ class TimestralTrainer:
         config = self.config
         generator = torch.Generator().manual_seed(config.seed) if training else None
         batch_size = config.batch_size if training else (config.eval_batch_size or config.batch_size)
+        bucket_max = batch_size if (config.compile_model and config.compile_mode == "reduce-overhead") else None
+        collator = DHFDataCollator.for_model(self.model.config, dataset.context_length, bucket_to_max=bucket_max)
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=training and config.shuffle,
-            collate_fn=dataset.collator(self.model.config),
+            collate_fn=collator,
             num_workers=config.num_workers,
             persistent_workers=config.num_workers > 0,
             pin_memory=self.device.type == "cuda",
@@ -444,38 +431,59 @@ class TimestralTrainer:
 
         was_training = self.model.training
         self.model.eval()
+        seen_series = 0
+        total_series = len(dataset)
         try:
             for batch in self._raw_loader(dataset, training=False):
                 batch.validate(patch)
                 on_device = batch.to(self.device, non_blocking=non_blocking)
-                output = training_forward(self.model, on_device, return_hidden=True, validate=False)
+                with self._autocast():
+                    output = training_forward(self.model, on_device, return_hidden=True, validate=False)
                 assert output.hidden is not None
                 target_rows_cpu = batch.target_rows
                 target_rows_dev = on_device.target_rows
                 series_count = int(target_rows_cpu.sum()) // n_targets
+                real_series = min(series_count, total_series - seen_series)
+                seen_series += real_series
+                if real_series == 0:
+                    continue
 
                 horizon_hidden = output.hidden[target_rows_dev, output.num_context_tokens :, :].detach().cpu()
-                hiddens.append(horizon_hidden.unflatten(0, (series_count, n_targets)))
-                locs.append(output.anchor_loc[target_rows_dev].detach().cpu().unflatten(0, (series_count, n_targets)))
-                scales.append(
-                    output.anchor_scale[target_rows_dev].detach().cpu().unflatten(0, (series_count, n_targets))
+                hiddens.append(horizon_hidden.unflatten(0, (series_count, n_targets))[:real_series])
+                locs.append(
+                    output.anchor_loc[target_rows_dev]
+                    .detach()
+                    .cpu()
+                    .unflatten(0, (series_count, n_targets))[:real_series]
                 )
-                targets_list.append(batch.targets[target_rows_cpu].unflatten(0, (series_count, n_targets)))
-                weights_list.append(batch.loss_weight[target_rows_cpu].unflatten(0, (series_count, n_targets)))
+                scales.append(
+                    output.anchor_scale[target_rows_dev]
+                    .detach()
+                    .cpu()
+                    .unflatten(0, (series_count, n_targets))[:real_series]
+                )
+                targets_list.append(
+                    batch.targets[target_rows_cpu].unflatten(0, (series_count, n_targets))[:real_series]
+                )
+                weights_list.append(
+                    batch.loss_weight[target_rows_cpu].unflatten(0, (series_count, n_targets))[:real_series]
+                )
 
                 if frame == "true_values":
                     f_loc, f_scale = target_frames(self.model, on_device, output, "true_values")
                     normalised = normalise_targets(self.model, on_device, f_loc, f_scale)[target_rows_dev].cpu()
-                    norm_list.append(normalised.unflatten(0, (series_count, n_targets)))
-                    floc_list.append(f_loc[target_rows_dev].cpu().unflatten(0, (series_count, n_targets)))
-                    fscale_list.append(f_scale[target_rows_dev].cpu().unflatten(0, (series_count, n_targets)))
+                    norm_list.append(normalised.unflatten(0, (series_count, n_targets))[:real_series])
+                    floc_list.append(f_loc[target_rows_dev].cpu().unflatten(0, (series_count, n_targets))[:real_series])
+                    fscale_list.append(
+                        f_scale[target_rows_dev].cpu().unflatten(0, (series_count, n_targets))[:real_series]
+                    )
                 elif horizon_patches > 1:
                     cnt, mean, m2 = context_welford_state(
                         batch.context[target_rows_cpu], batch.context_mask[target_rows_cpu], patch
                     )
-                    cnts.append(cnt.unflatten(0, (series_count, n_targets)))
-                    means.append(mean.unflatten(0, (series_count, n_targets)))
-                    m2s.append(m2.unflatten(0, (series_count, n_targets)))
+                    cnts.append(cnt.unflatten(0, (series_count, n_targets))[:real_series])
+                    means.append(mean.unflatten(0, (series_count, n_targets))[:real_series])
+                    m2s.append(m2.unflatten(0, (series_count, n_targets))[:real_series])
         finally:
             self.model.train(was_training)
 
@@ -649,9 +657,6 @@ class TimestralTrainer:
         if not isinstance(dataset, TimeSeriesDataset):
             raise TypeError(f"dataset must be a TimeSeriesDataset, got {type(dataset).__name__}")
         self._check_dataset(dataset, "dataset")
-        if self.config.compile_model and self.config.compile_mode == "reduce-overhead":
-            eval_bs = self.config.eval_batch_size or self.config.batch_size
-            self._check_fixed_batch_shapes(dataset, eval_bs, "dataset")
         was_training = self.model.training
         self.model.eval()
         try:

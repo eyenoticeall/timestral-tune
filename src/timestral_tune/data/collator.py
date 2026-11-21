@@ -35,7 +35,7 @@ import torch
 from .._vendor.timestral.config import TimestralConfig
 from .._vendor.timestral.forecaster import ffill_with_mask
 from .._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET
-from .batch import TrainingBatch
+from .batch import TrainingBatch, bucket_series_count, pad_batch_to_series
 from .encoders import encode_categorical_window, encoding_target
 
 __all__ = ["DHFDataCollator", "Window"]
@@ -108,27 +108,41 @@ class DHFDataCollator:
     The collator holds no tensors and no model, so it is cheap to copy into DataLoader workers.
     """
 
-    def __init__(self, patch_size: int, context_length: int, max_context: int, max_horizon: int) -> None:
+    def __init__(
+        self,
+        patch_size: int,
+        context_length: int,
+        max_context: int,
+        max_horizon: int,
+        *,
+        bucket_to_max: int | None = None,
+    ) -> None:
         if patch_size < 1:
             raise ValueError(f"patch_size must be positive, got {patch_size}")
         if context_length < 1:
             raise ValueError(f"context_length must be positive, got {context_length}")
         if context_length > max_context:
             raise ValueError(f"context_length {context_length} exceeds the model's context cap of {max_context} steps")
+        if bucket_to_max is not None and bucket_to_max < 1:
+            raise ValueError(f"bucket_to_max must be positive, got {bucket_to_max}")
         self.patch_size = patch_size
         self.context_length = context_length
         self.max_context = max_context
         self.max_horizon = max_horizon
         self.padded_context = _round_up(context_length, patch_size)
+        self.bucket_to_max = bucket_to_max
 
     @classmethod
-    def for_model(cls, config: TimestralConfig, context_length: int) -> DHFDataCollator:
+    def for_model(
+        cls, config: TimestralConfig, context_length: int, *, bucket_to_max: int | None = None
+    ) -> DHFDataCollator:
         """A collator sized to a model's patch size, context cap and decode block."""
         return cls(
             patch_size=config.patch_size,
             context_length=context_length,
             max_context=config.context_length,
             max_horizon=config.block_size * config.patch_size,
+            bucket_to_max=bucket_to_max,
         )
 
     def __repr__(self) -> str:
@@ -230,7 +244,7 @@ class DHFDataCollator:
             known_values = known_values.reshape(total_rows, horizon_steps)
             known_mask = known_mask.reshape(total_rows, horizon_steps)
 
-        return TrainingBatch(
+        batch = TrainingBatch(
             context=values.reshape(total_rows, context_steps),
             context_mask=observed.reshape(total_rows, context_steps),
             group_ids=torch.arange(batch_size).repeat_interleave(rows_per_series),
@@ -240,3 +254,6 @@ class DHFDataCollator:
             targets=labels.reshape(total_rows, horizon_steps),
             loss_weight=scored.reshape(total_rows, horizon_steps),
         )
+        if self.bucket_to_max is not None:
+            batch = pad_batch_to_series(batch, bucket_series_count(batch_size, self.bucket_to_max))
+        return batch
