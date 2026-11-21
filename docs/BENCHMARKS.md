@@ -151,3 +151,55 @@ uv run python scripts/benchmarks/run_sweeps.py --device cuda --size 5M --bf16 --
 | `fp32` | 0.1956 | 0.7759 | -0.0010 | -0.0166 |
 
 Real 200-step full fine-tuning under CUDA `bf16` agrees with `fp32` within `0.35%` on raw test wQL and MASE.
+
+---
+
+## 3. Large checkpoints: Timestral-123M & Timestral-209M (NVIDIA L4, 23 GiB VRAM)
+
+Measured on the same NVIDIA L4 VM (`bf16`, `sign_flip=True`, 160 steps, `eval_every=40`, `restore_best=True`,
+`lora_*` LR `1e-3` with `r=8, alpha=16, targets=("q","k","v","o"), dropout=0.05`, `full_ft` LR `3e-5`,
+`batch_size=32` for `123M` LoRA and `batch_size=16` for `123M full_ft` and all `209M` runs).
+
+### Timestral-123M — Realised Volatility (post-Oct 27, 2026) & Retail Demand
+
+| Dataset | Mode | Params | Pinball | wQL | MASE | Cov 80% | Wid 80% | Cov 90% | Wid 90% | Forg ΔwQL | Forg ΔMASE | Peak VRAM / Time |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **Volatility** | `zero_shot` | 0 | 0.000875 | 0.2201 | 1.8017 | 0.734 | 0.00656 | 0.842 | 0.00894 | +0.0000 | +0.0000 | — |
+| **Volatility** | `conformal_aci` | 0 | 0.000877 | 0.2205 | 1.8017 | **0.773** | 0.00718 | **0.878** | 0.01019 | +0.0000 | +0.0000 | — |
+| **Volatility** | `lora_variate` | 204,800 | 0.000853 | 0.2145 | 1.7435 | 0.741 | 0.00602 | 0.858 | 0.00856 | -0.0007 | -0.0082 | 2.00 GiB / 34.7 s |
+| **Volatility** | `lora_temporal` | 819,200 | **0.000840** | **0.2111** | **1.7242** | 0.717 | 0.00586 | 0.853 | 0.00858 | +0.0001 | +0.0018 | 2.39 GiB / 38.0 s |
+| **Volatility** | `full_ft` | 122,606,720 | 0.000851 | 0.2139 | 1.7249 | 0.742 | 0.00601 | 0.844 | 0.00835 | -0.0004 | -0.0096 | 2.75 GiB / 33.8 s |
+| **Retail** | `zero_shot` | 0 | 0.1327 | 0.2161 | 0.8401 | 0.838 | 1.353 | 0.932 | 1.846 | +0.0000 | +0.0000 | — |
+| **Retail** | `conformal_aci` | 0 | 0.1327 | 0.2161 | 0.8401 | **0.789** | 1.318 | **0.904** | 1.823 | +0.0000 | +0.0000 | — |
+| **Retail** | `lora_variate` | 204,800 | 0.1207 | 0.1966 | 0.7793 | 0.776 | 1.031 | 0.894 | 1.384 | +0.0002 | -0.0041 | 2.49 GiB / 28.6 s |
+| **Retail** | `lora_temporal` | 819,200 | **0.1197** | **0.1950** | **0.7729** | 0.783 | 1.010 | 0.898 | 1.352 | +0.0025 | +0.0295 | 3.00 GiB / 33.7 s |
+| **Retail** | `full_ft` | 122,606,720 | 0.1206 | 0.1965 | 0.7811 | 0.782 | 1.080 | 0.904 | 1.449 | +0.0005 | -0.0023 | 3.13 GiB / 27.5 s |
+
+### Timestral-209M — Realised Volatility (post-Oct 27, 2026) & Retail Demand
+
+| Dataset | Mode | Params | Pinball | wQL | MASE | Cov 80% | Wid 80% | Cov 90% | Wid 90% | Forg ΔwQL | Forg ΔMASE | Peak VRAM / Time |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **Volatility** | `zero_shot` | 0 | 0.000876 | 0.2201 | 1.7890 | 0.731 | 0.00639 | 0.835 | 0.00873 | +0.0000 | +0.0000 | — |
+| **Volatility** | `conformal_aci` | 0 | 0.000876 | 0.2202 | 1.7890 | **0.772** | 0.00700 | **0.876** | 0.01036 | +0.0000 | +0.0000 | — |
+| **Volatility** | `lora_variate` | 294,912 | 0.000866 | 0.2178 | 1.7615 | 0.728 | 0.00580 | 0.845 | 0.00830 | -0.0004 | -0.0079 | 2.09 GiB / 33.8 s |
+| **Volatility** | `lora_temporal` | 1,179,648 | **0.000846** | **0.2127** | **1.7395** | 0.718 | 0.00586 | 0.869 | 0.00873 | -0.0010 | -0.0192 | 2.38 GiB / 44.6 s |
+| **Volatility** | `full_ft` | 209,312,256 | 0.000860 | 0.2161 | 1.7517 | 0.728 | 0.00577 | 0.842 | 0.00815 | -0.0007 | -0.0170 | 4.37 GiB / 42.2 s |
+| **Retail** | `zero_shot` | 0 | 0.1366 | 0.2225 | 0.8603 | 0.829 | 1.434 | 0.922 | 1.974 | +0.0000 | +0.0000 | — |
+| **Retail** | `conformal_aci` | 0 | 0.1365 | 0.2223 | 0.8603 | **0.794** | 1.373 | **0.902** | 1.938 | +0.0000 | +0.0000 | — |
+| **Retail** | `lora_variate` | 294,912 | 0.1202 | 0.1957 | 0.7759 | 0.785 | 1.087 | 0.901 | 1.478 | -0.0005 | -0.0068 | 2.42 GiB / 25.8 s |
+| **Retail** | `lora_temporal` | 1,179,648 | **0.1181** | **0.1924** | **0.7641** | 0.788 | 1.042 | 0.901 | 1.396 | +0.0011 | -0.0033 | 2.79 GiB / 34.6 s |
+| **Retail** | `full_ft` | 209,312,256 | 0.1196 | 0.1948 | 0.7748 | 0.788 | 1.084 | 0.901 | 1.454 | +0.0003 | +0.0004 | 4.91 GiB / 34.7 s |
+
+### Direct real-data precision & attention-kernel ablation on 123M & 209M (retail, `lora_temporal`, 120 steps, `B=16`)
+
+| Model | Variant | Test wQL | Test MASE | Wall time | Peak VRAM |
+|---|---|---:|---:|---:|---:|
+| **123M** | `fp32` + default SDPA | 0.1963 | 0.7784 | 30.4 s | 2.23 GiB |
+| **123M** | `fp32` + `attention_context("math")` | 0.1965 | 0.7797 | 29.9 s | 2.30 GiB |
+| **123M** | `bf16` + default SDPA | 0.1970 | 0.7815 | **21.9 s** | **1.81 GiB** |
+| **209M** | `fp32` + default SDPA | 0.1947 | 0.7725 | 46.0 s | 3.36 GiB |
+| **209M** | `fp32` + `attention_context("math")` | 0.1952 | 0.7746 | 45.2 s | 3.47 GiB |
+| **209M** | `bf16` + default SDPA | **0.1943** | **0.7718** | **26.1 s** | **2.79 GiB** |
+
+On both `123M` and `209M`, `fp32` default SDPA, `fp32` math SDPA, and `bf16` default SDPA agree within `0.0002–0.0007` wQL on real data, and every mode — including `209M full_ft` — fits in `< 5 GiB` VRAM and trains in under 45 seconds on a single L4 GPU.
+

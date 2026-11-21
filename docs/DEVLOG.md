@@ -557,5 +557,18 @@ not started.
 - `sign_flip=True` reduced retail `full_ft` validation wQL by 4.0% (`0.2230 → 0.2141`).
 - 200-step 28M `bf16` vs `fp32` full fine-tuning matched within `0.35%` raw test wQL (`0.1963` vs `0.1956`).
 
+- **Large-checkpoint (`123M` & `209M`) CUDA probes & benchmarks (same session, L4 VM deleted immediately after):**
+  - Probed peak attention logits and CUDA gradient accuracy vs float64-RMSNorm reference: `123M` (`131.6k–132.4k`
+    peak logits, default-SDPA grad error `4.96e-4–6.94e-4`, `1 - cos <= 2.4e-7`, `math` `7.9e-6–9.4e-6`, `head_only`
+    `<= 1.9e-6`) and `209M` (`123.4k–131.4k` peak logits, default-SDPA grad error `2.63e-4–4.85e-4`,
+    `1 - cos <= 1.2e-7`, `math` `4.0e-6–2.3e-5`, `head_only` `<= 5.5e-7`) are significantly better-conditioned than
+    `5M` and `28M`.
+  - Direct 120-step real-data retail ablation (`lora_temporal`): `fp32` default, `fp32` math, and `bf16` agreed
+    within `0.0002–0.0007` test wQL (`123M`: `0.1963 / 0.1965 / 0.1970`; `209M`: `0.1947 / 0.1952 / 0.1943` with
+    `bf16` 1.76× faster in `2.79 GiB` VRAM).
+  - Full 160-step real-dataset benchmarks (`docs/BENCHMARKS.md` §3): all modes including `209M full_ft` ran in
+    `< 5 GiB` VRAM and `25–45 s` on L4; `lora_temporal` achieved the lowest test wQL across both domains on both
+    sizes (`123M`: `0.2111` vol / `0.1950` retail; `209M`: `0.2127` vol / `0.1924` retail — −13.5% vs zero-shot).
+
 **Not done / open.** `phase-3` is unpushed and unmerged pending review; PyPI release awaits maintainer
 approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.

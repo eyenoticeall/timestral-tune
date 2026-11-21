@@ -181,7 +181,7 @@ def _run_dataset_for_model(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--sizes", nargs="+", default=["5M", "28M"], choices=["5M", "28M"])
+    parser.add_argument("--sizes", nargs="+", default=["5M", "28M"], choices=["5M", "28M", "123M", "209M"])
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-steps", type=int, default=200)

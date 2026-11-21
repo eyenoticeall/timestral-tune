@@ -486,6 +486,22 @@ comparing `fp32` default SDPA, `fp32` `attention_context("math")`, and `bf16` au
 | 28M | `lora_temporal` (`lr=3e-4`) | 0.08629 | 0.08629 (1.2e-3) | 0.08618 (1.2e-2) |
 | 28M | `full_ft` (`lr=1e-5`) | 0.09022 | 0.09022 (7.2e-5) | 0.09034 (3.9e-3) |
 
+Large checkpoints — `Timestral-123M` (122.6M params, `d_model=640`, 20 layers) and `Timestral-209M`
+(209.3M params, `d_model=768`, 24 layers) probed on the same NVIDIA L4 architecture (one-off probe,
+2026-11-22, `B=2`, `ctx=128`, `H=64`, float64-RMSNorm reference on CUDA):
+
+| Model | Layout | Peak attention logit (layer) | Peak `||Wq||_2` / `||Wk||_2` | CUDA fp32 default grad rel L2 (`1 - cos`) | CUDA `math` SDPA | CUDA explicit | CUDA `head_only` | Fwd `fp32` / `bf16` vs CPU |
+|---|---|---|---:|---|---:|---:|---:|---|
+| 123M | univariate | 131.6k (`layers.17.attns.0`, gap 1,928) | 81.7 / 61.9 | 4.96e-4 (`1.2e-7`) | 9.39e-6 | 1.34e-5 | 4.86e-7 | 7.4e-7 / 1.0e-2 |
+| 123M | covariates | 132.4k (`layers.17.attns.0`, gap 191) | 81.7 / 61.9 | 6.94e-4 (`2.4e-7`) | 7.89e-6 | 1.07e-5 | 1.91e-6 | 3.0e-6 / 4.1e-2 |
+| 209M | univariate | 123.4k (`layers.1.attns.0`, gap 30,731) | 167.9 / 150.6 | 4.85e-4 (`1.2e-7`) | 4.03e-6 | 7.13e-6 | 4.24e-7 | 2.8e-7 / 5.7e-3 |
+| 209M | covariates | 131.4k (`layers.1.attns.0`, gap 2,268) | 167.9 / 150.6 | 2.63e-4 (`3.5e-8`) | 2.30e-5 | 2.32e-5 | 5.49e-7 | 5.5e-6 / 5.6e-2 |
+
+Both large checkpoints have 3×–4× lower peak attention logits than 5M (404k) and 28M (503k), and 10×–45×
+smaller CUDA default-SDPA gradient error (`2.6e-4`–`6.9e-4`, cosine `>= 0.9999997`). Real 120-step
+`retail_demand` `lora_temporal` training on `123M` and `209M` showed `fp32` default SDPA, `fp32` math
+SDPA, and `bf16` default SDPA agreeing within `0.0002–0.0007` test wQL (`docs/BENCHMARKS.md` §3).
+
 Environment requirement found on the way. With the VM's system Python 3.10 (PyTorch 2.14.1+cu130), every
 CUDA test failed: PyTorch routed an operation in upstream's attention layer through a Triton kernel, and
 Triton compiles a C helper on first use, which stopped at `fatal error: Python.h: No such file or directory`.
