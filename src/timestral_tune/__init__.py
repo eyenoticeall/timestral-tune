@@ -6,9 +6,9 @@ fine-tuning, conformal calibration and export are not built yet. See `README.md`
 `docs/STATUS.md` and `docs/SPEC.md`.
 """
 
-from .config import TrainingConfig
+from .config import LoraConfig, TrainingConfig
 from .trainer import TimestralTrainer
 
 __version__ = "0.1.0.dev0"
 
-__all__ = ["TimestralTrainer", "TrainingConfig", "__version__"]
+__all__ = ["LoraConfig", "TimestralTrainer", "TrainingConfig", "__version__"]

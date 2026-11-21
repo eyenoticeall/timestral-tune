@@ -1,29 +1,44 @@
 """Configuration dataclasses.
 
-`TrainingConfig` holds everything the trainer needs apart from the data. It accepts every
-adaptation mode and precision the specification names, so that configurations written today stay
-valid; the trainer raises a clear `NotImplementedError` for the ones that are not built yet.
+`TrainingConfig` holds everything the trainer needs apart from the data, and `LoraConfig`
+configures selective slice LoRA on attention projections (spec §5.1).
 
-`LoraConfig` (roadmap Phase 2) and `ReplayConfig` (Phase 4) are not defined yet.
+`ReplayConfig` (roadmap Phase 4) is not defined yet.
 
-- Spec: `docs/SPEC.md` §5 (modes), §5.4 (trainer), §7.1 (API example)
+- Spec: `docs/SPEC.md` §5 (modes), §5.1 (LoRA), §5.4 (trainer), §7.1 (API example)
 """
 
 from __future__ import annotations
 
 import math
 import numbers
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 from .models.forward import TARGET_FRAMES, TargetFrame
 
-__all__ = ["DEFAULT_LEARNING_RATES", "AdaptationMode", "TrainingConfig"]
+__all__ = [
+    "DEFAULT_LEARNING_RATES",
+    "AdaptationMode",
+    "CompileMode",
+    "LoraAxis",
+    "LoraConfig",
+    "LoraTarget",
+    "TrainingConfig",
+]
 
 AdaptationMode = Literal["head_only", "lora_variate", "lora_temporal", "full_ft"]
 MixedPrecision = Literal["fp32", "bf16"]
 LearningRateSchedule = Literal["cosine", "constant"]
+CompileMode = Literal["default", "reduce-overhead"]
+LoraAxis = Literal["time", "variate"]
+LoraTarget = Literal["q", "k", "v", "o", "gate"]
+
+LORA_AXES: tuple[str, ...] = get_args(LoraAxis)
+LORA_TARGETS: tuple[str, ...] = get_args(LoraTarget)
+SINGLE_ROW_ALLOWED_TARGETS: tuple[str, ...] = ("v", "o", "gate")
 
 # Starting points only. The paper publishes no optimiser settings; these are placeholders until the
 # Phase 3 sweeps (spec §5.4, §12).
@@ -33,6 +48,76 @@ DEFAULT_LEARNING_RATES: dict[str, float] = {
     "lora_temporal": 3e-4,
     "full_ft": 1e-5,
 }
+
+
+@dataclass(frozen=True)
+class LoraConfig:
+    """Settings for selective slice LoRA on Timestral's attention modules (spec §5.1).
+
+    Attributes:
+        r: Low-rank bottleneck dimension.
+        lora_alpha: Scaling numerator; each adapter adds `(lora_alpha / r) * B @ A`.
+        axes: Attention axes to adapt, selected from `"time"` and `"variate"` via each attention
+            module's `is_time` attribute.
+        targets: Projections/slices to adapt, selected from `"q"`, `"k"`, `"v"` (row slices of
+            the fused `wQKV`), `"o"` (`wO`) and `"gate"` (`_gate`).
+        dropout: Dropout rate applied to the adapter input path during training (`0 <= dropout < 1`).
+        allow_single_row: Override the single-row guard for `"variate"` attention. When True on
+            single-row data, only `"v"`, `"o"` and `"gate"` are permitted (`"q"` and `"k"` are
+            inert there and rejected).
+    """
+
+    r: int = 8
+    lora_alpha: float = 16.0
+    axes: tuple[LoraAxis, ...] = ("variate",)
+    targets: tuple[LoraTarget, ...] = ("q", "v")
+    dropout: float = 0.0
+    allow_single_row: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.r, numbers.Integral) or isinstance(self.r, bool) or self.r < 1:
+            raise ValueError(f"r must be a positive integer, got {self.r!r}")
+        object.__setattr__(self, "r", int(self.r))
+
+        if isinstance(self.lora_alpha, bool) or not (
+            isinstance(self.lora_alpha, numbers.Real) and math.isfinite(self.lora_alpha) and self.lora_alpha > 0
+        ):
+            raise ValueError(f"lora_alpha must be positive and finite, got {self.lora_alpha!r}")
+        object.__setattr__(self, "lora_alpha", float(self.lora_alpha))
+
+        if isinstance(self.dropout, bool) or not (
+            isinstance(self.dropout, numbers.Real) and math.isfinite(self.dropout) and 0.0 <= self.dropout < 1.0
+        ):
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout!r}")
+        object.__setattr__(self, "dropout", float(self.dropout))
+
+        if not isinstance(self.allow_single_row, bool):
+            raise ValueError(f"allow_single_row must be a bool, got {self.allow_single_row!r}")
+
+        object.__setattr__(self, "axes", _unique_choices("axes", self.axes, LORA_AXES))
+        object.__setattr__(self, "targets", _unique_choices("targets", self.targets, LORA_TARGETS))
+
+    @property
+    def scaling(self) -> float:
+        return self.lora_alpha / self.r
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "r": self.r,
+            "lora_alpha": self.lora_alpha,
+            "axes": list(self.axes),
+            "targets": list(self.targets),
+            "dropout": self.dropout,
+            "allow_single_row": self.allow_single_row,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LoraConfig:
+        known = {"r", "lora_alpha", "axes", "targets", "dropout", "allow_single_row"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown LoraConfig keys: {sorted(unknown)}")
+        return cls(**data)
 
 
 @dataclass(frozen=True)
@@ -145,3 +230,17 @@ class TrainingConfig:
 def _one_of(name: str, value: object, allowed: tuple[str, ...]) -> None:
     if value not in allowed:
         raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
+
+
+def _unique_choices(name: str, values: Sequence[str], allowed: tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(values, str) or not isinstance(values, Sequence):
+        raise ValueError(f"{name} must be a non-empty sequence of {allowed}, got {values!r}")
+    items = tuple(values)
+    if len(items) == 0:
+        raise ValueError(f"{name} must not be empty")
+    invalid = [v for v in items if v not in allowed]
+    if invalid:
+        raise ValueError(f"{name} holds invalid entries {invalid!r}; expected entries from {allowed}")
+    if len(set(items)) != len(items):
+        raise ValueError(f"{name} holds duplicate entries: {items!r}")
+    return items
