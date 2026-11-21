@@ -1,6 +1,6 @@
 # Phase 2 — Adaptation & Calibration
 
-**Status:** Not started
+**Status:** Complete on branch `phase-2` (2026-11-21); unmerged and unpushed.
 **Goal:** All five adaptation modes, both conformal calibrators, and exports that load in the official package.
 **Spec sections:** `docs/SPEC.md` §3.2, §5.1, §5.2, §7.3, §7.4, §9 (T9–T11, T13), §10
 
@@ -11,21 +11,22 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 
 - **LoRA slices.** In `wQKV.weight`, rows `[0, D)` are query, `[D, 2D)` key, `[2D, 3D)` value. The
   query/key order is from the code only; the value third is measured (`docs/VERIFICATION.md` §3).
-- **Adapter naming.** Wrapping a linear changes parameter names, so always export merged weights under
-  upstream names. T11 guards this.
+  `LoRASliceLinear` fuses `lora_A` projections across adapted slices of `wQKV` into one `F.linear`, uses
+  out-of-place `chunk(3) + cat` for autograd and `torch.compile` safety, and strips `_orig_mod.` keys in
+  `merged_state_dict` / `extract_lora_state_dict`.
+- **Adapter naming.** Wrapping a linear changes parameter names, so `merged_state_dict` always exports
+  merged weights under exact upstream names without mutating a live unmerged trainer. T11 guards this.
 - **Single-row guard** is measured, not theoretical: query and key perturbations change nothing on
-  univariate input.
+  univariate input (`validate_lora_for_rows`, enforced in both `inject_lora` and `TimestralTrainer`).
 - **Conformal formulas** are quoted from the papers in spec §5.2; the PDFs are in `papers/` locally.
+  Both `ConformalCalibrator` (CQR) and `OnlineConformalCalibrator` (ACI) run in float64 NumPy internally
+  (safe on Apple GPU) and return the caller's array/tensor type, device, and dtype.
 - **`config.json` must stay byte-compatible** with upstream; metadata goes in `tune_metadata.json`.
-
-- **Where modes plug in.** `TimestralTrainer._select_trainable` freezes everything and unfreezes the head;
-  extend it per mode. The trainer already raises `NotImplementedError` for the other modes, `bf16`,
-  `lora_config` and `export()`, and `tests/test_trainer.py` asserts that; update those tests as each lands.
-- **Use `compute_loss`** (`trainer/step.py`) for anything that needs the training loss.
-- **The Apple GPU has no float64**: move tensors to CPU before widening (see the Phase 1 notes).
-- **`bf16` needs CUDA.** fp32 on CUDA is verified (`docs/VERIFICATION.md` §13); autocast is not, and a first
-  look showed `bfloat16` moving forecasts by 1.5e-2 to 5.7e-2. There is no CUDA machine in CI:
-  `scripts/cuda_check.sh` is the way to test on one.
+  Because upstream's `resolve_checkpoint` only downloads `config.json` and `model.safetensors`, `export.py`
+  copies `LICENSE` from a local base directory or fetches it from Hub via `hf_hub_download`.
+- **`bf16` and `torch.compile` on CUDA:** verified on NVIDIA L4 (`512 passed, 2 skipped`). `bf16` alone
+  gives ~2× speed-up on 28M; `bf16 + compile("default")` gives 3.3× speed-up and 45% less VRAM.
+  CPU `torch.compile` requires a C++ compiler (`g++` or `clang++`).
 
 ## Open questions
 
@@ -33,4 +34,14 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 
 ## Log of what was done
 
-Add dated bullets here as work lands, with the evidence (which tests pass, on what).
+- 2026-11-21 (`c1396f8`): added `LoraConfig` and slice LoRA (`models/adapter.py`), T9 and T10 passing on
+  tiny, 5M, and 28M.
+- 2026-11-21 (`c179949`): added `lora_variate`, `lora_temporal`, `full_ft`, fused CUDA `AdamW`, `bf16`
+  autocast on CUDA, and optional `torch.compile` in `TimestralTrainer`.
+- 2026-11-21 (`01fdd53`): implemented `ConformalCalibrator` (CQR) and `OnlineConformalCalibrator` (ACI)
+  in `models/conformal.py`, T13 passing.
+- 2026-11-21 (`1d08f02`): implemented `export_checkpoint` (`export.py`) and `TimestralTrainer.export()`,
+  T11 passing on tiny, 5M, and 28M across all four modes.
+- 2026-11-21 (`3fe5bc9`): verified across PyTorch 2.4/2.8/2.14/2.15 locally (510 passed, 4 skipped; 411/26
+  on 2.4.0) and on NVIDIA L4 CUDA (**512 passed, 2 skipped**), resolved D15 via 20-step CUDA trajectories,
+  and verified verbatim Hub `LICENSE` export on `mistralai/Timestral-5M`.

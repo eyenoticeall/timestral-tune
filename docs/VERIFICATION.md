@@ -233,9 +233,10 @@ One-off 5-epoch `head_only` timing with per-epoch validation (24 covariate serie
 including epoch 1 cache build): 5M 615 → 151 ms on CPU (4.1×) and 1,002 → 290 ms on MPS (3.5×); 28M
 1,705 → 393 ms on CPU (4.3×) and 1,384 → 385 ms on MPS (3.6×).
 
-## 8. Leakage, loss mask and training
+## 8. Leakage, loss mask, training, LoRA, conformal and export
 
-Tests: `uv run pytest tests/acceptance tests/test_trainer.py`. Run on the tiny random model, 5M and 28M.
+Tests: `uv run pytest tests/acceptance tests/test_trainer.py tests/test_lora.py tests/test_conformal.py tests/test_export.py`.
+Run on the tiny random model, 5M and 28M.
 
 | Claim | Test | Result |
 |---|---|---|
@@ -244,11 +245,15 @@ Tests: `uv run pytest tests/acceptance tests/test_trainer.py`. Run on the tiny r
 | Noise on targets changes no covariate row's hidden state or output; noise on past-only rows changes no known-future row | T6 | Exactly 0 |
 | Noise on known-future horizon values changes the target forecast | T7 | Pass |
 | Loss gradient is exactly zero at covariate rows, unobserved steps and horizon padding, under both frames | T8 | Pass |
+| Freshly initialised LoRA leaves outputs unchanged (`< 1e-12` fp64, `< 1e-5` fp32); merged and unmerged agree (`< 1e-12` fp64, `< 1e-4` fp32) | T9 | Pass on tiny, 5M and 28M (variate and time axes) |
+| `lora_variate` raises on single-row data; `allow_single_row=True` rejects `q`/`k` and permits `v`/`o`/`gate` | T10 | Pass on tiny, 5M and 28M (and via `TimestralTrainer`) |
+| Exported checkpoint loads in vendored upstream `load_model` with `strict=True`, reproduces forecasts within `1e-4`, and writes `config.json`, `model.safetensors`, adapters (LoRA), `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` | T11 | Pass on tiny, 5M and 28M across all four modes (`head_only`, `lora_variate`, `lora_temporal`, `full_ft`) |
 | Categorical encodings are unchanged when data after the origin changes; a whole-series encoding would differ | T12 | Pass |
 | With two targets, a past-only category that first occurs after the origin (sorting first, or in the middle) changes no input; the dataset-wide codes do change | T12, several targets | Pass |
+| Static CQR meets nominal coverage across all 10 symmetric pairs on under- and over-covering exchangeable data; online ACI tracks nominal coverage under variance shift; quantiles are non-decreasing and median unshifted | T13 | Pass |
 | A category first seen after a `split_by_time` cutoff changes no training batch, with one or two targets | `test_dataset.py` | Pass (tiny model) |
 | Series that start and end at different times: no training window holds a step at or after the cutoff | `test_dataset.py` | Pass |
-| `head_only` on a fixed batch: loss falls, and every non-head parameter is bit-identical afterwards | `test_trainer.py` | Pass on CPU and the Apple GPU, with and without covariates |
+| `head_only`, `lora_variate`, `lora_temporal`, `full_ft` on a fixed batch: loss falls, only targeted weights change, deterministic for a seed | `test_trainer.py` | Pass on CPU, Apple GPU and CUDA (including `bf16` on CUDA and `torch.compile`) |
 
 ## 9. Target-frame check
 
@@ -306,13 +311,13 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 363 passed, 26 skipped. Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 72 further Apple GPU cases are not generated at all. CPU passes everything else, including all of T14's gradient checks and the tests on 5M and 28M |
-| 2.8.0 | 3.12 | 457 passed, 4 skipped, including every Apple GPU test |
-| 2.14.1 | 3.10 | 457 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 457 passed, 4 skipped |
+| 2.4.0 | 3.12 | 411 passed, 26 skipped. Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 CUDA-only `bf16` tests; 77 further Apple GPU cases are not generated at all. CPU passes everything else, including all 14 acceptance tests T1–T14 and `torch.compile` |
+| 2.8.0 | 3.12 | 510 passed, 4 skipped (the 4 CUDA-only `bf16` tests), including every Apple GPU test and all 14 acceptance tests |
+| 2.14.1 | 3.10 | 510 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
+| 2.15.0 | 3.13 | 510 passed, 4 skipped |
 
-These are the counts on `perf/phase1-kernels` (2026-11-21), all on macOS. The CUDA run (§13) used Linux and
-ran on the same branch (`9fc6735`).
+These are the counts on `phase-2` (2026-11-21), all on macOS. Zero acceptance test placeholders remain.
+The CUDA run (§13) used Linux on the same branch (`3fe5bc9`) and passed all 4 `bf16` tests as well.
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
@@ -362,18 +367,17 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 
 ## 13. CUDA
 
-Run: `bash scripts/cuda_check.sh` on the VM described at the top, on `perf/phase1-kernels` at commit
-`9fc6735` (2026-11-21; previous `main` run was at `50c170a`). It runs the device-parametrised tests, the
-whole suite and the device probes. All gradient numbers here use the float64-RMSNorm reference of §6.
+Run: `bash scripts/cuda_check.sh` and Phase 2 CUDA benchmarks on an NVIDIA L4 VM (`g2-standard-4`, Ubuntu
+22.04, 4 CPU threads, PyTorch 2.15.0+cu132, Python 3.12) on `phase-2` at commit `3fe5bc9` (2026-11-21). All
+gradient numbers here use the float64-RMSNorm reference of §6.
 
 | Check | Result |
 |---|---|
-| T14 and all other device-parametrised tests | 230 passed, 2 skipped (the Apple GPU tests) |
-| Whole suite | 455 passed, 6 skipped (4 Phase 2 placeholders, 2 Apple GPU tests) |
-| `head_only` training on CUDA: loss falls, nothing outside the head changes | Pass (part of the suite) |
+| T14 and all other device-parametrised tests | 247 passed, 2 skipped (the Apple GPU tests) |
+| Whole suite (including T1–T14, all 4 `bf16` CUDA modes, and `torch.compile`) | 512 passed, 2 skipped (only the 2 Apple GPU tests) |
 | `head_only` gradients on CUDA against the reference | At most 1.7e-6 (bound 1e-5) |
 | Verifiers (`run_checks`) on CUDA | Pass (part of the suite) |
-| The held branch `fix/math-sdpa-backend` (earlier run at `50c170a`), whole suite | 443 passed, 6 skipped |
+| Real Hub export of `mistralai/Timestral-5M` (`lora_variate`, `bf16`) | Copies verbatim 1,687-byte `Modified MIT License` from Hub; reloads via upstream `load_model(..., strict=True)` on CUDA (`5,208,960` params) |
 
 The first attempt at this run, one commit earlier, failed a single case on the VM's x86 CPU, not on CUDA:
 explicit attention on 5M with past-only covariates gave 5.3e-3 against a 5e-3 bound. That is the near-tie
@@ -447,6 +451,31 @@ flatter the GPU compared with a workstation CPU):
 
 On the same VM, a warmed-up 5-epoch `head_only` run with per-epoch validation on 28M (24 covariate series,
 batch 16, including epoch 1 cache build) dropped from 850 ms uncached to 273 ms cached (3.1× faster).
+
+Phase 2 CUDA step timing and peak memory (`bf16`, `torch.compile`, fused `AdamW`) on the L4 VM (`ctx=1,024`,
+`H=96`, batch 32, 5 rows/series with covariates; median of 6 steps after 3 warm-up steps; one-off benchmark):
+
+| Model | Mode | `fp32` | `bf16` | `bf16 + compile(default)` | `bf16 + compile(reduce-overhead)` |
+|---|---|---|---|---|---|
+| 5M | `lora_variate` (`r=8`, Q+V) | 37.9 ms, 0.47 GiB | 39.0 ms, 0.32 GiB | 17.8 ms, 0.26 GiB (2.1×) | 18.0 ms |
+| 5M | `full_ft` | 54.1 ms, 1.08 GiB | 53.8 ms, 0.73 GiB | 23.5 ms, 0.56 GiB (2.3×) | 23.0 ms |
+| 28M | `lora_variate` (`r=8`, Q+V) | 139.8 ms, 1.63 GiB | 69.7 ms, 1.12 GiB (2.0×) | 42.9 ms, 0.94 GiB (3.3×) | 43.6 ms |
+| 28M | `full_ft` | 197.0 ms, 3.28 GiB | 93.8 ms, 2.30 GiB (2.1×) | 59.8 ms, 1.80 GiB (3.3×) | 59.9 ms |
+
+(For `reduce-overhead`, CUDA graphs allocate from a private pool not reflected in `max_memory_allocated()`,
+so memory is reported for `compile(default)`.)
+
+Decision D15 resolution — 20-step AdamW training trajectories on L4 CUDA (16 covariate series, batch 16;
+comparing `fp32` default SDPA, `fp32` `attention_context("math")`, and `bf16` autocast; one-off script):
+
+| Model | Mode | `fp32` default val loss | `fp32` math val loss (forecast `max_rel` vs default) | `bf16` val loss (forecast `max_rel` vs default) |
+|---|---|---|---|---|
+| 5M | `lora_variate` (`lr=3e-4`) | 0.11511 | 0.11509 (4.3e-4) | 0.11519 (1.2e-3) |
+| 5M | `lora_temporal` (`lr=3e-4`) | 0.10853 | 0.10873 (7.8e-3) | 0.10876 (5.9e-3) |
+| 5M | `full_ft` (`lr=1e-5`) | 0.11559 | 0.11566 (8.7e-4) | 0.11548 (1.4e-3) |
+| 28M | `lora_variate` (`lr=3e-4`) | 0.09029 | 0.09029 (6.0e-6) | 0.09039 (3.0e-3) |
+| 28M | `lora_temporal` (`lr=3e-4`) | 0.08629 | 0.08629 (1.2e-3) | 0.08618 (1.2e-2) |
+| 28M | `full_ft` (`lr=1e-5`) | 0.09022 | 0.09022 (7.2e-5) | 0.09034 (3.9e-3) |
 
 Environment requirement found on the way. With the VM's system Python 3.10 (PyTorch 2.14.1+cu130), every
 CUDA test failed: PyTorch routed an operation in upstream's attention layer through a Triton kernel, and

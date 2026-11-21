@@ -7,9 +7,11 @@
 
 Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
 
-> **Status: pre-alpha.** Loading, the data pipeline and `head_only` training work and are tested against
-> the official code. LoRA, full fine-tuning, conformal calibration and checkpoint export are not built yet,
-> so a tuned model cannot be saved yet. See [docs/STATUS.md](docs/STATUS.md).
+> **Status: pre-alpha (Phases 0–2).** Loading, the data pipeline, all five adaptation modes (`conformal`,
+> `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), `bf16` + `torch.compile` on CUDA, and
+> upstream-loadable checkpoint export are built and tested against the official code (14/14 acceptance
+> tests passing). Phase 3 benchmarks, metrics and hyperparameter sweeps are next. See
+> [docs/STATUS.md](docs/STATUS.md).
 
 ## What this will be
 
@@ -39,18 +41,19 @@ is the project's overview guide and source of truth.
 | Specification | Written and verified against the paper, the official code and the released checkpoints |
 | Loading on any device | Done: CUDA, CPU, Apple GPU (PyTorch 2.8+) |
 | Data pipeline | Done: polars / pandas / pyarrow frames, point-in-time windows, time splits, collation |
-| Training forward and loss | Done; equal to official inference at float32 round-off |
-| `head_only` training | Done, fp32 |
-| LoRA, full fine-tuning, `bf16` | Not built (Phase 2) |
-| Conformal calibration, export | Not built (Phase 2) |
+| Training forward and loss | Done; trimmed covariate layout (`L + 2h` tokens), equal to official inference (`<= 1e-12` fp64) |
+| Adaptation modes | Done: `head_only` (with frozen-feature caching), `lora_variate` (with single-row guard), `lora_temporal`, `full_ft` |
+| CUDA acceleration | Done: `bf16` autocast, fused `AdamW`, optional `torch.compile` (verified on NVIDIA L4) |
+| Conformal calibration | Done: `ConformalCalibrator` (CQR) and `OnlineConformalCalibrator` (ACI) |
+| Checkpoint export | Done: upstream-loadable `config.json` + merged `model.safetensors`, LoRA adapters, `conformal.json`, sidecar, `LICENSE`, `NOTICE` |
 | Benchmarks, metrics, Lacuna integration | Not built (Phase 3) |
-| Acceptance tests T1–T14 | 10 of 14 implemented and passing on 5M and 28M; 4 are Phase 2 placeholders |
-| CI | Passing on Python 3.10–3.13 as of the last push |
+| Acceptance tests T1–T14 | All 14 of 14 implemented and passing on tiny, 5M and 28M (CPU, Apple GPU, CUDA) |
+| CI | Passing on Python 3.10–3.13 on Linux |
 
-## What works today: `head_only` training
+## Quick start
 
 ```python
-from timestral_tune import TimestralTrainer, TrainingConfig
+from timestral_tune import LoraConfig, TimestralTrainer, TrainingConfig
 from timestral_tune.data import TimeSeriesDataset
 
 # A long-format frame: one row per (series, timestamp). polars, pandas and pyarrow all work.
@@ -67,15 +70,22 @@ dataset = TimeSeriesDataset.from_polars(
 )
 train, validation = dataset.split_by_time("2024-02-15")   # training sees nothing from this date on
 
-config = TrainingConfig(model_name_or_path="mistralai/Timestral-5M", mode="head_only", batch_size=8, epochs=3)
-trainer = TimestralTrainer(config, train, validation)
+config = TrainingConfig(
+    model_name_or_path="mistralai/Timestral-5M",
+    mode="lora_variate",
+    batch_size=8,
+    epochs=3,
+    output_dir="./runs/load-lora",
+)
+lora = LoraConfig(r=8, lora_alpha=16, axes=("variate",), targets=("q", "v"))
+trainer = TimestralTrainer(config, train, validation, lora_config=lora)
 print(trainer.evaluate().loss)   # zero-shot validation loss
-result = trainer.fit()           # trains the quantile head only; everything else stays frozen
+result = trainer.fit()           # trains only the variate LoRA adapters
 print(result.best_eval_loss)
+trainer.export()                 # writes upstream-loadable merged checkpoint + adapters + NOTICE/LICENSE
 ```
 
-The tuned model is `trainer.model`. There is no `export()` yet, so it cannot be saved in the official
-checkpoint layout until Phase 2. Learning-rate defaults are placeholders that have not been tuned.
+Learning-rate and LoRA rank defaults are placeholders until the Phase 3 sweeps.
 
 To check your own data for leakage and parity with the official inference path:
 
@@ -93,7 +103,7 @@ for check in run_checks(trainer.model, batch):
 docs/SPEC.md                         Specification and overview guide (start here)
 AGENTS.md                            How to work in this repo: rules, commands, commit conventions
 docs/                                Also: status, development log, verification record, upstream and phase notes
-src/timestral_tune/                  The package (Phases 0-1 built, later phases stubbed) and the vendored upstream code in _vendor/
+src/timestral_tune/                  The package (Phases 0-2 built, Phases 3-4 stubbed) and the vendored upstream code in _vendor/
 tests/                               Unit tests and the acceptance tests of spec §9
 scripts/                             Vendoring, drift check, and verification probes
 papers/                              Reference papers (only the CC BY Timestral paper is tracked)

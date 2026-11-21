@@ -380,3 +380,56 @@ immediately after) for full `scripts/cuda_check.sh` verification and same-VM A/B
 230 passed, 2 skipped on device tests; 455 passed, 6 skipped overall (`head_only` gradients <= 1.7e-6).
 
 **Not done / open.** `perf/phase1-kernels` is not merged or pushed yet. Phase 2 has not been started.
+
+---
+
+## 2026-11-21 (eighth session) — Phase 2 built and verified locally and on NVIDIA L4
+
+**What.** Fast-forwarded `main` to `perf/phase1-kernels`, created branch `phase-2` off `main`, and
+implemented all of Phase 2 (spec §10): Slice LoRA (`models/adapter.py`, `LoraConfig`), all adaptation modes
+(`lora_variate`, `lora_temporal`, `full_ft`), `bf16` autocast + fused `AdamW` + optional `torch.compile` in
+`TimestralTrainer`, post-hoc CQR and online ACI conformal calibration (`models/conformal.py`), and
+upstream-loadable checkpoint export (`export.py`, `TimestralTrainer.export()`). Verified locally across all
+four PyTorch/Python environments and on a short-lived NVIDIA L4 VM (instance-scoped SSH key, deleted
+immediately after).
+
+**Design & kernel highlights (zero `_vendor/` edits):**
+
+- **Slice LoRA (`models/adapter.py`):** `LoRASliceLinear` fuses input projections across adapted `wQKV` slices
+  into one `F.linear(x, cat(A))` call, uses out-of-place `chunk(3) + cat` (compile- and autograd-safe),
+  accumulates `merge()`/`unmerge()` in at least float32, enforces the single-row guard (D5, T10), and strips
+  `_orig_mod.` prefixes in `merged_state_dict` / `extract_lora_state_dict` so compiled models export cleanly.
+- **Trainer (`trainer/trainer.py`, `config.py`):** supports `head_only`, `lora_variate`, `lora_temporal`, and
+  `full_ft`; uses `AdamW(..., fused=True)` on CUDA; supports `mixed_precision="bf16"` on CUDA (rejecting CPU,
+  MPS, and non-bf16 hardware); supports `compile_model=True` on `model.transformer` with fixed-shape
+  enforcement for `compile_mode="reduce-overhead"`.
+- **Conformal calibration (`models/conformal.py`):** `ConformalCalibrator` (CQR eqs. 9–11, finite-sample
+  `(1 - alpha)(1 + 1 / n)` quantile allowing negative offsets) and `OnlineConformalCalibrator` (ACI,
+  unclipped `alpha_t` per Lemma 4.1 with `.saturated` flag when `alpha_t <= 0`), both with scale
+  normalisation, configurable horizon buckets, outward monotonicity repair from the unshifted median,
+  NumPy/PyTorch type+device preservation, and JSON save/load.
+- **Export (`export.py`):** writes `config.json` (exact upstream schema), merged `model.safetensors`,
+  unmerged `adapter.safetensors` + `adapter_config.json` (LoRA only), `conformal.json`, `tune_metadata.json`,
+  base `LICENSE` (copied verbatim from local dir or fetched from Hub), and derivative `NOTICE` — non-destructively.
+
+**CUDA findings & D15 resolution (`docs/VERIFICATION.md` §13):**
+
+- **`bf16` + `torch.compile` on L4 (ctx 1,024, batch 32, 5 rows covariates):** 28M `full_ft` dropped from
+  `197.0 ms` / `3.28 GiB` (`fp32`) to `93.8 ms` / `2.30 GiB` (`bf16`) and **`59.8 ms` / `1.80 GiB`**
+  (`bf16 + compile("default")`, **3.3× faster**, 45% less VRAM); 28M `lora_variate` dropped from `139.8 ms` /
+  `1.63 GiB` to **`42.9 ms` / `0.94 GiB`** (**3.3× faster**).
+- **Decision D15 closed:** 20-step AdamW trajectories on L4 across `lora_variate`, `lora_temporal`, and
+  `full_ft` gave virtually identical validation losses between `fp32` default SDPA and `fp32` unfused math
+  (identical to 5 decimal places on 28M: `0.09029`, `0.08629`, `0.09022`; within `0.0002` on 5M), and `bf16`
+  also stayed within 0.1%–0.2%. No public attention-kernel option is needed.
+- **Two Linux/CUDA test catches fixed (`3fe5bc9`):** x86 float32 gate layout moved 28M step-0 LoRA by `2.8e-6`
+  (T9 now asserts `< 1e-12` in float64 + `< 1e-5` in float32); compiled export test now targets CUDA when
+  available and skips CPU compile when no C++ compiler (`g++`/`clang++`) is installed.
+
+**Evidence.** Ruff check & format clean; `uv build` clean; `check_upstream_drift.py` reports no drift.
+All 14/14 acceptance tests pass (zero placeholders). Local macOS: **510 passed, 4 skipped** (CUDA-only
+`bf16`) on PyTorch 2.15.0 (3.13), 2.14.1 (3.10), and 2.8.0 (3.12); **411 passed, 26 skipped** on PyTorch
+2.4.0 (3.12). NVIDIA L4 CUDA (`3fe5bc9`): **512 passed, 2 skipped** (only Apple GPU tests skipped), plus
+verbatim 1,687-byte Hub `LICENSE` export + upstream `strict=True` reload on `mistralai/Timestral-5M`.
+
+**Not done / open.** `phase-2` is unmerged and unpushed pending maintainer review. Phase 3 has not started.
