@@ -14,7 +14,8 @@ The decision and its reasons are in the spec, §6.1 and decision D3.
 | `mistralai/Timestral-209M` | `9874d252ab0aae16f7f7c999f98f98d6ad7d8365` |
 
 The code pin is also recorded in `src/timestral_tune/_vendor/timestral/VENDOR_MANIFEST.json` and in
-`scripts/vendor_upstream.py`. The Hub revisions are also in `scripts/probes/_common.py`.
+`scripts/vendor_upstream.py`. The Hub revisions are what the library loads by default: `PINNED_REVISIONS` in
+`src/timestral_tune/models/loader.py`. A test fails if that mapping and the table above disagree.
 
 ## What is vendored and how
 
@@ -74,7 +75,8 @@ Last checked 2026-11-21: no drift (upstream `main` was still the pinned commit).
 5. Update the pins table above and in the spec header, and fix any `[U file:line]` references that moved.
 6. Commit as its own commit: `build(vendor): re-vendor timestral at <short sha>`.
 
-If Mistral publishes new checkpoint revisions, update the Hub pins the same way and re-run the probes.
+If Mistral publishes new checkpoint revisions, update `PINNED_REVISIONS` in `src/timestral_tune/models/loader.py`,
+the table above and the spec header together, then re-run the full test suite and the probes.
 
 ## Notes on upstream
 

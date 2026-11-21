@@ -39,6 +39,16 @@ maintains or extends the phase.
   Early stopping compares those losses; prefer raw-space metrics for model selection once they exist.
 - **Floor runs on macOS.** PyTorch 2.4.0 hangs at exit after a DataLoader worker has run
   (`scripts/probes/worker_exit_hang.py`); the suite skips the one worker test there.
+- **Category codes are numbered per window** (`window_category_codes`), not per dataset: with several
+  targets the codes are model inputs, and a dataset-wide numbering let later categories renumber earlier
+  windows. `dataset.categories` and the stored codes are still dataset-wide; only windows renumber.
+- **Time-zone checks happen on the frame**, before conversion: polars and pyarrow turn zoned timestamps
+  into UTC on the way to NumPy.
+- **Gradient references use float64 RMSNorm** (`tests/helpers.py::reference_gradient`). Upstream's RMSNorm
+  computes in float32 even in a float64 model, which made the plain float64-weights reference wrong by up
+  to 3.8e-3. Do not compare gradients with `copy.deepcopy(model).double()` alone.
+- **A test that cannot fail is worse than none.** The review found three; each new test since was run
+  against a deliberately broken implementation before being trusted.
 - **`split_by_time`**: training gets nothing at or after the cutoff; the embargo is an extra gap.
 
 ## Open questions
@@ -56,5 +66,9 @@ maintains or extends the phase.
   recorded; D2 confirmed.
 - 2026-11-21 (later): T14 and the whole suite passed on CUDA (NVIDIA L4): 290 passed, 6 skipped. T14's
   gradient check became three tiers after that run, and a `head_only` gradient check was added (not yet
-  run on CUDA). Final local suite: 316 passed, 4 skipped on PyTorch 2.15.0, 2.14.1 and 2.8.0; 255 passed,
+  run on CUDA). Local suite at that point: 316 passed, 4 skipped on PyTorch 2.15.0, 2.14.1 and 2.8.0; 255 passed,
   22 skipped on 2.4.0.
+- 2026-11-21 (review): a ten-agent review found 21 issues; all are fixed. Two were data-layer leaks
+  (category numbering with several targets; time zones from polars and pyarrow). Final local suite: 405
+  passed, 4 skipped on PyTorch 2.15.0, 2.14.1 (Python 3.10) and 2.8.0; 331 passed, 26 skipped on 2.4.0.
+  Not re-run on CUDA.

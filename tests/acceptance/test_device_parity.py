@@ -1,26 +1,28 @@
 """Device parity (spec §9, T14).
 
-Forecasts on an accelerator are compared with CPU. Gradients are compared with a float64-weights
-reference on CPU, on every device including CPU float32. Over all parameters there are three tiers:
+Forecasts on an accelerator are compared with CPU. Gradients are compared with a float64 reference
+on CPU, on every device including CPU float32. Over all parameters there are three tiers:
 
-- Tiny random model: CPU, Apple GPU and CUDA gradients agree with the reference to about 3e-7.
-  Held to 1e-5. This is the structural check.
-- Released 5M and 28M checkpoints, attention written out as matmul and softmax: at most 1.1e-4
-  on every device, except one scenario (28M with covariates: 1.1e-4 on CUDA, 5.4e-4 on CPU,
-  1.2e-3 on the Apple GPU), which is unexplained. Held to 5e-3. This shows the library's own
-  forward, frames, loss and device handling are accurate on real weights.
+- Tiny random model: gradients agree with the reference to about 4e-7 on every device. Held to
+  1e-5. This is the structural check.
+- Released 5M and 28M checkpoints, attention written out as matmul and softmax: at most 1.2e-3 on
+  CPU and 2.1e-3 on the Apple GPU. Held to 5e-3. This shows the library's own forward, frames,
+  loss and device handling are accurate on real weights.
 - Released checkpoints as shipped, with upstream's `F.scaled_dot_product_attention`: off by up to
-  3.4e-3 on CPU, 1.1e-3 on the Apple GPU and 1.2e-2 on CUDA. On CUDA and CPU the float32 backward
-  pass of that call loses accuracy with these weights; on the Apple GPU the swap changes nothing
-  and its worst case is the unexplained scenario above (spec §12, docs/VERIFICATION.md §6, §13).
-  Held to 5e-2, which still catches a wrong gradient; one minus the cosine stays below 1e-4.
+  3.4e-3 on CPU and 2.1e-3 on the Apple GPU, and by up to 1.2e-2 on CUDA (measured against an
+  earlier reference). On CUDA and CPU the float32 backward pass of that call loses accuracy with
+  these weights (spec §12, docs/VERIFICATION.md §6, §13). Held to 5e-2, which still catches a
+  wrong gradient; one minus the cosine stays below 1e-4.
 
 With everything but the head frozen (`head_only`, the one mode the trainer implements so far), the
-backward pass never enters attention, and gradients match the reference within 1e-5 on released
-weights too (measured at most 2.6e-6 on CPU and the Apple GPU; not yet run on CUDA).
+backward pass never enters attention or the body's norms, and gradients match the reference within
+1e-5 on released weights too (measured at most 2.8e-6 on CPU and the Apple GPU; not yet run on
+CUDA).
 
-The reference uses float64 weights and inputs; upstream's RMSNorm and RoPE still compute in float32
-internally, so it is not a pure float64 computation.
+The reference uses float64 weights and inputs, and computes upstream's RMSNorm in float64
+(`helpers.reference_gradient`). Upstream's RMSNorm always computes in float32, which made an
+earlier reference itself inaccurate by up to 3.8e-3. RoPE still builds its table in float32, so the
+reference is not a pure float64 computation.
 """
 
 from __future__ import annotations

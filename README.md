@@ -93,8 +93,8 @@ for check in run_checks(trainer.model, batch):
 docs/SPEC.md                         Specification and overview guide (start here)
 AGENTS.md                            How to work in this repo: rules, commands, commit conventions
 docs/                                Also: status, development log, verification record, upstream and phase notes
-src/timestral_tune/                  The package (stubs) and the vendored upstream code in _vendor/
-tests/                               Scaffold checks and acceptance-test placeholders
+src/timestral_tune/                  The package (Phases 0-1 built, later phases stubbed) and the vendored upstream code in _vendor/
+tests/                               Unit tests and the acceptance tests of spec §9
 scripts/                             Vendoring, drift check, and verification probes
 papers/                              Reference papers (only the CC BY Timestral paper is tracked)
 assets/                              README banner (drawn by scripts/make_banner.py)

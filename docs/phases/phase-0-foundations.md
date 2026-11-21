@@ -14,7 +14,8 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - **Line offsets.** In those five vendored files, lines sit four lower than the `[U file:line]` references.
 - **Packaging.** Hatchling, src layout, version read from `src/timestral_tune/__init__.py`. The wheel
   includes the vendored `LICENSE` and manifest.
-- **Core dependencies** are exactly upstream's four. Dataframe libraries will be extras, added in Phase 1.
+- **Core dependencies** are exactly upstream's four. The data layer reads polars, pandas and pyarrow frames
+  without importing any of them, so none is a dependency or an extra; all three are in the dev group for tests.
 - **Loader and device shims are done** (`models/loader.py`, `models/device.py`). The shims are subclasses
   that override four methods (model `scale`; forecaster `_cap_quantiles`, `_refine_block`,
   `_encode_categorical`), move tensors to CPU and call the parent. On devices with float64 they call the

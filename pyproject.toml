@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # Core dependencies are exactly what the vendored upstream package imports (same floors as upstream).
-# Dataframe libraries are added as extras when the data layer lands (Phase 1).
+# The data layer reads polars, pandas and pyarrow frames without importing them, so none is a dependency.
 dependencies = [
     "huggingface_hub>=0.23",
     "numpy>=1.24",

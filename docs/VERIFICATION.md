@@ -69,15 +69,18 @@ key together. The order of query and key within the first two-thirds is from the
 ## 4. Training forward against upstream inference
 
 Tests: `uv run pytest tests/acceptance/test_forward_parity.py tests/test_collator.py tests/test_dataset.py`.
-Run on the tiny random model, 5M and 28M.
+The last column says which models each claim ran on; "all" means the tiny random model, 5M and 28M.
 
-| Claim | Measured |
-|---|---|
-| T1/T2: denormalised training forward against `predict_block`, both layouts | Bit-identical on PyTorch 2.4.0 and 2.15.0. One tiny-model case differs by 8e-10 on 2.8.0. Bound: 1e-6 |
-| T3: median-folded frame against `_refine_block`, and the full pipeline against `forecast()` | 1e-7 to 2e-7 relative. Bound: 1e-5 |
-| Collated batch against upstream's `_assemble_rows`, `_encoding_target`, `_encode_categorical` | Every tensor exactly equal, including missing values, a partial final patch, categoricals and several targets |
-| Extra left padding (1 and 3 patches beyond upstream's), both layouts | Forecast unchanged within 1e-5 |
-| Frame → dataset → collator → forward → frame, against `forecast()` on the same raw values | Within 1e-5, for polars, pandas and pyarrow |
+| Claim | Measured | Models |
+|---|---|---|
+| T1/T2: denormalised training forward against `predict_block`, both layouts, including covariates with none known in advance | Bit-identical on PyTorch 2.4.0 and 2.15.0. One tiny-model case differs by 8e-10 on 2.8.0. Bound: 1e-6 | all |
+| T3: median-folded frame against `_refine_block`, and the full pipeline against `forecast()` | 1e-7 to 2e-7 relative. Bound: 1e-5 | all |
+| T3: `true_values` frame of every horizon patch after the first, against upstream's `model.scale` on the context extended by the true values | Within 1e-6 | all |
+| Collated batch against upstream's `_assemble_rows` and `_encoding_target` | Every tensor exactly equal, including missing values, a partial final patch and several targets | all |
+| Categorical encodings against upstream's `_encode_categorical` | Exactly equal | tiny only |
+| Extra left padding (1 and 3 patches beyond upstream's), both layouts | Forecast unchanged within 1e-5 | all |
+| Frame → dataset → collator → forward → frame, against `forecast()` on the same raw values, for polars, pandas and pyarrow; and with two targets and categoricals | Within 1e-5 | tiny only |
+| The batch the dataset and collator build passes `check_forward_parity` | Pass | all |
 
 ## 5. Apple GPU (MPS) parity
 
@@ -107,48 +110,70 @@ Autocast on MPS, forward relative difference from CPU fp32:
 
 Probe: `uv run python scripts/probes/gradient_accuracy.py --device mps`.
 
-Relative L2 error of the float32 training-loss gradient against a float64-weights reference. The reference
-uses float64 weights and inputs on CPU; upstream's RMSNorm and RoPE still compute in float32 internally, so
-it is not a pure float64 computation.
+Relative L2 error of the float32 training-loss gradient against a float64 reference. The reference uses
+float64 weights and inputs on CPU and computes upstream's RMSNorm in float64 (upstream's own always
+computes in float32; see below). RoPE still builds its table in float32, so it is not a pure float64
+computation.
 
 | Model | Layout | CPU | Apple GPU |
 |---|---|---|---|
-| Tiny random | univariate | 5.0e-7 | 3.9e-7 |
-| Tiny random | multivariate | 3.5e-7 | 3.3e-7 |
-| Tiny random | covariates | 2.7e-7 | 3.0e-7 |
-| 5M | univariate | 1.1e-3 | 9.8e-6 |
-| 5M | multivariate | 2.1e-3 | 4.6e-5 |
-| 5M | covariates | 1.2e-3 | 5.6e-5 |
-| 28M | univariate | 8.1e-4 | 5.9e-6 |
+| Tiny random | univariate | 4.9e-7 | 3.6e-7 |
+| Tiny random | multivariate | 3.5e-7 | 3.2e-7 |
+| Tiny random | covariates | 2.8e-7 | 2.9e-7 |
+| Tiny random | past-only covariates | 3.5e-7 | 3.5e-7 |
+| 5M | univariate | 1.1e-3 | 3.1e-5 |
+| 5M | multivariate | 2.1e-3 | 5.4e-5 |
+| 5M | covariates | 1.2e-3 | 7.7e-5 |
+| 5M | past-only covariates | 5.3e-4 | 5.9e-6 |
+| 28M | univariate | 8.2e-4 | 1.8e-5 |
 | 28M | multivariate | 5.0e-4 | 1.4e-5 |
-| 28M | covariates | 9.8e-4 | 4.5e-5 |
+| 28M | covariates | 9.1e-4 | 1.8e-4 |
+| 28M | past-only covariates | 4.6e-4 | 9.5e-6 |
 
-Across the scenarios of acceptance test T14 (other batches; `uv run pytest
-tests/acceptance/test_device_parity.py -k gradients -s` prints each value): CPU 1.6e-7 to 3.4e-3, Apple GPU
-2.2e-7 to 1.1e-3. The largest Apple GPU value is 28M with covariates. The same test prints one minus the
-cosine similarity with the reference: at most 5.7e-6 on CPU and 6.4e-7 on the Apple GPU.
+Across the five scenarios of acceptance test T14, on 5M and 28M (other data than the probe's;
+`uv run pytest tests/acceptance/test_device_parity.py -k "gradients" -s` prints each value):
 
-What narrows it down, and what does not:
+| Tier | Bound | CPU, worst case | Apple GPU, worst case |
+|---|---|---|---|
+| Tiny random model, as shipped and with explicit attention | 1e-5 | 4.1e-7 | 4.5e-7 |
+| Released, as shipped | 5e-2 | 3.4e-3 (5M, two targets with covariates) | 2.1e-3 (5M, past-only covariates) |
+| Released, explicit attention | 5e-3 | 1.2e-3 (5M, past-only covariates) | 2.1e-3 (5M, past-only covariates) |
+| `head_only` (everything but the head frozen), all models | 1e-5 | 2.3e-6 | 2.8e-6 |
+
+One minus the cosine similarity with the reference, as shipped: at most 5.7e-6 on CPU and 2.1e-6 on the
+Apple GPU.
+
+What narrows it down, and what does not (probe, covariates batch unless stated):
 
 | Experiment | Result |
 |---|---|
-| CPU error with upstream's attention call replaced by explicit matmul and softmax, 5M | 1.2e-3 → 3.9e-5 |
-| Same, 28M | 9.8e-4 → 2.6e-4 |
+| Upstream's attention call replaced by explicit matmul and softmax, 5M | CPU 1.2e-3 → 5.9e-5; Apple GPU 7.7e-5 → 7.6e-5 |
+| Same, 28M | CPU 9.1e-4 → 3.9e-4; Apple GPU 1.8e-4 → 3.7e-5 |
 | Standalone attention call, fp32 vs fp64 gradient, max logit 5.5 | stock 5.5e-7, explicit 3.5e-7 |
 | Same, max logit 88 | stock 4.0e-6, explicit 3.7e-6 |
 | Same, max logit 1,409 | stock 5.0e-5, explicit 4.8e-5 |
+| A float64-weights reference with upstream's float32 RMSNorm, against the reference with float64 RMSNorm, over the twelve cells above | 6e-8 to 1.3e-4 (largest: 28M covariates) |
 
-Reading: the error depends on the weights (a random model shows none) and appears on every device. CUDA
-measurements (§13) then located most of it, on CUDA and CPU, in the float32 backward pass of upstream's
-attention call. On the Apple GPU the swap changes nothing (5M: 5.6e-5 → 5.5e-5; 28M: 4.5e-5 → 9.6e-5). A
-smaller remainder in one scenario (28M with covariates) is unexplained on all three.
+Reading. The error depends on the weights (a random model shows none) and appears on every device. Two
+sources are identified:
 
-`head_only` is not affected. With everything but the head frozen, head gradients match the reference within
-1.9e-6 on CPU and 2.6e-6 on the Apple GPU across T14's scenarios, on the tiny model, 5M and 28M
-(`uv run pytest tests/acceptance/test_device_parity.py -k head_only -s`). Not yet run on CUDA. Forward outputs are unaffected (about 3e-7 from the
-reference, §11).
+1. The float32 backward pass of upstream's attention call, on CUDA (§13) and CPU. On the Apple GPU the swap
+   changes little.
+2. Upstream's RMSNorm, which computes in float32 whatever the model's dtype. On T14's 5M scenario with
+   past-only covariates this moved the float64-weights reference itself by 3.8e-3 (§11), enough to fail a
+   check whose bound is 5e-3. All references now compute RMSNorm in float64 (`tests/helpers.py` and
+   `scripts/probes/_common.py`, by replacing the method while the reference runs; vendored files are not
+   edited). Numbers in this section were re-measured with that reference on 2026-11-21. The CUDA numbers in
+   §13 were not: they used the earlier reference.
 
-Consequence: T14 compares gradients with the reference on every device, in three tiers (spec D12).
+What remains with explicit attention and the better reference (at most 1.2e-3 on CPU, 2.1e-3 on the Apple
+GPU) is unexplained beyond being float32 arithmetic through the same layers.
+
+`head_only` is not affected: with the body frozen the backward pass never enters attention or the body's
+norms. Not yet run on CUDA. Forward outputs are unaffected (about 3e-7 from the reference, §11).
+
+Consequence: T14 compares gradients with the reference on every device, in three tiers plus the `head_only`
+check (spec D12).
 
 ## 7. Training-step timing, CPU against the Apple GPU
 
@@ -178,6 +203,9 @@ Tests: `uv run pytest tests/acceptance tests/test_trainer.py`. Run on the tiny r
 | Noise on known-future horizon values changes the target forecast | T7 | Pass |
 | Loss gradient is exactly zero at covariate rows, unobserved steps and horizon padding, under both frames | T8 | Pass |
 | Categorical encodings are unchanged when data after the origin changes; a whole-series encoding would differ | T12 | Pass |
+| With two targets, a past-only category that first occurs after the origin (sorting first, or in the middle) changes no input; the dataset-wide codes do change | T12, several targets | Pass |
+| A category first seen after a `split_by_time` cutoff changes no training batch, with one or two targets | `test_dataset.py` | Pass (tiny model) |
+| Series that start and end at different times: no training window holds a step at or after the cutoff | `test_dataset.py` | Pass |
 | `head_only` on a fixed batch: loss falls, and every non-head parameter is bit-identical afterwards | `test_trainer.py` | Pass on CPU and the Apple GPU, with and without covariates |
 
 ## 9. Target-frame check
@@ -236,21 +264,26 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 255 passed, 22 skipped. Skipped: 17 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 43 further Apple GPU cases are not generated at all. CPU passes everything else, including all of T14's gradient checks and the tests on 5M and 28M |
-| 2.8.0 | 3.12 | 316 passed, 4 skipped, including every Apple GPU test |
-| 2.14.1 | 3.10 | 316 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 316 passed, 4 skipped |
+| 2.4.0 | 3.12 | 331 passed, 26 skipped. Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 52 further Apple GPU cases are not generated at all. CPU passes everything else, including all of T14's gradient checks and the tests on 5M and 28M |
+| 2.8.0 | 3.12 | 405 passed, 4 skipped, including every Apple GPU test |
+| 2.14.1 | 3.10 | 405 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
+| 2.15.0 | 3.13 | 405 passed, 4 skipped |
 
-These are the counts for the final Phase 1 code, all on macOS. The CUDA run (§13) used Linux.
+These are the counts after the review fixes of 2026-11-21, all on macOS. The CUDA run (§13) used Linux and
+predates them.
 
 The 4 skips common to every row are the Phase 2 acceptance placeholders.
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
-calls:
+calls. Probe (it imports nothing from this library):
+`uv run --isolated --python 3.12 --with "torch==2.7.1" python scripts/probes/mps_cummax.py`.
 
 | PyTorch | 2.4.0 | 2.5.1 | 2.6.0 | 2.7.1 | 2.8.0 | 2.9.1 |
 |---|---|---|---|---|---|---|
 | `cummax` on MPS | raises | raises | raises | raises | works | works |
+
+2.7.1, 2.8.0 and 2.15.0 were re-run with the probe; 2.4.0, 2.5.1, 2.6.0 and 2.9.1 were measured with an
+equivalent one-line command before the probe existed.
 
 `resolve_device` skips the Apple GPU under `"auto"` on older versions and raises for an explicit `"mps"`.
 
@@ -278,6 +311,8 @@ Re-measure before relying on them.
 | Autocast speed on MPS, 28M covariate batch | fp32 1,778 ms; `bfloat16` 1,731 ms; `float16` 1,732 ms (no speed-up) |
 | Training step at context 4,096, univariate, batch 16 | 5M: CPU 138 ms, MPS 93 ms. 28M: CPU 526 ms, MPS 347 ms |
 | RMSNorm via `sqrt` instead of `rsqrt` (5M) | CPU fp32 gradient error moved from 3.9e-3 to 1.5e-3 |
+| Float64-weights reference with upstream's float32 RMSNorm against the same with float64 RMSNorm, on T14's scenarios | 5M past-only covariates 3.8e-3; 28M covariates 1.4e-4; 5M univariate 1.5e-5 |
+| The 5M past-only-covariates case with explicit attention, against the earlier (float32-RMSNorm) reference | CPU 2.6e-3, Apple GPU 5.9e-3; the error sat in layers 0 to 4 and the patch embedding, with the same distribution on both devices |
 
 ## 12. Facts read from sources, not measured
 
@@ -287,8 +322,9 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 ## 13. CUDA
 
 Run: `bash scripts/cuda_check.sh` on the VM described at the top, at commit `ecbab9d`. It runs the
-device-parametrised tests, the whole suite and the device probes. The 24 `head_only` gradient cases of T14
-were added after this run and have not run on CUDA.
+device-parametrised tests, the whole suite and the device probes. Everything added later has not run on
+CUDA: T14's `head_only` gradient cases, the past-only-covariate scenario and the review fixes. The gradient
+numbers below were measured against the earlier reference, which left upstream's RMSNorm in float32 (§6).
 
 | Check | Result |
 |---|---|

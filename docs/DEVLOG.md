@@ -190,3 +190,48 @@ removed after the VM was deleted.
 **Not done / open.** The library still trains with upstream's attention call. Whether explicit attention
 changes training results is untested; if it matters, it belongs with Phase 2's attention wrapping for LoRA.
 `bf16` on CUDA is untested. `phase-1` is still unmerged and unpushed.
+
+---
+
+## 2026-11-21 (fourth session) — review of Phase 1 and fixes
+
+**What.** The maintainer asked for a review workflow: five reviewers (forward and loss, data, trainer and
+loader, tests and verifiers, spec and docs), each followed by a skeptic that tried to refute its findings.
+22 findings survived (21 distinct: none high, 8 medium, 13 low) and 4 were refuted. All 21 are fixed.
+
+**Defects in the library.**
+
+- **Category codes depended on future data with several targets.** Codes were numbered over the whole
+  frame, and with more than one target they are model inputs. Windows now number their categories among
+  those they can see (decision D14, spec §6.3 rule 4).
+- **Time-zone-aware timestamps from polars and pyarrow were accepted silently** and converted to UTC, moving
+  local-time split cutoffs. The check now runs on the frame's column type.
+- Smaller: `PinballLoss` could not be moved to the Apple GPU (float64 buffer); integer-dtype batches passed
+  validation; `fit()` raised if a callback stopped it before the first step; callbacks were documented as
+  duck-typed but are not; the progress logger miscounted on a second `fit()`; `from_upstream` rounded
+  float64 weights through float32; the config rejected NumPy integers; `check_loss_mask` raised on a fully
+  frozen model.
+
+**Tests that could not fail.** The checkpoint fixture turned every loader error into a skip; the time-split
+test used one shared time axis; the `true_values` frame was only checked at the patch it is assigned from.
+All three are fixed, and each new test was run against the reviewer's mutation and seen to fail.
+
+**A finding of our own, while fixing.** Adding the missing past-only-covariate scenario made one T14 case
+fail (explicit attention, Apple GPU, 5M: 5.9e-3 against 5e-3). The bound was not loosened. The reference
+was at fault: upstream's RMSNorm computes in float32 even in a float64 model, and in that scenario this
+moved the "float64" reference by 3.8e-3. References now compute RMSNorm in float64, and every local
+gradient number was re-measured. This is a second identified source of the float32 gradient inaccuracy,
+next to the attention call.
+
+**Documents.** Spec §6.2 now describes what the collator does with long and short contexts; §9 no longer
+says every acceptance test is a placeholder; §12 says which evidence comes from which probe or test; the
+Hub pins are documented where they live, with a test that keeps the table and the code in step; the PyTorch
+2.8 floor has a probe.
+
+**Evidence.** 405 passed, 4 skipped on PyTorch 2.15.0 (Python 3.13), 2.14.1 (Python 3.10) and 2.8.0 (Python
+3.12); 331 passed, 26 skipped on 2.4.0.
+
+**Not done / open.** None of this has run on CUDA; the CUDA gradient numbers in `docs/VERIFICATION.md` §13
+predate the improved reference. The earlier claim "no leakage on the training path" was too strong: it
+held for what the tests covered, which did not include several targets with categoricals or zoned
+timestamps. `phase-1` is still unmerged and unpushed.
