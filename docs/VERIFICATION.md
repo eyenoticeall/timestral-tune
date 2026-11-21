@@ -123,8 +123,8 @@ it is not a pure float64 computation.
 
 Across the scenarios of acceptance test T14 (other batches; `uv run pytest
 tests/acceptance/test_device_parity.py -k gradients -s` prints each value): CPU 1.6e-7 to 3.4e-3, Apple GPU
-2.2e-7 to 1.1e-3. The largest Apple GPU value is 28M with covariates. In an earlier one-off run of the same
-scenarios, cosine similarity with the reference stayed above 0.999999 in every case.
+2.2e-7 to 1.1e-3. The largest Apple GPU value is 28M with covariates. The same test prints one minus the
+cosine similarity with the reference: at most 5.7e-6 on CPU and 6.4e-7 on the Apple GPU.
 
 What narrows it down, and what does not:
 
@@ -229,22 +229,34 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 227 passed, 21 skipped. The skips are the Apple GPU tests and the Phase 2 placeholders. CPU passes everything, including T14's gradient check and the tests on 5M and 28M |
-| 2.8.0 | 3.12 | 262 passed, 4 skipped, including every Apple GPU test |
-| 2.15.0 | 3.13 | 262 passed, 4 skipped |
+| 2.4.0 | 3.12 | 231 passed, 22 skipped. Skipped: 17 accelerator tests, one DataLoader-worker test (below) and the 4 Phase 2 placeholders; 19 further Apple GPU cases of the trainer and verifier tests are not generated at all. CPU passes everything else, including T14's gradient check and the tests on 5M and 28M |
+| 2.8.0 | 3.12 | 268 passed, 4 skipped, including every Apple GPU test |
+| 2.14.1 | 3.10 | 268 passed, 4 skipped (`uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
+| 2.15.0 | 3.13 | 268 passed, 4 skipped |
 
-The 4 skips are the Phase 2 acceptance placeholders. Python 3.10 has run only the scaffold tests locally
-(with PyTorch 2.14.1); CI runs the network-free tests on 3.10 to 3.13.
+The 4 skips common to every row are the Phase 2 acceptance placeholders.
 
-The Apple GPU needs PyTorch 2.8. `torch.Tensor.cummax` on that backend, which upstream's input assembly
+**The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls:
 
 | PyTorch | 2.4.0 | 2.5.1 | 2.6.0 | 2.7.1 | 2.8.0 | 2.9.1 |
 |---|---|---|---|---|---|---|
 | `cummax` on MPS | raises | raises | raises | raises | works | works |
 
-Before the library refused the Apple GPU on older versions, the suite on 2.4.0 failed there and then hung
-in one test. `resolve_device` now skips it under `"auto"` and raises for an explicit `"mps"`.
+`resolve_device` skips the Apple GPU under `"auto"` on older versions and raises for an explicit `"mps"`.
+
+**DataLoader workers hang the exit on macOS with PyTorch 2.4.0.** Probe (it imports nothing from this
+library): `uv run --isolated --python 3.12 --with "torch==2.4.0" python scripts/probes/worker_exit_hang.py`.
+
+| PyTorch | 2.4.0 | 2.8.0 | 2.15.0 |
+|---|---|---|---|
+| Process exits after reading batches through one worker | no (killed after 300 s) | yes | yes |
+
+While it hung, PyTorch's `torch_shm_manager` helper held the write end of the pipe that Python's
+multiprocessing resource tracker reads, so the interpreter waited for the tracker forever at shutdown.
+Versions 2.5 to 2.7, Python versions other than 3.12, and Linux were not tried. The suite skips
+`test_dataset_pickles_and_works_in_a_worker_process` on macOS below PyTorch 2.8 for this reason; with it
+included, all tests passed on 2.4.0 and the process then never exited.
 
 ## 11. One-off results not covered by a probe or test
 
@@ -254,7 +266,6 @@ Re-measure before relying on them.
 | Result | Value |
 |---|---|
 | Forward agreement with the float64-weights reference (5M) | CPU fp32 3.1e-7, MPS fp32 4.3e-7 |
-| Cosine similarity of float32 gradients with the reference, T14 scenarios | Above 0.999999 on CPU and the Apple GPU |
 | Autocast speed on MPS, 28M covariate batch | fp32 1,778 ms; `bfloat16` 1,731 ms; `float16` 1,732 ms (no speed-up) |
 | Training step at context 4,096, univariate, batch 16 | 5M: CPU 138 ms, MPS 93 ms. 28M: CPU 526 ms, MPS 347 ms |
 | RMSNorm via `sqrt` instead of `rsqrt` (5M) | CPU fp32 gradient error moved from 3.9e-3 to 1.5e-3 |

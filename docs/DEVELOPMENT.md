@@ -85,7 +85,8 @@ a batch with upstream's own input assembly as ground truth).
 - **Device tests** take their device list from `tests/conftest.py::available_accelerators` and skip
   cleanly when a device is absent or the PyTorch version is too old for it.
 - **Older PyTorch.** `uv run --isolated --python 3.12 --with "torch==2.4.0" pytest` runs the suite on the
-  floor without touching the project environment.
+  floor without touching the project environment. Each such run downloads a PyTorch build of a few hundred
+  megabytes into the uv cache; `uv cache prune` reclaims the space afterwards.
 - **Training tests** copy the model first (`copy.deepcopy`); the fixtures are shared across tests.
 
 ## Devices

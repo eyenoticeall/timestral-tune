@@ -15,7 +15,7 @@
 | Training | `TimestralTrainer` in `head_only` mode, fp32: AdamW, warm-up, cosine or constant schedule, clipping, evaluation, early stopping, best-state restore |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **10 of 14 implemented and passing**: T1–T8, T12, T14. T9, T10, T11, T13 are Phase 2 placeholders |
-| Test suite | 262 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0, Python 3.13, macOS) |
+| Test suite | 268 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; macOS) |
 | CI | Green on the last push (scaffold only). The Phase 1 work has not been pushed, so CI has not run on it |
 
 ## What does not exist yet
@@ -57,6 +57,10 @@ Full list in spec §12. The ones that matter next:
 - **The target-frame evidence is synthetic** (univariate, fully observed, one seed, 5M and 28M).
 - **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
 - **No export yet**, so a trained model lives only in memory (`trainer.model`).
+- **PyTorch 2.4.0 on macOS hangs at exit when a DataLoader uses worker processes.** A PyTorch issue, gone
+  by 2.8.0 (`docs/VERIFICATION.md` §10). `num_workers` defaults to 0.
+- **Validation loss under `median_folded` is in units that move with the model** (spec §12). Use it as a
+  training signal, not for model selection across runs, until the raw-space metrics exist.
 - **CI actions use a deprecated Node.js version.** GitHub warns that `actions/checkout@v4` and
   `astral-sh/setup-uv@v5` target Node.js 20. They still run.
 

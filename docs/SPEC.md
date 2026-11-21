@@ -334,11 +334,12 @@ Metrics, in raw space: MASE, mean weighted quantile loss over the 21 levels, pin
 src/timestral_tune/
 │
 ├── __init__.py
-├── config.py                 # TrainingConfig, LoraConfig, ReplayConfig dataclasses
+├── config.py                 # TrainingConfig (built); LoraConfig, ReplayConfig (later phases)
 ├── _vendor/
 │   └── timestral/            # Upstream code at the pinned commit (imports made relative), LICENSE, manifest
 │
 ├── data/
+│   ├── batch.py              # TrainingBatch: the packed row layout shared by collator, forward and loss
 │   ├── dataset.py            # Long-frame loader (Polars / PyArrow / pandas), windowing, time splits
 │   ├── collator.py           # Packed rows, roles, group ids, padding, loss weights
 │   └── encoders.py           # Per-window, context-only target encoding of categorical covariates
@@ -358,8 +359,9 @@ src/timestral_tune/
 │   └── distill.py            # Frozen-base distillation term
 │
 ├── trainer/
-│   ├── trainer.py            # Training loop (AMP, optional compile, clipping, early stopping)
-│   └── callbacks.py          # Logging, early stopping, checkpointing
+│   ├── step.py               # compute_loss: forward, target frame and pinball loss in one place
+│   ├── trainer.py            # Training loop (clipping, evaluation, early stopping; AMP and compile in Phase 2)
+│   └── callbacks.py          # Progress logging, early stopping
 │
 ├── export.py                 # Upstream-loadable checkpoint, adapter, metadata sidecar
 │
@@ -632,8 +634,10 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
 - **Benchmark contamination.** The paper says the models were post-trained on "a mixture of real and synthetic data" and does not list the real datasets. Any public benchmark dataset may have been seen. Results must say so, and should favour data published after October 2026 or private data where possible.
 - **Upstream drift.** Upstream is a first release with no stability promise. The drift-check job detects changes; re-vendoring requires re-running T1–T3 and T11.
 - **Benchmark dataset choice.** The realised-volatility and retail-demand datasets are not yet selected; licences must be checked first.
-- **Float32 gradients through the released weights are not at round-off, cause unknown.** Against a float64-weights reference (upstream's RMSNorm and RoPE still compute in float32 internally), float32 gradients of the training loss differ by up to 3.4e-3 on CPU and 1.1e-3 on the Apple GPU **[V]**, while forward outputs agree to about 3e-7. It depends on the weights, not the architecture: a randomly initialised model is at 3e-7 on both devices. CPU is usually 10 to 100 times worse than the Apple GPU. Replacing upstream's attention call with an explicit matmul-and-softmax shrinks the CPU error inside the model (1.2e-3 to 3.9e-5 on 5M), yet the same call is accurate in isolation at every attention-logit scale tried, so no single cause is established (`scripts/probes/gradient_accuracy.py`). The gradient direction is essentially unaffected (cosine above 0.999999), so training should be too, but this is why T14 has two tiers and compares against the reference rather than CPU float32. CUDA is untested.
+- **Float32 gradients through the released weights are not at round-off, cause unknown.** Against a float64-weights reference (upstream's RMSNorm and RoPE still compute in float32 internally), float32 gradients of the training loss differ by up to 3.4e-3 on CPU and 1.1e-3 on the Apple GPU **[V]**, while forward outputs agree to about 3e-7. It depends on the weights, not the architecture: a randomly initialised model is at 3e-7 on both devices. CPU is usually 10 to 100 times worse than the Apple GPU. Replacing upstream's attention call with an explicit matmul-and-softmax shrinks the CPU error inside the model (1.2e-3 to 3.9e-5 on 5M), yet the same call is accurate in isolation at every attention-logit scale tried, so no single cause is established (`scripts/probes/gradient_accuracy.py`). The gradient direction is nearly unaffected (one minus the cosine is at most 5.7e-6 on CPU and 6.4e-7 on the Apple GPU), so training should be too, but this is why T14 has two tiers and compares against the reference rather than CPU float32. CUDA is untested.
+- **Validation loss under `median_folded` is measured in units that move with the model.** From the second horizon patch on, the frame is built from the model's own predicted medians, so two checkpoints are scored against slightly different normalised targets. Early stopping and best-state restoration compare those losses across steps. The effect shrinks with context length (the frame is dominated by the context) and is absent for horizons of one patch, but it has not been measured. Until the raw-space metrics of §5.5 exist (Phase 3), treat the validation loss as a training signal, not as a model-selection metric across runs.
 - **Apple GPU scope.** Needs PyTorch 2.8 or newer. Verified on one machine, on 2.8.0 and 2.15.0.
+- **Worker processes on macOS with PyTorch 2.4.0.** A DataLoader with `num_workers > 0` leaves the process hanging at exit there **[V]**. It is a PyTorch issue that reproduces without this library and is gone by 2.8.0; `num_workers` defaults to 0.
 - **CUDA has never been run.** The code paths are the upstream ones plus device-agnostic logic, and CI covers CPU on Linux, but no test has executed on a CUDA device.
 - **Licence reach.** Whether adapter-only files count as derivatives is a legal question. The library takes the cautious position (§8).
 

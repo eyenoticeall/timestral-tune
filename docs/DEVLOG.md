@@ -119,7 +119,12 @@ run upstream's four float64 sites on CPU where the device has no float64. No ven
   T14's single 1e-3 gradient bound was replaced by two tiers (decision D12). An earlier statement in this
   project that Apple GPU gradients sit within 8e-5 of the reference is superseded: that was one batch.
 - **The Apple GPU needs PyTorch 2.8.** Older versions lack `cummax` on that backend. The library now
-  refuses it below 2.8 (decision in spec §5.4); before that, the suite on 2.4.0 failed and then hung.
+  refuses it below 2.8 (decision in spec §5.4).
+- **PyTorch 2.4.0 on macOS hangs at exit after a DataLoader worker has run.** First misread as a test
+  hanging on the Apple GPU (the commit message of the PyTorch 2.8 gate says so; it is wrong on that point).
+  A stack sample and `lsof` showed the interpreter waiting at shutdown for the multiprocessing resource
+  tracker, whose pipe PyTorch's `torch_shm_manager` kept open. It reproduces without this library
+  (`scripts/probes/worker_exit_hang.py`) and not on 2.8.0. One test is skipped on that combination.
 - **Bit-identity is not a safe assertion across PyTorch versions.** T1/T2 are bit-identical on 2.4.0 and
   2.15.0 but one case differs by 8e-10 on 2.8.0. The bound is now 1e-6.
 - **`split_by_time` semantics were tightened** (decision D11): training gets nothing at or after the
@@ -129,13 +134,17 @@ run upstream's four float64 sites on CPU where the device has no float64. No ven
 moving to CPU (in the frame computation, the device-order of a `.to()`, and the evaluation loop's
 accumulator). All three were found by running on the device, none by reading.
 
-**Evidence.** 262 passed, 4 skipped on PyTorch 2.15.0 (Python 3.13); 262 passed on 2.8.0 and 227 passed,
-21 skipped on 2.4.0 (Python 3.12). T1–T8 and T12 pass on 5M and 28M, which is Phase 1's exit criterion.
+**Evidence.** 268 passed, 4 skipped on PyTorch 2.15.0 (Python 3.13), on 2.14.1 (Python 3.10) and on 2.8.0
+(Python 3.12); 231 passed, 22 skipped on 2.4.0 (Python 3.12). T1–T8 and T12 pass on 5M and 28M, which is Phase 1's exit criterion.
 Numbers: `docs/VERIFICATION.md`.
 
 **Left open.**
 
 - T14 on CUDA: no hardware. One command when there is.
+- Gradient cosine against the reference was first recorded as above 0.999999 on both devices without a CPU
+  measurement. Measured since: one minus the cosine is at most 5.7e-6 on CPU and 6.4e-7 on the Apple GPU.
+  The docs carry the measured values.
+- Validation loss under `median_folded` is in units that move with the model (spec §12); unmeasured.
 - `phase-1` is not merged or pushed; CI has not run on it.
 - The gradient-accuracy cause.
 - The target-frame evidence is synthetic only.

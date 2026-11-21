@@ -35,6 +35,10 @@ maintains or extends the phase.
 - **Pinball losses are not comparable between the two target frames.** Each is in its own units.
 - **The tiny random model** (`tests/helpers.py`) makes structural tests network-free. It does not show the
   float32 gradient inaccuracy the released weights do, so gradient tests need both.
+- **Validation loss under `median_folded` moves its own units** as the model's medians change (spec §12).
+  Early stopping compares those losses; prefer raw-space metrics for model selection once they exist.
+- **Floor runs on macOS.** PyTorch 2.4.0 hangs at exit after a DataLoader worker has run
+  (`scripts/probes/worker_exit_hang.py`); the suite skips the one worker test there.
 - **`split_by_time`**: training gets nothing at or after the cutoff; the embargo is an extra gap.
 
 ## Open questions
@@ -46,6 +50,6 @@ maintains or extends the phase.
 
 ## Log of what was done
 
-- 2026-11-21: All Phase 1 items built. Evidence: 262 passed, 4 skipped on PyTorch 2.15.0; 262 passed on
-  2.8.0; 227 passed, 21 skipped on 2.4.0. T1–T8 and T12 pass on 5M and 28M. Target-frame check run and
+- 2026-11-21: All Phase 1 items built. Evidence: 268 passed, 4 skipped on PyTorch 2.15.0, 2.14.1
+  (Python 3.10) and 2.8.0; 231 passed, 22 skipped on 2.4.0. T1–T8 and T12 pass on 5M and 28M. Target-frame check run and
   recorded; D2 confirmed. Not done: CUDA.
