@@ -232,28 +232,39 @@ def test_aci_transform_is_read_only_and_update_uses_repaired_interval():
 
 
 def test_aci_window_eviction_and_anti_windup_regime_recovery():
-    """Verify rolling forecast-observation window eviction (mutation gap) AND bounded Lemma 4.1
-    recovery under over-wide -> narrow and escalating-error -> normal regime shifts with default 0.80.
+    """Verify rolling forecast-observation window semantics & eviction, median clamp on extreme
+    narrowing, and bounded Lemma 4.1 recovery on both the lower (-gamma) and upper (1 + gamma) bounds.
     """
-    # 1. Window eviction: push 3 huge outlier forecasts into window=4 (bucket_size=4), then 4 tiny forecasts.
-    # Once the 3 outliers are evicted (4 forecast updates later), the offset must drop from ~100 to ~0.1.
-    online = OnlineConformalCalibrator(target_coverage=0.80, gamma=0.005, window=4, bucket_size=4)
+    # 1. Window counts FORECASTS (not individual steps) and evicts old observations cleanly:
+    # with window=2, bucket_size=4 (4 step scores per forecast), pushing 1 outlier forecast (100.0)
+    # then 1 tiny forecast (0.1) MUST retain 100.0 (step-counting window=2 would have evicted it already);
+    # pushing a 2nd tiny forecast evicts the outlier and drops the offset to 0.1.
+    online = OnlineConformalCalibrator(target_coverage=0.80, gamma=0.005, window=2, bucket_size=4)
     zero_preds = np.zeros((1, 4, len(DEFAULT_QUANTILE_LEVELS)), dtype=np.float64)
-    for _ in range(3):
-        online.update(zero_preds, np.full((1, 4), 100.0), np.ones(1))
-    assert online.current_offsets(4)[0, 0] == pytest.approx(100.0)
-    for _ in range(4):
-        online.update(zero_preds, np.full((1, 4), 0.1), np.ones(1))
-    assert online.current_offsets(4)[0, 0] == pytest.approx(0.1), "old outlier forecasts were not evicted from window"
+    online.update(zero_preds, np.full((1, 4), 100.0), np.ones(1))
+    online.update(zero_preds, np.full((1, 4), 0.1), np.ones(1))
+    assert online.current_offsets(4)[0, 0] == pytest.approx(100.0), "window counted steps instead of forecasts"
+    online.update(zero_preds, np.full((1, 4), 0.1), np.ones(1))
+    assert online.current_offsets(4)[0, 0] == pytest.approx(0.1), "old outlier forecast was not evicted"
 
-    # 2. Over-wide -> narrow regime shift with default single coverage 0.80 (reviewer Finding 2).
+    # 2. Extreme negative offset clamps calibrated bounds at the unshifted median (never crosses median).
+    median_idx = DEFAULT_QUANTILE_LEVELS.index(0.50)
+    low_80, high_80 = DEFAULT_QUANTILE_LEVELS.index(0.10), DEFAULT_QUANTILE_LEVELS.index(0.90)
+    wide = np.linspace(-10.0, 10.0, len(DEFAULT_QUANTILE_LEVELS))[None, None, :].repeat(4, axis=1) + 5.0
+    cal_clamp = ConformalCalibrator(target_coverage=0.80, bucket_size=4).fit(wide, np.full((1, 4), 5.0), np.ones(1))
+    cal_clamp.offsets_ = np.array([[-50.0]])
+    clamped = cal_clamp.transform(wide, np.ones(1))
+    assert np.all(np.diff(clamped, axis=-1) >= 0.0)
+    np.testing.assert_array_equal(clamped[..., median_idx], wide[..., median_idx])
+    np.testing.assert_array_equal(clamped[..., low_80], wide[..., median_idx])
+    np.testing.assert_array_equal(clamped[..., high_80], wide[..., median_idx])
+
+    # 3. Over-wide -> narrow regime shift with default single coverage 0.80 (reviewer Finding 2).
     z = torch.distributions.Normal(0.0, 1.0).icdf(torch.tensor(DEFAULT_QUANTILE_LEVELS, dtype=torch.float64)).numpy()
     rng = np.random.default_rng(42)
-    low_80, high_80 = DEFAULT_QUANTILE_LEVELS.index(0.10), DEFAULT_QUANTILE_LEVELS.index(0.90)
     gamma = 0.01
     aci = OnlineConformalCalibrator(target_coverage=0.80, gamma=gamma, window=200, bucket_size=32)
 
-    # 600 steps of 2.2x over-wide forecasts: alpha_t must stay near 0.2 and never wind up above 1 + gamma.
     for _ in range(600):
         y = rng.normal(0.0, 1.0, size=(1, 32))
         p = (2.2 * z)[None, None, :].repeat(32, axis=1)
@@ -261,7 +272,6 @@ def test_aci_window_eviction_and_anti_windup_regime_recovery():
         assert -gamma - 1e-12 <= float(aci.alpha_t[0, 0]) <= 1.0 + gamma + 1e-12
     assert float(aci.alpha_t[0, 0]) < 0.45, f"alpha_t wound up on over-wide forecasts: {float(aci.alpha_t[0, 0]):.3f}"
 
-    # Sudden switch to 0.45x under-wide forecasts: must recover to ~0.80 quickly (not 31% for 500 steps).
     post_cov: list[float] = []
     for step in range(250):
         y = rng.normal(0.0, 1.0, size=(1, 32))
@@ -272,28 +282,86 @@ def test_aci_window_eviction_and_anti_windup_regime_recovery():
         aci.update(p, y, np.ones(1))
     assert float(np.mean(post_cov)) >= 0.72, f"post-shift recovery too slow: {float(np.mean(post_cov)):.3f}"
 
-    # 3. Escalating errors (mirror case): alpha_t hits saturation at -gamma (not -2.2) and recovers cleanly.
+    # 4. Escalating errors (lower bound): alpha_t saturates at -gamma (never winds down to -2.2).
     aci_esc = OnlineConformalCalibrator(target_coverage=0.80, gamma=0.05, window=50, bucket_size=4)
     for k in range(1, 80):
         aci_esc.update(zero_preds, np.full((1, 4), float(k)), np.ones(1))
     assert aci_esc.saturated and float(aci_esc.alpha_t[0, 0]) == pytest.approx(-0.05)
 
+    # 5. Zero-noise exact-median stream (upper bound): err_t == 0 forever, so alpha_t caps at 1 + gamma.
+    aci_hi = OnlineConformalCalibrator(target_coverage=0.80, gamma=0.05, window=50, bucket_size=4)
+    for _ in range(150):
+        aci_hi.update(zero_preds, np.zeros((1, 4)), np.ones(1))
+    assert float(aci_hi.alpha_t[0, 0]) == pytest.approx(1.0 + 0.05)
 
-def test_collect_conformal_data_bridges_dataset_and_calibrator(tiny_forecaster):
+
+def test_collect_conformal_data_matches_upstream_and_preserves_small_scales(tiny_forecaster):
     from timestral_tune import collect_conformal_data
+    from timestral_tune.data import SeriesData, TimeSeriesDataset
 
     from .helpers import make_toy_dataset
 
     dataset = make_toy_dataset(tiny_forecaster.patch_size, series=4, covariates=True)
-    preds, actuals, scale = collect_conformal_data(tiny_forecaster, dataset, batch_size=3)
-    n_targets = dataset.series[0].layout[0]
-    assert preds.shape == (
-        len(dataset) * n_targets,
-        dataset.forecast_horizon,
-        tiny_forecaster.model.config.num_quantiles,
+    preds, actuals, scale = collect_conformal_data(tiny_forecaster, dataset, batch_size=3, symmetric_averaging=True)
+    preds_nosym, _, _ = collect_conformal_data(tiny_forecaster, dataset, batch_size=3, symmetric_averaging=False)
+
+    # 1. Exact agreement with single-window upstream forecast (including known covariates) & actual alignment.
+    w0 = dataset[0]
+    ref_sym = (
+        tiny_forecaster.forecast(
+            w0.target_context[None],
+            dataset.forecast_horizon,
+            past_covariates=w0.past[None],
+            known_covariates=w0.known[None],
+            symmetric_averaging=True,
+        )
+        .quantiles.cpu()
+        .numpy()[0, 0]
     )
-    assert actuals.shape == (len(dataset) * n_targets, dataset.forecast_horizon)
-    assert scale.shape == (len(dataset) * n_targets,) and np.all(scale > 0.0) and np.isfinite(scale).all()
-    cal = ConformalCalibrator(target_coverage=0.80, bucket_size=tiny_forecaster.patch_size).fit(preds, actuals, scale)
-    out = cal.transform(preds, scale)
-    assert out.shape == preds.shape and np.all(np.diff(out, axis=-1) >= 0.0)
+    ref_nosym = (
+        tiny_forecaster.forecast(
+            w0.target_context[None],
+            dataset.forecast_horizon,
+            past_covariates=w0.past[None],
+            known_covariates=w0.known[None],
+            symmetric_averaging=False,
+        )
+        .quantiles.cpu()
+        .numpy()[0, 0]
+    )
+    np.testing.assert_allclose(preds[0], ref_sym, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(preds_nosym[0], ref_nosym, rtol=1e-5, atol=1e-5)
+    assert not np.allclose(preds[0], preds_nosym[0])
+    for i in range(len(dataset)):
+        np.testing.assert_allclose(actuals[i], dataset[i].target_future[0], rtol=1e-6, atol=1e-6)
+        assert scale[i] == pytest.approx(float(np.std(dataset[i].target_context[0])), rel=1e-6)
+
+    # 2. Small-magnitude data (realised-variance range ~3e-6 to 3e-5): true std preserved, NOT jumped to 1.0!
+    rng = np.random.default_rng(123)
+    patch = tiny_forecaster.patch_size
+    steps = 6 * patch
+    small_series = []
+    expected_stds = []
+    for idx, sigma in enumerate((3e-6, 5e-6, 9e-6, 2e-5, 3e-5)):
+        vals = (5 * sigma + rng.normal(0.0, sigma, size=(1, steps))).astype(np.float32)
+        small_series.append(
+            SeriesData(
+                series_id=f"rv-{idx}",
+                timestamps=np.arange(steps, dtype=np.int64),
+                targets=vals,
+                past=np.empty((0, steps), dtype=np.float32),
+                known=np.empty((0, steps), dtype=np.float32),
+                categorical_past=np.empty((0, steps), dtype=np.float64),
+                categorical_known=np.empty((0, steps), dtype=np.float64),
+            )
+        )
+        expected_stds.append(float(np.std(vals[0, : 4 * patch].astype(np.float64))))
+    small_ds = TimeSeriesDataset(
+        small_series, context_length=4 * patch, forecast_horizon=2 * patch, stride=2 * patch, min_context=4 * patch
+    )
+    s_preds, s_actuals, s_scale = collect_conformal_data(tiny_forecaster, small_ds, batch_size=3)
+    for got, exp in zip(s_scale, expected_stds, strict=True):
+        assert got == pytest.approx(exp, rel=1e-5), f"small-scale std corrupted: got {got:.3e}, expected {exp:.3e}"
+    cal = ConformalCalibrator(target_coverage=0.80, bucket_size=patch).fit(s_preds, s_actuals, s_scale)
+    out = cal.transform(s_preds, s_scale)
+    assert out.shape == s_preds.shape and np.all(np.diff(out, axis=-1) >= 0.0)

@@ -429,7 +429,8 @@ class OnlineConformalCalibrator:
         target_coverage: Nominal central coverage(s) or `"all"`.
         gamma: Online step size in `alpha_{t+1} = alpha_t + gamma * (alpha - err_t)`.
         window: Rolling window length in forecast observations per `(pair, bucket)` (default 500;
-            with `bucket_size=32`, holds up to 500 forecasts / 16,000 step scores).
+            with `bucket_size=32`, holds up to 500 forecasts / 16,000 step scores — ~1 MB JSON per
+            pair or ~10 MB for `"all"` at horizon 96).
         bucket_size: Horizon steps pooled per bucket (default 32, down to 1).
         quantile_levels: Sorted quantile levels matching the model's output axis.
     """
@@ -720,13 +721,18 @@ def collect_conformal_data(
             q_np = forecast.quantiles.detach().cpu().to(torch.float64).numpy()  # (B, V, H, Q)
             b_size, n_targets, _, num_q = q_np.shape
 
-            # Context standard deviation per (window, target_variate), floored cleanly for constant contexts.
+            # Scale-invariant context std per (window, target_variate): preserve arbitrarily small
+            # real scales (e.g. realised variance ~1e-6), falling back to 1.0 only on constant / <2-point series.
             flat_ctx = context.astype(np.float64).reshape(b_size * n_targets, ctx_len)
             scales_b = np.empty(b_size * n_targets, dtype=np.float64)
             for row_i in range(flat_ctx.shape[0]):
                 obs = flat_ctx[row_i][np.isfinite(flat_ctx[row_i])]
-                std = float(np.std(obs)) if obs.size >= 2 else 0.0
-                scales_b[row_i] = std if (math.isfinite(std) and std > 1e-5) else 1.0
+                if obs.size >= 2:
+                    std = float(np.std(obs))
+                    mag = float(np.max(np.abs(obs)))
+                    scales_b[row_i] = std if (math.isfinite(std) and std > 0.0 and std > 1e-12 * mag) else 1.0
+                else:
+                    scales_b[row_i] = 1.0
 
             preds_parts.append(q_np.reshape(b_size * n_targets, horizon, num_q))
             actuals_parts.append(actuals_b.astype(np.float64).reshape(b_size * n_targets, horizon))

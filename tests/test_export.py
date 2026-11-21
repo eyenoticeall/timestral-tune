@@ -175,6 +175,19 @@ def test_export_fingerprint_splits_mismatched_lora_atomic_metrics_and_chained_li
     val_eq = val._with_windows(keep_v)
     assert len(train_eq) == len(val_eq) and dataset_fingerprint(train_eq) != dataset_fingerprint(val_eq)
 
+    # Also verify `_series_index` (not just `_origins`) enters the fingerprint: two 1-window subsets
+    # sharing the exact same origin on different series must hash distinctly.
+    idx_s0 = next(i for i in range(len(full)) if full._series_index[i] == 0)
+    origin_s0 = full._origins[idx_s0]
+    idx_s1 = next(i for i in range(len(full)) if full._series_index[i] == 1 and full._origins[i] == origin_s0)
+    m0 = np.zeros(len(full), dtype=bool)
+    m0[idx_s0] = True
+    m1 = np.zeros(len(full), dtype=bool)
+    m1[idx_s1] = True
+    ds_s0, ds_s1 = full._with_windows(m0), full._with_windows(m1)
+    assert ds_s0._origins.tolist() == ds_s1._origins.tolist()
+    assert dataset_fingerprint(ds_s0) != dataset_fingerprint(ds_s1)
+
     # 2. Mismatched lora_config against model._lora_config raises ValueError before writing anything.
     adapted = copy.deepcopy(tiny_forecaster.model)
     inject_lora(adapted, LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("q", "v")))
@@ -203,3 +216,11 @@ def test_export_fingerprint_splits_mismatched_lora_atomic_metrics_and_chained_li
     chained_notice = (chained_dir / "NOTICE").read_text(encoding="utf-8")
     assert "no verbatim LICENSE was found" in chained_notice
     assert any("fallback LICENSE pointer" in r.getMessage() for r in caplog.records)
+
+    # 5. Explicit `license_path` pointing at a fallback pointer also warns and stays non-verbatim.
+    ptr_dir = tmp_path / "from-pointer-file"
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="timestral_tune.export"):
+        export_checkpoint(tiny_forecaster.model, ptr_dir, license_path=ok_dir / "LICENSE")
+    assert "no verbatim LICENSE was found" in (ptr_dir / "NOTICE").read_text(encoding="utf-8")
+    assert any("fallback pointer" in r.getMessage() for r in caplog.records)

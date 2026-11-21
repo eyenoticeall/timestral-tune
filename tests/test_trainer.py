@@ -736,6 +736,22 @@ def test_bf16_training_on_cuda(tiny_forecaster, mode):
     result = trainer.fit()
     loss_after = trainer.evaluate(dataset).loss
     assert result.steps == 10 and math.isfinite(loss_after) and loss_after < loss_before
+    if mode == "head_only":
+        cache = trainer._get_head_cache(dataset)
+        assert cache is not None and cache.hidden.dtype == torch.bfloat16
+        stream = TimestralTrainer(
+            fixed_batch_config(
+                dataset,
+                "cuda",
+                mode="head_only",
+                mixed_precision="bf16",
+                max_steps=1,
+                cache_frozen_features=False,
+            ),
+            dataset,
+            model=fresh_model(tiny_forecaster),
+        )
+        assert loss_before == pytest.approx(stream.evaluate(dataset).loss, rel=1e-4)
 
 
 def test_compile_model_trains_and_produces_clean_merged_state_dict(tiny_forecaster):
@@ -817,16 +833,56 @@ def test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_o
     bucketed_collator = DHFDataCollator.for_model(tiny_forecaster.model.config, dataset.context_length, bucket_to_max=5)
     assert bucketed_collator([dataset[0], dataset[1], dataset[2]]).num_rows == 4 * dataset.rows_per_series
 
-    # Non-divisible dataset (len % 5 != 0) runs cleanly under compile_mode="reduce-overhead" when supported.
+    # Build a 13-window dataset (5 + 5 + 3 -> tail must be bucketed to 4, NOT left at 3!) so we can
+    # directly assert the trainer wires bucketing AND that `_build_head_cache` drops the dummy series.
+    keep13 = np.zeros(len(dataset), dtype=bool)
+    keep13[:13] = True
+    ds13 = (
+        dataset._with_windows(keep13)
+        if len(dataset) >= 13
+        else make_toy_dataset(tiny_forecaster.patch_size, series=5, covariates=True)
+    )
+    if len(ds13) > 13:
+        k13 = np.zeros(len(ds13), dtype=bool)
+        k13[:13] = True
+        ds13 = ds13._with_windows(k13)
+    assert len(ds13) == 13
+
+    # Verify trainer._raw_loader actually buckets the 3-window tail to 4 series, and head cache keeps 13 (not 14).
+    head_bucket_trainer = TimestralTrainer(
+        config_for(
+            "cpu",
+            mode="head_only",
+            batch_size=5,
+            eval_batch_size=5,
+            max_steps=1,
+            shuffle=False,
+            compile_model=True,
+            compile_mode="reduce-overhead",
+            cache_frozen_features=True,
+        ),
+        ds13,
+        model=fresh_model(tiny_forecaster),
+    )
+    raw_row_counts = [b.num_rows for b in head_bucket_trainer._raw_loader(ds13, training=False)]
+    assert raw_row_counts == [5 * ds13.rows_per_series, 5 * ds13.rows_per_series, 4 * ds13.rows_per_series], (
+        f"trainer did not wire power-of-two bucketing: got row counts {raw_row_counts}"
+    )
+
+    # Non-divisible dataset (13 windows, batch 5) runs cleanly under compile_mode="reduce-overhead" when supported.
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu" and shutil.which("g++") is None and shutil.which("clang++") is None:
         return
-    assert len(dataset) % 5 != 0
+    cache13 = head_bucket_trainer._get_head_cache(ds13)
+    assert cache13 is not None and len(cache13) == 13, (
+        f"head cache must drop dummy padded series (expected 13, got {len(cache13) if cache13 else None})"
+    )
+
     uncomp_eval = TimestralTrainer(
         config_for(device, mode="lora_variate", batch_size=5, eval_batch_size=5, max_steps=2, shuffle=False),
-        dataset,
+        ds13,
         model=fresh_model(tiny_forecaster),
-    ).evaluate(dataset)
+    ).evaluate(ds13)
     comp_trainer = TimestralTrainer(
         config_for(
             device,
@@ -838,10 +894,10 @@ def test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_o
             compile_model=True,
             compile_mode="reduce-overhead",
         ),
-        dataset,
+        ds13,
         model=fresh_model(tiny_forecaster),
     )
-    comp_eval = comp_trainer.evaluate(dataset)
+    comp_eval = comp_trainer.evaluate(ds13)
     assert comp_eval.loss == pytest.approx(uncomp_eval.loss, rel=1e-5)
     assert comp_eval.scored_positions == uncomp_eval.scored_positions
     res = comp_trainer.fit()
