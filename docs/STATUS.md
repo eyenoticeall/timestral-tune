@@ -20,7 +20,7 @@
 | Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters (`load_lora`), `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
-| Test suite | 534 passed, 5 skipped (4 CUDA-only `bf16`, 1 optional `lacuna`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; live `lacuna-quant==0.14.1`: 4/4 passed; NVIDIA L4 CUDA at `6880061`: 528/2) |
+| Test suite | 536 passed, 5 skipped (4 CUDA-only `bf16`, 1 optional `lacuna`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; live `lacuna-quant==0.14.1`: 4/4 passed; NVIDIA L4 CUDA at `6880061`: 528/2) |
 | CI | Green on `main` (run `44936917337`, Python 3.10–3.13 on Linux); `phase-3` pending PR/merge |
 
 ## What does not exist yet
@@ -54,7 +54,7 @@ Not verified anywhere: Apple GPU on `123M`/`209M`, multi-GPU.
 Full list in spec §12. The ones that matter next:
 
 - **CUDA needs a C compiler and Python headers** with recent PyTorch (spec §12). `scripts/cuda_check.sh` checks for them.
-- **123M and 209M checkpoints** have not been swept or benchmarked yet.
+- **Apple GPU on `123M`/`209M` and multi-GPU training** remain untested (`123M` and `209M` are verified on L4 CUDA; `docs/BENCHMARKS.md` §3, `docs/VERIFICATION.md` §13).
 - **PyTorch 2.4.0 on macOS hangs at exit when a DataLoader uses worker processes.** Gone by 2.8.0 (`docs/VERIFICATION.md` §10). `num_workers` defaults to 0.
 - **CI actions use a deprecated Node.js version.** GitHub warns that `actions/checkout@v4` and `astral-sh/setup-uv@v5` target Node.js 20. They still run.
 

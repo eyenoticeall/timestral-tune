@@ -33,7 +33,15 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - 2026-11-22 (`8cbb7b2`): implemented `TrainingConfig.sign_flip` and `flip_batch_signs` + unit tests.
 - 2026-11-22 (`f8b9c9c`): implemented `integrations/lacuna.py` (`LacunaExporter`, `write_signal_frame`) and
   verified live against `lacuna-quant==0.14.1` (`ExperimentRegistry` + `SignalStudy`).
-- 2026-11-22 (`604d8d5` + L4 GPU run): built `scripts/benchmarks/{datasets,run_sweeps,run_benchmarks}.py`,
-  ran LR/rank/targets/sign-flip sweeps on 5M & 28M and the full 5M + 28M 7-mode benchmark + forgetting matrix
-  on an NVIDIA L4 VM (VM deleted immediately after), updated sweep-backed defaults in `config.py` and
-  `SPEC.md` §5.4, and published `docs/BENCHMARKS.md`.
+- 2026-11-22 (`604d8d5`..`3f12fe2`, `cf0520c`): built `scripts/benchmarks/{datasets,run_sweeps,run_benchmarks,significance}.py`,
+  ran 5M/28M sweeps + benchmarks, `123M`/`209M` CUDA gradient probes & benchmarks (`docs/VERIFICATION.md` §13),
+  and 28M multi-seed / clustered CI / classical baseline checks (`docs/BENCHMARKS.md` §4).
+- 2026-11-22 (`ae120e2`, `ecbd2d8`, and follow-up review remediation): fixed chronological horizon-delayed
+  online ACI evaluation (`_apply_online_chronological`, D20), closed all 9 review mutation-test gaps,
+  fixed retail series-selection leakage (ranked strictly on first 70 train days), switched benchmark
+  forgetting to equal-weighted 3-domain macro relative % with explicit zero-shot baselines, added full
+  reproducibility CLI flags (`--modes`, `--eval-batch-size`, `--full-ft-batch-size`, `--attention-backend`,
+  peak VRAM) to `run_benchmarks.py`, ran properly bracketed LR sweeps on 5M/28M/123M (`head_only=3e-3`,
+  `lora_variate=3e-3`, `lora_temporal=3e-3`, `full_ft=3e-4`, D19), re-ran all 5M/28M/123M/209M benchmarks
+  and 28M significance checks on L4 CUDA (VM deleted immediately after), committed raw JSON artifacts in
+  `docs/benchmarks/`, and tightened all claims and date ranges (`2026-11-03` to `2026-11-20`) in `docs/BENCHMARKS.md`.

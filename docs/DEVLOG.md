@@ -577,5 +577,27 @@ not started.
     - Extended 10-month 2026 volatility (`51` equities × `49` market blocks, trained strictly on 2024–2025): `lora_temporal` `0.1819` vs zero-shot `0.1926` and Corsi `har_rv` `0.1981`; improves `49/51` equities (`CI [-0.0128, -0.0087]`) and `44/49` market blocks (`CI [-0.0140, -0.0076]`, `DM p = 4.1e-10`).
     - Strict 3-week post-Oct 27, 2026 slice (`3` blocks): beats `har_rv` (`0.2171 ± 0.0016` vs `0.2253`) and `38/51` equities (`series CI [-0.0208, -0.0006]`), while 3-block time CI straddles zero (`[-0.0293, +0.0061]`, `2/3` blocks) as expected for `n=3`.
 
-**Not done / open.** `phase-3` is unpushed and unmerged pending review; PyPI release awaits maintainer
+- **Independent Phase 3 review remediation (`ae120e2`, `ecbd2d8`, and final sweep/benchmark re-run on L4, VM deleted immediately after):**
+  - Fixed online ACI evaluation order in `utils/metrics.py::_apply_online_chronological` (D20): groups
+    windows by forecast-origin timestamp in ascending chronological order and flushes `calibrator.update()`
+    only once a prior window's full horizon completes (`t_end < t_origin`), eliminating cross-series lookahead.
+  - Closed all 9 review mutation-test gaps across `tests/test_metrics.py`, `tests/test_trainer.py`, and
+    `tests/test_lacuna.py` (including `sign_flip=True` vs `False` weight divergence, exact forgetting sign,
+    10,000x-scale MASE context alignment, distinct 80%/90% coverage/width assertions, chronological
+    non-peeking ACI spy test, and all 4 built-in `write_signal_frame` reductions & `horizon_index`).
+  - Fixed retail series selection in `scripts/benchmarks/datasets.py` to rank strictly on training-period
+    sales (first 70 days, zero val/test leakage) and print exact scored test date ranges (`2026-11-03` to
+    `2026-11-20` for volatility, `2024-06-21` to `2024-07-02` for retail).
+  - Properly bracketed all four LR defaults strictly on validation splits across `5M`, `28M`, and `123M`
+    (`head_only=3e-3`, `lora_variate=3e-3`, `lora_temporal=3e-3`, `full_ft=3e-4`, D19) with macro
+    GIFT-Eval forgetting visible alongside validation wQL (zero test-set peeking).
+  - Added full CLI reproducibility flags (`--modes`, `--datasets`, `--eval-batch-size`, `--full-ft-batch-size`,
+    `--attention-backend`, peak VRAM, per-block ACI coverage, equal-weighted 3-domain macro forgetting) to
+    `run_benchmarks.py`, re-ran `5M`, `28M`, `123M`, `209M` benchmarks and `28M` significance checks on L4,
+    committed raw JSON outputs in `docs/benchmarks/`, added D19/D20 to `SPEC.md` §11, fixed stale `STATUS.md`
+    wording, and corrected all claims in `docs/BENCHMARKS.md` (including per-block ACI overshoot on volatility,
+    `head_only`'s `+5.0%–13.9%` macro forgetting, `full_ft` leading 6/8 cells at `3e-4`, and pre-release
+    contamination on the 10-month volatility holdout).
+
+**Not done / open.** `phase-3` is unpushed and unmerged pending final review; PyPI release awaits maintainer
 approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.
