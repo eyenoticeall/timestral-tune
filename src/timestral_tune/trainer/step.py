@@ -69,6 +69,8 @@ class CachedHeadBatch:
     loss_weight: Tensor
     context_welford: tuple[Tensor, Tensor, Tensor] | None = None
     normalised_targets: Tensor | None = None
+    frame_loc: Tensor | None = None
+    frame_scale: Tensor | None = None
 
     @property
     def num_scored(self) -> int:
@@ -100,6 +102,10 @@ class CachedHeadBatch:
                 if self.normalised_targets is None
                 else self.normalised_targets.to(target_device, non_blocking=non_blocking)
             ),
+            frame_loc=(None if self.frame_loc is None else self.frame_loc.to(target_device, non_blocking=non_blocking)),
+            frame_scale=(
+                None if self.frame_scale is None else self.frame_scale.to(target_device, non_blocking=non_blocking)
+            ),
         )
 
     def pin_memory(self) -> CachedHeadBatch:
@@ -113,6 +119,8 @@ class CachedHeadBatch:
                 None if self.context_welford is None else tuple(t.pin_memory() for t in self.context_welford)
             ),
             normalised_targets=(None if self.normalised_targets is None else self.normalised_targets.pin_memory()),
+            frame_loc=(None if self.frame_loc is None else self.frame_loc.pin_memory()),
+            frame_scale=(None if self.frame_scale is None else self.frame_scale.pin_memory()),
         )
 
 
@@ -154,11 +162,9 @@ def _compute_cached_head_loss(model: TimestralModel, batch: CachedHeadBatch, fra
         num_context_tokens=0,
     )
     if frame == "true_values":
-        if batch.normalised_targets is None:
-            raise ValueError("CachedHeadBatch for 'true_values' requires precomputed normalised_targets")
-        loc = batch.anchor_loc[:, None].expand(-1, horizon_patches)
-        scale = batch.anchor_scale[:, None].expand(-1, horizon_patches)
-        normalised = batch.normalised_targets
+        if batch.normalised_targets is None or batch.frame_loc is None or batch.frame_scale is None:
+            raise ValueError("CachedHeadBatch for 'true_values' requires precomputed normalised_targets and frames")
+        loc, scale, normalised = batch.frame_loc, batch.frame_scale, batch.normalised_targets
     elif horizon_patches == 1:
         loc, scale = batch.anchor_loc[:, None], batch.anchor_scale[:, None]
         normalised = apply_affine_asinh_masked(

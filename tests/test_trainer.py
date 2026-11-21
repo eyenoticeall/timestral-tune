@@ -377,7 +377,11 @@ def test_the_configured_target_frame_is_the_one_trained_and_evaluated_in(tiny_fo
 
     seen = []
     real = trainer_module.compute_loss
-    monkeypatch.setattr(trainer_module, "compute_loss", lambda m, b, frame: seen.append(frame) or real(m, b, frame))
+    monkeypatch.setattr(
+        trainer_module,
+        "compute_loss",
+        lambda m, b, frame, **kwargs: seen.append(frame) or real(m, b, frame, **kwargs),
+    )
     for frame in ("median_folded", "true_values"):
         config = fixed_batch_config(dataset, "cpu", max_steps=1, target_frame=frame)
         trainer = TimestralTrainer(config, dataset, model=fresh_model(tiny_forecaster))
@@ -427,8 +431,8 @@ def test_a_non_finite_loss_stops_training_with_an_explanation(tiny_forecaster, m
     trainer = TimestralTrainer(config_for(max_steps=3), dataset, model=fresh_model(tiny_forecaster))
     real = trainer_module.compute_loss
 
-    def poisoned(model, batch, frame):
-        output = real(model, batch, frame)
+    def poisoned(*args, **kwargs):
+        output = real(*args, **kwargs)
         return dataclasses.replace(output, loss=output.loss * float("nan"))
 
     monkeypatch.setattr(trainer_module, "compute_loss", poisoned)
@@ -501,6 +505,7 @@ def test_incompatible_datasets_and_models_are_rejected_at_construction(tiny_fore
         {"seed": True},
         {"batch_size": np.bool_(True)},
         {"max_steps": np.float64(3.0)},
+        {"cache_frozen_features": "yes"},
     ],
 )
 def test_config_rejects_invalid_values(overrides):
@@ -522,8 +527,94 @@ def test_config_accepts_numpy_integers_and_stores_python_ints(tiny_forecaster):
 def test_config_defaults_follow_the_spec():
     config = TrainingConfig(model_name_or_path="mistralai/Timestral-28M")
     assert config.mode == "head_only" and config.target_frame == "median_folded" and config.mixed_precision == "fp32"
+    assert config.cache_frozen_features is True
     assert config.gradient_clip_val == 1.0 and config.lr_schedule == "cosine"
     assert config.resolved_learning_rate == 1e-4
     assert dataclasses.replace(config, mode="lora_variate").resolved_learning_rate == 3e-4
     assert dataclasses.replace(config, mode="full_ft", learning_rate=5e-6).resolved_learning_rate == 5e-6
     assert TrainingConfig(model_name_or_path="x", gradient_clip_val=None).gradient_clip_val is None
+
+
+# -------------------------------------------------- frozen-feature cache
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("covariates", [False, True], ids=["univariate", "covariates"])
+@pytest.mark.parametrize("frame", ["median_folded", "true_values"])
+def test_head_only_cache_matches_uncached_training(tiny_forecaster, device, covariates, frame):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=covariates)
+    train, val = dataset.split_by_time(12 * tiny_forecaster.patch_size)
+    results = {}
+    heads = {}
+    for cached in (False, True):
+        model = fresh_model(tiny_forecaster)
+        config = config_for(
+            device,
+            batch_size=4,
+            epochs=4,
+            learning_rate=1e-2,
+            target_frame=frame,
+            seed=5,
+            cache_frozen_features=cached,
+        )
+        trainer = TimestralTrainer(config, train, val, model=model)
+        results[cached] = trainer.fit()
+        heads[cached] = torch.cat([p.detach().cpu().flatten() for p in model.head.parameters()])
+
+    assert results[True].steps == results[False].steps
+    assert results[True].best_eval_loss == pytest.approx(results[False].best_eval_loss, rel=1e-4)
+    assert results[True].final_train_loss == pytest.approx(results[False].final_train_loss, rel=1e-4)
+    torch.testing.assert_close(heads[True], heads[False], rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_head_only_cache_runs_transformer_once_per_dataset(tiny_forecaster, device):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    train, val = dataset.split_by_time(12 * tiny_forecaster.patch_size)
+
+    def count_body_calls(cached: bool) -> int:
+        model = fresh_model(tiny_forecaster)
+        calls = 0
+
+        def bump(*_):
+            nonlocal calls
+            calls += 1
+
+        handle = model.transformer.register_forward_hook(bump)
+        try:
+            config = config_for(
+                device, batch_size=len(train), epochs=5, learning_rate=1e-2, cache_frozen_features=cached
+            )
+            trainer = TimestralTrainer(config, train, val, model=model)
+            trainer.fit()
+            trainer.evaluate()
+        finally:
+            handle.remove()
+        return calls
+
+    cached_calls = count_body_calls(True)
+    uncached_calls = count_body_calls(False)
+    # Cached: 1 pass to build train cache + 1 pass to build val cache.
+    # Uncached: 5 train epochs + 5 end-of-epoch evals + 1 explicit evaluate() = 11 passes.
+    assert cached_calls == 2, f"expected 2 body passes with cache, got {cached_calls}"
+    assert uncached_calls == 11, f"expected 11 body passes without cache, got {uncached_calls}"
+
+
+def test_head_only_cache_falls_back_when_over_memory_cap(tiny_forecaster, monkeypatch):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, covariates=True)
+    model = fresh_model(tiny_forecaster)
+    calls = 0
+
+    def bump(*_):
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(trainer_module, "_MAX_HEAD_CACHE_BYTES", 1)
+    handle = model.transformer.register_forward_hook(bump)
+    try:
+        config = fixed_batch_config(dataset, "cpu", max_steps=4, learning_rate=1e-2, cache_frozen_features=True)
+        trainer = TimestralTrainer(config, dataset, model=model)
+        assert trainer.fit().steps == 4
+    finally:
+        handle.remove()
+    assert calls == 4, "expected streaming fallback to run the body on every step"

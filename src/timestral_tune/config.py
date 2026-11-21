@@ -68,6 +68,10 @@ class TrainingConfig:
             from the evaluation with the lowest loss.
         log_every: Log training progress every this many steps.
         shuffle: Shuffle the training windows each epoch.
+        cache_frozen_features: In `head_only` mode, cache the frozen transformer's per-window
+            horizon representations on CPU (up to 256 MiB per dataset) so multi-epoch training and
+            repeated evaluations skip re-running the frozen body. Ignored in other modes, and falls
+            back to streaming when the estimated cache exceeds the memory cap.
         output_dir: Where `export()` will write (roadmap Phase 2). Nothing is written before then.
     """
 
@@ -93,6 +97,7 @@ class TrainingConfig:
     restore_best: bool = True
     log_every: int = 50
     shuffle: bool = True
+    cache_frozen_features: bool = True
     output_dir: str | Path | None = None
 
     def __post_init__(self) -> None:
@@ -100,6 +105,8 @@ class TrainingConfig:
         _one_of("mixed_precision", self.mixed_precision, get_args(MixedPrecision))
         _one_of("lr_schedule", self.lr_schedule, get_args(LearningRateSchedule))
         _one_of("target_frame", self.target_frame, TARGET_FRAMES)
+        if not isinstance(self.cache_frozen_features, bool):
+            raise ValueError(f"cache_frozen_features must be a bool, got {self.cache_frozen_features!r}")
         if self.learning_rate is not None and not (math.isfinite(self.learning_rate) and self.learning_rate > 0):
             raise ValueError(f"learning_rate must be positive and finite, got {self.learning_rate}")
         if not (math.isfinite(self.weight_decay) and self.weight_decay >= 0):

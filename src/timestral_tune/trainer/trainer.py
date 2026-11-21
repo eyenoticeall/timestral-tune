@@ -20,19 +20,78 @@ from pathlib import Path
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from ..config import TrainingConfig
 from ..data.batch import TrainingBatch
 from ..data.dataset import TimeSeriesDataset
 from ..models.device import TuneTimestralModel, supports_float64
+from ..models.forward import context_welford_state, normalise_targets, target_frames, training_forward
 from ..models.loader import load_model, resolve_device
 from .callbacks import Callback, EarlyStopping, ProgressLogger
-from .step import compute_loss
+from .step import CachedHeadBatch, compute_loss
 
 __all__ = ["EvalResult", "TimestralTrainer", "TrainingResult"]
 
 logger = logging.getLogger("timestral_tune.trainer")
+
+# Cap per-dataset CPU memory for cached `head_only` representations (256 MiB ~ 45k windows on 28M).
+_MAX_HEAD_CACHE_BYTES = 256 * 1024 * 1024
+
+
+class _CachedHeadDataset(Dataset[int]):
+    """Per-window frozen-body representations on CPU, indexed directly by window index."""
+
+    def __init__(
+        self,
+        horizon_hidden: Tensor,
+        anchor_loc: Tensor,
+        anchor_scale: Tensor,
+        targets: Tensor,
+        loss_weight: Tensor,
+        context_welford: tuple[Tensor, Tensor, Tensor] | None,
+        normalised_targets: Tensor | None,
+        frame_loc: Tensor | None,
+        frame_scale: Tensor | None,
+    ) -> None:
+        self.horizon_hidden = horizon_hidden
+        self.anchor_loc = anchor_loc
+        self.anchor_scale = anchor_scale
+        self.targets = targets
+        self.loss_weight = loss_weight
+        self.context_welford = context_welford
+        self.normalised_targets = normalised_targets
+        self.frame_loc = frame_loc
+        self.frame_scale = frame_scale
+
+    def __len__(self) -> int:
+        return self.horizon_hidden.shape[0]
+
+    def __getitem__(self, index: int) -> int:
+        return index
+
+    def collate(self, indices: Sequence[int]) -> CachedHeadBatch:
+        idx = torch.as_tensor(indices, dtype=torch.long)
+        hidden = self.horizon_hidden[idx].flatten(0, 1)
+        loc = self.anchor_loc[idx].flatten(0, 1)
+        scale = self.anchor_scale[idx].flatten(0, 1)
+        targets = self.targets[idx].flatten(0, 1)
+        weight = self.loss_weight[idx].flatten(0, 1)
+        welford = None if self.context_welford is None else tuple(t[idx].flatten(0, 1) for t in self.context_welford)
+        normalised = None if self.normalised_targets is None else self.normalised_targets[idx].flatten(0, 1)
+        f_loc = None if self.frame_loc is None else self.frame_loc[idx].flatten(0, 1)
+        f_scale = None if self.frame_scale is None else self.frame_scale[idx].flatten(0, 1)
+        return CachedHeadBatch(
+            horizon_hidden=hidden,
+            anchor_loc=loc,
+            anchor_scale=scale,
+            targets=targets,
+            loss_weight=weight,
+            context_welford=welford,
+            normalised_targets=normalised,
+            frame_loc=f_loc,
+            frame_scale=f_scale,
+        )
 
 
 @dataclass(frozen=True)
@@ -172,6 +231,7 @@ class TimestralTrainer:
         self.global_step = 0
         self.fit_start_step = 0
         self.should_stop = False
+        self._head_cache: dict[int, _CachedHeadDataset] = {}
 
     # ----------------------------------------------------------------- setup
 
@@ -214,7 +274,7 @@ class TimestralTrainer:
     def num_trainable_parameters(self) -> int:
         return sum(parameter.numel() for parameter in self._trainable)
 
-    def _loader(self, dataset: TimeSeriesDataset, *, training: bool) -> DataLoader:
+    def _raw_loader(self, dataset: TimeSeriesDataset, *, training: bool) -> DataLoader:
         config = self.config
         generator = torch.Generator().manual_seed(config.seed) if training else None
         batch_size = config.batch_size if training else (config.eval_batch_size or config.batch_size)
@@ -229,12 +289,139 @@ class TimestralTrainer:
             generator=generator,
         )
 
+    def _estimate_head_cache_bytes(self, dataset: TimeSeriesDataset) -> int:
+        model_config = self.model.config
+        patch = model_config.patch_size
+        n_targets = dataset.series[0].layout[0]
+        horizon_patches = -(-dataset.forecast_horizon // patch)
+        horizon_steps = horizon_patches * patch
+        bytes_per_target = (
+            horizon_patches * model_config.d_model * 4  # horizon_hidden (fp32)
+            + horizon_steps * 5  # targets (fp32) + loss_weight (bool)
+            + 8  # anchor_loc + anchor_scale (fp32)
+            + (24 if self.config.target_frame == "median_folded" and horizon_patches > 1 else 0)  # 3x fp64 Welford
+            + (horizon_steps * 4 if self.config.target_frame == "true_values" else 0)  # precomputed normalised targets
+        )
+        return len(dataset) * n_targets * bytes_per_target
+
+    def _get_head_cache(self, dataset: TimeSeriesDataset) -> _CachedHeadDataset | None:
+        if self.config.mode != "head_only" or not self.config.cache_frozen_features:
+            return None
+        if dataset is not self.train_dataset and dataset is not self.val_dataset:
+            return None
+        key = id(dataset)
+        if key in self._head_cache:
+            return self._head_cache[key]
+        estimated = self._estimate_head_cache_bytes(dataset)
+        if estimated > _MAX_HEAD_CACHE_BYTES:
+            logger.info(
+                "skipping frozen-feature cache for %d windows (estimated %.1f MiB exceeds %.0f MiB cap)",
+                len(dataset),
+                estimated / (1024 * 1024),
+                _MAX_HEAD_CACHE_BYTES / (1024 * 1024),
+            )
+            return None
+        cache = self._build_head_cache(dataset)
+        self._head_cache[key] = cache
+        return cache
+
+    @torch.no_grad()
+    def _build_head_cache(self, dataset: TimeSeriesDataset) -> _CachedHeadDataset:
+        model_config = self.model.config
+        patch = model_config.patch_size
+        n_targets = dataset.series[0].layout[0]
+        horizon_patches = -(-dataset.forecast_horizon // patch)
+        frame = self.config.target_frame
+        non_blocking = self.device.type == "cuda"
+
+        hiddens: list[Tensor] = []
+        locs: list[Tensor] = []
+        scales: list[Tensor] = []
+        targets_list: list[Tensor] = []
+        weights_list: list[Tensor] = []
+        cnts: list[Tensor] = []
+        means: list[Tensor] = []
+        m2s: list[Tensor] = []
+        norm_list: list[Tensor] = []
+        floc_list: list[Tensor] = []
+        fscale_list: list[Tensor] = []
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for batch in self._raw_loader(dataset, training=False):
+                batch.validate(patch)
+                on_device = batch.to(self.device, non_blocking=non_blocking)
+                output = training_forward(self.model, on_device, return_hidden=True, validate=False)
+                assert output.hidden is not None
+                target_rows_cpu = batch.target_rows
+                target_rows_dev = on_device.target_rows
+                series_count = int(target_rows_cpu.sum()) // n_targets
+
+                horizon_hidden = output.hidden[target_rows_dev, output.num_context_tokens :, :].detach().cpu()
+                hiddens.append(horizon_hidden.unflatten(0, (series_count, n_targets)))
+                locs.append(output.anchor_loc[target_rows_dev].detach().cpu().unflatten(0, (series_count, n_targets)))
+                scales.append(
+                    output.anchor_scale[target_rows_dev].detach().cpu().unflatten(0, (series_count, n_targets))
+                )
+                targets_list.append(batch.targets[target_rows_cpu].unflatten(0, (series_count, n_targets)))
+                weights_list.append(batch.loss_weight[target_rows_cpu].unflatten(0, (series_count, n_targets)))
+
+                if frame == "true_values":
+                    f_loc, f_scale = target_frames(self.model, on_device, output, "true_values")
+                    normalised = normalise_targets(self.model, on_device, f_loc, f_scale)[target_rows_dev].cpu()
+                    norm_list.append(normalised.unflatten(0, (series_count, n_targets)))
+                    floc_list.append(f_loc[target_rows_dev].cpu().unflatten(0, (series_count, n_targets)))
+                    fscale_list.append(f_scale[target_rows_dev].cpu().unflatten(0, (series_count, n_targets)))
+                elif horizon_patches > 1:
+                    cnt, mean, m2 = context_welford_state(
+                        batch.context[target_rows_cpu], batch.context_mask[target_rows_cpu], patch
+                    )
+                    cnts.append(cnt.unflatten(0, (series_count, n_targets)))
+                    means.append(mean.unflatten(0, (series_count, n_targets)))
+                    m2s.append(m2.unflatten(0, (series_count, n_targets)))
+        finally:
+            self.model.train(was_training)
+
+        welford = (torch.cat(cnts), torch.cat(means), torch.cat(m2s)) if cnts else None
+        normalised_all = torch.cat(norm_list) if norm_list else None
+        floc_all = torch.cat(floc_list) if floc_list else None
+        fscale_all = torch.cat(fscale_list) if fscale_list else None
+        return _CachedHeadDataset(
+            horizon_hidden=torch.cat(hiddens),
+            anchor_loc=torch.cat(locs),
+            anchor_scale=torch.cat(scales),
+            targets=torch.cat(targets_list),
+            loss_weight=torch.cat(weights_list),
+            context_welford=welford,
+            normalised_targets=normalised_all,
+            frame_loc=floc_all,
+            frame_scale=fscale_all,
+        )
+
+    def _loader(self, dataset: TimeSeriesDataset, *, training: bool) -> DataLoader:
+        cache = self._get_head_cache(dataset)
+        if cache is None:
+            return self._raw_loader(dataset, training=training)
+        config = self.config
+        generator = torch.Generator().manual_seed(config.seed) if training else None
+        batch_size = config.batch_size if training else (config.eval_batch_size or config.batch_size)
+        return DataLoader(
+            cache,
+            batch_size=batch_size,
+            shuffle=training and config.shuffle,
+            collate_fn=cache.collate,
+            num_workers=0,
+            pin_memory=self.device.type == "cuda",
+            generator=generator,
+        )
+
     # ------------------------------------------------------------------ loop
 
-    def training_step(self, batch: TrainingBatch) -> float:
+    def training_step(self, batch: TrainingBatch | CachedHeadBatch, *, validate: bool = True) -> float:
         """One optimiser step on `batch` (already on the device). Returns the loss."""
         self.optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(self.model, batch, self.config.target_frame).loss
+        loss = compute_loss(self.model, batch, self.config.target_frame, validate=validate).loss
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError(
                 f"the training loss became {loss.item()} at step {self.global_step + 1}. Lower the learning rate, "
@@ -283,6 +470,8 @@ class TimestralTrainer:
             for callback in self.callbacks:
                 callback.on_evaluate(self, self.global_step, result)
 
+        patch = self.model.config.patch_size
+        non_blocking = self.device.type == "cuda"
         for callback in self.callbacks:
             callback.on_fit_start(self)
         self.model.train()
@@ -294,8 +483,10 @@ class TimestralTrainer:
                     if batch.num_scored == 0:
                         skipped += 1
                         continue
+                    if isinstance(batch, TrainingBatch):
+                        batch.validate(patch)
                     learning_rate = self.optimizer.param_groups[0]["lr"]
-                    loss = self.training_step(batch.to(self.device))
+                    loss = self.training_step(batch.to(self.device, non_blocking=non_blocking), validate=False)
                     self.global_step += 1
                     train_history.append((self.global_step, loss))
                     for callback in self.callbacks:
@@ -355,7 +546,9 @@ class TimestralTrainer:
         finally:
             self.model.train(was_training)
 
-    def _evaluate(self, batches: Iterable[TrainingBatch]) -> EvalResult:
+    def _evaluate(self, batches: Iterable[TrainingBatch | CachedHeadBatch]) -> EvalResult:
+        patch = self.model.config.patch_size
+        non_blocking = self.device.type == "cuda"
         total = 0.0
         scored = count = 0
         for batch in batches:
@@ -363,7 +556,14 @@ class TimestralTrainer:
             positions = batch.num_scored
             if positions == 0:
                 continue
-            loss = compute_loss(self.model, batch.to(self.device), self.config.target_frame).loss
+            if isinstance(batch, TrainingBatch):
+                batch.validate(patch)
+            loss = compute_loss(
+                self.model,
+                batch.to(self.device, non_blocking=non_blocking),
+                self.config.target_frame,
+                validate=False,
+            ).loss
             # Weight each batch by its scored positions, so the result is the mean over the dataset.
             total += loss.item() * positions  # .item() is a Python float, so the sum accumulates in float64
             scored += positions
