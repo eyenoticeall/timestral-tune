@@ -458,5 +458,5 @@ plus clean Minor/perf fixes:
   reproduced the L4 timings (28M cov5: `62 ms` / `1.90 GiB` `full_ft`, `43 ms` `lora_variate`).
 
 **Not done / open.** `phase-2` is pushed to `origin/phase-2` and awaits review/merge into `main`;
-`perf/phase1-kernels` (merged into `main` at `fc26d03`) and `fix/math-sdpa-backend` (closed by D15) are
-ready for branch cleanup. Phase 3 has not started.
+`perf/phase1-kernels` has been deleted locally and on `origin`; `fix/math-sdpa-backend` stays open
+pending maintainer decision. Phase 3 has not started.
