@@ -9,13 +9,13 @@
 | Area | State |
 |---|---|
 | Loading | `load_model` / `load_forecaster`: pinned Hub revisions, config from the checkpoint, any device |
-| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32), CUDA (verified once: NVIDIA L4, PyTorch 2.15.0, fp32) |
+| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32), CUDA (verified on one NVIDIA L4, PyTorch 2.15.0, fp32; last at commit `50c170a`) |
 | Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator`; per-window categorical encoding |
 | Training forward and loss | Normalised-space forward for both layouts, both target frames, pinball loss, `compute_loss` |
 | Training | `TimestralTrainer` in `head_only` mode, fp32: AdamW, warm-up, cosine or constant schedule, clipping, evaluation, early stopping, best-state restore |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **10 of 14 implemented and passing**: T1–T8, T12, T14. T9, T10, T11, T13 are Phase 2 placeholders |
-| Test suite | 438 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; 349 passed, 26 skipped on 2.4.0; macOS). On CUDA, at an earlier commit: 290 passed, 6 skipped |
+| Test suite | 438 passed, 4 skipped, on the tiny random model, 5M and 28M (PyTorch 2.15.0 on Python 3.13; also 2.14.1 on Python 3.10 and 2.8.0 on 3.12; 349 passed, 26 skipped on 2.4.0; macOS). On CUDA and Linux: 436 passed, 6 skipped |
 | CI | Green on Phase 1 (pull request #1, 2026-11-21): lint, build, and the network-free tests on Python 3.10–3.13, on Linux |
 
 ## What does not exist yet
@@ -38,19 +38,17 @@ All on one machine (Apple M4, macOS); details in `docs/VERIFICATION.md`.
 - PyTorch floors: CPU on 2.4.0; Apple GPU from 2.8.0.
 - `head_only` training lowers the loss and changes nothing outside the head, on CPU and the Apple GPU.
 
-Not verified anywhere: the 123M and 209M checkpoints, real datasets, `bf16`. Everything changed after the
-CUDA run (T14's `head_only` check, the past-only-covariate scenario, the review fixes, the float64-RMSNorm
-gradient reference) has run on CPU and the Apple GPU only. CI covers the network-free tests on Linux; the tests on the released
-checkpoints run only locally.
+Not verified anywhere: the 123M and 209M checkpoints, real datasets, `bf16`. CI covers the network-free
+tests on Linux; the tests on the released checkpoints run only locally and through `scripts/cuda_check.sh`.
 
 ## Next steps
 
 1. **Start Phase 2** (spec §10) when the maintainer says so: the slice LoRA adapter (T9, T10), `full_ft`, the
    conformal calibrators (T13), export (T11), `bf16` on CUDA.
-2. **Re-run `bash scripts/cuda_check.sh`** on a GPU machine early in Phase 2: nothing since commit `ecbab9d`
-   has run on CUDA.
-3. **Decide the attention kernel** once a mode trains body weights (spec D15); the held option is on
+2. **Decide the attention kernel** once a mode trains body weights (spec D15); the held option is on
    `fix/math-sdpa-backend`.
+3. **Re-run `bash scripts/cuda_check.sh`** on a GPU machine after any device-related change in Phase 2;
+   there is no CUDA machine in CI.
 
 ## Open questions and known issues
 
@@ -58,14 +56,13 @@ Full list in spec §12. The ones that matter next:
 
 - **CUDA needs a C compiler and Python headers** with recent PyTorch (spec §12). `scripts/cuda_check.sh`
   checks for them.
-- **Float32 gradients through released weights are not at round-off**, worst on CUDA (up to 1.2e-2).
+- **Float32 gradients through released weights are not at round-off**, worst on CUDA (up to 1.1e-2).
   The released checkpoints have peak attention logits of 370k–404k (5M) and 203k–503k (28M), where float32
   ULP is 0.015625 below 262k and 0.03125 above it, triggering both fused-SDPA backward inaccuracy and ULP
   quantization on near-tied large-logit rows (`docs/VERIFICATION.md` §6, §13). PyTorch's unfused
   kernel cuts the CPU error on typical batches (2.5×–79× on the probe layouts) but is worse on one batch,
-  changes nothing in `head_only`, and is untested on CUDA, so no choice of kernel is exposed yet (spec D15).
-- **Re-run `bash scripts/cuda_check.sh` on a GPU machine** before relying on CUDA for Phase 2: the CUDA
-  gradient numbers predate the improved reference, the review fixes, and `attention_context("math")`.
+  changes nothing in `head_only`, and is not reliably best on a near-tie batch, so no choice of kernel is
+  exposed yet (spec D15). On CUDA it lowers the error 50 to 900 times for 5% to 25% more step time.
 - **The target-frame evidence is synthetic** (univariate, fully observed, one seed, 5M and 28M).
 - **Hyperparameter defaults are placeholders** until the Phase 3 sweeps.
 - **No export yet**, so a trained model lives only in memory (`trainer.model`).

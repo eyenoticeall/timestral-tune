@@ -306,3 +306,33 @@ split: 438 passed, 4 skipped on PyTorch 2.15.0, 2.14.1 (Python 3.10) and 2.8.0; 
 the network-free tests passed on Python 3.10 to 3.13 on Linux, the first CI run on any Phase 1 work. `main`
 was fast-forwarded and pushed, and `phase-1` deleted locally and on the remote. `fix/math-sdpa-backend` is
 one commit on top of `main`, pushed, and stays open. Phase 2 has not been started.
+
+---
+
+## 2026-11-21 (sixth session) — CUDA re-run before Phase 2
+
+**What.** With the maintainer's clearance, a second short-lived Google Cloud VM (one NVIDIA L4, about 35
+minutes, deleted afterwards). The login key was scoped to the instance this time, so the project's shared
+metadata was not touched. Three things ran: `scripts/cuda_check.sh` on `main`, a one-off timing of each
+attention kernel, and the suite of the held branch `fix/math-sdpa-backend`.
+
+**Results.** At commit `50c170a`: 218 device tests and then 436 passed, 6 skipped overall; the held branch
+443 passed, 6 skipped. `head_only` gradients on CUDA are within 2.2e-6 of the reference. Numbers are in
+`docs/VERIFICATION.md` §6 and §13.
+
+**Findings.**
+
+- **On CUDA the unfused kernels remove most of the gradient error**: 50 to 900 times lower across the eight
+  probe layouts, for PyTorch's unfused kernel and for explicit attention alike, at 5% to 25% more step
+  time and at most 0.2 GiB more memory at a context of 1,024. This is the CUDA evidence decision D15 was
+  waiting for. The option stays deferred: it still changes nothing in `head_only`, and whether it changes
+  training results is untested.
+- **One T14 case failed on the VM's x86 CPU, not on CUDA**: explicit attention on 5M with past-only
+  covariates, 5.3e-3 against 5e-3, where the Mac gives 1.2e-3. It is the batch with a near-tie at a logit of
+  351k. Across four device and three kernel combinations it lands between 1.2e-3 and 1.1e-2, and the worst
+  kernel differs by machine. That case now has its own 2e-2 bound, and PyTorch's unfused kernel is held to
+  the same 5e-3 as explicit attention on the other nine (it was 2e-2). Decision D12 records the history of
+  this criterion; this is the third time a bound turned out to be about one batch and not about our code.
+
+**Not done / open.** A short training run under each kernel (needs a mode that trains body weights), and
+the kernels' cost at long contexts. Phase 2 has not been started.

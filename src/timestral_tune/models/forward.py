@@ -99,8 +99,9 @@ def attention_context(backend: AttentionBackend = "default") -> Iterator[None]:
     fused scaled-dot-product-attention kernels (flash, memory-efficient, cuDNN) so PyTorch runs its
     unfused one. On typical CPU batches that avoids the float32 backward error of the fused kernel,
     at the cost of materialising the O(S^2) attention matrix. It can still be less accurate than
-    `"default"` on individual batches with near-tied large logits (spec §12), is identical to
-    `"default"` on the Apple GPU, and is untested on CUDA.
+    `"default"` on individual batches with near-tied large logits (spec §12), and is identical to
+    `"default"` on the Apple GPU. On CUDA it lowers the error 50 to 900 times for roughly 5% to 25%
+    more step time at a context of 1,024 (docs/VERIFICATION.md §13).
 
     PyTorch's flags are process-global, so other threads also see math-only attention while any
     `"math"` block is active. Overlapping or nested blocks are reference-counted, so the original

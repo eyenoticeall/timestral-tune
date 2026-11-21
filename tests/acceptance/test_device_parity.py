@@ -12,7 +12,7 @@ on CPU, on every device including CPU float32. Over all parameters there are fou
   cosine, which still catches a wrong gradient.
 - Released checkpoints with attention written out as matmul and softmax, and
 - released checkpoints with PyTorch's unfused kernel (`attention_context("math")`, experimental,
-  spec D15): for nine of the ten cases, at most 5.4e-4 on CPU (Apple and x86) and CUDA, and 1.2e-3
+  spec D15): for nine of the ten cases, at most 6.1e-4 on CPU (Apple and x86) and CUDA, and 1.2e-3
   on the Apple GPU. Held to 5e-3.
   These show the library's own forward, frames, loss and device handling are accurate on real
   weights.

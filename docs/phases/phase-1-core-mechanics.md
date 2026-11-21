@@ -78,4 +78,7 @@ maintains or extends the phase.
   a 15-seed sweep. The measurements, probe and tests were folded into `phase-1`; the public
   `attention_backend` option stays on that branch until Phase 2 (spec D15). Final local suite: 438 passed,
   4 skipped on PyTorch 2.15.0 (Python 3.13), 2.14.1 (Python 3.10) and 2.8.0 (Python 3.12); 349 passed, 26
-  skipped on 2.4.0 (Python 3.12). Not yet run on CUDA.
+  skipped on 2.4.0 (Python 3.12).
+- 2026-11-21 (second CUDA run, commit `50c170a`): 436 passed, 6 skipped on an NVIDIA L4, including the
+  `head_only` gradient check and all five scenarios. One near-tie case got its own T14 bound after failing
+  on the VM's x86 CPU. On CUDA the unfused attention kernels lower the gradient error 50 to 900 times.

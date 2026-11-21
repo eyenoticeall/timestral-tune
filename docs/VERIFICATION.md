@@ -131,19 +131,28 @@ computation.
 | 28M | past-only covariates | 4.6e-4 | 9.5e-6 |
 
 Across the five scenarios of acceptance test T14, on 5M and 28M (other data than the probe's;
-`uv run pytest tests/acceptance/test_device_parity.py -k "gradients" -s` prints each value):
+`uv run pytest tests/acceptance/test_device_parity.py -k "gradients" -s` prints each value). The x86 CPU and
+CUDA columns are from the VM of §13. One case, 5M with past-only covariates, is ill-conditioned in float32
+(see below) and has its own rows and its own bound:
 
-| Tier | Bound | CPU, worst case | Apple GPU, worst case |
-|---|---|---|---|
-| Tiny random model (default, explicit, and `attention_context("math")`) | 1e-5 | 4.1e-7 | 4.5e-7 |
-| Released, default SDPA | 5e-2 (`1 - cos < 1e-4`) | 3.4e-3 (5M, two targets with covariates) | 2.1e-3 (5M, past-only covariates) |
-| Released, explicit matmul-and-softmax | 5e-3 | 1.2e-3 (5M, past-only covariates) | 2.1e-3 (5M, past-only covariates) |
-| Released, `attention_context("math")` | 2e-2 (`1 - cos < 1e-4`) | 9.0e-3 (5M, past-only covariates; other 9 scenarios 4.0e-6 to 3.7e-4) | 2.1e-3 (5M, past-only covariates; other 9 scenarios 4.6e-6 to 1.2e-3) |
-| `head_only` (everything but the head frozen), all models | 1e-5 | 2.3e-6 | 2.8e-6 |
+| Check | Bound | Apple CPU | Apple GPU | x86 CPU | CUDA |
+|---|---|---|---|---|---|
+| Tiny random model, every kernel | 1e-5 | 4.0e-7 | 4.5e-7 | 4.4e-7 | 3.5e-7 |
+| Released, default kernel, all ten cases | 5e-2 | 3.4e-3 | 2.1e-3 | 2.4e-3 | 1.1e-2 |
+| Released, explicit matmul-and-softmax, nine cases | 5e-3 | 6.1e-4 | 1.2e-3 | 2.1e-4 | 1.1e-4 |
+| Released, PyTorch's unfused kernel, nine cases | 5e-3 | 3.7e-4 | 1.2e-3 | 5.4e-4 | 3.0e-4 |
+| Near-tie case, default kernel | 5e-2 | 2.2e-3 | 2.1e-3 | 2.4e-3 | 1.1e-2 |
+| Near-tie case, explicit matmul-and-softmax | 2e-2 | 1.2e-3 | 2.1e-3 | 5.3e-3 | 1.9e-3 |
+| Near-tie case, PyTorch's unfused kernel | 2e-2 | 9.0e-3 | 2.1e-3 | 1.4e-3 | 1.4e-3 |
+| `head_only` (everything but the head frozen), all models | 1e-5 | 2.3e-6 | 2.8e-6 | 1.7e-6 | 2.2e-6 |
 
-One minus the cosine similarity with the reference: at most 5.7e-6 (CPU) and 2.1e-6 (Apple GPU) with default
-SDPA, and at most 3.7e-5 (CPU, 5M past-only covariates; all other 9 scenarios at most 6.4e-8) and 2.1e-6
-(Apple GPU) with `attention_context("math")`.
+One minus the cosine similarity with the reference (bound 1e-4): with the default kernel at most 5.7e-6,
+2.1e-6, 2.5e-6 and 5.6e-5 in the same column order; with the unfused kernel at most 3.7e-5, 2.1e-6, 8.5e-7
+and 8.5e-7.
+
+The near-tie case shows that the residual error on such a batch is a matter of how each kernel happens to
+round on each machine: the worst kernel is the unfused one on an Apple CPU, explicit attention on an x86
+CPU, and the default kernel on CUDA. No kernel is reliably best on it.
 
 Probe Experiment [2] (`default` vs `attention_context("math")` vs explicit matmul-and-softmax) and Experiment
 [5] (strictly same-row peak logit with its own top-1/top-2 gap, and strictly same-row largest near-tie logit
@@ -192,11 +201,11 @@ random model has O(1) logits), where one float32 ULP is `0.015625` below 262k an
 Separately, upstream's float32 RMSNorm alone moved the old reference by 3.8e-3 on T14's 5M
 past-only-covariates batch (`uv run pytest tests/acceptance/test_device_parity.py -k
 "device_parity_gradients and cpu" -s`), so all references compute RMSNorm in float64 (`tests/helpers.py`
-and `scripts/probes/_common.py`, without editing vendored code). The CUDA numbers in §13 predate both the
-float64-RMSNorm reference and `attention_context("math")`.
+and `scripts/probes/_common.py`, without editing vendored code). The CUDA numbers in §13 use the same
+reference.
 
 `head_only` is not affected: with the body frozen the backward pass never enters attention or the body's
-norms. Not yet run on CUDA. Forward outputs are unaffected (about 3e-7 from the reference, §11).
+norms; this holds on CUDA too (§13). Forward outputs are unaffected (about 3e-7 from the reference, §11).
 
 Consequence: T14 keeps its tight `5e-3` explicit-attention tier alongside the three existing tiers, adds a
 separate check for `attention_context("math")` (spec D12). That helper is experimental and no training
@@ -297,7 +306,7 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 | 2.15.0 | 3.13 | 438 passed, 4 skipped |
 
 These are the counts at the end of Phase 1 on 2026-11-21, all on macOS. The CUDA run (§13) used Linux and
-predates the review fixes and the attention-kernel measurements.
+ran at commit `50c170a`, after the review fixes and the attention-kernel measurements.
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
@@ -347,17 +356,23 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 
 ## 13. CUDA
 
-Run: `bash scripts/cuda_check.sh` on the VM described at the top, at commit `ecbab9d`. It runs the
-device-parametrised tests, the whole suite and the device probes. Everything added later has not run on
-CUDA: T14's `head_only` gradient cases, the past-only-covariate scenario and the review fixes. The gradient
-numbers below were measured against the earlier reference, which left upstream's RMSNorm in float32 (§6).
+Run: `bash scripts/cuda_check.sh` on the VM described at the top, at commit `50c170a` (2026-11-21). It runs
+the device-parametrised tests, the whole suite and the device probes. All gradient numbers here use the
+float64-RMSNorm reference of §6. An earlier run at `ecbab9d` used the previous reference; its numbers were
+within 1.4e-4 of these wherever both exist.
 
 | Check | Result |
 |---|---|
-| T14 and all other device-parametrised tests | 127 passed, 2 skipped (the Apple GPU tests) |
-| Whole suite | 290 passed, 6 skipped (4 Phase 2 placeholders, 2 Apple GPU tests) |
+| T14 and all other device-parametrised tests | 218 passed, 2 skipped (the Apple GPU tests) |
+| Whole suite | 436 passed, 6 skipped (4 Phase 2 placeholders, 2 Apple GPU tests) |
 | `head_only` training on CUDA: loss falls, nothing outside the head changes | Pass (part of the suite) |
+| `head_only` gradients on CUDA against the reference | At most 2.2e-6 (bound 1e-5) |
 | Verifiers (`run_checks`) on CUDA | Pass (part of the suite) |
+| The held branch `fix/math-sdpa-backend` (the `attention_backend` option), whole suite | 443 passed, 6 skipped |
+
+The first attempt at this run, one commit earlier, failed a single case on the VM's x86 CPU, not on CUDA:
+explicit attention on 5M with past-only covariates gave 5.3e-3 against a 5e-3 bound. That is the near-tie
+case of §6, which now has its own bound.
 
 Forward, relative L2 difference from CPU (`device_parity.py --device cuda`):
 
@@ -371,51 +386,58 @@ Forward, relative L2 difference from CPU (`device_parity.py --device cuda`):
 | Autocast `bfloat16` (not a supported mode yet) | 1.5e-2 | 5.7e-2 |
 | Autocast `float16` | 2.0e-3 | 5.9e-3 |
 
-Float32 training-loss gradients against the float64-weights reference (`gradient_accuracy.py --device cuda`;
-the CPU column is that VM's CPU):
+Float32 training-loss gradients against the reference, by attention kernel (`gradient_accuracy.py --device
+cuda`, experiments 1 and 2; the CPU columns are that VM's x86 CPU):
 
-| Model | Layout | CPU | CUDA |
+| Model | Layout | CPU default / unfused / explicit | CUDA default / unfused / explicit |
 |---|---|---|---|
-| Tiny random | univariate / multivariate / covariates | 3.4e-7 / 3.0e-7 / 2.3e-7 | 3.2e-7 / 2.4e-7 / 1.8e-7 |
-| 5M | univariate | 2.0e-3 | 1.2e-2 |
-| 5M | multivariate | 1.2e-3 | 1.2e-2 |
-| 5M | covariates | 9.2e-4 | 3.2e-3 |
-| 28M | univariate | 5.9e-4 | 1.4e-3 |
-| 28M | multivariate | 9.6e-4 | 2.3e-3 |
-| 28M | covariates | 1.1e-3 | 1.5e-3 |
+| Tiny random | all four | 2.3e-7 to 3.6e-7 (default) | 1.6e-7 to 3.1e-7 (default) |
+| 5M | univariate | 2.0e-3 / 2.1e-5 / 1.9e-5 | 1.2e-2 / 1.3e-5 / 6.0e-6 |
+| 5M | multivariate | 1.1e-3 / 1.6e-4 / 5.6e-5 | 1.2e-2 / 1.5e-5 / 1.4e-5 |
+| 5M | covariates | 9.1e-4 / 1.0e-4 / 1.3e-4 | 3.2e-3 / 2.3e-5 / 1.9e-5 |
+| 5M | past-only covariates | 7.9e-4 / 8.3e-6 / 1.1e-5 | 2.7e-3 / 3.4e-6 / 5.5e-6 |
+| 28M | univariate | 5.9e-4 / 5.8e-5 / 5.8e-5 | 1.4e-3 / 2.6e-5 / 3.5e-6 |
+| 28M | multivariate | 9.6e-4 / 7.5e-6 / 7.9e-6 | 2.3e-3 / 5.5e-6 / 8.9e-6 |
+| 28M | covariates | 1.1e-3 / 4.0e-4 / 1.5e-4 | 1.6e-3 / 2.0e-5 / 1.8e-5 |
+| 28M | past-only covariates | 1.3e-3 / 1.2e-5 / 2.0e-5 | 3.2e-3 / 6.9e-6 / 1.2e-5 |
 
-Across T14's scenarios on that VM: CUDA 2.2e-7 to 7.4e-3 as shipped (one minus the cosine at most 2.7e-5),
-and at most 1.1e-4 with explicit attention; CPU at most 1.4e-3 as shipped and 1.2e-4 with explicit attention.
-On the Mac, explicit attention gives at most 5.4e-4 on CPU and 1.2e-3 on the Apple GPU; both maxima are the
-28M covariates scenario, and every other case is at 6e-5 or less.
+On CUDA both unfused kernels lower the error on every one of these eight layouts, by 50 to 900 times. The
+15-seed sweep on that VM's CPU (experiment 6): default median 1.24e-3 (max 4.94e-3), unfused median 1.41e-5
+(max 1.32e-3, on a seed with a near-tie), explicit median 1.16e-5 (max 8.3e-5). T14's per-tier maxima on
+this VM are in the table of §6.
 
-Where the CUDA error comes from:
-
-| Experiment | 5M | 28M |
-|---|---|---|
-| CUDA float32, as shipped (covariates batch) | 3.2e-3 | 1.5e-3 |
-| CUDA float32, attention written out as matmul and softmax (same batch) | 7.1e-5 | 7.7e-5 |
-| CPU float32, as shipped / explicit attention (same batch) | 9.2e-4 / 1.8e-4 | 1.1e-3 / 9.5e-5 |
-
-The next four rows were measured once in a throwaway script on the VM (univariate batch) and are not
+Cost of each kernel on CUDA: a full training step, all parameters, context 1,024, horizon 96, batch of 32
+series. Measured once in a throwaway script on the VM (median of six steps after two warm-up steps); not
 reproduced by a probe:
 
+| Model | Batch | Default | PyTorch's unfused kernel | Explicit matmul-and-softmax |
+|---|---|---|---|---|
+| 5M | univariate | 47 ms, 0.3 GiB | 59 ms, 0.3 GiB | 58 ms, 0.3 GiB |
+| 5M | 5 rows per series, with covariates | 95 ms, 1.9 GiB | 102 ms, 1.9 GiB | 100 ms, 1.9 GiB |
+| 28M | univariate | 72 ms, 0.9 GiB | 89 ms, 0.9 GiB | 90 ms, 0.9 GiB |
+| 28M | 5 rows per series, with covariates | 393 ms, 5.7 GiB | 411 ms, 5.9 GiB | 408 ms, 5.9 GiB |
+
+So at this context length the unfused kernels cost 5% to 25% more time and at most 0.2 GiB more memory. The
+attention matrix grows with the square of the context, so longer contexts will cost more; that was not
+measured.
+
+These rows were measured once in a throwaway script during the first CUDA run (univariate batch, earlier
+reference) and are not reproduced by a probe:
+
 | Experiment | 5M | 28M |
 |---|---|---|
-| CUDA float32, as shipped | 1.2e-2 | 1.4e-3 |
-| CUDA float32, explicit attention | 2.3e-5 | 4.1e-6 |
 | CUDA with float64 weights | 1.2e-5 | 1.2e-5 |
 | CUDA float32 with TF32 disabled; and with `TRITON_DEFAULT_FP_FUSION=0` | 1.2e-2 (unchanged) | 1.4e-3 (unchanged) |
 
-Training-step timing (`step_timing.py --device cuda`; the CPU has only 4 threads, so the ratios flatter the
-GPU compared with a workstation CPU):
+Training-step timing against the VM's CPU (`step_timing.py --device cuda`; the CPU has only 4 threads, so the
+ratios flatter the GPU compared with a workstation CPU):
 
 | Model | Batch | CPU | CUDA | Speed-up | GPU memory allocated |
 |---|---|---|---|---|---|
-| 5M | univariate | 309 ms | 52 ms | 5.9× | 0.3 GiB |
-| 5M | 5 rows per series, with covariates | 2,644 ms | 94 ms | 28× | 1.9 GiB |
-| 28M | univariate | 1,163 ms | 79 ms | 15× | 1.9 GiB |
-| 28M | 5 rows per series, with covariates | 10,833 ms | 380 ms | 29× | 5.7 GiB |
+| 5M | univariate | 300 ms | 48 ms | 6.2× | 0.3 GiB |
+| 5M | 5 rows per series, with covariates | 2,607 ms | 93 ms | 28× | 1.9 GiB |
+| 28M | univariate | 1,140 ms | 75 ms | 15× | 1.9 GiB |
+| 28M | 5 rows per series, with covariates | 10,681 ms | 389 ms | 28× | 5.7 GiB |
 
 Environment requirement found on the way. With the VM's system Python 3.10 (PyTorch 2.14.1+cu130), every
 CUDA test failed: PyTorch routed an operation in upstream's attention layer through a Triton kernel, and
