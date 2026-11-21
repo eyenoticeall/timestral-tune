@@ -367,17 +367,20 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 
 ## 13. CUDA
 
-Run: `bash scripts/cuda_check.sh` and Phase 2 CUDA benchmarks on an NVIDIA L4 VM (`g2-standard-4`, Ubuntu
-22.04, 4 CPU threads, PyTorch 2.15.0+cu132, Python 3.12) on `phase-2` at commit `3fe5bc9` (2026-11-21). All
-gradient numbers here use the float64-RMSNorm reference of §6.
+Run: `bash scripts/cuda_check.sh` and `step_timing.py` (`--bf16`, `--compile`, `--mode`) on an NVIDIA L4 VM
+(`g2-standard-4`, Ubuntu 22.04, 4 CPU threads, PyTorch 2.15.0+cu132, Python 3.12) on `phase-2` at commit
+`b0980cb` (2026-11-21; post both review-fix passes). All gradient numbers here use the float64-RMSNorm
+reference of §6.
 
 | Check | Result |
 |---|---|
-| T14 and all other device-parametrised tests | 247 passed, 2 skipped (the Apple GPU tests) |
-| Whole suite (including T1–T14, all 4 `bf16` CUDA modes, and `torch.compile`) | 512 passed, 2 skipped (only the 2 Apple GPU tests) |
+| T14 and all other device-parametrised tests | 249 passed, 2 skipped (the Apple GPU tests) |
+| Whole suite (including T1–T14, all 4 `bf16` CUDA modes, `torch.compile`, `load_lora` resume) | 521 passed, 2 skipped (only the 2 Apple GPU tests) |
 | `head_only` gradients on CUDA against the reference | At most 1.7e-6 (bound 1e-5) |
 | Verifiers (`run_checks`) on CUDA | Pass (part of the suite) |
-| Real Hub export of `mistralai/Timestral-5M` (`lora_variate`, `bf16`) | Copies verbatim 1,687-byte `Modified MIT License` from Hub; reloads via upstream `load_model(..., strict=True)` on CUDA (`5,208,960` params) |
+| `step_timing.py --device cuda --bf16 --compile default` (`full_ft`, batch 32, ctx 1,024) | 5M uni 21 ms / 0.18 GiB, cov5 25 ms / 0.58 GiB; 28M uni 32 ms / 0.73 GiB, cov5 62 ms / 1.90 GiB |
+| `step_timing.py --device cuda --mode lora_variate --bf16 --compile reduce-overhead` | 5M cov5 18 ms; 28M cov5 43 ms |
+| Real Hub export of `mistralai/Timestral-5M` (`lora_variate`, `bf16`, run at `3fe5bc9`) | Copies verbatim 1,687-byte `Modified MIT License` from Hub; reloads via upstream `load_model(..., strict=True)` on CUDA (`5,208,960` params) |
 
 The first attempt at this run, one commit earlier, failed a single case on the VM's x86 CPU, not on CUDA:
 explicit attention on 5M with past-only covariates gave 5.3e-3 against a 5e-3 bound. That is the near-tie

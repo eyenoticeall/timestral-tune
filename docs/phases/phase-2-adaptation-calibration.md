@@ -45,8 +45,10 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - 2026-11-21 (`3fe5bc9`): verified across PyTorch 2.4/2.8/2.14/2.15 locally (510 passed, 4 skipped; 411/26
   on 2.4.0) and on NVIDIA L4 CUDA (**512 passed, 2 skipped**), resolved D15 via 20-step CUDA trajectories,
   and verified verbatim Hub `LICENSE` export on `mistralai/Timestral-5M`.
-- 2026-11-21 (review-fix pass, `4ec2e46`..`352f832`): addressed all Important findings from a 4-agent review
-  (`load_lora`, exact pre-merge snapshot in `unmerge`, exact O(n) CQR order statistic, repaired-interval ACI
-  `err_t` + `bisect`-sorted window, strict `from_dict`, CPU `best_state`, `evaluate()` shape guard, local
-  LoRA RNG, content `dataset_fingerprint`, dirty-dir cleanup, unfitted-calibrator guard, fallback `LICENSE`
-  warning, `--bf16`/`--compile` flags on `step_timing.py`). Local suite: **518 passed, 4 skipped**.
+- 2026-11-21 (review-fix passes & final L4 CUDA run, `4ec2e46`..`b0980cb`): addressed all findings from
+  two subagent review passes (`load_lora` + trainer resume, exact pre-merge snapshot in `unmerge`, exact
+  O(n) CQR order statistic, repaired-interval ACI `err_t` + `bisect`-sorted window, strict `from_dict`,
+  CPU `best_state`, `evaluate()` shape guard, local LoRA RNG, content `dataset_fingerprint`, dirty-dir
+  cleanup, unfitted-calibrator guard, fallback `LICENSE` warning, `--bf16`/`--compile` flags on
+  `step_timing.py`). Verified on NVIDIA L4 CUDA (`b0980cb`): **521 passed, 2 skipped** (exit 0) and
+  `step_timing.py --bf16 --compile` reproduced 28M cov5 at `62 ms` (`full_ft`) / `43 ms` (`lora_variate`).

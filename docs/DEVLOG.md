@@ -448,7 +448,13 @@ plus clean Minor/perf fixes:
 - Export (`352f832`): made `dataset_fingerprint` hash actual timestamps/values, unlinked stale conditional
   artifacts on re-export, rejected unfitted calibrators, warned on fallback `LICENSE` with honest `NOTICE`,
   and recorded full hyperparameters + `model_provided_directly`.
-- Probe & docs: added `--bf16`/`--compile`/`--mode` to `scripts/probes/step_timing.py` and fixed stale
-  Phase 2 / D15 text. Local suite after fixes: **518 passed, 4 skipped** (PyTorch 2.15.0, Python 3.13).
+- Probe & docs (`ed0df48`, `b0980cb`): added `--bf16`/`--compile`/`--mode` to `scripts/probes/step_timing.py`,
+  fixed stale Phase 2 / D15 text, and after a second-pass 2-agent review (merge-ready, zero regressions) added
+  `load_lora` resume support in `TimestralTrainer` plus strict ACI `from_dict` scalar checks and duplicate-slice
+  rejection.
+- Final NVIDIA L4 CUDA re-verification (`b0980cb`, short-lived VM deleted immediately after): `cuda_check.sh`
+  passed with **249 passed, 2 skipped** on device tests and **521 passed, 2 skipped** overall, and
+  `step_timing.py --device cuda --bf16 --compile default` / `--mode lora_variate --bf16 --compile reduce-overhead`
+  reproduced the L4 timings (28M cov5: `62 ms` / `1.90 GiB` `full_ft`, `43 ms` `lora_variate`).
 
 **Not done / open.** `phase-2` is unmerged and unpushed pending maintainer review. Phase 3 has not started.
