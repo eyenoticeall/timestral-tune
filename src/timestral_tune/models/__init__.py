@@ -16,7 +16,12 @@ from .adapter import (
     unmerge_lora,
     validate_lora_for_rows,
 )
-from .conformal import DEFAULT_QUANTILE_LEVELS, ConformalCalibrator, OnlineConformalCalibrator
+from .conformal import (
+    DEFAULT_QUANTILE_LEVELS,
+    ConformalCalibrator,
+    OnlineConformalCalibrator,
+    collect_conformal_data,
+)
 from .device import MIN_TORCH_FOR_MPS, TuneTimestralForecaster, TuneTimestralModel, mps_is_usable, supports_float64
 from .forward import (
     ForwardOutput,
@@ -39,6 +44,7 @@ __all__ = [
     "TargetFrame",
     "TuneTimestralForecaster",
     "TuneTimestralModel",
+    "collect_conformal_data",
     "denormalise_quantiles",
     "extract_lora_state_dict",
     "has_lora",

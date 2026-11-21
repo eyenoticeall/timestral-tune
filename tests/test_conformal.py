@@ -218,8 +218,8 @@ def test_aci_transform_is_read_only_and_update_uses_repaired_interval():
     p1 = np.zeros((1, 4, len(DEFAULT_QUANTILE_LEVELS)))
     # Seed 0.50 with score 10.0 and 0.80 with score 0.0, with alpha_t=0.5 / 0.2.
     multi._ensure_buckets(1)
-    multi._push_score(0, 0, 10.0)
-    multi._push_score(1, 0, 0.0)
+    multi._push_observation(0, 0, [10.0])
+    multi._push_observation(1, 0, [0.0])
     alpha_80_before = float(multi.alpha_t[1, 0])
     # y=5.0 lies outside raw 0.80 [0, 0] + 0 = [0, 0], but INSIDE repaired 0.80 [-10, 10] pushed by 0.50!
     multi.update(p1, np.full((1, 4), 5.0), np.ones(1))
@@ -229,3 +229,71 @@ def test_aci_transform_is_read_only_and_update_uses_repaired_interval():
     t_bf16 = torch.tensor(preds, dtype=torch.bfloat16, requires_grad=True)
     t_out = multi.transform(t_bf16)
     assert isinstance(t_out, torch.Tensor) and t_out.dtype == torch.bfloat16 and (t_out.diff(dim=-1) >= 0).all()
+
+
+def test_aci_window_eviction_and_anti_windup_regime_recovery():
+    """Verify rolling forecast-observation window eviction (mutation gap) AND bounded Lemma 4.1
+    recovery under over-wide -> narrow and escalating-error -> normal regime shifts with default 0.80.
+    """
+    # 1. Window eviction: push 3 huge outlier forecasts into window=4 (bucket_size=4), then 4 tiny forecasts.
+    # Once the 3 outliers are evicted (4 forecast updates later), the offset must drop from ~100 to ~0.1.
+    online = OnlineConformalCalibrator(target_coverage=0.80, gamma=0.005, window=4, bucket_size=4)
+    zero_preds = np.zeros((1, 4, len(DEFAULT_QUANTILE_LEVELS)), dtype=np.float64)
+    for _ in range(3):
+        online.update(zero_preds, np.full((1, 4), 100.0), np.ones(1))
+    assert online.current_offsets(4)[0, 0] == pytest.approx(100.0)
+    for _ in range(4):
+        online.update(zero_preds, np.full((1, 4), 0.1), np.ones(1))
+    assert online.current_offsets(4)[0, 0] == pytest.approx(0.1), "old outlier forecasts were not evicted from window"
+
+    # 2. Over-wide -> narrow regime shift with default single coverage 0.80 (reviewer Finding 2).
+    z = torch.distributions.Normal(0.0, 1.0).icdf(torch.tensor(DEFAULT_QUANTILE_LEVELS, dtype=torch.float64)).numpy()
+    rng = np.random.default_rng(42)
+    low_80, high_80 = DEFAULT_QUANTILE_LEVELS.index(0.10), DEFAULT_QUANTILE_LEVELS.index(0.90)
+    gamma = 0.01
+    aci = OnlineConformalCalibrator(target_coverage=0.80, gamma=gamma, window=200, bucket_size=32)
+
+    # 600 steps of 2.2x over-wide forecasts: alpha_t must stay near 0.2 and never wind up above 1 + gamma.
+    for _ in range(600):
+        y = rng.normal(0.0, 1.0, size=(1, 32))
+        p = (2.2 * z)[None, None, :].repeat(32, axis=1)
+        aci.update(p, y, np.ones(1))
+        assert -gamma - 1e-12 <= float(aci.alpha_t[0, 0]) <= 1.0 + gamma + 1e-12
+    assert float(aci.alpha_t[0, 0]) < 0.45, f"alpha_t wound up on over-wide forecasts: {float(aci.alpha_t[0, 0]):.3f}"
+
+    # Sudden switch to 0.45x under-wide forecasts: must recover to ~0.80 quickly (not 31% for 500 steps).
+    post_cov: list[float] = []
+    for step in range(250):
+        y = rng.normal(0.0, 1.0, size=(1, 32))
+        p = (0.45 * z)[None, None, :].repeat(32, axis=1)
+        cal = aci.transform(p, np.ones(1))
+        if step >= 60:
+            post_cov.append(float(np.mean((y >= cal[..., low_80]) & (y <= cal[..., high_80]))))
+        aci.update(p, y, np.ones(1))
+    assert float(np.mean(post_cov)) >= 0.72, f"post-shift recovery too slow: {float(np.mean(post_cov)):.3f}"
+
+    # 3. Escalating errors (mirror case): alpha_t hits saturation at -gamma (not -2.2) and recovers cleanly.
+    aci_esc = OnlineConformalCalibrator(target_coverage=0.80, gamma=0.05, window=50, bucket_size=4)
+    for k in range(1, 80):
+        aci_esc.update(zero_preds, np.full((1, 4), float(k)), np.ones(1))
+    assert aci_esc.saturated and float(aci_esc.alpha_t[0, 0]) == pytest.approx(-0.05)
+
+
+def test_collect_conformal_data_bridges_dataset_and_calibrator(tiny_forecaster):
+    from timestral_tune import collect_conformal_data
+
+    from .helpers import make_toy_dataset
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size, series=4, covariates=True)
+    preds, actuals, scale = collect_conformal_data(tiny_forecaster, dataset, batch_size=3)
+    n_targets = dataset.series[0].layout[0]
+    assert preds.shape == (
+        len(dataset) * n_targets,
+        dataset.forecast_horizon,
+        tiny_forecaster.model.config.num_quantiles,
+    )
+    assert actuals.shape == (len(dataset) * n_targets, dataset.forecast_horizon)
+    assert scale.shape == (len(dataset) * n_targets,) and np.all(scale > 0.0) and np.isfinite(scale).all()
+    cal = ConformalCalibrator(target_coverage=0.80, bucket_size=tiny_forecaster.patch_size).fit(preds, actuals, scale)
+    out = cal.transform(preds, scale)
+    assert out.shape == preds.shape and np.all(np.diff(out, axis=-1) >= 0.0)

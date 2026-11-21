@@ -6,12 +6,18 @@ model weights (spec §5.2, decision D6):
 - `ConformalCalibrator`: static split Conformalized Quantile Regression (Romano et al., 2019,
   eqs. 9-11), with scale-normalised conformity scores, horizon buckets, exact finite-sample
   order statistic `ceil((n + 1) * (1 - alpha))` computed in O(n) via `np.partition`, and
-  outward monotonicity repair from the unshifted median.
+  anchor-aware monotonicity repair around the unshifted median (so narrowing a single pair like
+  the default `target_coverage=0.80` is not undone by uncalibrated neighbours).
 - `OnlineConformalCalibrator`: Adaptive Conformal Inference (Gibbs & Candès, 2021) for
   non-exchangeable series, maintaining per-bucket working miscoverage `alpha_t` over a rolling
-  score window (kept sorted for O(1) quantile lookup). `err_t` is evaluated on the actual
-  emitted (monotone-repaired) interval; `alpha_t` is never clipped (ACI Lemma 4.1); saturation
-  at `alpha_t <= 0` uses the largest score in the window and raises `.saturated`.
+  window of `window` recent forecast observations (kept sorted for O(1) quantile lookup).
+  `err_t` is evaluated on the actual emitted (repaired) interval; `alpha_t` is never clipped at
+  `[0, 1]` and is bounded only at Lemma 4.1's theoretical envelope `[-gamma, 1 + gamma]` so
+  finite-window extremes (`max`/`min`) cannot cause unbounded wind-up. Saturation at
+  `alpha_t <= 0` uses the largest score in the window and raises `.saturated`.
+- `collect_conformal_data`: runs an upstream-compatible `TimestralForecaster` over a
+  `TimeSeriesDataset` and returns `(predictions, actuals, context_scale)` ready for either
+  calibrator.
 
 - Spec: `docs/SPEC.md` §5.2, §7.3, §11 (D6)
 - Acceptance tests: T13
@@ -26,16 +32,21 @@ import numbers
 from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import numpy as np
 import torch
 from torch import Tensor
 
+if TYPE_CHECKING:
+    from .._vendor.timestral.forecaster import TimestralForecaster
+    from ..data.dataset import TimeSeriesDataset
+
 __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
     "ConformalCalibrator",
     "OnlineConformalCalibrator",
+    "collect_conformal_data",
 ]
 
 DEFAULT_QUANTILE_LEVELS: tuple[float, ...] = (0.01, *(round(0.05 * i, 2) for i in range(1, 20)), 0.99)
@@ -116,6 +127,12 @@ def _positive_int(name: str, value: object) -> int:
     return int(value)
 
 
+def _finite_real(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}")
+    return float(value)
+
+
 def _to_numpy_f64(value: ArrayOrTensor, name: str) -> tuple[np.ndarray, bool, torch.device | None, torch.dtype | None]:
     if isinstance(value, Tensor):
         return value.detach().cpu().to(torch.float64).numpy(), True, value.device, value.dtype
@@ -176,11 +193,52 @@ def _cqr_order_statistic(scores: np.ndarray, coverage: float) -> float:
     return float(np.partition(scores, idx)[idx])
 
 
-def _repair_monotonicity_outward(quantiles: np.ndarray, median_idx: int) -> np.ndarray:
-    """Outward monotonicity repair from the unshifted median (spec §5.2): intervals can only widen."""
+def _repair_monotonicity_anchored(
+    quantiles: np.ndarray,
+    median_idx: int,
+    pairs: tuple[tuple[float, int, int], ...],
+) -> np.ndarray:
+    """Repair monotonicity around fixed anchors (unshifted median + calibrated levels).
+
+    Calibrated levels are clamped so they never cross the median and repaired outward relative
+    to each other (so calibrated intervals can only widen against other calibrated pairs).
+    Uncalibrated levels are then reconciled into the bounds between adjacent anchors (or outward
+    beyond the outermost anchor) without moving any calibrated level. When every symmetric pair
+    is calibrated (`target_coverage="all"`), this reduces identically to pure outward repair.
+    """
     out = quantiles.copy()
-    out[..., median_idx:] = np.maximum.accumulate(out[..., median_idx:], axis=-1)
-    out[..., : median_idx + 1] = np.minimum.accumulate(out[..., median_idx::-1], axis=-1)[..., ::-1]
+    num_q = out.shape[-1]
+    cal_upper = sorted(high_idx for _, _, high_idx in pairs)
+    cal_lower = sorted((low_idx for _, low_idx, _ in pairs), reverse=True)
+
+    # Upper half: calibrated anchors repair outward from the unshifted median.
+    prev = out[..., median_idx]
+    for c in cal_upper:
+        out[..., c] = np.maximum(out[..., c], prev)
+        prev = out[..., c]
+    upper_anchors = [median_idx, *cal_upper]
+    for a_lo, a_hi in zip(upper_anchors, upper_anchors[1:], strict=False):
+        if a_hi - a_lo > 1:
+            seg = np.clip(out[..., a_lo + 1 : a_hi], out[..., a_lo : a_lo + 1], out[..., a_hi : a_hi + 1])
+            out[..., a_lo + 1 : a_hi] = np.maximum.accumulate(seg, axis=-1)
+    last_hi = upper_anchors[-1]
+    if last_hi < num_q - 1:
+        out[..., last_hi:] = np.maximum.accumulate(out[..., last_hi:], axis=-1)
+
+    # Lower half: calibrated anchors repair outward (towards index 0) from the unshifted median.
+    prev = out[..., median_idx]
+    for c in cal_lower:
+        out[..., c] = np.minimum(out[..., c], prev)
+        prev = out[..., c]
+    lower_anchors = [median_idx, *cal_lower]
+    for a_hi, a_lo in zip(lower_anchors, lower_anchors[1:], strict=False):
+        if a_hi - a_lo > 1:
+            seg = np.clip(out[..., a_lo + 1 : a_hi], out[..., a_lo : a_lo + 1], out[..., a_hi : a_hi + 1])
+            out[..., a_lo + 1 : a_hi] = np.minimum.accumulate(seg[..., ::-1], axis=-1)[..., ::-1]
+    last_lo = lower_anchors[-1]
+    if last_lo > 0:
+        out[..., : last_lo + 1] = np.minimum.accumulate(out[..., last_lo::-1], axis=-1)[..., ::-1]
+
     return out
 
 
@@ -192,7 +250,7 @@ def _apply_offsets(
     bucket_size: int,
     median_idx: int,
 ) -> np.ndarray:
-    """Apply `(num_pairs, num_buckets)` scaled offsets and outward monotonicity repair."""
+    """Apply `(num_pairs, num_buckets)` scaled offsets and anchor-aware monotonicity repair."""
     _, h, _ = preds.shape
     bucket_ids = np.arange(h) // bucket_size
     if int(bucket_ids[-1]) >= offsets.shape[1]:
@@ -204,7 +262,7 @@ def _apply_offsets(
         shift = offsets[pair_idx, bucket_ids][None, :] * scale[:, None]
         out[..., low_idx] -= shift
         out[..., high_idx] += shift
-    return _repair_monotonicity_outward(out, median_idx)
+    return _repair_monotonicity_anchored(out, median_idx, pairs)
 
 
 def _restore_type(arr: np.ndarray, is_tensor: bool, device: torch.device | None, dtype: torch.dtype | None) -> Any:
@@ -292,7 +350,7 @@ class ConformalCalibrator:
         predictions: ArrayOrTensor,
         context_scale: ArrayOrTensor | None = None,
     ) -> ArrayOrTensor:
-        """Apply calibrated shifts and outward monotonicity repair to raw-space quantile forecasts."""
+        """Apply calibrated shifts and anchor-aware monotonicity repair to raw-space quantile forecasts."""
         if self.offsets_ is None:
             raise RuntimeError("ConformalCalibrator must be fitted before calling transform()")
         preds, _, scale, is_tensor, device, dtype = _validate_inputs(
@@ -356,17 +414,22 @@ class ConformalCalibrator:
 class OnlineConformalCalibrator:
     """Adaptive Conformal Inference (ACI; Gibbs & Candès, 2021) for non-exchangeable series.
 
-    Maintains a rolling score window (with a sorted mirror for O(1) quantile lookup) and
-    unclipped working miscoverage `alpha_t` per `(coverage_pair, horizon_bucket)`. Realised
-    miscoverage `err_t` is evaluated on the actual emitted (monotone-repaired) interval; with
-    `bucket_size > 1`, `err_t` is the mean miscoverage fraction across observed steps in the
-    bucket. When `alpha_t <= 0`, the largest score in the window is used and `.saturated` is
-    True; when `alpha_t >= 1`, the smallest score is used.
+    Maintains a rolling window of up to `window` recent forecast observations per
+    `(coverage_pair, horizon_bucket)` (with a sorted step-score mirror for O(1) quantile lookup)
+    and working miscoverage `alpha_t`. Realised miscoverage `err_t` is evaluated on the actual
+    emitted (anchor-repaired) interval; with `bucket_size > 1`, `err_t` is the mean miscoverage
+    fraction across observed steps in the bucket.
+
+    `alpha_t` is never clipped at `[0, 1]`: it crosses `0` (emitting the largest score in the
+    window and setting `.saturated = True`) and `1` (emitting the smallest score). Because finite
+    window extremes replace the paper's infinite / empty intervals, `alpha_t` is bounded only at
+    Lemma 4.1's theoretical envelope `[-gamma, 1 + gamma]` to prevent unbounded wind-up.
 
     Args:
         target_coverage: Nominal central coverage(s) or `"all"`.
         gamma: Online step size in `alpha_{t+1} = alpha_t + gamma * (alpha - err_t)`.
-        window: Rolling window length of recent scaled conformity scores per `(pair, bucket)`.
+        window: Rolling window length in forecast observations per `(pair, bucket)` (default 500;
+            with `bucket_size=32`, holds up to 500 forecasts / 16,000 step scores).
         bucket_size: Horizon steps pooled per bucket (default 32, down to 1).
         quantile_levels: Sorted quantile levels matching the model's output axis.
     """
@@ -389,7 +452,7 @@ class OnlineConformalCalibrator:
         self.bucket_size = _positive_int("bucket_size", bucket_size)
         self._num_buckets: int = 0
         self._alpha_t: list[list[float]] = [[] for _ in self.pairs]
-        self._scores: list[list[deque[float]]] = [[] for _ in self.pairs]
+        self._scores: list[list[deque[tuple[float, ...]]]] = [[] for _ in self.pairs]
         self._sorted: list[list[list[float]]] = [[] for _ in self.pairs]
 
     @property
@@ -407,14 +470,20 @@ class OnlineConformalCalibrator:
                 self._sorted[pair_idx].append([])
         self._num_buckets = num_buckets
 
-    def _push_score(self, pair_idx: int, bucket_idx: int, score: float) -> None:
+    def _push_observation(self, pair_idx: int, bucket_idx: int, obs_scores: Sequence[float]) -> None:
+        """Append one forecast observation's finite step scores and evict the oldest observation if full."""
+        if not obs_scores:
+            return
         fifo = self._scores[pair_idx][bucket_idx]
         ordered = self._sorted[pair_idx][bucket_idx]
         if len(fifo) >= self.window:
             evicted = fifo.popleft()
-            del ordered[bisect.bisect_left(ordered, evicted)]
-        fifo.append(score)
-        bisect.insort(ordered, score)
+            for old in evicted:
+                del ordered[bisect.bisect_left(ordered, old)]
+        entry = tuple(float(v) for v in obs_scores)
+        fifo.append(entry)
+        for val in entry:
+            bisect.insort(ordered, val)
 
     def _bucket_offset(self, pair_idx: int, bucket_idx: int) -> tuple[float, bool]:
         if bucket_idx >= self._num_buckets:
@@ -433,7 +502,7 @@ class OnlineConformalCalibrator:
 
     @property
     def alpha_t(self) -> np.ndarray:
-        """Current unclipped working miscoverage `(num_pairs, num_buckets)`."""
+        """Current working miscoverage `(num_pairs, num_buckets)`."""
         if self._num_buckets == 0:
             return np.empty((len(self.pairs), 0), dtype=np.float64)
         return np.asarray(self._alpha_t, dtype=np.float64)
@@ -468,7 +537,7 @@ class OnlineConformalCalibrator:
         predictions: ArrayOrTensor,
         context_scale: ArrayOrTensor | None = None,
     ) -> ArrayOrTensor:
-        """Apply the current online offsets and outward monotonicity repair without mutating state."""
+        """Apply the current online offsets and anchor-aware monotonicity repair without mutating state."""
         preds, _, scale, is_tensor, device, dtype = _validate_inputs(
             predictions, len(self.quantile_levels), None, context_scale
         )
@@ -482,7 +551,7 @@ class OnlineConformalCalibrator:
         actuals: ArrayOrTensor,
         context_scale: ArrayOrTensor | None = None,
     ) -> OnlineConformalCalibrator:
-        """Update working miscoverages and rolling score windows chronologically as actuals arrive."""
+        """Update working miscoverages and rolling observation windows chronologically as actuals arrive."""
         preds, y, scale, _, _, _ = _validate_inputs(predictions, len(self.quantile_levels), actuals, context_scale)
         assert y is not None
         n, h, _ = preds.shape
@@ -491,7 +560,7 @@ class OnlineConformalCalibrator:
 
         for i in range(n):
             s_i = float(scale[i])
-            # Evaluate miscoverage against the actual emitted (outward-repaired) interval before updating.
+            # Evaluate miscoverage against the actual emitted (anchor-repaired) interval before updating.
             offsets_i = self.current_offsets(h)
             emitted_i = _apply_offsets(
                 preds[i : i + 1], scale[i : i + 1], self.pairs, offsets_i, self.bucket_size, self.median_idx
@@ -509,13 +578,14 @@ class OnlineConformalCalibrator:
                     lo = emitted_i[start:end, low_idx][valid]
                     hi = emitted_i[start:end, high_idx][valid]
                     err = float(np.mean((y_v < lo) | (y_v > hi)))
-                    # ACI update: alpha_t is never clipped (Lemma 4.1).
-                    self._alpha_t[p][b] = self._alpha_t[p][b] + self.gamma * (alpha - err)
+                    # Never clipped at [0, 1]; bounded at Lemma 4.1's [-gamma, 1 + gamma] envelope so
+                    # finite-window extremes (max / min) do not wind up unboundedly under regime shifts.
+                    next_alpha = self._alpha_t[p][b] + self.gamma * (alpha - err)
+                    self._alpha_t[p][b] = min(1.0 + self.gamma, max(-self.gamma, next_alpha))
                     q_low = preds[i, start:end, low_idx][valid]
                     q_high = preds[i, start:end, high_idx][valid]
-                    new_scores = np.maximum(q_low - y_v, y_v - q_high) / s_i
-                    for val in new_scores:
-                        self._push_score(p, b, float(val))
+                    new_scores = (np.maximum(q_low - y_v, y_v - q_high) / s_i).tolist()
+                    self._push_observation(p, b, new_scores)
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -528,7 +598,7 @@ class OnlineConformalCalibrator:
             "bucket_size": self.bucket_size,
             "num_buckets": self._num_buckets,
             "alpha_t": [list(row) for row in self._alpha_t],
-            "scores": [[list(dq) for dq in row] for row in self._scores],
+            "scores": [[[list(obs) for obs in dq] for dq in row] for row in self._scores],
         }
 
     @classmethod
@@ -565,17 +635,18 @@ class OnlineConformalCalibrator:
             if not isinstance(scores[p], list) or len(scores[p]) != num_buckets:
                 raise ValueError(f"scores[{p}] must have length {num_buckets}")
             for b in range(num_buckets):
-                raw_a = alpha_t[p][b]
-                if isinstance(raw_a, bool) or not isinstance(raw_a, numbers.Real) or not math.isfinite(float(raw_a)):
-                    raise ValueError(f"alpha_t[{p}][{b}] must be a finite real number, got {raw_a!r}")
-                cal._alpha_t[p][b] = float(raw_a)
+                cal._alpha_t[p][b] = _finite_real(f"alpha_t[{p}][{b}]", alpha_t[p][b])
                 bucket_scores = scores[p][b]
                 if not isinstance(bucket_scores, list):
                     raise ValueError(f"scores[{p}][{b}] must be a list")
-                for s in bucket_scores[-cal.window :]:
-                    if isinstance(s, bool) or not isinstance(s, numbers.Real) or not math.isfinite(float(s)):
-                        raise ValueError(f"score {s!r} in scores[{p}][{b}] must be a finite real number")
-                    cal._push_score(p, b, float(s))
+                for entry in bucket_scores[-cal.window :]:
+                    if isinstance(entry, list):
+                        if not entry:
+                            raise ValueError(f"empty observation list in scores[{p}][{b}]")
+                        cal._push_observation(p, b, [_finite_real(f"scores[{p}][{b}] entry", s) for s in entry])
+                    else:
+                        # Legacy flat-score format: treat each scalar as a single-step observation.
+                        cal._push_observation(p, b, [_finite_real(f"scores[{p}][{b}] entry", entry)])
         return cal
 
     def save(self, path: str | Path) -> Path:
@@ -586,3 +657,85 @@ class OnlineConformalCalibrator:
     @classmethod
     def load(cls, path: str | Path) -> OnlineConformalCalibrator:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+@torch.no_grad()
+def collect_conformal_data(
+    forecaster: TimestralForecaster,
+    dataset: TimeSeriesDataset,
+    *,
+    batch_size: int = 32,
+    symmetric_averaging: bool = True,
+    clip_nonnegative: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run `forecaster.forecast()` over `dataset` and return `(predictions, actuals, context_scale)`.
+
+    Bridges a `TimeSeriesDataset` directly to `ConformalCalibrator.fit()` / `OnlineConformalCalibrator.update()`
+    using the exact upstream inference path (symmetric averaging and non-negative clipping on by
+    default; spec §5.2, §5.5). Each `(window, target_variate)` becomes one row of the returned
+    arrays: `predictions` `(N, H, Q)`, `actuals` `(N, H)`, and `context_scale` `(N,)`.
+    """
+    bs = _positive_int("batch_size", batch_size)
+    n_windows = len(dataset)
+    if n_windows == 0:
+        raise ValueError("dataset has no windows")
+
+    horizon = dataset.forecast_horizon
+    preds_parts: list[np.ndarray] = []
+    actuals_parts: list[np.ndarray] = []
+    scales_parts: list[np.ndarray] = []
+
+    was_training = forecaster.model.training
+    forecaster.model.eval()
+    try:
+        idx = 0
+        while idx < n_windows:
+            first = dataset[idx]
+            ctx_len = first.target_context.shape[1]
+            group = [first]
+            idx += 1
+            while idx < n_windows and len(group) < bs:
+                nxt = dataset[idx]
+                if nxt.target_context.shape[1] != ctx_len:
+                    break
+                group.append(nxt)
+                idx += 1
+
+            context = np.stack([w.target_context for w in group], axis=0)  # (B, V, T)
+            actuals_b = np.stack([w.target_future for w in group], axis=0)  # (B, V, H)
+            kwargs: dict[str, Any] = {
+                "symmetric_averaging": symmetric_averaging,
+                "clip_nonnegative": clip_nonnegative,
+            }
+            if group[0].past.shape[0] > 0:
+                kwargs["past_covariates"] = np.stack([w.past for w in group], axis=0)
+            if group[0].known.shape[0] > 0:
+                kwargs["known_covariates"] = np.stack([w.known for w in group], axis=0)
+            if group[0].categorical_past.shape[0] > 0:
+                kwargs["categorical_past_covariates"] = np.stack([w.categorical_past for w in group], axis=0)
+            if group[0].categorical_known.shape[0] > 0:
+                kwargs["categorical_known_covariates"] = np.stack([w.categorical_known for w in group], axis=0)
+
+            forecast = forecaster.forecast(context, prediction_length=horizon, **kwargs)
+            q_np = forecast.quantiles.detach().cpu().to(torch.float64).numpy()  # (B, V, H, Q)
+            b_size, n_targets, _, num_q = q_np.shape
+
+            # Context standard deviation per (window, target_variate), floored cleanly for constant contexts.
+            flat_ctx = context.astype(np.float64).reshape(b_size * n_targets, ctx_len)
+            scales_b = np.empty(b_size * n_targets, dtype=np.float64)
+            for row_i in range(flat_ctx.shape[0]):
+                obs = flat_ctx[row_i][np.isfinite(flat_ctx[row_i])]
+                std = float(np.std(obs)) if obs.size >= 2 else 0.0
+                scales_b[row_i] = std if (math.isfinite(std) and std > 1e-5) else 1.0
+
+            preds_parts.append(q_np.reshape(b_size * n_targets, horizon, num_q))
+            actuals_parts.append(actuals_b.astype(np.float64).reshape(b_size * n_targets, horizon))
+            scales_parts.append(scales_b)
+    finally:
+        forecaster.model.train(was_training)
+
+    return (
+        np.concatenate(preds_parts, axis=0),
+        np.concatenate(actuals_parts, axis=0),
+        np.concatenate(scales_parts, axis=0),
+    )

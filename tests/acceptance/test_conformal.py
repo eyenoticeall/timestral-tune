@@ -77,6 +77,17 @@ def test_t13_conformal_coverage_and_monotonicity(width_factor):
     if width_factor > 1.0:
         assert calibrator.offsets_ is not None and (calibrator.offsets_ < 0.0).all()
 
+        # Default single target_coverage=0.80 must ALSO narrow an over-wide interval to ~0.80
+        # (uncalibrated interior neighbours must not pull q_0.10 / q_0.90 back outward).
+        single = ConformalCalibrator(target_coverage=0.80, bucket_size=32).fit(
+            cal_preds, cal_y, context_scale=cal_scale
+        )
+        single_cal = single.transform(test_preds, context_scale=test_scale)
+        assert np.all(np.diff(single_cal, axis=-1) >= 0.0), "single-coverage calibrated quantiles must stay monotone"
+        assert np.array_equal(single_cal[..., median_idx], test_preds[..., median_idx]), "median must not shift"
+        single_cov = float(np.mean((test_y >= single_cal[..., low_80]) & (test_y <= single_cal[..., high_80])))
+        assert 0.77 <= single_cov <= 0.84, f"single target_coverage=0.80 failed to narrow: got {single_cov:.3f}"
+
 
 @pytest.mark.acceptance
 def test_t13_online_conformal_tracks_coverage_under_shift():
