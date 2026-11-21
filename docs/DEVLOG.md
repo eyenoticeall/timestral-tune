@@ -460,3 +460,42 @@ plus clean Minor/perf fixes:
 **Not done / open.** `phase-2` is pushed to `origin/phase-2` and awaits review/merge into `main`;
 `perf/phase1-kernels` and `fix/math-sdpa-backend` have both been deleted locally and on `origin`.
 Phase 3 has not started.
+
+---
+
+## 2026-11-22 — External review fixes (conformal narrowing & ACI wind-up, shape bucketing, export atomicity)
+
+**What.** Addressed all findings from an independent review agent on `phase-2` (including three
+mutation-test gaps) and verified a 5M LoRA export inside a standalone isolated install of the official
+`mistralai/timestral@a534bdb` package (bit-identical forecasts: `max_abs = 0.0`, `4.9%` diff vs zero-shot):
+
+- **Conformal calibration (`d0077ea`):**
+  - Fixed Finding 1: replaced blind outward repair with `_repair_monotonicity_anchored` so uncalibrated
+    interior levels (`q_0.85`, `q_0.15`) no longer undo negative offsets on single-coverage calibrators
+    (default `ConformalCalibrator(0.80)` on 2.2× over-wide data now hits `80.1%` coverage instead of `97.6%`).
+  - Fixed Finding 2: bounded ACI `alpha_t` at Lemma 4.1's theoretical envelope `[-gamma, 1 + gamma]`
+    (still unclipped at `[0, 1]`), eliminating unbounded wind-up (`+2.84` / `-2.2`) from finite-window
+    extremes (3,000 over-wide steps → `alpha_t = 0.1975`, immediate recovery on regime shift).
+  - Fixed Finding 6a/6d: `OnlineConformalCalibrator.window` now counts forecast observations per bucket
+    (500 forecasts at `bucket_size=32`, instead of ~15), and added `collect_conformal_data(forecaster, dataset)`.
+  - Added ACI window-eviction test (mutation gap 1).
+- **Shape bucketing & trainer (`dc9409f`):**
+  - Fixed Finding 3: added `bucket_series_count`, `pad_batch_to_series` (zero-weighted, group-isolated
+    tail padding, verified `< 1e-12` float64 loss/gradient equivalence), and `DHFDataCollator(bucket_to_max=...)`,
+    wired automatically under `compile_mode="reduce-overhead"` so non-divisible datasets work without
+    dropping data.
+  - Fixed Finding 6c: wrapped `_build_head_cache` forward in `self._autocast()` for `bf16` parity.
+  - Added gradient-clipping tests for `lora_variate`/`full_ft` and `restore_best` test for `full_ft`
+    (mutation gaps 2 and 3).
+- **Export & LoRA (`5292b43`):**
+  - Fixed Finding 4: hashed `dataset._series_index` and `dataset._origins` in `dataset_fingerprint` so
+    equal-sized train/val splits sharing `series` hash distinctly.
+  - Fixed Findings 5a–c & 6b: rejected mismatched `lora_config` vs `model._lora_config`, pre-serialised
+    all JSON/licence artefacts (coercing NumPy scalars) before writing any file (no partial exports),
+    detected fallback `LICENSE` pointers on chained exports, and used a local `torch.Generator` in `load_lora`.
+
+**Evidence.** Ruff check & format clean; `uv build` clean; `check_upstream_drift.py` reports no drift.
+Local macOS suite: **526 passed, 4 skipped** (PyTorch 2.15.0, Python 3.13); PyTorch 2.4.0 floor
+network-free pass green.
+
+**Not done / open.** Ready to push updated `phase-2` and re-run CUDA check if desired before merging into `main`.

@@ -250,7 +250,9 @@ Run on the tiny random model, 5M and 28M.
 | Exported checkpoint loads in vendored upstream `load_model` with `strict=True`, reproduces forecasts within `1e-4`, and writes `config.json`, `model.safetensors`, adapters (LoRA), `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` | T11 | Pass on tiny, 5M and 28M across all four modes (`head_only`, `lora_variate`, `lora_temporal`, `full_ft`) |
 | Categorical encodings are unchanged when data after the origin changes; a whole-series encoding would differ | T12 | Pass |
 | With two targets, a past-only category that first occurs after the origin (sorting first, or in the middle) changes no input; the dataset-wide codes do change | T12, several targets | Pass |
-| Static CQR meets nominal coverage across all 10 symmetric pairs on under- and over-covering exchangeable data; online ACI tracks nominal coverage under variance shift; quantiles are non-decreasing and median unshifted | T13 | Pass |
+| Static CQR meets nominal coverage across all 10 symmetric pairs and single default `0.80` on under- and over-covering exchangeable data; online ACI tracks nominal coverage under regime shift without `alpha_t` wind-up, evicts stale forecast windows, and keeps quantiles non-decreasing with median unshifted | T13, `test_conformal.py` | Pass |
+| Power-of-two shape bucketing (`pad_batch_to_series`) preserves loss and gradients to `< 1e-12` in float64 and trains/evaluates non-divisible datasets under `compile_mode="reduce-overhead"` | `test_trainer.py` | Pass |
+| External isolated install of `mistralai/timestral@a534bdb` (without `timestral-tune`) loads an exported 5M LoRA checkpoint | One-off isolated check (2026-11-22) | Bit-identical to library (`max_abs = 0.0`), `4.9%` relative diff from zero-shot |
 | A category first seen after a `split_by_time` cutoff changes no training batch, with one or two targets | `test_dataset.py` | Pass (tiny model) |
 | Series that start and end at different times: no training window holds a step at or after the cutoff | `test_dataset.py` | Pass |
 | `head_only`, `lora_variate`, `lora_temporal`, `full_ft` on a fixed batch: loss falls, only targeted weights change, deterministic for a seed | `test_trainer.py` | Pass on CPU, Apple GPU and CUDA (including `bf16` on CUDA and `torch.compile`) |
@@ -314,7 +316,7 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 | 2.4.0 | 3.12 | 411 passed, 26 skipped (`3fe5bc9`; network-free post-review-fix pass also verified). Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 CUDA-only `bf16` tests; 77 further Apple GPU cases are not generated at all |
 | 2.8.0 | 3.12 | 510 passed, 4 skipped (`3fe5bc9`; the 4 CUDA-only `bf16` tests), including every Apple GPU test and all 14 acceptance tests |
 | 2.14.1 | 3.10 | 510 passed, 4 skipped (`3fe5bc9`; `uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 518 passed, 4 skipped (includes 8 new tests added in the Phase 2 review-fix pass) |
+| 2.15.0 | 3.13 | 526 passed, 4 skipped (includes all Phase 2 review-fix and mutation-guard tests) |
 
 These are the counts on `phase-2` (2026-11-21), all on macOS. Zero acceptance test placeholders remain.
 The CUDA run (§13) used Linux on the same branch (`3fe5bc9`) and passed all 4 `bf16` tests as well.

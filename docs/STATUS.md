@@ -13,11 +13,11 @@
 | Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator`; per-window categorical encoding |
 | Training forward and loss | Normalised-space forward (trimmed `L + 2h` covariate layout), both target frames, pinball loss, `compute_loss` |
 | Adaptation & training | `TimestralTrainer` across `head_only` (with frozen-feature caching), `lora_variate` (with single-row guard), `lora_temporal`, and `full_ft`; fp32 everywhere, `bf16` + fused AdamW on CUDA, optional `torch.compile`, early stopping, best-state restore |
-| Conformal calibration | `ConformalCalibrator` (static split CQR) and `OnlineConformalCalibrator` (online ACI) with scale normalisation, horizon buckets, outward monotonicity repair, and JSON persistence |
+| Conformal calibration | `ConformalCalibrator` (static split CQR), `OnlineConformalCalibrator` (online ACI, forecast-count rolling window, Lemma 4.1 anti-windup), and `collect_conformal_data` helper, with anchor-aware monotonicity repair and JSON persistence |
 | Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters, `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
-| Test suite | 519 passed, 4 skipped (CUDA-only `bf16`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; earlier commit `3fe5bc9`: 510/4 on 2.14.1 and 2.8.0, 411/26 on 2.4.0; macOS). On NVIDIA L4 CUDA (Linux, `b0980cb`): **521 passed, 2 skipped** |
+| Test suite | 526 passed, 4 skipped (CUDA-only `bf16`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; earlier commit `3fe5bc9`: 510/4 on 2.14.1 and 2.8.0, 411/26 on 2.4.0; macOS). On NVIDIA L4 CUDA (Linux, `b0980cb`): **521 passed, 2 skipped** |
 | CI | Green on `main` (`fc26d03`, Python 3.10–3.13 on Linux); `phase-2` is pushed to `origin/phase-2` and awaits a PR/merge for CI |
 
 ## What does not exist yet
