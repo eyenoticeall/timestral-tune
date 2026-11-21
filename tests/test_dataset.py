@@ -11,7 +11,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from timestral_tune.data import SeriesData, TimeSeriesDataset
+from timestral_tune.data import SeriesData, TimeSeriesDataset, window_category_codes
 from timestral_tune.models import denormalise_quantiles, target_frames, training_forward
 
 from .helpers import FRAME_KINDS, make_columns, max_rel, role_kwargs, to_frame
@@ -400,6 +400,71 @@ def test_dataset_pickles_and_works_in_a_worker_process(tiny_forecaster):
     in_worker = next(iter(DataLoader(dataset, batch_size=4, collate_fn=collate, num_workers=1)))
     assert torch.equal(in_process.context, in_worker.context) and torch.equal(in_process.targets, in_worker.targets)
     in_process.validate(tiny_forecaster.patch_size)
+
+
+@pytest.mark.parametrize("targets", [1, 2])
+def test_a_category_first_seen_after_the_cutoff_changes_no_training_window(tiny_forecaster, targets):
+    """Spec §6.3 rules 4 and 5: training inputs do not depend on which categories exist after the cutoff."""
+    columns = make_columns(21, series=2, steps=60, **{**FULL, "targets": targets})
+    step = np.arange(columns["time"].shape[0]) % 60
+    changed = dict(columns, cp0=columns["cp0"].copy(), ck0=columns["ck0"].copy())
+    changed["cp0"][step >= 44] = "A_sorts_first"
+    changed["ck0"][step >= 44] = np.where(step[step >= 44] % 2 == 0, "A_sorts_first", "bb_sorts_in_the_middle")
+    cutoff = columns["time"][44]
+
+    def training_batch(frame_columns):
+        dataset = build(frame_columns, context_length=16, forecast_horizon=6, stride=3)
+        train, _ = dataset.split_by_time(cutoff)
+        return train, train.collator(tiny_forecaster.config)([train[i] for i in range(len(train))])
+
+    train, batch = training_batch(columns)
+    changed_train, changed_batch = training_batch(changed)
+    assert len(train) == len(changed_train) > 4
+    assert train.categories["ck0"].tolist() != changed_train.categories["ck0"].tolist()
+    for name in ("context", "context_mask", "known_future", "known_future_mask", "targets", "loss_weight"):
+        assert torch.equal(getattr(batch, name), getattr(changed_batch, name)), name
+
+
+def test_frame_to_forecast_matches_upstream_with_several_targets(tiny_forecaster):
+    """With several targets the category codes are model inputs. Feeding upstream's `forecast` the codes of
+    the dataset's window (`window_category_codes` of the raw codes) reproduces the training forward.
+    """
+    forecaster = tiny_forecaster
+    patch = forecaster.patch_size
+    context_length, horizon, steps = 9 * patch + 1, 2 * patch + 1, 60
+    columns = make_columns(17, series=2, steps=steps, **FULL)
+    dataset = build(columns, context_length=context_length, forecast_horizon=horizon, stride=1000)
+    windows = [dataset[0], dataset[1]]
+    batch = dataset.collator(forecaster.config)(windows)
+
+    model = forecaster.model
+    with torch.no_grad():
+        output = training_forward(model, batch)
+        loc, scale = target_frames(model, batch, output)
+        ours = denormalise_quantiles(model, output.quantiles, loc, scale)
+    ours = ours.reshape(2, dataset.rows_per_series, batch.horizon_steps, -1)[:, :2, :horizon]
+
+    span = slice(steps - horizon - context_length, steps)
+    raw_past = np.stack([s.categorical_past[:, span][:, :context_length] for s in dataset.series])
+    raw_known = np.stack([s.categorical_known[:, span] for s in dataset.series])
+    codes_past, _ = window_category_codes(raw_past)
+    codes_known = np.concatenate(
+        window_category_codes(raw_known[..., :context_length], raw_known[..., context_length:]), -1
+    )
+    assert np.array_equal(codes_past, np.stack([w.categorical_past for w in windows]), equal_nan=True)
+    assert np.array_equal(codes_known, np.stack([w.categorical_known for w in windows]), equal_nan=True)
+
+    expected = forecaster.forecast(
+        np.stack([w.target_context for w in windows]),
+        horizon,
+        past_covariates=np.stack([w.past for w in windows]),
+        known_covariates=np.stack([w.known for w in windows]),
+        categorical_past_covariates=codes_past,
+        categorical_known_covariates=codes_known,
+        symmetric_averaging=False,
+        clip_nonnegative=False,
+    ).quantiles
+    assert max_rel(ours, expected) < 1e-5
 
 
 @pytest.mark.parametrize("kind", FRAME_KINDS)

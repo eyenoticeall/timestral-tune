@@ -164,6 +164,30 @@ def test_t12_encoding_causality(forecaster, columns):
 
 
 @pytest.mark.acceptance
+def test_t12_category_numbering_ignores_later_categories(forecaster):
+    """T12, several targets. With more than one target the category codes themselves are model inputs, so
+    their numbering must not depend on what comes after the origin: a past-only category that first occurs
+    later, wherever it sorts, changes nothing.
+    """
+    steps = steps_for(forecaster)
+    columns = make_columns(12, series=2, steps=steps, **{**ROLES, "targets": 2})
+    rows = after_origin(forecaster, columns)
+    changed = dict(columns, cp0=columns["cp0"].copy())
+    changed["cp0"][rows] = np.where(np.arange(int(rows.sum())) % 2 == 0, "A_sorts_first", "bb_sorts_in_the_middle")
+
+    batch, dataset = last_window_batch(forecaster, columns)
+    other, changed_dataset = last_window_batch(forecaster, changed)
+    assert dataset.categories["cp0"].tolist() != changed_dataset.categories["cp0"].tolist(), "the labels are new"
+    assert inputs_equal(batch, other), "a category that first occurs after the origin renumbered the inputs"
+    assert torch.equal(batch.targets, other.targets)
+
+    # Positive control: the dataset-wide codes, which the windows no longer expose, do change.
+    window = slice(dataset[0].origin - dataset[0].context_steps, dataset[0].origin)
+    stored, changed_stored = dataset.series[0].categorical_past, changed_dataset.series[0].categorical_past
+    assert not np.array_equal(stored[:, window], changed_stored[:, window], equal_nan=True)
+
+
+@pytest.mark.acceptance
 def test_collated_batches_pass_forward_parity(forecaster, columns):
     """The batch built by the dataset and collator, not only upstream's own assembly, reproduces `predict_block`."""
     batch, _ = last_window_batch(forecaster, columns)

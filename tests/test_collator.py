@@ -10,7 +10,14 @@ import numpy as np
 import pytest
 import torch
 
-from timestral_tune.data import DHFDataCollator, Window, encode_categorical_window, encoding_target, forward_fill
+from timestral_tune.data import (
+    DHFDataCollator,
+    Window,
+    encode_categorical_window,
+    encoding_target,
+    forward_fill,
+    window_category_codes,
+)
 from timestral_tune.models import denormalise_quantiles, target_frames, training_forward
 
 from .helpers import RawSeries, make_raw, max_rel, upstream_batch
@@ -178,6 +185,26 @@ def test_several_targets_receive_raw_category_codes(tiny_forecaster):
     assert torch.equal(
         batch.known_future[known_rows], torch.as_tensor(codes_known[:, 0, 4 * patch :], dtype=torch.float32)
     )
+
+
+def test_window_category_codes_rank_what_the_window_can_see():
+    nan = np.nan
+    context = np.array([[7.0, 3.0, nan, 7.0, 40.0], [nan, nan, nan, nan, nan]])
+    ranked, horizon = window_category_codes(context)
+    assert horizon is None and ranked.dtype == np.float64
+    assert np.array_equal(ranked, [[1, 0, nan, 1, 2], [nan] * 5], equal_nan=True)
+    assert np.isnan(context[0, 2]) and context[0, 0] == 7.0  # input untouched
+
+    # A known-future covariate is ranked over context and horizon together: its horizon is known in advance.
+    ranked, horizon = window_category_codes(np.array([7.0, 3.0, 7.0]), np.array([5.0, nan, 3.0]))
+    assert np.array_equal(ranked, [2, 0, 2]) and np.array_equal(horizon, [1, nan, 0], equal_nan=True)
+
+    # Renumbering keeps the order of the codes and ignores codes that are absent from the window.
+    sparse, _ = window_category_codes(np.array([10.0, 30.0, 20.0]))
+    dense, _ = window_category_codes(np.array([0.0, 2.0, 1.0]))
+    assert np.array_equal(sparse, dense) and np.array_equal(dense, [0, 2, 1])
+    with pytest.raises(ValueError, match="finite or NaN"):
+        window_category_codes(np.array([1.0, np.inf]))
 
 
 def test_forward_fill():

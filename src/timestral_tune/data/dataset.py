@@ -2,7 +2,8 @@
 
 A `TimeSeriesDataset` holds every series as contiguous arrays on a regular time grid and yields
 forecast-origin `Window`s: up to `context_length` steps before an origin and `forecast_horizon`
-steps from it. Windows are views into the series arrays; the collator makes the padded copies.
+steps from it. A window's numeric arrays are views into the series arrays; the collator makes the
+padded copies.
 
 Point-in-time rules enforced here (spec §6.3):
 
@@ -11,6 +12,8 @@ Point-in-time rules enforced here (spec §6.3):
 - `available_lag` shifts a past-only covariate that is published late, so that the value at each
   step is the one that was known at that step.
 - `split_by_time` gives training windows nothing at or after the cutoff.
+- A window's category codes are numbered among the categories that window can see, so a category
+  that first occurs later cannot change them (`window_category_codes`).
 
 Input problems raise instead of being papered over: null ids or timestamps, duplicate
 (id, timestamp) pairs, timestamps off the regular grid, non-numeric value columns, infinities.
@@ -32,6 +35,7 @@ from torch.utils.data import Dataset
 
 from .._vendor.timestral.config import TimestralConfig
 from .collator import DHFDataCollator, Window
+from .encoders import window_category_codes
 
 __all__ = ["ColumnRoles", "SeriesData", "TimeSeriesDataset", "WindowStats"]
 
@@ -170,8 +174,10 @@ class TimeSeriesDataset(Dataset[Window]):
         stride: Distance between consecutive origins of one series.
         min_context: Minimum number of steps before an origin.
         roles: Column names per role, for reference; set by the frame constructors.
-        categories: For each categorical column, the sorted category values; the code of a value
-            is its index here. Set by the frame constructors.
+        categories: For each categorical column, the sorted category values. The codes stored in
+            `series` index this list. Windows do not expose those codes: each window renumbers
+            them among the categories it can see (`window_category_codes`). Set by the frame
+            constructors.
     """
 
     def __init__(
@@ -289,6 +295,12 @@ class TimeSeriesDataset(Dataset[Window]):
         data = self.series[series_index]
         start = max(0, origin - self.context_length)
         end = origin + self.forecast_horizon
+        # The stored codes index every category of the dataset, including ones that first occur after this
+        # window. Renumber them among the categories the window can see, so its inputs depend on nothing later.
+        categorical_past, _ = window_category_codes(data.categorical_past[:, start:origin])
+        known_context, known_horizon = window_category_codes(
+            data.categorical_known[:, start:origin], data.categorical_known[:, origin:end]
+        )
         return Window(
             series_index=series_index,
             origin=origin,
@@ -296,8 +308,8 @@ class TimeSeriesDataset(Dataset[Window]):
             target_future=data.targets[:, origin:end],
             past=data.past[:, start:origin],
             known=data.known[:, start:end],
-            categorical_past=data.categorical_past[:, start:origin],
-            categorical_known=data.categorical_known[:, start:end],
+            categorical_past=categorical_past,
+            categorical_known=np.concatenate([known_context, known_horizon], axis=-1),
         )
 
     def __repr__(self) -> str:

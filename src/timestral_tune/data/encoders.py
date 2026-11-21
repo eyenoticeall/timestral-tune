@@ -13,6 +13,10 @@ a category never seen in the context maps to the context's target mean.
 These functions reproduce upstream's `TimestralForecaster._encoding_target` and
 `._encode_categorical` for a single series, so training inputs equal inference inputs.
 
+With several target variates there is no single target to encode against, and upstream feeds the
+category codes to the model as numbers. The numbering must then not depend on the future either:
+`window_category_codes` numbers the categories a window can see, and nothing else.
+
 - Spec: `docs/SPEC.md` §6.3 rule 4
 - Acceptance tests: T12
 """
@@ -23,7 +27,7 @@ import numpy as np
 
 from .._vendor.timestral.covariate_encoding import target_encode
 
-__all__ = ["encode_categorical_window", "encoding_target", "forward_fill"]
+__all__ = ["encode_categorical_window", "encoding_target", "forward_fill", "window_category_codes"]
 
 
 def forward_fill(values: np.ndarray) -> np.ndarray:
@@ -82,3 +86,38 @@ def encode_categorical_window(
     encoded_context, encoded_horizon = target_encode(target, codes_context, horizon)
     is_padding = np.isnan(target) & np.isnan(codes_context)
     return np.where(is_padding, np.float32(np.nan), encoded_context), encoded_horizon
+
+
+def window_category_codes(
+    codes_context: np.ndarray, codes_horizon: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Renumber category codes by rank among the categories one window can see.
+
+    A code becomes the position of its category in the sorted list of the categories present in
+    the window: in the context for a past-only covariate, in the context and the horizon together
+    for a known-future one. The result depends on nothing outside the window, so a category that
+    first occurs later (after the forecast origin, or after a time-split cutoff) cannot change it.
+    The order of the original codes is kept, so ordered categories stay ordered.
+
+    This matters when several target variates are forecast together: the codes are then model
+    inputs. To forecast with a model trained that way, apply the same function to the window's
+    codes before calling upstream's `forecast`.
+
+    Args:
+        codes_context: `(..., T)` numeric category codes over the context; NaN marks a missing value.
+        codes_horizon: `(..., H)` codes over the horizon, for a known-future covariate.
+
+    Returns:
+        `(context, horizon)` as float64 with NaN kept; `horizon` is None when `codes_horizon` is None.
+    """
+    context = np.asarray(codes_context, dtype=np.float64)
+    steps = context.shape[-1]
+    visible = context if codes_horizon is None else np.concatenate([context, np.asarray(codes_horizon)], axis=-1)
+    if np.isinf(visible).any():
+        raise ValueError("category codes must be finite or NaN")
+    ranked = np.full(visible.shape, np.nan, dtype=np.float64)
+    for index in np.ndindex(visible.shape[:-1]):
+        row = visible[index]
+        present = ~np.isnan(row)
+        ranked[index][present] = np.unique(row[present], return_inverse=True)[1]
+    return ranked[..., :steps], (None if codes_horizon is None else ranked[..., steps:])
