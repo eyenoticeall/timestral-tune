@@ -26,6 +26,8 @@ SCENARIOS = {
     "multivariate": (3, 0, 0),
     "covariates": (1, 2, 2),
     "multi_target_covariates": (2, 1, 1),
+    # Covariates but none known in advance: the covariate layout with no known-future values at all.
+    "past_only_covariates": (1, 2, 0),
 }
 
 

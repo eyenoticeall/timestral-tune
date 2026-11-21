@@ -35,13 +35,13 @@ from timestral_tune.trainer import compute_loss
 
 from ..conftest import available_accelerators
 from ..helpers import (
-    as_double,
     explicit_attention,
     forecaster_on,
     l2_rel,
     loss_gradient,
     make_raw,
     max_rel,
+    reference_gradient,
     upstream_batch,
 )
 
@@ -90,7 +90,7 @@ def test_t14_device_parity_gradients(forecaster, raw, device, is_released_checkp
     on released checkpoints.
     """
     batch, _, _ = upstream_batch(forecaster, raw)
-    reference_loss, reference = loss_gradient(copy.deepcopy(forecaster.model).double(), as_double(batch))
+    reference_loss, reference = reference_gradient(forecaster.model, batch)
 
     on_device = forecaster if device == "cpu" else forecaster_on(forecaster, device)
     loss, gradient = loss_gradient(on_device.model, batch.to(device))
@@ -115,7 +115,7 @@ def test_t14_gradients_with_explicit_attention(forecaster, raw, device, is_relea
     attention call, and shows the rest of the training path is accurate on real weights.
     """
     batch, _, _ = upstream_batch(forecaster, raw)
-    _, reference = loss_gradient(copy.deepcopy(forecaster.model).double(), as_double(batch))
+    _, reference = reference_gradient(forecaster.model, batch)
 
     monkeypatch.setattr(upstream_layers, "_sdpa", explicit_attention)
     on_device = forecaster if device == "cpu" else forecaster_on(forecaster, device)
@@ -143,11 +143,11 @@ def test_t14_head_only_gradients(forecaster, raw, device):
         for parameter in model.head.parameters():
             parameter.requires_grad_(True)
         compute_loss(model, batch).loss.backward()
-        return torch.cat([p.grad.detach().cpu().double().flatten() for p in model.head.parameters()])
+        return 0.0, torch.cat([p.grad.detach().cpu().double().flatten() for p in model.head.parameters()])
 
     batch, _, _ = upstream_batch(forecaster, raw)
-    reference = head_gradient(copy.deepcopy(forecaster.model).double(), as_double(batch))
+    _, reference = reference_gradient(forecaster.model, batch, head_gradient)
     model = copy.deepcopy(forecaster.model) if device == "cpu" else forecaster_on(forecaster, device).model
-    relative = l2_rel(head_gradient(model, batch.to(device)), reference)
+    relative = l2_rel(head_gradient(model, batch.to(device))[1], reference)
     print(f"head-only gradient on {device}: relative L2 error {relative:.2e}")  # `pytest -s`
     assert relative < GRADIENT_RTOL_RANDOM_WEIGHTS, f"relative L2 {relative:.2e}"

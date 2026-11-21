@@ -7,6 +7,7 @@ and lets the forward and frame tests run independently of the collator.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import math
@@ -16,6 +17,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+import timestral_tune._vendor.timestral.layers as upstream_layers
 from timestral_tune._vendor.timestral import TimestralConfig, TimestralForecaster
 from timestral_tune.data.batch import TrainingBatch
 from timestral_tune.models import TuneTimestralForecaster, TuneTimestralModel
@@ -141,6 +143,38 @@ def as_double(batch: TrainingBatch) -> TrainingBatch:
         targets=batch.targets.double(),
         known_future=None if batch.known_future is None else batch.known_future.double(),
     )
+
+
+@contextlib.contextmanager
+def float64_reference():
+    """While active, upstream's RMSNorm computes in its input's own dtype instead of always in float32.
+
+    Upstream's RMSNorm casts to float32 internally, even in a float64 model. Its backward pass is then
+    only float32-accurate, and with the released weights that alone moves a "float64" gradient by up to
+    4e-3 (5M, past-only covariates). The reference a float32 gradient is judged against must not carry
+    that error, so reference computations run inside this context. The formula is upstream's, unchanged.
+    """
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.scale
+
+    original = upstream_layers.RMSNorm.forward
+    upstream_layers.RMSNorm.forward = forward
+    try:
+        yield
+    finally:
+        upstream_layers.RMSNorm.forward = original
+
+
+def reference_gradient(model: TuneTimestralModel, batch: TrainingBatch, gradient=None) -> tuple[float, Tensor]:
+    """`loss_gradient` (or `gradient`) of a float64 copy of `model` on CPU, with float64 RMSNorm.
+
+    RoPE still builds its rotation table in float32, so this is not a pure float64 computation; it is
+    the most accurate reference available without editing vendored code.
+    """
+    gradient = loss_gradient if gradient is None else gradient
+    with float64_reference():
+        return gradient(copy.deepcopy(model).to("cpu").double(), as_double(batch.to("cpu")))
 
 
 def loss_gradient(

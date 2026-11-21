@@ -65,6 +65,17 @@ def test_t02_forward_parity_with_covariates(forecaster, raw, scenario):
 
 
 @pytest.mark.acceptance
+@pytest.mark.parametrize("scenario", ["past_only_covariates"], indirect=True)
+def test_t02_forward_parity_with_past_only_covariates(forecaster, raw, scenario):
+    """T2, the common case of covariates none of which are known in advance: the `2n`-token layout with no
+    known-future values at all (`known_future` is None).
+    """
+    batch, _, _ = upstream_batch(forecaster, raw)
+    assert batch.role_ids is not None and batch.known_future is None and batch.known_future_mask is None
+    _assert_forward_parity(forecaster, raw)
+
+
+@pytest.mark.acceptance
 def test_t03_frame_parity(forecaster, raw):
     """T3. Passes when: Applying the median-folded frame reproduces `_refine_block`, and the full pipeline
     matches `forecast(symmetric_averaging=False, clip_nonnegative=False)` on a forecaster built with

@@ -11,7 +11,7 @@ from ..helpers import upstream_batch
 
 
 @pytest.mark.acceptance
-@pytest.mark.parametrize("scenario", ["covariates", "multi_target_covariates"], indirect=True)
+@pytest.mark.parametrize("scenario", ["covariates", "multi_target_covariates", "past_only_covariates"], indirect=True)
 @pytest.mark.parametrize("frame", ["median_folded", "true_values"])
 def test_t08_loss_mask(forecaster, raw, frame):
     """T8. Passes when: The gradient of the loss with respect to predictions is exactly zero at covariate
