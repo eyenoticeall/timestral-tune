@@ -5,53 +5,29 @@
 
 # timestral-tune
 
-Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
+[![PyPI](https://img.shields.io/pypi/v/timestral-tune)](https://pypi.org/project/timestral-tune/)
+[![Python](https://img.shields.io/pypi/pyversions/timestral-tune)](https://pypi.org/project/timestral-tune/)
+[![CI](https://github.com/eyenoticeall/timestral-tune/actions/workflows/ci.yml/badge.svg)](https://github.com/eyenoticeall/timestral-tune/actions/workflows/ci.yml)
+[![Licence](https://img.shields.io/pypi/l/timestral-tune)](https://github.com/eyenoticeall/timestral-tune/blob/main/LICENSE)
 
-> **Status: alpha (v0.1).** Loading, the data pipeline, all five adaptation modes (`conformal`,
-> `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), anti-forgetting replay mixing and frozen-base
-> distillation (`ReplayConfig`, `SyntheticReplaySource`), `bf16` + `torch.compile` on CUDA, full Apple GPU
-> coverage (`5M`–`209M`, contexts up to `32,768`), upstream-loadable checkpoint export, raw-space evaluation
-> & forgetting metrics, optional Lacuna integration, and real-dataset benchmarks (5M–209M) are built and
-> verified (14/14 acceptance tests passing). See [docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md) and
-> [docs/STATUS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/STATUS.md).
+Adapt Mistral AI's [Timestral](https://arxiv.org/abs/2610.37585) time-series foundation models to your own
+data: fine-tune them, attach small LoRA adapters, or just recalibrate their prediction intervals.
 
-## What it is
+The [official package](https://github.com/mistralai/timestral) runs the released models but cannot train
+them. `timestral-tune` adds the training side, for all four released sizes (5M, 28M, 123M and 209M
+parameters), in plain PyTorch on CUDA, CPU and Apple GPUs.
 
-[Timestral](https://arxiv.org/abs/2610.37585) is Mistral AI's family of time-series foundation models
-(5M, 28M, 123M and 209M parameters). The [official repository](https://github.com/mistralai/timestral)
-provides inference only. `timestral-tune` is an open adaptation toolkit for the released weights,
-with a ladder of increasingly invasive options:
+- **Faithful to the paper and the official code.** The training forward pass, attention masks,
+  normalisation and loss are tested against the official inference path on the released weights; in
+  float64 the two agree to 1e-12.
+- **No leakage, and you can check it.** Windows are point-in-time, covariates keep their roles
+  (past-only or known in advance), and one call runs the leakage and parity checks on your own batch.
+- **Results you can take elsewhere.** A fine-tuned checkpoint loads in the official package unchanged.
+- **Forgetting is measured, not assumed.** The benchmarks report how much each tuned model lost on data
+  it was not tuned on.
 
-| Mode | What changes |
-|---|---|
-| `conformal` | Nothing in the model; forecast quantiles are recalibrated after the fact |
-| `head_only` | The quantile head |
-| `lora_variate` | Low-rank adapters on cross-series (variate) attention |
-| `lora_temporal` | Low-rank adapters on temporal attention |
-| `full_ft` | All weights; lower learning rate, or pair with distillation / real-data replay to limit forgetting |
-
-Design goals: reproduce the paper's objective, masks and normalisation exactly and prove it with tests
-against the official code; export checkpoints that load in the official package; make runs auditable.
-
-The full design is in **[docs/SPEC.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/SPEC.md)**, which
-is the project's overview guide and source of truth.
-
-## What exists today
-
-| Piece | State |
-|---|---|
-| Specification | Written and verified against the paper, the official code and the released checkpoints |
-| Loading on any device | Done: CUDA, CPU, Apple GPU (`5M`–`209M` and contexts up to `32,768`, PyTorch 2.8+) |
-| Data pipeline | Done: polars / pandas / pyarrow frames, point-in-time windows, time splits, collation |
-| Training forward and loss | Done; trimmed covariate layout (`L + 2h` tokens), equal to official inference (`<= 1e-12` fp64) |
-| Adaptation modes | Done: `head_only` (with frozen-feature caching), `lora_variate` (with single-row guard), `lora_temporal`, `full_ft` |
-| Anti-forgetting replay & distillation | Done: `ReplayConfig`, `SyntheticReplaySource`, `distillation_loss` (low-VRAM teacher caching & `disable_lora`) |
-| CUDA acceleration | Done: `bf16` autocast, fused `AdamW`, optional `torch.compile` (verified on NVIDIA L4) |
-| Conformal calibration | Done: `ConformalCalibrator` (CQR) and `OnlineConformalCalibrator` (ACI) |
-| Checkpoint export | Done: upstream-loadable `config.json` + merged `model.safetensors`, LoRA adapters, `conformal.json`, sidecar, `LICENSE`, `NOTICE` |
-| Benchmarks, metrics, Lacuna integration | Done: `utils/metrics.py`, `integrations/lacuna.py`, sweep-backed defaults, 5M–209M tables in [docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md) |
-| Acceptance tests T1–T14 | All 14 of 14 implemented and passing on tiny, 5M and 28M (CPU, Apple GPU, CUDA) |
-| CI | Passing on `main` (Python 3.10–3.13 on Linux) |
+It is an alpha release: well tested, but the API may still change between 0.x versions
+([changelog](https://github.com/eyenoticeall/timestral-tune/blob/main/CHANGELOG.md)).
 
 ## Install
 
@@ -63,10 +39,9 @@ Requires Python 3.10+ and PyTorch 2.4+ (2.8+ for the Apple GPU). The data layer 
 pyarrow frames, so install whichever you use; none is a dependency. Model weights are downloaded from the
 Hugging Face Hub on first use, under Mistral AI's licence (see [below](#licence-and-important-restrictions)).
 
-The API may change between 0.x releases; changes are listed in the
-[changelog](https://github.com/eyenoticeall/timestral-tune/blob/main/CHANGELOG.md).
-
 ## Quick start
+
+Fine-tune the 5M model on an hourly load series with one past-only and one known-in-advance covariate:
 
 ```python
 from timestral_tune import LoraConfig, TimestralTrainer, TrainingConfig
@@ -101,18 +76,104 @@ print(result.best_eval_loss)
 trainer.export()                 # writes upstream-loadable merged checkpoint + adapters + NOTICE/LICENSE
 ```
 
-Default settings (`sign_flip=True`, learning rates `head_only=3e-3`, `lora_variate=3e-3`,
-`lora_temporal=1e-3`, `full_ft=1e-4`, and LoRA `r=8, targets=("q","k","v","o")`) are backed by
-Phase 3 validation and forgetting sweeps across `5M`–`209M` in [docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md).
-For `full_ft` on the two smaller checkpoints (`5M` and `28M`), we recommend setting
-`learning_rate=3e-4`: it achieved lower error in our benchmarks (three seeds on `5M`, one seed on
-`28M`, where the gain is mainly on volatility), at the cost of roughly two to three percentage
-points more forgetting. Keep the `1e-4` default on `123M` and `209M`, where the two rates tie or
-favour `1e-4` on validation and `1e-4` forgets less.
+Then score and forecast with the result:
 
-To limit forgetting of the pretrained behaviour, pass a `ReplayConfig`. Its default adds a light
-distillation term that pulls forecasts on built-in synthetic series towards the frozen base model; it
-needs no extra data and no labels:
+```python
+from timestral_tune.models import load_forecaster
+from timestral_tune.utils import evaluate_forecaster
+
+forecaster = load_forecaster("./runs/load-lora")          # device="cpu" by default; "cuda" and "mps" also work
+metrics = evaluate_forecaster(forecaster, validation, seasonality=24)
+print(metrics.wql, metrics.mase)                           # raw-unit scores on the held-out windows
+
+forecast = forecaster.forecast(      # arrays or tensors of recent history
+    context,                    # (series, targets, time)
+    prediction_length=96,
+    past_covariates=past,       # (series, covariates, time)
+    known_covariates=known,     # (series, covariates, time + 96)
+)
+forecast.median                 # (series, targets, 96)
+forecast.quantiles              # (series, targets, 96, 21)
+```
+
+## Choosing how much to change
+
+The options form a ladder. Start at the top and go down only if the step above is not enough.
+
+| Option | What changes | Trainable parameters (28M) | Reach for it when |
+|---|---|---:|---|
+| Conformal calibration | Nothing in the model; interval offsets are fitted | 0 | You have little data, or only need honest intervals |
+| `head_only` | The quantile head | 1.9M | The shape of the distribution differs, such as heavier tails |
+| `lora_variate` | Low-rank adapters on attention across a series' targets and covariates | 74k | Relationships between targets and covariates differ |
+| `lora_temporal` | Low-rank adapters on attention over time | 295k | Seasonality or regimes differ |
+| `full_ft` | All weights | 27.8M | You have a large dataset (1,000+ series) |
+
+The four training modes are `TrainingConfig(mode=...)`; conformal calibration is a separate step that
+needs no training (see below). LoRA counts are for the default adapter settings.
+
+Default learning rates (`head_only` and `lora_variate` 3e-3, `lora_temporal` 1e-3, `full_ft` 1e-4) and
+the default adapter (`r=8`, all four attention projections) come from sweeps across all four model sizes.
+For `full_ft` on 5M and 28M, `learning_rate=3e-4` gave lower error in our benchmarks, at the cost of two
+to three percentage points more forgetting; keep 1e-4 on 123M and 209M.
+
+## Results
+
+Weighted quantile loss on held-out data (lower is better) for Timestral-28M at the default settings,
+mean and standard deviation over three seeds:
+
+| | Retail demand | Realised volatility |
+|---|---:|---:|
+| Best classical baseline | 0.2177 | 0.2253 |
+| Zero-shot | 0.2193 | 0.2293 |
+| `lora_variate` | 0.1979 ± 0.0010 | 0.2185 ± 0.0020 |
+| `lora_temporal` | 0.1977 ± 0.0001 | 0.2171 ± 0.0016 |
+| `full_ft` | **0.1951 ± 0.0004** | **0.2161 ± 0.0012** |
+
+- **Fine-tuning helped at every size.** Across the four model sizes and both datasets, the LoRA modes and
+  `full_ft` lowered the loss by 3% to 14% against zero-shot.
+- **Forgetting stayed small for LoRA and `full_ft`.** On three unrelated public datasets their loss
+  moved by between -2.7% and +4.6%. `head_only` at its default rate forgot more, +5% to +14% on the two
+  sizes measured.
+- **Zero-shot did not beat the classical baselines here; tuned models did.** The baselines are a
+  seasonal ridge regression (retail) and a HAR model (volatility).
+- **Read these with their limits.** The volatility test set is the 18 days of data after the models'
+  release, only three time blocks, so its evidence over time is thin. The retail data is from 2024 and
+  may have been in the models' training mix; there the gain holds on 63 or 64 of 64 series and on all
+  six time blocks.
+
+Every table, the raw results and the commands to reproduce them are in
+[docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md).
+
+## Calibrate intervals without training
+
+Conformal calibration leaves the model untouched. It measures the forecast errors on a held-out
+calibration period and shifts the quantiles so that interval coverage moves towards the level you ask
+for:
+
+```python
+from timestral_tune import ConformalCalibrator, collect_conformal_data
+from timestral_tune.models import load_forecaster
+
+zero_shot = load_forecaster("mistralai/Timestral-5M")                 # the released weights, untouched
+calibration, test = validation.split_by_time("2024-02-28")
+
+preds, actuals, scale = collect_conformal_data(zero_shot, calibration)
+calibrator = ConformalCalibrator(target_coverage=0.80).fit(preds, actuals, scale)
+
+test_preds, test_actuals, test_scale = collect_conformal_data(zero_shot, test)
+calibrated = calibrator.transform(test_preds, context_scale=test_scale)   # (windows, 96, 21) quantiles
+```
+
+A calibration fitted on one period lags when the data changes regime. `OnlineConformalCalibrator` keeps
+adjusting as observations arrive; in our volatility benchmark it still under-covered right after a regime
+jump and then over-corrected. Pass either one to `trainer.export(calibrator=...)` to ship it with a
+checkpoint.
+
+## Limit forgetting
+
+Pass a `ReplayConfig` to keep a tuned model close to the original on data it is not being tuned on. Its
+default adds a light distillation term that pulls forecasts on built-in synthetic series towards the
+frozen base model; it needs no extra data and no labels:
 
 ```python
 from timestral_tune import ReplayConfig
@@ -120,11 +181,13 @@ from timestral_tune import ReplayConfig
 trainer = TimestralTrainer(config, train, validation, lora_config=lora, replay_config=ReplayConfig())
 ```
 
-Measured effects and their limits are in
-[docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md) §5: it
-helped most for `head_only`, and for `full_ft` a lower learning rate did as well.
+In our measurements it helped most for `head_only`; for `full_ft`, lowering the learning rate did as
+well. You can also supply your own general-purpose dataset as `replay_dataset`. Details and numbers are in
+[docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md) §5.
 
-To check your own data for leakage and parity with the official inference path:
+## Check your own data
+
+Run the leakage and parity checks on a batch of your data before trusting a training run:
 
 ```python
 from timestral_tune.utils import run_checks
@@ -134,36 +197,66 @@ for check in run_checks(trainer.model, batch):
     print(check)
 ```
 
-## Repository layout
+They confirm that the forward pass matches the official one, that labels cannot reach the predictions,
+that covariates respect their roles, and that the loss scores only the positions it should.
+
+## What an export contains
+
+`trainer.export()` writes a directory that the official `timestral` package loads as it is:
 
 ```
-docs/SPEC.md                         Specification and overview guide (start here)
-AGENTS.md                            How to work in this repo: rules, commands, commit conventions
-docs/                                Also: status, development log, verification record, upstream and phase notes
-src/timestral_tune/                  The package (Phases 0-4 built) and the vendored upstream code in _vendor/
-tests/                               Unit tests and the acceptance tests of spec §9
-scripts/                             Vendoring, drift check, and verification probes
-papers/                              Reference papers (only the CC BY Timestral paper is tracked)
-assets/                              README banner (drawn by scripts/make_banner.py)
-archive/                             The original draft of the specification
+config.json            the official schema, unchanged
+model.safetensors      merged weights under the official parameter names
+adapter.safetensors    LoRA modes only: the adapters on their own, for load_lora()
+adapter_config.json    LoRA modes only
+conformal.json         if a fitted calibrator was passed
+tune_metadata.json     base model and revision, mode, settings, data fingerprint, library version
+LICENSE, NOTICE        Mistral AI's weights licence and a notice that the weights are a derivative
 ```
+
+On a Mac the official package runs on CPU only; `load_forecaster(..., device="mps")` runs the same
+forecaster on the Apple GPU.
+
+## Hardware and versions
+
+| Device | Needs | Precision | Checked on |
+|---|---|---|---|
+| CPU | PyTorch 2.4+ | float32 | PyTorch 2.4, 2.8, 2.14, 2.15; Python 3.10 to 3.13 |
+| NVIDIA GPU | PyTorch 2.4+ | float32 or `bf16` | One NVIDIA L4, PyTorch 2.15 |
+| Apple GPU | PyTorch 2.8+ | float32 | One Apple M4 (16 GB), all four sizes |
+
+On CUDA, `mixed_precision="bf16"` with `compile_model=True` ran 28M training steps about three times
+faster than float32. Multi-GPU training is untested.
+
+## Limits
+
+- One training forward covers a forecast horizon of up to 1,024 steps and a context of up to 32,768.
+- It adapts the released checkpoints; it does not reproduce Mistral AI's pre-training.
+- Any public dataset may have been part of the models' training data, so benchmark gains are evidence,
+  not proof.
+- The official code is vendored at a pinned commit. A change upstream can require a new release here.
+
+More in the [specification](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/SPEC.md), §12.
+
+## Documentation
+
+| | |
+|---|---|
+| [Specification](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/SPEC.md) | Design, maths, API and the decisions behind them |
+| [Benchmarks](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md) | All results, with raw data and reproduction commands |
+| [Verification record](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/VERIFICATION.md) | What was measured, on what hardware, and how to repeat it |
+| [Status](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/STATUS.md) | What works today and what is next |
+| [Changelog](https://github.com/eyenoticeall/timestral-tune/blob/main/CHANGELOG.md) | Changes by release |
 
 ## Development
 
 Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync                      # create the environment
-uv run pytest                # downloads the 5M and 28M checkpoints on first run
+uv sync                          # create the environment
+uv run pytest                    # downloads the 5M and 28M checkpoints on first run
 uv run pytest -m "not network"   # no downloads; what CI runs
 uv run ruff check . && uv run ruff format --check .
-```
-
-The verification probes download released checkpoints from the Hugging Face Hub on first use:
-
-```bash
-uv run python scripts/probes/model_facts.py
-uv run python scripts/probes/device_parity.py --device mps    # or cuda
 ```
 
 More in [docs/DEVELOPMENT.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/DEVELOPMENT.md). Contributors and coding agents should read

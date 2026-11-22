@@ -784,3 +784,20 @@ the tagged commit before tagging.
 
 **Not done / open.** `main` still carries version `0.1.0`; set the next version when the next change to
 the package lands. Tiled DHF remains deferred as exploratory.
+
+---
+
+## 2026-11-23 — README rewritten for outside readers; repository topics and homepage set
+
+**Done.** The README now leads with what the library is for and why to trust it, and adds sections on
+choosing a mode, headline results with their limits, conformal calibration, forecasting from an export,
+hardware, and limits. The internal status table and repository layout were removed; they live in
+`docs/STATUS.md` and `docs/DEVELOPMENT.md`. Conformal calibration is no longer typeset as a
+`TrainingConfig` mode, which it is not. The licence section is unchanged.
+
+**Evidence.** All five Python blocks were extracted from the README and run in order against
+`timestral-tune==0.1.0` installed from PyPI. The results table was recomputed from
+`docs/benchmarks/sig_v2.json` and the cross-size ranges from `bench_5m_28m.json` and
+`bench_123m_209m.json`. All 19 links resolve and `twine check --strict` passes.
+
+**Not done / open.** The PyPI project page keeps the `0.1.0` README until the next release.
