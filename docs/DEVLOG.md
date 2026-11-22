@@ -801,3 +801,27 @@ hardware, and limits. The internal status table and repository layout were remov
 `bench_123m_209m.json`. All 19 links resolve and `twine check --strict` passes.
 
 **Not done / open.** The PyPI project page keeps the `0.1.0` README until the next release.
+
+---
+
+## 2026-11-23 — README: tagline, results chart, and a memory and speed section
+
+**Done.** At the maintainer's request the README gained an opening tagline, a results section built
+around one chart, and a section on memory use and training time.
+
+- `assets/results.png` is drawn by `scripts/make_results_chart.py` from `docs/benchmarks/sig_v2.json`.
+  Per dataset it shows three bars: the best classical model, Timestral-28M as released, and
+  Timestral-28M after full fine-tuning. Bars start at zero, and the fine-tuned bar carries the number
+  of series that improved and the 95% confidence interval of the gain.
+- The 28M comparison was chosen because it is the best-evidenced one: three seeds, paired confidence
+  intervals and classical baselines all exist for it. The volatility panel uses the ten-month 2026
+  test (2,499 windows); the README's fine print says that most of it predates the models' release
+  and gives the 18-day post-release result alongside.
+- Drafts that were rejected, and why: a before-and-after range chart across all four sizes (too dense
+  to read); a chart plotting only the differences (it exaggerated a 10% gap); and a comparison of the
+  fine-tuned 5M model with the 209M model as released as the headline (true on retail demand, but a
+  tie on volatility, and on retail the 209M is the weakest model as released).
+- Memory and speed figures are the peak GPU memory and wall time recorded in `bench_5m_28m.json` and
+  `bench_123m_209m.json` (NVIDIA L4, `bf16`).
+
+**Not done / open.** The PyPI project page keeps the `0.1.0` README until the next release.

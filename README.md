@@ -5,6 +5,8 @@
 
 # timestral-tune
 
+**Open tooling for fine-tuning Timestral, Mistral AI's time-series foundation models.**
+
 [![PyPI](https://img.shields.io/pypi/v/timestral-tune)](https://pypi.org/project/timestral-tune/)
 [![Python](https://img.shields.io/pypi/pyversions/timestral-tune)](https://pypi.org/project/timestral-tune/)
 [![CI](https://github.com/eyenoticeall/timestral-tune/actions/workflows/ci.yml/badge.svg)](https://github.com/eyenoticeall/timestral-tune/actions/workflows/ci.yml)
@@ -100,16 +102,27 @@ forecast.quantiles              # (series, targets, 96, 21)
 
 The options form a ladder. Start at the top and go down only if the step above is not enough.
 
-| Option | What changes | Trainable parameters (28M) | Reach for it when |
-|---|---|---:|---|
-| Conformal calibration | Nothing in the model; interval offsets are fitted | 0 | You have little data, or only need honest intervals |
-| `head_only` | The quantile head | 1.9M | The shape of the distribution differs, such as heavier tails |
-| `lora_variate` | Low-rank adapters on attention across a series' targets and covariates | 74k | Relationships between targets and covariates differ |
-| `lora_temporal` | Low-rank adapters on attention over time | 295k | Seasonality or regimes differ |
-| `full_ft` | All weights | 27.8M | You have a large dataset (1,000+ series) |
+| Option | What changes | Reach for it when |
+|---|---|---|
+| Conformal calibration | Nothing in the model; interval offsets are fitted | You have little data, or only need honest intervals |
+| `head_only` | The quantile head | The shape of the distribution differs, such as heavier tails |
+| `lora_variate` | Low-rank adapters on attention across a series' targets and covariates | Relationships between targets and covariates differ |
+| `lora_temporal` | Low-rank adapters on attention over time | Seasonality or regimes differ |
+| `full_ft` | All weights | You have a large dataset (1,000+ series) |
 
 The four training modes are `TrainingConfig(mode=...)`; conformal calibration is a separate step that
-needs no training (see below). LoRA counts are for the default adapter settings.
+needs no training (see below).
+
+How many parameters each mode trains, by model size:
+
+| Mode | 5M | 28M | 123M | 209M |
+|---|---:|---:|---:|---:|
+| `head_only` | 793k | 1.9M | 3.8M | 4.9M |
+| `lora_variate` | 25k | 74k | 205k | 295k |
+| `lora_temporal` | 98k | 295k | 819k | 1.2M |
+| `full_ft` | 5.2M | 27.8M | 122.6M | 209.3M |
+
+LoRA counts are for the default adapter (`r=8` on all four attention projections); they scale with `r`.
 
 Default learning rates (`head_only` and `lora_variate` 3e-3, `lora_temporal` 1e-3, `full_ft` 1e-4) and
 the default adapter (`r=8`, all four attention projections) come from sweeps across all four model sizes.
@@ -118,31 +131,77 @@ to three percentage points more forgetting; keep 1e-4 on 123M and 209M.
 
 ## Results
 
-Weighted quantile loss on held-out data (lower is better) for Timestral-28M at the default settings,
-mean and standard deviation over three seeds:
+Fine-tuning cut forecast error by about 11% on retail demand and 6% on stock volatility, in under a
+minute on a single GPU.
 
-| | Retail demand | Realised volatility |
-|---|---:|---:|
-| Best classical baseline | 0.2177 | 0.2253 |
-| Zero-shot | 0.2193 | 0.2293 |
-| `lora_variate` | 0.1979 ± 0.0010 | 0.2185 ± 0.0020 |
-| `lora_temporal` | 0.1977 ± 0.0001 | 0.2171 ± 0.0016 |
-| `full_ft` | **0.1951 ± 0.0004** | **0.2161 ± 0.0012** |
+<p align="center">
+  <img src="https://raw.githubusercontent.com/eyenoticeall/timestral-tune/main/assets/results.png" width="100%"
+       alt="Forecast error of a classical statistical model, Timestral-28M as released, and Timestral-28M fine-tuned. Retail demand: 0.218, 0.219 and 0.195; fine-tuning gives 11% less error, better on 64 of 64 series. Stock volatility: 0.198, 0.193 and 0.182; 6% less error, better on 50 of 51 stocks.">
+</p>
 
-- **Fine-tuning helped at every size.** Across the four model sizes and both datasets, the LoRA modes and
-  `full_ft` lowered the loss by 3% to 14% against zero-shot.
-- **Forgetting stayed small for LoRA and `full_ft`.** On three unrelated public datasets their loss
-  moved by between -2.7% and +4.6%. `head_only` at its default rate forgot more, +5% to +14% on the two
-  sizes measured.
-- **Zero-shot did not beat the classical baselines here; tuned models did.** The baselines are a
-  seasonal ridge regression (retail) and a HAR model (volatility).
-- **Read these with their limits.** The volatility test set is the 18 days of data after the models'
-  release, only three time blocks, so its evidence over time is thin. The retail data is from 2024 and
-  may have been in the models' training mix; there the gain holds on 63 or 64 of 64 series and on all
-  six time blocks.
+We fine-tuned Timestral-28M on two real datasets and scored it on later data it had never seen. The
+bars show how far the forecasts were from what happened, so shorter is better. The dashed line marks
+the model exactly as Mistral AI released it.
 
-Every table, the raw results and the commands to reproduce them are in
+These gains are not noise:
+
+- **Nearly every series improved.** Fine-tuning made the forecasts better on all 64 retail series and
+  on 50 of the 51 stocks.
+- **It held up over time.** Splitting the test data into consecutive periods, the fine-tuned model was
+  ahead in 6 of 6 periods on retail demand and in 46 of 49 on stock volatility.
+- **The uncertainty is small next to the gain.** The 95% confidence interval is 10% to 13% less error
+  on retail demand and 5% to 7% less on stock volatility.
+- **Repeating the training changes little.** Three fine-tuning runs on retail demand with different
+  random seeds landed within 0.4% of each other.
+
+What else we found:
+
+- **Every model size improved**, from 5M to 209M.
+- **A small fine-tuned model can beat a larger one as released.** On retail demand the fine-tuned 5M
+  model made 7% to 10% less error than every model size as released, the 209M included.
+- **Little was forgotten.** On three unrelated datasets, the error of the fully fine-tuned models moved
+  by less than 3% either way.
+
+The fine print:
+
+- The chart uses full fine-tuning at default settings. Error is the weighted quantile loss, which
+  scores the whole predicted range and not just a single best guess. The classical models are a
+  seasonal ridge regression for retail demand and a HAR model for stock volatility.
+- The stock volatility test covers January to November 2026. Most of that is before the models'
+  release in late October, so the released model may have seen some of it in its own training. On the
+  18 days after the release the gain is the same 6%, but that is too short a period to confirm on its
+  own (95% interval: 1.5% to 10%).
+- The retail data is from 2024 and may also have been part of the models' training data.
+
+All the numbers, for every model size and mode, with the commands to reproduce them, are in
 [docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md).
+
+## Memory and speed
+
+You do not need a large GPU. On a single NVIDIA L4, every fine-tuning run behind the results above
+finished in under a minute and used less than 5 GiB of GPU memory:
+
+| Model | Peak GPU memory | Time to fine-tune |
+|---|---:|---:|
+| Timestral-5M | up to 0.5 GiB | under 20 s |
+| Timestral-28M | up to 1.5 GiB | under 30 s |
+| Timestral-123M | up to 3.1 GiB | under 45 s |
+| Timestral-209M | up to 4.9 GiB | under 60 s |
+
+Each run was 160 to 200 training steps at batch size 16 to 32, with a 256-step context, seven or eight
+covariates per series and `mixed_precision="bf16"`. Your numbers will scale with context length and
+batch size.
+
+Why it stays small:
+
+- **LoRA trains under 2% of the weights.**
+- **`head_only` computes the frozen part of the model up front** and reuses it on every later pass.
+- **Covariates cost about 40% less memory** than in the official forward pass, because the training
+  layout drops tokens that carry no information.
+- **`bf16` and `compile_model=True` help on NVIDIA GPUs.** On the 28M model they took one full
+  fine-tuning step from 197 ms and 3.3 GiB to 60 ms and 1.8 GiB.
+- **Apple GPUs work too.** A full fine-tuning step of the 209M model at the longest supported context
+  (32,768 steps) fit in about 6 GiB on a 16 GB M4.
 
 ## Calibrate intervals without training
 
@@ -225,8 +284,7 @@ forecaster on the Apple GPU.
 | NVIDIA GPU | PyTorch 2.4+ | float32 or `bf16` | One NVIDIA L4, PyTorch 2.15 |
 | Apple GPU | PyTorch 2.8+ | float32 | One Apple M4 (16 GB), all four sizes |
 
-On CUDA, `mixed_precision="bf16"` with `compile_model=True` ran 28M training steps about three times
-faster than float32. Multi-GPU training is untested.
+Multi-GPU training is untested. Memory and timing figures are in [Memory and speed](#memory-and-speed).
 
 ## Limits
 
