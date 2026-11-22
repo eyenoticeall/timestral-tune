@@ -734,6 +734,6 @@ lengths) as exploratory due to token doubling (undoing D16), per-window categori
        `ssh-keys` added; VM and disk deleted immediately after): **42/42** in `tests/test_replay.py`,
        **255 passed, 3 skipped** (device tests), and **580 passed, 4 skipped** (whole suite, exit 0).
 
-**Not done / open.** Phase 4 fast-forwarded into `main` at `9261c75`, pushed to `origin/main`, and
-`phase-4` deleted locally and on `origin`. PyPI publish awaits maintainer approval; tiled DHF remains
-deferred as exploratory.
+**Not done / open.** Phase 4 fast-forwarded into `main` at `9261c75`, pushed to `origin/main` (CI run
+`45046304547` green across Python 3.10–3.13), and `phase-4` deleted locally and on `origin`. PyPI
+publish awaits maintainer approval; tiled DHF remains deferred as exploratory.

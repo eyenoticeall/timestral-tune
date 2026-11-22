@@ -22,7 +22,7 @@
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
 | Test suite | 567 passed, 17 skipped (16 CUDA-only, 1 optional `lacuna`), on tiny, 5M, 28M, and 123M MPS parity (`main`, PyTorch 2.15.0 on 3.13; PyTorch 2.4.0 `-m "not network"`: 313/25; PyTorch 2.8.0 & Python 3.10/2.14.1: 356/15; live `lacuna-quant==0.14.1`: 4/4; NVIDIA L4 Linux x86 CUDA at `89ac249`: **580 passed, 4 skipped**) |
-| CI | Running on `main` (Python 3.10–3.13 on Linux) |
+| CI | Green on `main` (run `45046304547`, Python 3.10–3.13 on Linux: lint, build, and network-free tests) |
 
 ## What does not exist yet
 
