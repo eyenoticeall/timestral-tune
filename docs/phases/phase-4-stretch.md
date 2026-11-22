@@ -24,17 +24,18 @@ Phase 4 was rescoped to **Item 1 (replay + distillation)** and **Item 4 (Apple G
 
 ## Log of what was done
 
-- 2026-11-22 (`68c64c5`, `7304681`, `258965d`, `e3c6883`): implemented `ReplayConfig` (defaulting to
-  light label-free distillation `replay_fraction=0.0, distill_weight=0.1, smooth_beta=1e-3`),
-  `SyntheticReplaySource` (5 classical families), `distillation_loss` (Huber `smooth_beta=1e-3`, exact L1
-  at `0.0`), `disable_lora`, full `TimestralTrainer` integration across all 4 modes with low-VRAM teacher
-  caching/bypass, val-as-replay rejection, isolated head-cache slots (`"train"`, `"val"`, `"replay"`),
-  `tune_metadata.json` `replay_config` + `replay_source` export, and unit/parity/mutation/CUDA tests
-  (`tests/test_replay.py`: 39 tests total — 30 CPU + 9 CUDA `fp32`/`bf16`/`reduce-overhead`).
-- 2026-11-22 (`e31a2b2`, `4db0fa1`): ran empirical Apple GPU replay & distillation ablation with lower-LR
-  (`head_only 1e-3`, `full_ft 2e-4`) and 256-series pool controls (`scripts/benchmarks/run_replay_ablation.py`,
-  `docs/benchmarks/replay_ablation.json`).
-- 2026-11-22 (`3608c60`, `e3c6883`): added and ran `scripts/probes/mps_large_and_long_context.py`
-  (`docs/benchmarks/mps_coverage.json`) on 16 GiB Apple M4 (PyTorch 2.15.0) and ran full
-  `scripts/cuda_check.sh` on NVIDIA L4 Linux x86 (`255/3` device tests, `577/4` whole suite, exit 0; VM
-  deleted immediately after).
+- 2026-11-22 (`68c64c5`, `7304681`, `258965d`, `e3c6883`, `58c1cc6`): implemented `ReplayConfig`
+  (defaulting to light label-free distillation `replay_fraction=0.0, distill_weight=0.1,
+  smooth_beta=1e-3`), `SyntheticReplaySource` (5 classical families), `distillation_loss` (Huber
+  `smooth_beta=1e-3`, exact L1 at `0.0`), `disable_lora`, full `TimestralTrainer` integration across all
+  4 modes with low-VRAM teacher caching/bypass, val-as-replay rejection, isolated head-cache slots
+  (`"train"`, `"val"`, `"replay"`), `tune_metadata.json` `replay_config` + `replay_source` export, and
+  unit/parity/mutation/CUDA tests (`tests/test_replay.py`: 42 tests total — 30 CPU + 12 CUDA including
+  cached+live `reduce-overhead` and released `Timestral-5M` `bf16`).
+- 2026-11-22 (`e31a2b2`, `4db0fa1`, `89ac249`): ran empirical Apple GPU replay & distillation ablation
+  with lower-LR (`head_only 1e-3`, `full_ft 2e-4`), `distill_0.1` across all modes, and 256-series pool
+  controls (`scripts/benchmarks/run_replay_ablation.py`, `docs/benchmarks/replay_ablation.json`), plus
+  committed `scripts/probes/replay_bf16_parity.py` (`docs/benchmarks/replay_bf16_parity.json`).
+- 2026-11-22 (`3608c60`, `89ac249`): regenerated `docs/benchmarks/mps_coverage.json` with finite-loss
+  assertions on 16 GiB Apple M4 (PyTorch 2.15.0) and ran full `scripts/cuda_check.sh` on NVIDIA L4 Linux
+  x86 (`255/3` device tests, `580/4` whole suite, exit 0; OS-Login VM deleted immediately after).

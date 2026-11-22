@@ -9,7 +9,7 @@
 | Area | State |
 |---|---|
 | Loading | `load_model` / `load_forecaster`: pinned Hub revisions, config from the checkpoint, any device |
-| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32; `5M`/`28M` on 2.8 & 2.15, `123M`/`209M` & contexts up to `32,768` on 2.15), CUDA (verified on NVIDIA L4 Linux x86, PyTorch 2.15.0, fp32 and `bf16`; commit `e3c6883`) |
+| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32; `5M`/`28M` on 2.8 & 2.15, `123M`/`209M` & contexts up to `32,768` on 2.15), CUDA (verified on NVIDIA L4 Linux x86, PyTorch 2.15.0, fp32 and `bf16`; commit `89ac249`) |
 | Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator` (with power-of-two shape bucketing); per-window categorical encoding; `flip_batch_signs` |
 | Training forward and loss | Normalised-space forward (trimmed `L + 2h` covariate layout), both target frames, pinball loss, `compute_loss` |
 | Adaptation & training | `TimestralTrainer` across `head_only` (with dual-orientation `+x`/`-x` frozen-feature caching), `lora_variate` (with single-row guard), `lora_temporal`, and `full_ft`; `sign_flip=True` and sweep-backed single cross-size LR & LoRA defaults (D19; `full_ft` recommendation of `3e-4` on `5M`/`28M` documented in `docs/BENCHMARKS.md` §2.2); fp32 everywhere, `bf16` + fused AdamW + `torch.compile` on CUDA; early stopping, CPU best-state restore |
@@ -21,7 +21,7 @@
 | Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters (`load_lora`), `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
-| Test suite | 567 passed, 14 skipped (13 CUDA-only, 1 optional `lacuna`), on tiny, 5M, 28M, and 123M MPS parity (`phase-4`, PyTorch 2.15.0 on 3.13; PyTorch 2.4.0 `-m "not network"`: 313/24; PyTorch 2.8.0 & Python 3.10/2.14.1: 356/14; live `lacuna-quant==0.14.1`: 4/4; NVIDIA L4 Linux x86 CUDA at `e3c6883`: **577 passed, 4 skipped**) |
+| Test suite | 567 passed, 17 skipped (16 CUDA-only, 1 optional `lacuna`), on tiny, 5M, 28M, and 123M MPS parity (`phase-4`, PyTorch 2.15.0 on 3.13; PyTorch 2.4.0 `-m "not network"`: 313/25; PyTorch 2.8.0 & Python 3.10/2.14.1: 356/15; live `lacuna-quant==0.14.1`: 4/4; NVIDIA L4 Linux x86 CUDA at `89ac249`: **580 passed, 4 skipped**) |
 | CI | Green on `main` (run `45006472178`, Python 3.10–3.13 on Linux); `phase-4` pending PR/merge |
 
 ## What does not exist yet

@@ -447,11 +447,13 @@ Note: most `head_only` runs select their final step (`200`), so longer schedules
 | Volatility | `lr1e-3_none` (lower-LR control) | `0.2231 / 0.2234 / 0.2242` (0.2236) | `+6.9% / +7.8% / +7.4%` (**+7.8%**) |
 | Volatility | `none` (`3e-3`) | `0.2196 / 0.2203 / 0.2210` (0.2203) | `+13.7% / +13.0% / +14.1%` (**+14.1%**) |
 | Volatility | `replay_0.25` (`3e-3`, `0.25 / 0.0`) | `0.2232 / 0.2216 / 0.2246` (**0.2231**) | `+5.0% / +3.5% / +4.0%` (**+5.0%**) |
+| Volatility | `distill_0.1` (`3e-3`, `0.0 / 0.1`, default) | `0.2254 / 0.2243 / 0.2254` (0.2251) | `+0.7% / +1.4% / +0.0%` (**+1.4%**) |
 | Volatility | `distill_0.5` (`3e-3`, `0.0 / 0.5`) | `0.2302 / 0.2302 / 0.2308` (0.2304) | `+0.7% / +0.9% / +0.6%` (**+0.9%**) |
 | Volatility | `both_0.2_0.5` (`3e-3`, `0.2 / 0.5`) | `0.2308 / 0.2309 / 0.2312` (0.2310) | `+1.1% / +0.7% / +0.5%` (**+1.1%**) |
 | Retail | `lr1e-3_none` (lower-LR control) | `0.2115 / 0.2114 / 0.2114` (0.2114) | `+3.6% / +3.6% / +3.4%` (**+3.6%**) |
 | Retail | `none` (`3e-3`) | `0.2098 / 0.2099 / 0.2095` (0.2097) | `+5.0% / +5.0% / +4.8%` (**+5.0%**) |
 | Retail | `replay_0.25` (`3e-3`, `0.25 / 0.0`) | `0.2099 / 0.2103 / 0.2098` (0.2100) | `+3.8% / +5.6% / +3.8%` (**+5.6%**) |
+| Retail | `distill_0.1` (`3e-3`, `0.0 / 0.1`, default) | `0.2105 / 0.2105 / 0.2103` (**0.2105**) | `+2.5% / +2.3% / +2.2%` (**+2.5%**) |
 | Retail | `distill_0.5` (`3e-3`, `0.0 / 0.5`) | `0.2123 / 0.2120 / 0.2118` (0.2120) | `+1.9% / +1.7% / +1.6%` (**+1.9%**) |
 
 #### `28M` (seed `0`, single run)
@@ -461,12 +463,14 @@ Note: most `head_only` runs select their final step (`200`), so longer schedules
 | Volatility | `lr1e-3_none` (lower-LR control) | 0.1800 | 0.2169 | +6.7% | 81.0 s (−20%) |
 | Volatility | `none` (`3e-3`) | 0.1794 | 0.2165 | +10.3% | 101.5 s (0%) |
 | Volatility | `replay_0.25` (`3e-3`, `0.25 / 0.0`) | 0.1805 | 0.2195 | +4.1% | 105.1 s (+4%) |
+| Volatility | `distill_0.1` (`3e-3`, `0.0 / 0.1`, default) | 0.1805 | 0.2196 | **−0.7%** | 65.1 s (−36%) |
 | Volatility | `distill_0.5` (`3e-3`, `0.0 / 0.5`) | 0.1822 | 0.2235 | +0.7% | 107.1 s (+6%) |
 | Volatility | `distill_1.0` (`3e-3`, `0.0 / 1.0`) | 0.1829 | 0.2252 | +0.9% | 114.2 s (+13%) |
 | Volatility | `both_0.2_0.5` (`3e-3`, `0.2 / 0.5`) | 0.1827 | 0.2247 | +0.4% | 117.3 s (+16%) |
 | Retail | `lr1e-3_none` (lower-LR control) | 0.2271 | 0.2090 | +4.2% | 34.5 s (−29%) |
 | Retail | `none` (`3e-3`) | 0.2256 | 0.2072 | +7.0% | 48.4 s (0%) |
 | Retail | `replay_0.25` (`3e-3`, `0.25 / 0.0`) | 0.2262 | 0.2075 | +5.3% | 49.3 s (+2%) |
+| Retail | `distill_0.1` (`3e-3`, `0.0 / 0.1`, default) | 0.2266 | **0.2079** | **+3.6%** | 31.0 s (−36%) |
 | Retail | `distill_0.5` (`3e-3`, `0.0 / 0.5`) | 0.2279 | 0.2095 | +2.7% | 45.8 s (−5%) |
 | Retail | `distill_1.0` (`3e-3`, `0.0 / 1.0`) | 0.2288 | 0.2104 | +2.1% | 45.3 s (−6%) |
 | Retail | `both_0.2_0.5` (`3e-3`, `0.2 / 0.5`) | 0.2284 | 0.2098 | +2.4% | 49.1 s (+2%) |
@@ -478,6 +482,7 @@ Note: most `head_only` runs select their final step (`200`), so longer schedules
 | `lr1e-3_none` (shipped default) | `0.2175 / 0.2185 / 0.2198` (0.2186) | `-0.2% / -1.2% / +1.6%` (**+1.6%**) |
 | `lr3e-3_none` (forgetting cliff) | `0.2167 / 0.2167 / 0.2161` (0.2165) | `+20.8% / +31.3% / +7.6%` (**+31.3%**) |
 | `lr3e-3_replay_0.25` (`0.25 / 0.0`) | `0.2201 / 0.2155 / 0.2186` (0.2181) | `+0.1% / +1.1% / -0.2%` (**+1.1%**) |
+| `lr3e-3_distill_0.1` (`0.0 / 0.1`, default) | `0.2170 / 0.2181 / 0.2183` (**0.2178**) | `-1.0% / +0.6% / -0.3%` (**+0.6%**) |
 | `lr3e-3_distill_0.5` (`0.0 / 0.5`) | `0.2209 / 0.2227 / 0.2221` (0.2219) | `-1.2% / -1.3% / -0.4%` (**-0.4%**) |
 | `lr3e-3_distill_1.0` (`0.0 / 1.0`) | `0.2252 / 0.2254 / 0.2248` (0.2251) | `-0.4% / -1.5% / +0.4%` (**+0.4%**) |
 | `lr3e-3_both_0.2_0.5` (`0.2 / 0.5`) | `0.2231 / 0.2247 / 0.2223` (0.2234) | `+1.4% / -1.5% / +0.4%` (**+1.4%**) |
@@ -497,7 +502,8 @@ Note: most `head_only` runs select their final step (`200`), so longer schedules
 | `lr3e-4_both_0.2_0.5` (`0.2 / 0.5`, 64 series) | `0.2026 / 0.2027 / 0.2027` (0.2027) | `+0.5% / +0.6% / +0.8%` (+0.7%, **+0.8%**) |
 
 **What the data actually shows (with lower-LR and pool-size controls):**
-- **Lowering the learning rate is often as effective as synthetic replay/distillation:** on `5M full_ft` retail, plain `lr=2e-4` (`0.1995`, worst forg `+1.3%`) matches or slightly beats `3e-4 + distill_0.1` (`0.1999`, worst `+1.3%`, mean `+0.9%` vs `+1.2%`), and plain `lr=1e-4` (`0.2016`, worst `+0.6%`) strictly beats `3e-4 + distill_0.5` (`0.2016`, worst `+1.1%`). On `5M lora_temporal` volatility, `3e-3 + replay_0.25` (`0.2181`, worst `+1.1%`) rescues a non-default higher LR from its `+31.3%` cliff, but is indistinguishable across 3 seeds from shipped `1e-3` without replay (`0.2186`, worst `+1.6%`).
-- **Where built-in replay/distillation beats the lower-LR control:** on `5M head_only` volatility (3 seeds), `3e-3 + replay_0.25` matches plain `1e-3`'s test wQL (`0.2231` vs `0.2236`) while lowering worst-seed forgetting from `+7.8%` to `+5.0%`; on `5M` and `28M` retail `head_only`, `3e-3 + distill_0.5` roughly halves forgetting relative to plain `1e-3` (`+1.9%` vs `+3.6%` on `5M`, `+2.7%` vs `+4.2%` on `28M`) for `+0.0005–0.0006` wQL. On `28M` volatility (single seed), however, plain `1e-3` gives lower wQL (`0.2169` vs `0.2195`). Across `28M` single runs, `head_only` wall time with dual-cached replay/distillation ranged from `−6%` to `+16%` relative to `none`.
+- **Where `ReplayConfig()` default (`replay_fraction=0.0, distill_weight=0.1`) improves over lower-LR controls:**
+  - `head_only` retail: `3e-3 + distill_0.1` strictly beats plain `1e-3` on both test wQL and forgetting on `5M` (3/3 seeds: `0.2105` / worst `+2.5%` vs `0.2114` / worst `+3.6%`) and on `28M` (`0.2079` / `+3.6%` vs `0.2090` / `+4.2%`). On `5M` volatility, `3e-3 + replay_0.25` matches plain `1e-3` wQL (`0.2231` vs `0.2236`) at lower worst-seed forgetting (`+5.0%` vs `+7.8%`), while `distill_0.1` brings worst-seed forgetting to `+1.4%` (`−0.7%` on `28M` vol) for `~0.0015–0.0027` wQL.
+  - `lora_temporal` `5M` volatility (3 seeds): `3e-3 + distill_0.1` eliminates the `+31.3%` cliff down to `+0.6%` worst-seed forgetting (mean `−0.2%`) and beats shipped `1e-3` on 3/3 seeds (`0.2178` vs `0.2186`, worst `+0.6%` vs `+1.6%`), though the mean wQL difference (`0.0008`) is small relative to seed spread (`~0.0013–0.0023`). By contrast, `3e-3 + replay_0.25` (`0.2181`, worst `+1.1%`) is indistinguishable from shipped `1e-3`.
+- **Where lowering the learning rate is as good as synthetic replay/distillation:** on `5M full_ft` retail, plain `lr=2e-4` (`0.1995`, worst forg `+1.3%`) matches or slightly beats `3e-4 + distill_0.1` (`0.1999`, worst `+1.3%`, mean `+0.9%` vs `+1.2%`), and plain `lr=1e-4` (`0.2016`, worst `+0.6%`) strictly beats `3e-4 + distill_0.5` (`0.2016`, worst `+1.1%`). On `28M head_only` volatility (1 seed), plain `1e-3` gives lower wQL (`0.2169` vs `0.2195`–`0.2196`). Single-run `28M` wall times vary across sessions (`−36%` to `+16%` relative to `none`, due to background thermal/MPS variance).
 - **Synthetic pool size vs generator mismatch (`full_ft`):** expanding the `SyntheticReplaySource` pool from 64 series (256 windows, cycled ~6×) to 256 series (1,024 windows, cycled ~1.5×) dropped `full_ft 3e-4` synthetic-pinball worst-seed forgetting from `+4.1%` back to `+2.8%`, showing that memorising a small pool explained the `+4.1%` spike — while synthetic pinball still did not improve forgetting over plain `3e-4` (`+2.8%`), consistent with D7. Real general-domain replay sets remain untested.
-- **Note on `ReplayConfig()` default (`replay_fraction=0.0, distill_weight=0.1`):** chosen as a conservative default that avoids synthetic pinball worsening `full_ft`, but it is lightly evidenced — `distill_weight=0.1` was measured only on `5M full_ft` (where it tied plain `2e-4`), whereas the `head_only` reductions above used `distill_weight=0.5` or `replay_fraction=0.25`.

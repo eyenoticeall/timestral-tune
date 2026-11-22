@@ -716,6 +716,23 @@ lengths) as exploratory due to token doubling (undoing D16), per-window categori
     (`356/14`), Python `3.10` / `2.14.1` (`356/14`), and `2.15.0` full suite (`567/14`); fixed every
     remaining doc contradiction across `SPEC.md`, `BENCHMARKS.md`, `VERIFICATION.md`, `README.md`,
     `STATUS.md`, and `phases/phase-4-stretch.md`.
+  - Closed all five remaining non-blocking gaps (`58c1cc6`, `89ac249`, final `docs:` commit):
+    1. Added `test_cuda_bf16_replay_released_5m_checkpoint` (released `Timestral-5M` `head_only` &
+       `lora_temporal` under CUDA `bf16` + upstream export) and parametrised
+       `test_cuda_bf16_replay_with_reduce_overhead_compile` over `cache_base_outputs=[True, False]`
+       (exercising live `disable_lora` under CUDA graphs).
+    2. Committed `scripts/probes/replay_bf16_parity.py` and its NVIDIA L4 CUDA `bf16` output
+       `docs/benchmarks/replay_bf16_parity.json` (`0.00e+00` cached-vs-live diff on `tiny` and released
+       `Timestral-5M` across `smooth_beta` `{0.0, 1e-3, 1e-2}` for `lora_temporal` and `full_ft`).
+    3. Added `distill_0.1` (`ReplayConfig()` default) cells to `head_only` (`5M` 3 seeds, `28M` seed 0)
+       and `lora_temporal` (`5M` vol, 3 seeds) in `docs/benchmarks/replay_ablation.json`: strictly beat
+       lower-LR `1e-3` on `head_only` retail (`5M` `0.2105/+2.5%` vs `0.2114/+3.6%`; `28M` `0.2079/+3.6%`
+       vs `0.2090/+4.2%`), and beat shipped `1e-3` on `lora_temporal` 5M vol on 3/3 seeds (`0.2178/+0.6%`
+       vs `0.2186/+1.6%`, small margin vs seed spread).
+    4. Regenerated `docs/benchmarks/mps_coverage.json` with `assert torch.isfinite(loss)` active.
+    5. Ran full `scripts/cuda_check.sh` on a fresh OS-Login NVIDIA L4 VM (`89ac249`, no new project-wide
+       `ssh-keys` added; VM and disk deleted immediately after): **42/42** in `tests/test_replay.py`,
+       **255 passed, 3 skipped** (device tests), and **580 passed, 4 skipped** (whole suite, exit 0).
 
 **Not done / open.** `phase-4` is unpushed and unmerged pending review; PyPI publish awaits maintainer
 approval; tiled DHF remains deferred as exploratory.
