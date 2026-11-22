@@ -10,16 +10,19 @@ import shutil
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from timestral_tune import LoraConfig, TimestralTrainer, TrainingConfig
+from timestral_tune._vendor.timestral import TimestralConfig
+from timestral_tune._vendor.timestral.loading import load_model as upstream_load_model
 from timestral_tune.config import DEFAULT_LEARNING_RATES
-from timestral_tune.models import merged_state_dict
+from timestral_tune.models import TuneTimestralModel, merged_state_dict
 from timestral_tune.trainer import Callback, EarlyStopping, EvalResult, compute_loss
 from timestral_tune.trainer import trainer as trainer_module
 from timestral_tune.trainer.trainer import _learning_rate_factor
 
 from .conftest import available_accelerators
-from .helpers import l2_rel, make_toy_dataset
+from .helpers import QUANTILE_LEVELS, l2_rel, make_toy_dataset
 
 DEVICES = ["cpu", *available_accelerators()]
 
@@ -1174,3 +1177,54 @@ def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny
     assert any(not torch.equal(states[0][k], allneg_state[k]) for k in states[0]), (
         "sign_flip=True (p=0.5) produced weights identical to negating every series every step"
     )
+
+
+# A shape that is neither the test suite's tiny model nor any released size, but uses the released
+# line's architecture: the same layer pattern, gate, quantile knots and width factor.
+UNRELEASED_SHAPE = TimestralConfig(
+    patch_size=8,
+    d_model=48,
+    num_heads=3,
+    mlp_hidden_dim=96,
+    block_schedule=("time", "time", "time", "time_variate") * 2,
+    quantile_knots=QUANTILE_LEVELS,
+    block_size=4,
+    context_length=128,
+    quantile_width_factor=3.0,
+)
+
+
+@pytest.mark.parametrize("mode", ["head_only", "lora_variate", "lora_temporal", "full_ft"])
+def test_local_checkpoint_of_an_unreleased_shape_trains_and_exports(mode, tmp_path):
+    """Sizes are not hard-coded: a local checkpoint of a new shape loads by path, trains in every
+    mode, and exports to a directory that the official loader accepts with `strict=True`."""
+    torch.manual_seed(0)
+    base = TuneTimestralModel(UNRELEASED_SHAPE)
+    checkpoint = tmp_path / "base"
+    checkpoint.mkdir()
+    base.config.save(checkpoint / "config.json")
+    save_file(base.state_dict(), str(checkpoint / "model.safetensors"))
+
+    dataset = make_toy_dataset(UNRELEASED_SHAPE.patch_size, covariates=True)
+    config = TrainingConfig(
+        model_name_or_path=str(checkpoint),
+        mode=mode,
+        device="cpu",
+        batch_size=4,
+        max_steps=2,
+        lr_schedule="constant",
+        log_every=100,
+    )
+    trainer = TimestralTrainer(config, dataset)  # no `model=`: the trainer loads the directory itself
+    assert trainer.model.config == UNRELEASED_SHAPE
+    trainer.fit()
+    out_dir = trainer.export(tmp_path / "export")
+
+    reloaded = upstream_load_model(out_dir, device="cpu")  # strict=True inside
+    assert reloaded.config == UNRELEASED_SHAPE
+    exported, original = reloaded.state_dict(), base.state_dict()
+    assert exported.keys() == original.keys()
+    changed = [name for name in original if not torch.equal(exported[name], original[name])]
+    assert changed, "training left every exported weight equal to the base checkpoint"
+    if mode == "head_only":
+        assert all(name.startswith("head.") for name in changed)
