@@ -799,8 +799,10 @@ class TestTrainerReplayAndDistillation:
     @pytest.mark.skipif(
         not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(), reason="requires bf16 CUDA"
     )
-    def test_cuda_bf16_replay_with_reduce_overhead_compile(self) -> None:
-        # Non-divisible train (5 windows, B=4) and replay (3 windows, B=2) exercise bucket_to_max on both loaders.
+    @pytest.mark.parametrize("cache_base_outputs", [True, False])
+    def test_cuda_bf16_replay_with_reduce_overhead_compile(self, cache_base_outputs: bool) -> None:
+        # Non-divisible train (5 windows, B=4) and replay (3 windows, B=2) exercise bucket_to_max on both loaders,
+        # covering both the CPU-cached teacher and live `disable_lora` teacher under CUDA graphs.
         train_ds = _make_covariate_dataset(num_series=5, length=48, context_length=32, forecast_horizon=8, seed=70)
         replay_ds = SyntheticReplaySource(
             num_series=3, context_length=32, forecast_horizon=6, series_length=38, seed=71
@@ -821,9 +823,42 @@ class TestTrainerReplayAndDistillation:
         trainer = TimestralTrainer(
             cfg,
             train_ds,
-            replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2),
+            replay_config=ReplayConfig(
+                replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=cache_base_outputs
+            ),
             replay_dataset=replay_ds,
             model=_fresh_tiny_model(seed=73),
         )
         res = trainer.fit()
         assert res.steps == 4 and res.final_train_loss is not None and np.isfinite(res.final_train_loss)
+
+    @pytest.mark.network
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(), reason="requires bf16 CUDA"
+    )
+    @pytest.mark.parametrize("mode", ["head_only", "lora_temporal"])
+    def test_cuda_bf16_replay_released_5m_checkpoint(self, mode: str, tmp_path: Path) -> None:
+        train_ds = _make_covariate_dataset(num_series=3, length=128, context_length=64, forecast_horizon=32, seed=80)
+        replay_ds = SyntheticReplaySource(num_series=4, context_length=64, forecast_horizon=32, seed=81)
+        lr = 3e-3 if mode == "head_only" else 1e-3
+        cfg = TrainingConfig(
+            model_name_or_path="mistralai/Timestral-5M",
+            mode=mode,  # type: ignore[arg-type]
+            learning_rate=lr,
+            batch_size=2,
+            max_steps=4,
+            mixed_precision="bf16",
+            device="cuda",
+            seed=82,
+            sign_flip=True,
+        )
+        replay_cfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.1, batch_size=2, cache_base_outputs=True)
+        trainer = TimestralTrainer(cfg, train_ds, replay_config=replay_cfg, replay_dataset=replay_ds)
+        res = trainer.fit()
+        assert res.steps == 4 and res.final_train_loss is not None and np.isfinite(res.final_train_loss)
+        out_dir = trainer.export(tmp_path / f"cuda_bf16_5m_{mode}")
+        meta = json.loads((out_dir / "tune_metadata.json").read_text())
+        assert meta["replay_config"] == replay_cfg.to_dict()
+        assert meta["replay_source"]["type"] == "SyntheticReplaySource"
+        loaded = TimestralForecaster.from_pretrained(out_dir, device="cpu")
+        assert loaded.model.config.d_model == trainer.model.config.d_model
