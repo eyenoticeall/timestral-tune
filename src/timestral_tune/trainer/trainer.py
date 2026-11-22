@@ -10,9 +10,10 @@ of spec §4 over the windows of a `TimeSeriesDataset`.
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,16 +22,17 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-from ..config import LoraConfig, TrainingConfig
+from ..config import LoraConfig, ReplayConfig, TrainingConfig
 from ..data.batch import TrainingBatch, flip_batch_signs
-from ..data.collator import DHFDataCollator
+from ..data.collator import DHFDataCollator, Window
 from ..data.dataset import TimeSeriesDataset
 from ..export import dataset_fingerprint, export_checkpoint
-from ..models.adapter import has_lora, inject_lora, lora_parameters, unmerge_lora, validate_lora_for_rows
+from ..models.adapter import disable_lora, has_lora, inject_lora, lora_parameters, unmerge_lora, validate_lora_for_rows
 from ..models.conformal import ConformalCalibrator, OnlineConformalCalibrator
 from ..models.device import TuneTimestralModel, supports_float64
 from ..models.forward import context_welford_state, normalise_targets, target_frames, training_forward
 from ..models.loader import load_model, resolve_device
+from ..replay import SyntheticReplaySource, distillation_loss
 from .callbacks import Callback, EarlyStopping, ProgressLogger
 from .step import CachedHeadBatch, compute_loss
 
@@ -38,8 +40,57 @@ __all__ = ["EvalResult", "TimestralTrainer", "TrainingResult"]
 
 logger = logging.getLogger("timestral_tune.trainer")
 
-# Cap per-dataset CPU memory for cached `head_only` representations (256 MiB ~ 45k windows on 28M).
+# Cap per-dataset CPU memory for cached `head_only` representations and frozen-base teacher outputs (256 MiB).
 _MAX_HEAD_CACHE_BYTES = 256 * 1024 * 1024
+
+
+class _IndexedReplayDataset(Dataset[tuple[int, Window]]):
+    """Wraps a `TimeSeriesDataset` to emit `(window_index, Window)` for cached teacher lookup."""
+
+    def __init__(self, dataset: TimeSeriesDataset) -> None:
+        self._dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, index: int) -> tuple[int, Window]:
+        return index, self._dataset[index]
+
+
+@dataclass(frozen=True)
+class _ReplayBatchItem:
+    """One collated replay micro-batch paired with its window indices and unpadded series count."""
+
+    batch: TrainingBatch
+    indices: Tensor
+    real_series: int
+
+    def pin_memory(self) -> _ReplayBatchItem:
+        return _ReplayBatchItem(batch=self.batch.pin_memory(), indices=self.indices, real_series=self.real_series)
+
+
+def _apply_series_flip(batch: TrainingBatch, flip_mask: Tensor, rows_per_series: int) -> TrainingBatch:
+    """Negate every row of each real series `i` where `flip_mask[i]` is True; padded tail series stay +1."""
+    real_series = int(flip_mask.numel())
+    row_signs = torch.ones((batch.num_rows,), dtype=batch.context.dtype, device=batch.device)
+    real_signs = torch.where(flip_mask, -1.0, 1.0).to(dtype=batch.context.dtype, device=batch.device)
+    row_signs[: real_series * rows_per_series] = real_signs.repeat_interleave(rows_per_series)
+    signs = row_signs.unsqueeze(-1)
+    return TrainingBatch(
+        context=batch.context * signs,
+        context_mask=batch.context_mask,
+        group_ids=batch.group_ids,
+        role_ids=batch.role_ids,
+        known_future=None if batch.known_future is None else batch.known_future * signs,
+        known_future_mask=batch.known_future_mask,
+        targets=batch.targets * signs,
+        loss_weight=batch.loss_weight,
+    )
+
+
+def _cycle_loader(loader: DataLoader) -> Iterator[Any]:
+    while True:
+        yield from loader
 
 
 class _CachedHeadDataset(Dataset[int]):
@@ -205,6 +256,12 @@ class TimestralTrainer:
             restoration.
         lora_config: Optional `LoraConfig` for `lora_variate` and `lora_temporal` (defaults to a
             mode-appropriate config when omitted; rejected for `head_only` and `full_ft`).
+        replay_config: Optional `ReplayConfig` enabling replay mixing and/or frozen-base
+            distillation (spec §5.3).
+        replay_dataset: Optional `TimeSeriesDataset` supplying replay windows when `replay_config`
+            is set. When omitted and `replay_config` is set, a deterministic
+            `SyntheticReplaySource` matching `train_dataset`'s context and horizon is created.
+            May have a different covariate layout or horizon from `train_dataset`.
         callbacks: Extra `Callback` instances, run after the built-in progress logger and early stopping.
         model: An already loaded model to train, instead of loading `config.model_name_or_path`.
             It is moved to the configured device and modified in place. For LoRA modes, a model
@@ -218,6 +275,8 @@ class TimestralTrainer:
         val_dataset: TimeSeriesDataset | None = None,
         *,
         lora_config: LoraConfig | None = None,
+        replay_config: ReplayConfig | None = None,
+        replay_dataset: TimeSeriesDataset | None = None,
         callbacks: Sequence[Callback] = (),
         model: TuneTimestralModel | None = None,
     ) -> None:
@@ -236,6 +295,14 @@ class TimestralTrainer:
         explicit_lora_config = lora_config is not None
         self.lora_config = self._resolve_lora_config(config.mode, lora_config)
         self._explicit_lora_config = explicit_lora_config
+
+        if replay_config is not None and not isinstance(replay_config, ReplayConfig):
+            raise TypeError(f"replay_config must be a ReplayConfig or None, got {type(replay_config).__name__}")
+        if replay_dataset is not None and replay_config is None:
+            raise ValueError("replay_dataset requires a ReplayConfig")
+        if replay_dataset is not None and not isinstance(replay_dataset, TimeSeriesDataset):
+            raise TypeError(f"replay_dataset must be a TimeSeriesDataset or None, got {type(replay_dataset).__name__}")
+        self.replay_config = replay_config
 
         self._model_provided_directly = model is not None
         if model is None:
@@ -263,7 +330,29 @@ class TimestralTrainer:
                     "val_dataset must have the same columns per role and forecast horizon as train_dataset"
                 )
 
+        self.replay_dataset: TimeSeriesDataset | None = None
+        if replay_config is not None:
+            if replay_dataset is None:
+                replay_dataset = SyntheticReplaySource(
+                    num_series=64,
+                    context_length=train_dataset.context_length,
+                    forecast_horizon=train_dataset.forecast_horizon,
+                    seed=config.seed + 2_000_003,
+                )
+            self._check_dataset(replay_dataset, "replay_dataset")
+            if len(replay_dataset) == 0:
+                raise ValueError("replay_dataset has no windows")
+            self.replay_dataset = replay_dataset
+
         self._trainable = self._select_trainable()
+
+        self._frozen_head: torch.nn.Module | None = None
+        self._frozen_base: TuneTimestralModel | None = None
+        self._replay_base_pos: Tensor | None = None
+        self._replay_base_neg: Tensor | None = None
+        if self.replay_config is not None:
+            self._setup_replay_teacher()
+
         if config.compile_model:
             self.model.transformer = torch.compile(self.model.transformer, mode=config.compile_mode)
 
@@ -294,7 +383,9 @@ class TimestralTrainer:
         self.should_stop = False
         self._train_head_cache: _CachedHeadDataset | None = None
         self._val_head_cache: _CachedHeadDataset | None = None
+        self._replay_head_cache: _CachedHeadDataset | None = None
         self._fit_flip_generator: torch.Generator | None = None
+        self._replay_flip_generator: torch.Generator | None = None
         self._val_loader: DataLoader | None = None
 
     # ----------------------------------------------------------------- setup
@@ -423,16 +514,102 @@ class TimestralTrainer:
         )
         return len(dataset) * n_targets * bytes_per_target
 
+    @property
+    def _replay_sign_flip(self) -> bool:
+        if self.replay_config is None:
+            return False
+        return self.config.sign_flip if self.replay_config.sign_flip is None else self.replay_config.sign_flip
+
+    def _estimate_replay_base_cache_bytes(self, dataset: TimeSeriesDataset) -> int:
+        model_config = self.model.config
+        patch = model_config.patch_size
+        n_targets = dataset.series[0].layout[0]
+        horizon_steps = -(-dataset.forecast_horizon // patch) * patch
+        bytes_per_target = horizon_steps * model_config.num_quantiles * 4  # fp32 normalised quantiles
+        return len(dataset) * n_targets * bytes_per_target * (2 if self._replay_sign_flip else 1)
+
+    def _setup_replay_teacher(self) -> None:
+        """Prepare the step-0 frozen base reference for replay distillation (before `torch.compile`)."""
+        assert self.replay_config is not None and self.replay_dataset is not None
+        if self.replay_config.distill_weight <= 0.0:
+            return
+        if self.config.mode == "head_only":
+            frozen_head = copy.deepcopy(self.model.head).to(self.device).eval()
+            for parameter in frozen_head.parameters():
+                parameter.requires_grad_(False)
+            self._frozen_head = frozen_head
+            return
+
+        estimated = self._estimate_replay_base_cache_bytes(self.replay_dataset)
+        if self.replay_config.cache_base_outputs and estimated <= _MAX_HEAD_CACHE_BYTES:
+            self._replay_base_pos = self._precompute_replay_base_outputs(self.replay_dataset, negate=False)
+            if self._replay_sign_flip:
+                self._replay_base_neg = self._precompute_replay_base_outputs(self.replay_dataset, negate=True)
+            return
+
+        if self.replay_config.cache_base_outputs and estimated > _MAX_HEAD_CACHE_BYTES:
+            logger.info(
+                "skipping frozen-base teacher cache for %d replay windows (estimated %.1f MiB exceeds %.0f MiB cap)",
+                len(self.replay_dataset),
+                estimated / (1024 * 1024),
+                _MAX_HEAD_CACHE_BYTES / (1024 * 1024),
+            )
+        if self.config.mode == "full_ft":
+            frozen_base = copy.deepcopy(self.model).to(self.device).eval()
+            for parameter in frozen_base.parameters():
+                parameter.requires_grad_(False)
+            self._frozen_base = frozen_base
+
+    @torch.no_grad()
+    def _precompute_replay_base_outputs(self, dataset: TimeSeriesDataset, *, negate: bool) -> Tensor:
+        """Precompute `(N, n_targets, horizon_steps, Q)` frozen-base normalised quantiles on CPU."""
+        patch = self.model.config.patch_size
+        n_targets = dataset.series[0].layout[0]
+        batch_size = self.config.eval_batch_size or self.config.batch_size
+        collator = DHFDataCollator.for_model(self.model.config, dataset.context_length, bucket_to_max=None)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collator,
+            num_workers=0,
+            pin_memory=self.device.type == "cuda",
+        )
+        non_blocking = self.device.type == "cuda"
+        outputs: list[Tensor] = []
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with disable_lora(self.model):
+                for batch in loader:
+                    if negate:
+                        batch = flip_batch_signs(batch, p=1.0)
+                    batch.validate(patch)
+                    on_device = batch.to(self.device, non_blocking=non_blocking)
+                    with self._autocast():
+                        out = training_forward(self.model, on_device, validate=False)
+                    target_q = out.quantiles[on_device.target_rows].detach().to(torch.float32).cpu()
+                    series_count = target_q.shape[0] // n_targets
+                    outputs.append(target_q.unflatten(0, (series_count, n_targets)))
+        finally:
+            self.model.train(was_training)
+        return torch.cat(outputs, dim=0)
+
     def _get_head_cache(self, dataset: TimeSeriesDataset) -> _CachedHeadDataset | None:
         if self.config.mode != "head_only" or not self.config.cache_frozen_features:
             return None
-        dual = dataset is self.train_dataset and self.config.sign_flip
         if dataset is self.train_dataset:
+            dual = self.config.sign_flip
             if self._train_head_cache is not None:
                 return self._train_head_cache
         elif dataset is self.val_dataset:
+            dual = False
             if self._val_head_cache is not None:
                 return self._val_head_cache
+        elif dataset is self.replay_dataset:
+            dual = self._replay_sign_flip
+            if self._replay_head_cache is not None:
+                return self._replay_head_cache
         else:
             return None
 
@@ -450,8 +627,10 @@ class TimestralTrainer:
             cache.negated = self._build_head_cache(dataset, negate=True)
         if dataset is self.train_dataset:
             self._train_head_cache = cache
-        else:
+        elif dataset is self.val_dataset:
             self._val_head_cache = cache
+        else:
+            self._replay_head_cache = cache
         return cache
 
     @torch.no_grad()
@@ -574,10 +753,147 @@ class TimestralTrainer:
             generator=generator,
         )
 
+    def _replay_loader(self) -> DataLoader:
+        assert self.replay_config is not None and self.replay_dataset is not None
+        dataset = self.replay_dataset
+        config = self.config
+        replay_batch_size = self.replay_config.resolved_batch_size(config.batch_size)
+        shuffle_gen = torch.Generator().manual_seed(config.seed + 2_000_009)
+
+        cache = self._get_head_cache(dataset)
+        if cache is not None:
+            flip_gen = self._replay_flip_generator
+            collate_fn = (
+                (lambda idx: cache.collate_sign_flipped(idx, flip_gen))
+                if (flip_gen is not None and cache.negated is not None)
+                else cache.collate
+            )
+            return DataLoader(
+                cache,
+                batch_size=replay_batch_size,
+                shuffle=config.shuffle,
+                collate_fn=collate_fn,
+                num_workers=0,
+                pin_memory=self.device.type == "cuda",
+                generator=shuffle_gen,
+            )
+
+        bucket_max = replay_batch_size if (config.compile_model and config.compile_mode == "reduce-overhead") else None
+        collator = DHFDataCollator.for_model(self.model.config, dataset.context_length, bucket_to_max=bucket_max)
+
+        def collate_indexed(items: Sequence[tuple[int, Window]]) -> _ReplayBatchItem:
+            indices = torch.as_tensor([idx for idx, _ in items], dtype=torch.long)
+            windows = [window for _, window in items]
+            return _ReplayBatchItem(batch=collator(windows), indices=indices, real_series=len(windows))
+
+        return DataLoader(
+            _IndexedReplayDataset(dataset),
+            batch_size=replay_batch_size,
+            shuffle=config.shuffle,
+            collate_fn=collate_indexed,
+            num_workers=0,
+            pin_memory=self.device.type == "cuda",
+            generator=shuffle_gen,
+        )
+
+    def _compute_replay_terms(
+        self,
+        replay_batch: TrainingBatch | CachedHeadBatch,
+        *,
+        real_series: int | None,
+        teacher_quantiles: Tensor | None,
+        validate: bool,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Compute `(replay_pinball_loss, distill_loss)` on one replay micro-batch already on device."""
+        assert self.replay_config is not None and self.replay_dataset is not None
+        need_pinball = self.replay_config.replay_fraction > 0.0 and replay_batch.num_scored > 0
+        need_distill = self.replay_config.distill_weight > 0.0
+        if not need_pinball and not need_distill:
+            return None, None
+
+        need_hidden = need_distill and isinstance(replay_batch, TrainingBatch) and self._frozen_head is not None
+        if need_pinball:
+            out = compute_loss(
+                self.model,
+                replay_batch,
+                self.config.target_frame,
+                return_hidden=need_hidden,
+                validate=validate,
+            )
+            replay_pinball: Tensor | None = out.loss
+            student_quantiles = out.forward.quantiles
+            student_hidden = out.forward.hidden
+            num_context_tokens = out.forward.num_context_tokens
+        else:
+            replay_pinball = None
+            if isinstance(replay_batch, CachedHeadBatch):
+                student_quantiles = self.model.head(replay_batch.horizon_hidden)
+                student_hidden = None
+                num_context_tokens = 0
+            else:
+                fwd = training_forward(self.model, replay_batch, return_hidden=need_hidden, validate=validate)
+                student_quantiles = fwd.quantiles
+                student_hidden = fwd.hidden
+                num_context_tokens = fwd.num_context_tokens
+
+        if not need_distill:
+            return replay_pinball, None
+
+        horizon_steps = student_quantiles.shape[1]
+        requested_horizon = min(self.replay_dataset.forecast_horizon, horizon_steps)
+        step_mask = torch.arange(horizon_steps, device=student_quantiles.device) < requested_horizon
+
+        if isinstance(replay_batch, CachedHeadBatch):
+            assert self._frozen_head is not None
+            with torch.no_grad():
+                teacher_q = self._frozen_head(replay_batch.horizon_hidden)
+            student_q = student_quantiles
+            distill_mask = step_mask.unsqueeze(0).expand(student_q.shape[0], horizon_steps)
+            return replay_pinball, distillation_loss(student_q, teacher_q, distill_mask)
+
+        rows_per_series = sum(self.replay_dataset.series[0].layout)
+        real_row_limit = replay_batch.num_rows if real_series is None else real_series * rows_per_series
+        real_target_mask = replay_batch.target_rows & (
+            torch.arange(replay_batch.num_rows, device=student_quantiles.device) < real_row_limit
+        )
+        student_q = student_quantiles[real_target_mask]
+
+        if teacher_quantiles is not None:
+            teacher_q = teacher_quantiles
+        elif self._frozen_head is not None:
+            assert student_hidden is not None
+            with torch.no_grad():
+                teacher_q = self._frozen_head(student_hidden[real_target_mask, num_context_tokens:, :])
+        elif self._frozen_base is not None:
+            with torch.no_grad():
+                teacher_q = training_forward(self._frozen_base, replay_batch, validate=False).quantiles[
+                    real_target_mask
+                ]
+        else:
+            # Zero-VRAM frozen-base forward for LoRA modes when teacher caching is disabled/exceeded.
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                with torch.no_grad(), disable_lora(self.model):
+                    teacher_q = training_forward(self.model, replay_batch, validate=False).quantiles[real_target_mask]
+            finally:
+                self.model.train(was_training)
+
+        distill_mask = step_mask.unsqueeze(0).expand(student_q.shape[0], horizon_steps)
+        return replay_pinball, distillation_loss(student_q, teacher_q, distill_mask)
+
     # ------------------------------------------------------------------ loop
 
-    def training_step(self, batch: TrainingBatch | CachedHeadBatch, *, validate: bool = True) -> float:
-        """One optimiser step on `batch` (already on the device). Returns the loss."""
+    def training_step(
+        self,
+        batch: TrainingBatch | CachedHeadBatch,
+        *,
+        validate: bool = True,
+        replay_batch: TrainingBatch | CachedHeadBatch | None = None,
+        replay_real_series: int | None = None,
+        replay_teacher_quantiles: Tensor | None = None,
+    ) -> float:
+        """One optimiser step on `batch` (already on the device), with optional replay micro-batch."""
         if (
             self.config.compile_model
             and self.config.compile_mode == "reduce-overhead"
@@ -588,7 +904,20 @@ class TimestralTrainer:
             torch.compiler.cudagraph_mark_step_begin()
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
-            loss = compute_loss(self.model, batch, self.config.target_frame, validate=validate).loss
+            domain_loss = compute_loss(self.model, batch, self.config.target_frame, validate=validate).loss
+            loss = domain_loss
+            if replay_batch is not None and self.replay_config is not None:
+                replay_pinball, distill_term = self._compute_replay_terms(
+                    replay_batch,
+                    real_series=replay_real_series,
+                    teacher_quantiles=replay_teacher_quantiles,
+                    validate=validate,
+                )
+                if replay_pinball is not None:
+                    frac = self.replay_config.replay_fraction
+                    loss = (1.0 - frac) * domain_loss + frac * replay_pinball
+                if distill_term is not None:
+                    loss = loss + self.replay_config.distill_weight * distill_term
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError(
                 f"the training loss became {loss.item()} at step {self.global_step + 1}. Lower the learning rate, "
@@ -615,7 +944,13 @@ class TimestralTrainer:
         self.scheduler = self._new_schedule()
         flip_generator = torch.Generator().manual_seed(config.seed + 1_000_003) if config.sign_flip else None
         self._fit_flip_generator = flip_generator
+        replay_flip_generator = (
+            torch.Generator().manual_seed(config.seed + 3_000_007) if self._replay_sign_flip else None
+        )
+        self._replay_flip_generator = replay_flip_generator
         loader = self._loader(self.train_dataset, training=True)
+        replay_iter = _cycle_loader(self._replay_loader()) if self.replay_config is not None else None
+        replay_rows_per_series = sum(self.replay_dataset.series[0].layout) if self.replay_dataset is not None else 0
         train_history: list[tuple[int, float]] = []
         eval_history: list[tuple[int, float]] = []
         best_loss: float | None = None
@@ -658,8 +993,42 @@ class TimestralTrainer:
                         if flip_generator is not None:
                             batch = flip_batch_signs(batch, flip_generator)
                         batch.validate(patch)
+
+                    replay_dev: TrainingBatch | CachedHeadBatch | None = None
+                    replay_real_series: int | None = None
+                    replay_teacher_dev: Tensor | None = None
+                    if replay_iter is not None:
+                        replay_item = next(replay_iter)
+                        if isinstance(replay_item, CachedHeadBatch):
+                            replay_dev = replay_item.to(self.device, non_blocking=non_blocking)
+                        else:
+                            assert isinstance(replay_item, _ReplayBatchItem)
+                            r_batch = replay_item.batch
+                            replay_real_series = replay_item.real_series
+                            flip_mask: Tensor | None = None
+                            if replay_flip_generator is not None:
+                                flip_mask = torch.rand((replay_real_series,), generator=replay_flip_generator) < 0.5
+                                r_batch = _apply_series_flip(r_batch, flip_mask, replay_rows_per_series)
+                            r_batch.validate(patch)
+                            replay_dev = r_batch.to(self.device, non_blocking=non_blocking)
+                            if self._replay_base_pos is not None:
+                                pos_q = self._replay_base_pos[replay_item.indices]
+                                if flip_mask is not None and self._replay_base_neg is not None:
+                                    neg_q = self._replay_base_neg[replay_item.indices]
+                                    sel = flip_mask.view(-1, 1, 1, 1)
+                                    teacher_cpu = torch.where(sel, neg_q, pos_q).flatten(0, 1)
+                                else:
+                                    teacher_cpu = pos_q.flatten(0, 1)
+                                replay_teacher_dev = teacher_cpu.to(self.device, non_blocking=non_blocking)
+
                     learning_rate = self.optimizer.param_groups[0]["lr"]
-                    loss = self.training_step(batch.to(self.device, non_blocking=non_blocking), validate=False)
+                    loss = self.training_step(
+                        batch.to(self.device, non_blocking=non_blocking),
+                        validate=False,
+                        replay_batch=replay_dev,
+                        replay_real_series=replay_real_series,
+                        replay_teacher_quantiles=replay_teacher_dev,
+                    )
                     self.global_step += 1
                     train_history.append((self.global_step, loss))
                     for callback in self.callbacks:
@@ -679,6 +1048,8 @@ class TimestralTrainer:
             if self.val_dataset is not None and last_evaluated_step != self.global_step:
                 evaluate_now()
         finally:
+            self._fit_flip_generator = None
+            self._replay_flip_generator = None
             self.model.eval()
 
         restored = False
@@ -786,6 +1157,7 @@ class TimestralTrainer:
             mode=self.config.mode,
             training_config=self.config,
             lora_config=self.lora_config,
+            replay_config=self.replay_config,
             calibrator=calibrator,
             metrics=metrics,
             data_fingerprint=fingerprint,

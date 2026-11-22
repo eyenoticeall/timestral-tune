@@ -1,15 +1,22 @@
 """Distillation to the frozen base model (spec §5.3).
 
-Mean absolute difference (L1) between the tuned model's and the frozen base model's normalised
-quantiles on replay samples. Because the supervision comes from the base model's own forecast
-distribution, distillation requires no target labels.
+Smooth L1 (Huber) difference between the tuned model's and the frozen base model's normalised
+quantiles on replay samples (default transition `smooth_beta=1e-3`, falling back to exact L1 when
+`smooth_beta=0.0`). Smoothing the kink at zero prevents floating-point round-off (`~1e-7` in
+fp32 GEMMs or `bf16` autocast) from firing full-strength `+/-1` subgradients at step 0 when the
+student still equals the frozen base. Because supervision comes from the base model's own
+forecast distribution, distillation requires no target labels.
 
-- Spec: `docs/SPEC.md` §5.3
+- Spec: `docs/SPEC.md` §5.3, §11 (D21)
 """
 
 from __future__ import annotations
 
+import math
+import numbers
+
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 __all__ = ["distillation_loss"]
@@ -19,8 +26,10 @@ def distillation_loss(
     student_quantiles: Tensor,
     teacher_quantiles: Tensor,
     weight_mask: Tensor | None = None,
+    *,
+    smooth_beta: float = 1e-3,
 ) -> Tensor:
-    """Mean absolute difference between student and frozen-base normalised quantiles.
+    """Mean absolute (or smooth L1) difference between student and frozen-base normalised quantiles.
 
     Computes in at least float32 (matching `pinball_loss` promotion) and detaches
     `teacher_quantiles` so gradients never flow into the reference model. Averages equally over
@@ -33,6 +42,10 @@ def distillation_loss(
         weight_mask: Optional `(R, H)` boolean or non-negative float mask selecting active
             `(row, step)` positions (e.g. real target rows inside the requested unpadded horizon).
             If omitted, every `(row, step)` position receives weight 1.
+        smooth_beta: Huber/Smooth-L1 transition threshold in normalised quantile units (`>= 0`).
+            Default `1e-3` behaves as exact L1 for all meaningful drift (`|diff| >= 1e-3`) while
+            preventing `+/-1` subgradient kicks from `1e-7` step-0 floating-point round-off.
+            Set to `0.0` for exact unsmoothed L1.
     """
     if student_quantiles.ndim != 3:
         raise ValueError(f"student_quantiles must be 3-D (R, H, Q), got {tuple(student_quantiles.shape)}")
@@ -41,11 +54,18 @@ def distillation_loss(
             f"teacher_quantiles shape {tuple(teacher_quantiles.shape)} does not match "
             f"student_quantiles shape {tuple(student_quantiles.shape)}"
         )
+    if isinstance(smooth_beta, bool) or not (
+        isinstance(smooth_beta, numbers.Real) and math.isfinite(smooth_beta) and smooth_beta >= 0.0
+    ):
+        raise ValueError(f"smooth_beta must be non-negative and finite, got {smooth_beta!r}")
 
     work_dtype = torch.promote_types(student_quantiles.dtype, torch.float32)
     student = student_quantiles.to(work_dtype)
     teacher = teacher_quantiles.detach().to(device=student.device, dtype=work_dtype)
-    per_pos = (student - teacher).abs().mean(dim=-1)  # (R, H)
+    if smooth_beta == 0.0:
+        per_pos = (student - teacher).abs().mean(dim=-1)  # (R, H)
+    else:
+        per_pos = F.smooth_l1_loss(student, teacher, reduction="none", beta=float(smooth_beta)).mean(dim=-1)
 
     if weight_mask is None:
         if per_pos.numel() == 0:

@@ -36,7 +36,7 @@ from safetensors.torch import save_file
 
 from ._vendor.timestral.loading import CONFIG_FILE, WEIGHTS_FILE
 from ._vendor.timestral.model import TimestralModel
-from .config import LoraConfig, TrainingConfig
+from .config import LoraConfig, ReplayConfig, TrainingConfig
 from .data.dataset import TimeSeriesDataset
 from .models.adapter import extract_lora_state_dict, has_lora, merged_state_dict
 from .models.conformal import ConformalCalibrator, OnlineConformalCalibrator
@@ -248,6 +248,7 @@ def export_checkpoint(
     mode: str | None = None,
     training_config: TrainingConfig | None = None,
     lora_config: LoraConfig | None = None,
+    replay_config: ReplayConfig | None = None,
     calibrator: ConformalCalibrator | OnlineConformalCalibrator | None = None,
     metrics: Mapping[str, Any] | None = None,
     data_fingerprint: str | None = None,
@@ -299,6 +300,7 @@ def export_checkpoint(
         "mode": mode if mode is not None else (training_config.mode if training_config is not None else None),
         "hyperparameters": None if training_config is None else _serialise_training_config(training_config),
         "lora_config": None if effective_lora is None else effective_lora.to_dict(),
+        "replay_config": None if replay_config is None else replay_config.to_dict(),
         "has_conformal": calibrator is not None,
         "data_fingerprint": data_fingerprint,
         "metrics": None if metrics is None else dict(metrics),
