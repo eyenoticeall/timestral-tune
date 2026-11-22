@@ -225,12 +225,52 @@ def test_evaluate_forecaster_online_aci_is_chronological_and_never_peeks(tiny_fo
     """Online ACI must run strictly in origin-time order across series, never peek before transform,
     and delay updates until a prior window's full horizon has completed (`t_end < t_origin`).
     """
-    dataset = make_toy_dataset(tiny_forecaster.patch_size, series=3, covariates=True)
-    # Dataset stores windows series-by-series: verify we actually have multiple origins per series.
+    # Build two series with STAGGERED timestamps so series 0 starts LATER than series 1:
+    # dict insertion order of origins is then strictly non-chronological (catching both dataset-order
+    # iteration AND dropping `sorted(by_origin)`).
+    base_ds = make_toy_dataset(tiny_forecaster.patch_size, series=3, covariates=True)
+    staggered_series = [
+        SeriesData(
+            series_id="late-0",
+            timestamps=base_ds.series[0].timestamps + 1000,
+            targets=base_ds.series[0].targets,
+            past=base_ds.series[0].past,
+            known=base_ds.series[0].known,
+            categorical_past=base_ds.series[0].categorical_past,
+            categorical_known=base_ds.series[0].categorical_known,
+        ),
+        SeriesData(
+            series_id="early-1",
+            timestamps=base_ds.series[1].timestamps,
+            targets=base_ds.series[1].targets,
+            past=base_ds.series[1].past,
+            known=base_ds.series[1].known,
+            categorical_past=base_ds.series[1].categorical_past,
+            categorical_known=base_ds.series[1].categorical_known,
+        ),
+        SeriesData(
+            series_id="shared-2",
+            timestamps=base_ds.series[2].timestamps + 1000,
+            targets=base_ds.series[2].targets,
+            past=base_ds.series[2].past,
+            known=base_ds.series[2].known,
+            categorical_past=base_ds.series[2].categorical_past,
+            categorical_known=base_ds.series[2].categorical_known,
+        ),
+    ]
+    dataset = TimeSeriesDataset(
+        staggered_series,
+        context_length=base_ds.context_length,
+        forecast_horizon=base_ds.forecast_horizon,
+        stride=base_ds.stride,
+        min_context=base_ds.context_length,
+        roles=base_ds.roles,
+    )
     origins = [
         int(dataset.series[dataset._series_index[i]].timestamps[dataset._origins[i]]) for i in range(len(dataset))
     ]
-    assert len(set(origins)) >= 2 and origins != sorted(origins), "test requires non-chronological dataset ordering"
+    unique_insertion = list(dict.fromkeys(origins))
+    assert unique_insertion != sorted(unique_insertion), "test requires non-chronological first-seen origin order"
 
     preds_raw, actuals_raw, _ = collect_conformal_data(tiny_forecaster, dataset, batch_size=4)
 
@@ -274,12 +314,12 @@ def test_evaluate_forecaster_online_aci_is_chronological_and_never_peeks(tiny_fo
     horizon = 2 * patch
     stride = patch  # overlaps by `patch` steps!
     overlap_ds = TimeSeriesDataset(
-        dataset.series[:2],
-        context_length=dataset.context_length,
+        base_ds.series[:2],
+        context_length=base_ds.context_length,
         forecast_horizon=horizon,
         stride=stride,
-        min_context=dataset.context_length,
-        roles=dataset.roles,
+        min_context=base_ds.context_length,
+        roles=base_ds.roles,
     )
     ov_origins = sorted(
         {

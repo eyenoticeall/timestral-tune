@@ -997,7 +997,7 @@ def test_trainer_resumes_from_load_lora_and_rejects_mismatched_pre_injected_mode
         )
 
 
-def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny_forecaster):
+def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny_forecaster, monkeypatch):
     from timestral_tune.data import TimeSeriesDataset, flip_batch_signs
 
     dataset = make_toy_dataset(tiny_forecaster.patch_size, series=4, covariates=True)
@@ -1059,10 +1059,50 @@ def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny
         finally:
             if handle is not None:
                 handle.remove()
+        if cached:
+            # Evaluating the training set AFTER fit() MUST use unflipped positive orientation
+            # (catches dropping `if training else None` on `_fit_flip_generator`).
+            ev_cached_1 = trainer.evaluate(train).loss
+            ev_cached_2 = trainer.evaluate(train).loss
+            ref_eval = (
+                TimestralTrainer(
+                    config_for(
+                        "cpu", mode="head_only", batch_size=len(train), sign_flip=False, cache_frozen_features=False
+                    ),
+                    train,
+                    model=copy.deepcopy(model),
+                )
+                .evaluate(train)
+                .loss
+            )
+            assert ev_cached_1 == pytest.approx(ref_eval, rel=1e-5)
+            assert ev_cached_2 == pytest.approx(ref_eval, rel=1e-5)
         heads_sf[cached] = torch.cat([p.detach().cpu().flatten() for p in model.head.parameters()])
     assert calls_cached == 3, f"expected 3 body passes (pos train + neg train + val), got {calls_cached}"
     assert l2_rel(heads_sf[True], heads_sf[False]) < 1e-4
     torch.testing.assert_close(heads_sf[True], heads_sf[False], rtol=1e-2, atol=1e-4)
+
+    # Dual-orientation cache doubles memory estimate: cap at 1.5x single-orientation allows
+    # sign_flip=False to cache while forcing sign_flip=True to fall back to streaming (None).
+    probe_tr = TimestralTrainer(
+        config_for("cpu", mode="head_only", batch_size=len(train), sign_flip=False, cache_frozen_features=True),
+        train,
+        model=fresh_model(tiny_forecaster),
+    )
+    single_bytes = probe_tr._estimate_head_cache_bytes(train)
+    monkeypatch.setattr(trainer_module, "_MAX_HEAD_CACHE_BYTES", int(single_bytes * 1.5))
+    tr_single = TimestralTrainer(
+        config_for("cpu", mode="head_only", batch_size=len(train), sign_flip=False, cache_frozen_features=True),
+        train,
+        model=fresh_model(tiny_forecaster),
+    )
+    tr_dual = TimestralTrainer(
+        config_for("cpu", mode="head_only", batch_size=len(train), sign_flip=True, cache_frozen_features=True),
+        train,
+        model=fresh_model(tiny_forecaster),
+    )
+    assert tr_single._get_head_cache(train) is not None
+    assert tr_dual._get_head_cache(train) is None
 
     # p=0.0 is a no-op; p=0.5 actually produces BOTH flipped and unflipped series across 16 series;
     # known_future=None also works cleanly.
