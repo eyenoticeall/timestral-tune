@@ -1109,6 +1109,386 @@
             }
           }
         ],
+        "distill_0.1": [
+          {
+            "mode": "head_only",
+            "lr": 0.003,
+            "seed": 0,
+            "replay_config": {
+              "replay_fraction": 0.0,
+              "distill_weight": 0.1,
+              "batch_size": null,
+              "sign_flip": null,
+              "cache_base_outputs": true,
+              "smooth_beta": 0.001
+            },
+            "wall_s": 22.26,
+            "best_step": 150,
+            "val": {
+              "wql": 0.18380161557275537,
+              "mase": 1.3656472068740035
+            },
+            "test": {
+              "pinball": 0.0008967341243556225,
+              "wql": 0.22541636760310754,
+              "mase": 1.871459885564754,
+              "coverage_80": 0.7363153594771242,
+              "width_80": 0.006469278748233169,
+              "coverage_90": 0.8623366013071896,
+              "width_90": 0.009282500851458833,
+              "num_series": 153,
+              "num_scored": 4896
+            },
+            "forgetting": {
+              "macro_relative_delta_wql": 0.00743428391595824,
+              "macro_relative_delta_mase": 0.009456823320765424,
+              "per_domain": {
+                "ett1": {
+                  "delta_pinball": 0.01792599245867832,
+                  "relative_delta_pinball": 0.009829108971008306,
+                  "delta_wql": 0.0016937543177328318,
+                  "relative_delta_wql": 0.009829108971007803,
+                  "delta_mase": 0.02130479082853398,
+                  "relative_delta_mase": 0.01960453593581207,
+                  "tuned": {
+                    "pinball": 1.8416917591779585,
+                    "wql": 0.17401398423163184,
+                    "mase": 1.1080324184698502,
+                    "coverage_80": 0.73828125,
+                    "width_80": 14.119914995572929,
+                    "coverage_90": 0.8688616071428571,
+                    "width_90": 19.82595150492021,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  },
+                  "zero_shot": {
+                    "pinball": 1.8237657667192801,
+                    "wql": 0.172320229913899,
+                    "mase": 1.0867276276413163,
+                    "coverage_80": 0.7399553571428571,
+                    "width_80": 14.073255628879581,
+                    "coverage_90": 0.8666294642857143,
+                    "width_90": 19.286059927062265,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  }
+                },
+                "jena_weather": {
+                  "delta_pinball": 0.04728960145775396,
+                  "relative_delta_pinball": 0.011928700621556654,
+                  "delta_wql": 0.0005775617244460976,
+                  "relative_delta_wql": 0.011928700621556612,
+                  "delta_mase": -0.0007098865505230645,
+                  "relative_delta_mase": -0.0004657998972930782,
+                  "tuned": {
+                    "pinball": 4.011644392313661,
+                    "wql": 0.04899538548995945,
+                    "mase": 1.5233062299159188,
+                    "coverage_80": 0.6569940476190477,
+                    "width_80": 30.786487664768693,
+                    "coverage_90": 0.7581845238095238,
+                    "width_90": 43.634102937350676,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  },
+                  "zero_shot": {
+                    "pinball": 3.964354790855907,
+                    "wql": 0.04841782376551335,
+                    "mase": 1.5240161164664419,
+                    "coverage_80": 0.6904761904761905,
+                    "width_80": 35.78914243768548,
+                    "coverage_90": 0.7832961309523809,
+                    "width_90": 50.55954084151478,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  }
+                },
+                "loop_seattle": {
+                  "delta_pinball": 0.0009402499081831994,
+                  "relative_delta_pinball": 0.000545042155310783,
+                  "delta_wql": 3.1883994075471156e-05,
+                  "relative_delta_wql": 0.0005450421553103031,
+                  "delta_mase": 0.00750560893935881,
+                  "relative_delta_mase": 0.009231733923777283,
+                  "tuned": {
+                    "pinball": 1.7260360044687986,
+                    "wql": 0.058530100627097154,
+                    "mase": 0.820528276330946,
+                    "coverage_80": 0.8328125,
+                    "width_80": 15.440283228829504,
+                    "coverage_90": 0.9013671875,
+                    "width_90": 21.68593065738678,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  },
+                  "zero_shot": {
+                    "pinball": 1.7250957545606154,
+                    "wql": 0.05849821663302168,
+                    "mase": 0.8130226673915872,
+                    "coverage_80": 0.8111328125,
+                    "width_80": 15.584681832045316,
+                    "coverage_90": 0.8763671875,
+                    "width_90": 21.51379627790302,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  }
+                }
+              }
+            }
+          },
+          {
+            "mode": "head_only",
+            "lr": 0.003,
+            "seed": 1,
+            "replay_config": {
+              "replay_fraction": 0.0,
+              "distill_weight": 0.1,
+              "batch_size": null,
+              "sign_flip": null,
+              "cache_base_outputs": true,
+              "smooth_beta": 0.001
+            },
+            "wall_s": 21.14,
+            "best_step": 150,
+            "val": {
+              "wql": 0.18396984928178878,
+              "mase": 1.3623625687398229
+            },
+            "test": {
+              "pinball": 0.0008923945519522758,
+              "wql": 0.22432550842696528,
+              "mase": 1.861445131440278,
+              "coverage_80": 0.735702614379085,
+              "width_80": 0.00648980971931855,
+              "coverage_90": 0.8662173202614379,
+              "width_90": 0.00953928076936422,
+              "num_series": 153,
+              "num_scored": 4896
+            },
+            "forgetting": {
+              "macro_relative_delta_wql": 0.013662410592878189,
+              "macro_relative_delta_mase": 0.011186548921643669,
+              "per_domain": {
+                "ett1": {
+                  "delta_pinball": -0.004206992207652416,
+                  "relative_delta_pinball": -0.002306761254335996,
+                  "delta_wql": -0.0003975016297037559,
+                  "relative_delta_wql": -0.002306761254336594,
+                  "delta_mase": 0.010097129545635797,
+                  "relative_delta_mase": 0.009291315771138599,
+                  "tuned": {
+                    "pinball": 1.8195587745116277,
+                    "wql": 0.17192272828419525,
+                    "mase": 1.096824757186952,
+                    "coverage_80": 0.7572544642857143,
+                    "width_80": 14.753180019890092,
+                    "coverage_90": 0.890625,
+                    "width_90": 20.64919048334871,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  },
+                  "zero_shot": {
+                    "pinball": 1.8237657667192801,
+                    "wql": 0.172320229913899,
+                    "mase": 1.0867276276413163,
+                    "coverage_80": 0.7399553571428571,
+                    "width_80": 14.073255628879581,
+                    "coverage_90": 0.8666294642857143,
+                    "width_90": 19.286059927062265,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  }
+                },
+                "jena_weather": {
+                  "delta_pinball": 0.11037724423414463,
+                  "relative_delta_pinball": 0.02784242330901824,
+                  "delta_wql": 0.0013480695449808872,
+                  "relative_delta_wql": 0.02784242330901867,
+                  "delta_mase": 0.0044467169316049215,
+                  "relative_delta_mase": 0.0029177624065518447,
+                  "tuned": {
+                    "pinball": 4.074732035090052,
+                    "wql": 0.04976589331049424,
+                    "mase": 1.5284628333980468,
+                    "coverage_80": 0.6292782738095238,
+                    "width_80": 31.659179308573226,
+                    "coverage_90": 0.7405133928571429,
+                    "width_90": 45.97567428533947,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  },
+                  "zero_shot": {
+                    "pinball": 3.964354790855907,
+                    "wql": 0.04841782376551335,
+                    "mase": 1.5240161164664419,
+                    "coverage_80": 0.6904761904761905,
+                    "width_80": 35.78914243768548,
+                    "coverage_90": 0.7832961309523809,
+                    "width_90": 50.55954084151478,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  }
+                },
+                "loop_seattle": {
+                  "delta_pinball": 0.026655437332090415,
+                  "relative_delta_pinball": 0.015451569723954017,
+                  "delta_wql": 0.0009038892730320117,
+                  "relative_delta_wql": 0.015451569723952488,
+                  "delta_mase": 0.017358496223125353,
+                  "relative_delta_mase": 0.02135056858724056,
+                  "tuned": {
+                    "pinball": 1.7517511918927058,
+                    "wql": 0.059402105906053694,
+                    "mase": 0.8303811636147126,
+                    "coverage_80": 0.82421875,
+                    "width_80": 15.739781063236297,
+                    "coverage_90": 0.8888671875,
+                    "width_90": 22.182543613575398,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  },
+                  "zero_shot": {
+                    "pinball": 1.7250957545606154,
+                    "wql": 0.05849821663302168,
+                    "mase": 0.8130226673915872,
+                    "coverage_80": 0.8111328125,
+                    "width_80": 15.584681832045316,
+                    "coverage_90": 0.8763671875,
+                    "width_90": 21.51379627790302,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  }
+                }
+              }
+            }
+          },
+          {
+            "mode": "head_only",
+            "lr": 0.003,
+            "seed": 2,
+            "replay_config": {
+              "replay_fraction": 0.0,
+              "distill_weight": 0.1,
+              "batch_size": null,
+              "sign_flip": null,
+              "cache_base_outputs": true,
+              "smooth_beta": 0.001
+            },
+            "wall_s": 21.17,
+            "best_step": 200,
+            "val": {
+              "wql": 0.18356900474648577,
+              "mase": 1.3621776714305995
+            },
+            "test": {
+              "pinball": 0.0008967763633262354,
+              "wql": 0.22542698541620093,
+              "mase": 1.872064694936864,
+              "coverage_80": 0.7428513071895425,
+              "width_80": 0.006624090948201651,
+              "coverage_90": 0.8668300653594772,
+              "width_90": 0.00939899245307007,
+              "num_series": 153,
+              "num_scored": 4896
+            },
+            "forgetting": {
+              "macro_relative_delta_wql": 0.0002730481305906641,
+              "macro_relative_delta_mase": 0.004784254789629177,
+              "per_domain": {
+                "ett1": {
+                  "delta_pinball": 0.00020265753748427429,
+                  "relative_delta_pinball": 0.00011112037586319493,
+                  "delta_wql": 1.9148288716741568e-05,
+                  "relative_delta_wql": 0.00011112037586248082,
+                  "delta_mase": 0.010829503545059183,
+                  "relative_delta_mase": 0.009965241767676448,
+                  "tuned": {
+                    "pinball": 1.8239684242567644,
+                    "wql": 0.17233937820261575,
+                    "mase": 1.0975571311863754,
+                    "coverage_80": 0.7399553571428571,
+                    "width_80": 14.087927065656654,
+                    "coverage_90": 0.8755580357142857,
+                    "width_90": 19.70383401906916,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  },
+                  "zero_shot": {
+                    "pinball": 1.8237657667192801,
+                    "wql": 0.172320229913899,
+                    "mase": 1.0867276276413163,
+                    "coverage_80": 0.7399553571428571,
+                    "width_80": 14.073255628879581,
+                    "coverage_90": 0.8666294642857143,
+                    "width_90": 19.286059927062265,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  }
+                },
+                "jena_weather": {
+                  "delta_pinball": -0.026619026271177848,
+                  "relative_delta_pinball": -0.006714592329772478,
+                  "delta_wql": -0.00032510594808016213,
+                  "relative_delta_wql": -0.0067145923297718705,
+                  "delta_mase": -0.011809245851747807,
+                  "relative_delta_mase": -0.007748767040028767,
+                  "tuned": {
+                    "pinball": 3.9377357645847293,
+                    "wql": 0.04809271781743319,
+                    "mase": 1.512206870614694,
+                    "coverage_80": 0.671875,
+                    "width_80": 30.781288272577793,
+                    "coverage_90": 0.7762276785714286,
+                    "width_90": 44.04268304978948,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  },
+                  "zero_shot": {
+                    "pinball": 3.964354790855907,
+                    "wql": 0.04841782376551335,
+                    "mase": 1.5240161164664419,
+                    "coverage_80": 0.6904761904761905,
+                    "width_80": 35.78914243768548,
+                    "coverage_90": 0.7832961309523809,
+                    "width_90": 50.55954084151478,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  }
+                },
+                "loop_seattle": {
+                  "delta_pinball": 0.012804723945668117,
+                  "relative_delta_pinball": 0.007422616345681925,
+                  "delta_wql": 0.0004342098189734772,
+                  "relative_delta_wql": 0.007422616345681382,
+                  "delta_mase": 0.009867078576357713,
+                  "relative_delta_mase": 0.012136289641239851,
+                  "tuned": {
+                    "pinball": 1.7379004785062835,
+                    "wql": 0.05893242645199516,
+                    "mase": 0.822889745967945,
+                    "coverage_80": 0.8232421875,
+                    "width_80": 15.449678522348403,
+                    "coverage_90": 0.8865234375,
+                    "width_90": 21.55477147642523,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  },
+                  "zero_shot": {
+                    "pinball": 1.7250957545606154,
+                    "wql": 0.05849821663302168,
+                    "mase": 0.8130226673915872,
+                    "coverage_80": 0.8111328125,
+                    "width_80": 15.584681832045316,
+                    "coverage_90": 0.8763671875,
+                    "width_90": 21.51379627790302,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  }
+                }
+              }
+            }
+          }
+        ],
         "distill_0.5": [
           {
             "mode": "head_only",
@@ -3345,6 +3725,386 @@
             }
           }
         ],
+        "distill_0.1": [
+          {
+            "mode": "head_only",
+            "lr": 0.003,
+            "seed": 0,
+            "replay_config": {
+              "replay_fraction": 0.0,
+              "distill_weight": 0.1,
+              "batch_size": null,
+              "sign_flip": null,
+              "cache_base_outputs": true,
+              "smooth_beta": 0.001
+            },
+            "wall_s": 9.55,
+            "best_step": 200,
+            "val": {
+              "wql": 0.22629009169256303,
+              "mase": 0.8068940363270777
+            },
+            "test": {
+              "pinball": 0.12487268366709281,
+              "wql": 0.21051867525012655,
+              "mase": 0.8293128314045797,
+              "coverage_80": 0.8298611111111112,
+              "width_80": 1.1666019200290774,
+              "coverage_90": 0.9207899305555556,
+              "width_90": 1.5445343875924462,
+              "num_series": 384,
+              "num_scored": 18432
+            },
+            "forgetting": {
+              "macro_relative_delta_wql": 0.025105952028309727,
+              "macro_relative_delta_mase": 0.004930615575626,
+              "per_domain": {
+                "ett1": {
+                  "delta_pinball": 0.010873236158533306,
+                  "relative_delta_pinball": 0.0059619696547396316,
+                  "delta_wql": 0.0010273679816443781,
+                  "relative_delta_wql": 0.005961969654739375,
+                  "delta_mase": 0.0017430071919746215,
+                  "relative_delta_mase": 0.001603904370921097,
+                  "tuned": {
+                    "pinball": 1.8346390028778135,
+                    "wql": 0.17334759789554338,
+                    "mase": 1.0884706348332909,
+                    "coverage_80": 0.7449776785714286,
+                    "width_80": 14.45869132982833,
+                    "coverage_90": 0.8510044642857143,
+                    "width_90": 19.454341425360845,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  },
+                  "zero_shot": {
+                    "pinball": 1.8237657667192801,
+                    "wql": 0.172320229913899,
+                    "mase": 1.0867276276413163,
+                    "coverage_80": 0.7399553571428571,
+                    "width_80": 14.073255628879581,
+                    "coverage_90": 0.8666294642857143,
+                    "width_90": 19.286059927062265,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  }
+                },
+                "jena_weather": {
+                  "delta_pinball": 0.2343315940396158,
+                  "relative_delta_pinball": 0.05910964240136121,
+                  "delta_wql": 0.0028619602486316606,
+                  "relative_delta_wql": 0.059109642401361996,
+                  "delta_mase": 0.012779901492963708,
+                  "relative_delta_mase": 0.008385673455078003,
+                  "tuned": {
+                    "pinball": 4.198686384895523,
+                    "wql": 0.05127978401414501,
+                    "mase": 1.5367960179594056,
+                    "coverage_80": 0.6263020833333334,
+                    "width_80": 33.553447572800074,
+                    "coverage_90": 0.7287946428571429,
+                    "width_90": 46.25610991032819,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  },
+                  "zero_shot": {
+                    "pinball": 3.964354790855907,
+                    "wql": 0.04841782376551335,
+                    "mase": 1.5240161164664419,
+                    "coverage_80": 0.6904761904761905,
+                    "width_80": 35.78914243768548,
+                    "coverage_90": 0.7832961309523809,
+                    "width_90": 50.55954084151478,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  }
+                },
+                "loop_seattle": {
+                  "delta_pinball": 0.017675752074324702,
+                  "relative_delta_pinball": 0.010246244028828849,
+                  "delta_wql": 0.0005993870028731738,
+                  "relative_delta_wql": 0.010246244028827805,
+                  "delta_mase": 0.003904353471324229,
+                  "relative_delta_mase": 0.004802268900878899,
+                  "tuned": {
+                    "pinball": 1.74277150663494,
+                    "wql": 0.059097603635894856,
+                    "mase": 0.8169270208629115,
+                    "coverage_80": 0.810546875,
+                    "width_80": 15.318121935613453,
+                    "coverage_90": 0.86953125,
+                    "width_90": 21.186667815223338,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  },
+                  "zero_shot": {
+                    "pinball": 1.7250957545606154,
+                    "wql": 0.05849821663302168,
+                    "mase": 0.8130226673915872,
+                    "coverage_80": 0.8111328125,
+                    "width_80": 15.584681832045316,
+                    "coverage_90": 0.8763671875,
+                    "width_90": 21.51379627790302,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  }
+                }
+              }
+            }
+          },
+          {
+            "mode": "head_only",
+            "lr": 0.003,
+            "seed": 1,
+            "replay_config": {
+              "replay_fraction": 0.0,
+              "distill_weight": 0.1,
+              "batch_size": null,
+              "sign_flip": null,
+              "cache_base_outputs": true,
+              "smooth_beta": 0.001
+            },
+            "wall_s": 9.48,
+            "best_step": 200,
+            "val": {
+              "wql": 0.226671717003395,
+              "mase": 0.8078493050301061
+            },
+            "test": {
+              "pinball": 0.12487335192917036,
+              "wql": 0.21051980185078228,
+              "mase": 0.8288325267221893,
+              "coverage_80": 0.8245442708333334,
+              "width_80": 1.158079499545339,
+              "coverage_90": 0.9190538194444444,
+              "width_90": 1.5459468636658533,
+              "num_series": 384,
+              "num_scored": 18432
+            },
+            "forgetting": {
+              "macro_relative_delta_wql": 0.022671199455127865,
+              "macro_relative_delta_mase": 0.0030679709371800447,
+              "per_domain": {
+                "ett1": {
+                  "delta_pinball": 0.003402859426046456,
+                  "relative_delta_pinball": 0.001865842362074688,
+                  "delta_wql": 0.0003215223848157811,
+                  "relative_delta_wql": 0.0018658423620745632,
+                  "delta_mase": -0.00251620075629555,
+                  "relative_delta_mase": -0.00231539227704814,
+                  "tuned": {
+                    "pinball": 1.8271686261453266,
+                    "wql": 0.17264175229871478,
+                    "mase": 1.0842114268850207,
+                    "coverage_80": 0.7393973214285714,
+                    "width_80": 14.182283854245075,
+                    "coverage_90": 0.8543526785714286,
+                    "width_90": 19.228855313201034,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  },
+                  "zero_shot": {
+                    "pinball": 1.8237657667192801,
+                    "wql": 0.172320229913899,
+                    "mase": 1.0867276276413163,
+                    "coverage_80": 0.7399553571428571,
+                    "width_80": 14.073255628879581,
+                    "coverage_90": 0.8666294642857143,
+                    "width_90": 19.286059927062265,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  }
+                },
+                "jena_weather": {
+                  "delta_pinball": 0.21343670363566147,
+                  "relative_delta_pinball": 0.05383895107672246,
+                  "delta_wql": 0.002606764844952855,
+                  "relative_delta_wql": 0.0538389510767227,
+                  "delta_mase": 0.012198657662926493,
+                  "relative_delta_mase": 0.008004283899050947,
+                  "tuned": {
+                    "pinball": 4.177791494491569,
+                    "wql": 0.05102458861046621,
+                    "mase": 1.5362147741293684,
+                    "coverage_80": 0.6344866071428571,
+                    "width_80": 33.08953791512735,
+                    "coverage_90": 0.7362351190476191,
+                    "width_90": 45.611885787132984,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  },
+                  "zero_shot": {
+                    "pinball": 3.964354790855907,
+                    "wql": 0.04841782376551335,
+                    "mase": 1.5240161164664419,
+                    "coverage_80": 0.6904761904761905,
+                    "width_80": 35.78914243768548,
+                    "coverage_90": 0.7832961309523809,
+                    "width_90": 50.55954084151478,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  }
+                },
+                "loop_seattle": {
+                  "delta_pinball": 0.021233867122569805,
+                  "relative_delta_pinball": 0.012308804926586875,
+                  "delta_wql": 0.000720043137089052,
+                  "relative_delta_wql": 0.012308804926586335,
+                  "delta_mase": 0.0028577919034555865,
+                  "relative_delta_mase": 0.0035150211895373256,
+                  "tuned": {
+                    "pinball": 1.7463296216831852,
+                    "wql": 0.059218259770110734,
+                    "mase": 0.8158804592950428,
+                    "coverage_80": 0.81015625,
+                    "width_80": 15.2080082885921,
+                    "coverage_90": 0.87109375,
+                    "width_90": 21.048616193421186,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  },
+                  "zero_shot": {
+                    "pinball": 1.7250957545606154,
+                    "wql": 0.05849821663302168,
+                    "mase": 0.8130226673915872,
+                    "coverage_80": 0.8111328125,
+                    "width_80": 15.584681832045316,
+                    "coverage_90": 0.8763671875,
+                    "width_90": 21.51379627790302,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  }
+                }
+              }
+            }
+          },
+          {
+            "mode": "head_only",
+            "lr": 0.003,
+            "seed": 2,
+            "replay_config": {
+              "replay_fraction": 0.0,
+              "distill_weight": 0.1,
+              "batch_size": null,
+              "sign_flip": null,
+              "cache_base_outputs": true,
+              "smooth_beta": 0.001
+            },
+            "wall_s": 11.88,
+            "best_step": 200,
+            "val": {
+              "wql": 0.22667703556328217,
+              "mase": 0.8075577724566206
+            },
+            "test": {
+              "pinball": 0.12476364574933003,
+              "wql": 0.21033485187638823,
+              "mase": 0.8270771306777883,
+              "coverage_80": 0.8269314236111112,
+              "width_80": 1.16824111934208,
+              "coverage_90": 0.9177517361111112,
+              "width_90": 1.5567286498343391,
+              "num_series": 384,
+              "num_scored": 18432
+            },
+            "forgetting": {
+              "macro_relative_delta_wql": 0.021604689482178852,
+              "macro_relative_delta_mase": 0.003615552935111,
+              "per_domain": {
+                "ett1": {
+                  "delta_pinball": 0.0037266505964188568,
+                  "relative_delta_pinball": 0.0020433822502999503,
+                  "delta_wql": 0.00035211609917357167,
+                  "relative_delta_wql": 0.0020433822502993926,
+                  "delta_mase": -0.0015835587756476421,
+                  "relative_delta_mase": -0.0014571809305011147,
+                  "tuned": {
+                    "pinball": 1.827492417315699,
+                    "wql": 0.17267234601307258,
+                    "mase": 1.0851440688656686,
+                    "coverage_80": 0.74609375,
+                    "width_80": 14.449455864062267,
+                    "coverage_90": 0.8571428571428571,
+                    "width_90": 19.537928248955204,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  },
+                  "zero_shot": {
+                    "pinball": 1.8237657667192801,
+                    "wql": 0.172320229913899,
+                    "mase": 1.0867276276413163,
+                    "coverage_80": 0.7399553571428571,
+                    "width_80": 14.073255628879581,
+                    "coverage_90": 0.8666294642857143,
+                    "width_90": 19.286059927062265,
+                    "num_series": 28,
+                    "num_scored": 1792
+                  }
+                },
+                "jena_weather": {
+                  "delta_pinball": 0.21010789639468275,
+                  "relative_delta_pinball": 0.05299926658413948,
+                  "delta_wql": 0.0025661091491723104,
+                  "relative_delta_wql": 0.05299926658413915,
+                  "delta_mase": 0.012879471957855548,
+                  "relative_delta_mase": 0.008451007714877501,
+                  "tuned": {
+                    "pinball": 4.17446268725059,
+                    "wql": 0.05098393291468566,
+                    "mase": 1.5368955884242974,
+                    "coverage_80": 0.6329985119047619,
+                    "width_80": 34.00196521977872,
+                    "coverage_90": 0.7306547619047619,
+                    "width_90": 47.05790675911897,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  },
+                  "zero_shot": {
+                    "pinball": 3.964354790855907,
+                    "wql": 0.04841782376551335,
+                    "mase": 1.5240161164664419,
+                    "coverage_80": 0.6904761904761905,
+                    "width_80": 35.78914243768548,
+                    "coverage_90": 0.7832961309523809,
+                    "width_90": 50.55954084151478,
+                    "num_series": 84,
+                    "num_scored": 5376
+                  }
+                },
+                "loop_seattle": {
+                  "delta_pinball": 0.01685663448886121,
+                  "relative_delta_pinball": 0.009771419612098356,
+                  "delta_wql": 0.000571610621280666,
+                  "relative_delta_wql": 0.009771419612098008,
+                  "delta_mase": 0.003132439766689865,
+                  "relative_delta_mase": 0.003852832020956613,
+                  "tuned": {
+                    "pinball": 1.7419523890494766,
+                    "wql": 0.05906982725430235,
+                    "mase": 0.8161551071582771,
+                    "coverage_80": 0.812109375,
+                    "width_80": 15.339881106838584,
+                    "coverage_90": 0.870703125,
+                    "width_90": 21.224996505491436,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  },
+                  "zero_shot": {
+                    "pinball": 1.7250957545606154,
+                    "wql": 0.05849821663302168,
+                    "mase": 0.8130226673915872,
+                    "coverage_80": 0.8111328125,
+                    "width_80": 15.584681832045316,
+                    "coverage_90": 0.8763671875,
+                    "width_90": 21.51379627790302,
+                    "num_series": 80,
+                    "num_scored": 5120
+                  }
+                }
+              }
+            }
+          }
+        ],
         "distill_0.5": [
           {
             "mode": "head_only",
@@ -4849,6 +5609,132 @@
             }
           }
         },
+        "distill_0.1": {
+          "mode": "head_only",
+          "lr": 0.003,
+          "seed": 0,
+          "replay_config": {
+            "replay_fraction": 0.0,
+            "distill_weight": 0.1,
+            "batch_size": null,
+            "sign_flip": null,
+            "cache_base_outputs": true,
+            "smooth_beta": 0.001
+          },
+          "wall_s": 65.12,
+          "best_step": 150,
+          "val": {
+            "wql": 0.18048285503342992,
+            "mase": 1.3326721068357181
+          },
+          "test": {
+            "pinball": 0.0008734018667209986,
+            "wql": 0.21955122583909106,
+            "mase": 1.8294262441562583,
+            "coverage_80": 0.7322303921568627,
+            "width_80": 0.006435408748883573,
+            "coverage_90": 0.8656045751633987,
+            "width_90": 0.009513494607138758,
+            "num_series": 153,
+            "num_scored": 4896
+          },
+          "forgetting": {
+            "macro_relative_delta_wql": -0.007423784437502572,
+            "macro_relative_delta_mase": -1.4113848665120153e-05,
+            "per_domain": {
+              "ett1": {
+                "delta_pinball": -0.008068423489786758,
+                "relative_delta_pinball": -0.004499944148563788,
+                "delta_wql": -0.0007623526091861121,
+                "relative_delta_wql": -0.004499944148563777,
+                "delta_mase": 0.010701340216511701,
+                "relative_delta_mase": 0.010189761894772512,
+                "tuned": {
+                  "pinball": 1.7849368280002555,
+                  "wql": 0.16865144098854734,
+                  "mase": 1.060906470328692,
+                  "coverage_80": 0.7349330357142857,
+                  "width_80": 12.815342674031854,
+                  "coverage_90": 0.8683035714285714,
+                  "width_90": 17.825573105365038,
+                  "num_series": 28,
+                  "num_scored": 1792
+                },
+                "zero_shot": {
+                  "pinball": 1.7930052514900423,
+                  "wql": 0.16941379359773345,
+                  "mase": 1.0502051301121802,
+                  "coverage_80": 0.734375,
+                  "width_80": 12.750610640272498,
+                  "coverage_90": 0.8560267857142857,
+                  "width_90": 17.469724164943077,
+                  "num_series": 28,
+                  "num_scored": 1792
+                }
+              },
+              "jena_weather": {
+                "delta_pinball": -0.0121038265108675,
+                "relative_delta_pinball": -0.0030483226142903773,
+                "delta_wql": -0.000147827570893308,
+                "relative_delta_wql": -0.0030483226142900954,
+                "delta_mase": -0.007813254765336897,
+                "relative_delta_mase": -0.005029486282177939,
+                "tuned": {
+                  "pinball": 3.9585475914609023,
+                  "wql": 0.04834689874196929,
+                  "mase": 1.5456763716053092,
+                  "coverage_80": 0.6638764880952381,
+                  "width_80": 29.705656166893625,
+                  "coverage_90": 0.7405133928571429,
+                  "width_90": 42.0255342887093,
+                  "num_series": 84,
+                  "num_scored": 5376
+                },
+                "zero_shot": {
+                  "pinball": 3.97065141797177,
+                  "wql": 0.0484947263128626,
+                  "mase": 1.5534896263706461,
+                  "coverage_80": 0.6687127976190477,
+                  "width_80": 34.40417412299735,
+                  "coverage_90": 0.7475818452380952,
+                  "width_90": 48.225339414852314,
+                  "num_series": 84,
+                  "num_scored": 5376
+                }
+              },
+              "loop_seattle": {
+                "delta_pinball": -0.02487179178407506,
+                "relative_delta_pinball": -0.01472308654965323,
+                "delta_wql": -0.000843405625449975,
+                "relative_delta_wql": -0.014723086549653843,
+                "delta_mase": -0.003992054082013752,
+                "relative_delta_mase": -0.005202617158589933,
+                "tuned": {
+                  "pinball": 1.66443375567675,
+                  "wql": 0.05644116052890741,
+                  "mase": 0.7633244638021734,
+                  "coverage_80": 0.7904296875,
+                  "width_80": 13.450897835195065,
+                  "coverage_90": 0.861328125,
+                  "width_90": 18.92453062068671,
+                  "num_series": 80,
+                  "num_scored": 5120
+                },
+                "zero_shot": {
+                  "pinball": 1.689305547460825,
+                  "wql": 0.05728456615435738,
+                  "mase": 0.7673165178841872,
+                  "coverage_80": 0.781640625,
+                  "width_80": 13.747029548510909,
+                  "coverage_90": 0.83671875,
+                  "width_90": 18.994699643738567,
+                  "num_series": 80,
+                  "num_scored": 5120
+                }
+              }
+            }
+          }
+        },
         "distill_0.5": {
           "mode": "head_only",
           "lr": 0.003,
@@ -5571,6 +6457,132 @@
                   "width_80": 13.500732808560134,
                   "coverage_90": 0.83125,
                   "width_90": 18.35927412547171,
+                  "num_series": 80,
+                  "num_scored": 5120
+                },
+                "zero_shot": {
+                  "pinball": 1.689305547460825,
+                  "wql": 0.05728456615435738,
+                  "mase": 0.7673165178841872,
+                  "coverage_80": 0.781640625,
+                  "width_80": 13.747029548510909,
+                  "coverage_90": 0.83671875,
+                  "width_90": 18.994699643738567,
+                  "num_series": 80,
+                  "num_scored": 5120
+                }
+              }
+            }
+          }
+        },
+        "distill_0.1": {
+          "mode": "head_only",
+          "lr": 0.003,
+          "seed": 0,
+          "replay_config": {
+            "replay_fraction": 0.0,
+            "distill_weight": 0.1,
+            "batch_size": null,
+            "sign_flip": null,
+            "cache_base_outputs": true,
+            "smooth_beta": 0.001
+          },
+          "wall_s": 30.98,
+          "best_step": 200,
+          "val": {
+            "wql": 0.22659550063139006,
+            "mase": 0.80510743663132
+          },
+          "test": {
+            "pinball": 0.12332554906541346,
+            "wql": 0.20791041284065157,
+            "mase": 0.8138802333387618,
+            "coverage_80": 0.8221028645833334,
+            "width_80": 1.1701048236969251,
+            "coverage_90": 0.9160698784722222,
+            "width_90": 1.5577517411123456,
+            "num_series": 384,
+            "num_scored": 18432
+          },
+          "forgetting": {
+            "macro_relative_delta_wql": 0.03649850850770341,
+            "macro_relative_delta_mase": 0.008887784338594374,
+            "per_domain": {
+              "ett1": {
+                "delta_pinball": 0.017048435413474783,
+                "relative_delta_pinball": 0.009508301997056066,
+                "delta_wql": 0.0016108375119941454,
+                "relative_delta_wql": 0.009508301997055902,
+                "delta_mase": 0.0027136254052295694,
+                "relative_delta_mase": 0.00258390035186717,
+                "tuned": {
+                  "pinball": 1.810053686903517,
+                  "wql": 0.1710246311097276,
+                  "mase": 1.0529187555174098,
+                  "coverage_80": 0.7421875,
+                  "width_80": 12.938840899416912,
+                  "coverage_90": 0.8655133928571429,
+                  "width_90": 17.575083390144364,
+                  "num_series": 28,
+                  "num_scored": 1792
+                },
+                "zero_shot": {
+                  "pinball": 1.7930052514900423,
+                  "wql": 0.16941379359773345,
+                  "mase": 1.0502051301121802,
+                  "coverage_80": 0.734375,
+                  "width_80": 12.750610640272498,
+                  "coverage_90": 0.8560267857142857,
+                  "width_90": 17.469724164943077,
+                  "num_series": 28,
+                  "num_scored": 1792
+                }
+              },
+              "jena_weather": {
+                "delta_pinball": 0.3224162673066062,
+                "relative_delta_pinball": 0.08119984188168757,
+                "delta_wql": 0.0039377641087001425,
+                "relative_delta_wql": 0.08119984188168727,
+                "delta_mase": 0.017775980709855865,
+                "relative_delta_mase": 0.011442613074530247,
+                "tuned": {
+                  "pinball": 4.293067685278376,
+                  "wql": 0.05243249042156274,
+                  "mase": 1.571265607080502,
+                  "coverage_80": 0.5840773809523809,
+                  "width_80": 32.275494320054676,
+                  "coverage_90": 0.6636904761904762,
+                  "width_90": 44.15678113765403,
+                  "num_series": 84,
+                  "num_scored": 5376
+                },
+                "zero_shot": {
+                  "pinball": 3.97065141797177,
+                  "wql": 0.0484947263128626,
+                  "mase": 1.5534896263706461,
+                  "coverage_80": 0.6687127976190477,
+                  "width_80": 34.40417412299735,
+                  "coverage_90": 0.7475818452380952,
+                  "width_90": 48.225339414852314,
+                  "num_series": 84,
+                  "num_scored": 5376
+                }
+              },
+              "loop_seattle": {
+                "delta_pinball": 0.03173762803409419,
+                "relative_delta_pinball": 0.018787381644367794,
+                "delta_wql": 0.0010762270066739035,
+                "relative_delta_wql": 0.018787381644367045,
+                "delta_mase": 0.00969645575078848,
+                "relative_delta_mase": 0.012636839589385704,
+                "tuned": {
+                  "pinball": 1.7210431754949191,
+                  "wql": 0.05836079316103129,
+                  "mase": 0.7770129736349757,
+                  "coverage_80": 0.7859375,
+                  "width_80": 13.934102586098016,
+                  "coverage_90": 0.8421875,
+                  "width_90": 19.302876566536725,
                   "num_series": 80,
                   "num_scored": 5120
                 },
@@ -7044,6 +8056,386 @@
                 "width_80": 18.44248404726386,
                 "coverage_90": 0.93515625,
                 "width_90": 26.142952275648714,
+                "num_series": 80,
+                "num_scored": 5120
+              },
+              "zero_shot": {
+                "pinball": 1.7250957545606154,
+                "wql": 0.05849821663302168,
+                "mase": 0.8130226673915872,
+                "coverage_80": 0.8111328125,
+                "width_80": 15.584681832045316,
+                "coverage_90": 0.8763671875,
+                "width_90": 21.51379627790302,
+                "num_series": 80,
+                "num_scored": 5120
+              }
+            }
+          }
+        }
+      }
+    ],
+    "lr3e-3_distill_0.1": [
+      {
+        "mode": "lora_temporal",
+        "lr": 0.003,
+        "seed": 0,
+        "replay_config": {
+          "replay_fraction": 0.0,
+          "distill_weight": 0.1,
+          "batch_size": null,
+          "sign_flip": null,
+          "cache_base_outputs": true,
+          "smooth_beta": 0.001
+        },
+        "wall_s": 48.54,
+        "best_step": 150,
+        "val": {
+          "wql": 0.17866213278488585,
+          "mase": 1.3124651567169958
+        },
+        "test": {
+          "pinball": 0.0008630773864139471,
+          "wql": 0.2169559115926553,
+          "mase": 1.7724672453701031,
+          "coverage_80": 0.7365196078431373,
+          "width_80": 0.006261044034818636,
+          "coverage_90": 0.8547794117647058,
+          "width_90": 0.008883299084534443,
+          "num_series": 153,
+          "num_scored": 4896
+        },
+        "forgetting": {
+          "macro_relative_delta_wql": -0.009983556922807139,
+          "macro_relative_delta_mase": 0.01540024149690187,
+          "per_domain": {
+            "ett1": {
+              "delta_pinball": 0.011029855024867974,
+              "relative_delta_pinball": 0.006047846289334218,
+              "delta_wql": 0.0010421662630618889,
+              "relative_delta_wql": 0.006047846289333612,
+              "delta_mase": 0.005380715179031936,
+              "relative_delta_mase": 0.0049513006223192175,
+              "tuned": {
+                "pinball": 1.8347956217441481,
+                "wql": 0.1733623961769609,
+                "mase": 1.0921083428203482,
+                "coverage_80": 0.7723214285714286,
+                "width_80": 14.95527295615258,
+                "coverage_90": 0.8922991071428571,
+                "width_90": 20.471385678209895,
+                "num_series": 28,
+                "num_scored": 1792
+              },
+              "zero_shot": {
+                "pinball": 1.8237657667192801,
+                "wql": 0.172320229913899,
+                "mase": 1.0867276276413163,
+                "coverage_80": 0.7399553571428571,
+                "width_80": 14.073255628879581,
+                "coverage_90": 0.8666294642857143,
+                "width_90": 19.286059927062265,
+                "num_series": 28,
+                "num_scored": 1792
+              }
+            },
+            "jena_weather": {
+              "delta_pinball": -0.1677069453125184,
+              "relative_delta_pinball": -0.04230371754297762,
+              "delta_wql": -0.0020482539406219413,
+              "relative_delta_wql": -0.04230371754297752,
+              "delta_mase": -0.01779361079899222,
+              "relative_delta_mase": -0.011675474167719557,
+              "tuned": {
+                "pinball": 3.7966478455433887,
+                "wql": 0.04636956982489141,
+                "mase": 1.5062225056674496,
+                "coverage_80": 0.7018229166666666,
+                "width_80": 31.122690259702967,
+                "coverage_90": 0.7831101190476191,
+                "width_90": 46.46510131474206,
+                "num_series": 84,
+                "num_scored": 5376
+              },
+              "zero_shot": {
+                "pinball": 3.964354790855907,
+                "wql": 0.04841782376551335,
+                "mase": 1.5240161164664419,
+                "coverage_80": 0.6904761904761905,
+                "width_80": 35.78914243768548,
+                "coverage_90": 0.7832961309523809,
+                "width_90": 50.55954084151478,
+                "num_series": 84,
+                "num_scored": 5376
+              }
+            },
+            "loop_seattle": {
+              "delta_pinball": 0.010877074588711233,
+              "relative_delta_pinball": 0.006305200485222712,
+              "delta_wql": 0.0003688429838991786,
+              "relative_delta_wql": 0.0063052004852224884,
+              "delta_mase": 0.04302914177274264,
+              "relative_delta_mase": 0.052924898036105957,
+              "tuned": {
+                "pinball": 1.7359728291493266,
+                "wql": 0.05886705961692086,
+                "mase": 0.8560518091643299,
+                "coverage_80": 0.8171875,
+                "width_80": 16.658319737762213,
+                "coverage_90": 0.8998046875,
+                "width_90": 23.488420510850847,
+                "num_series": 80,
+                "num_scored": 5120
+              },
+              "zero_shot": {
+                "pinball": 1.7250957545606154,
+                "wql": 0.05849821663302168,
+                "mase": 0.8130226673915872,
+                "coverage_80": 0.8111328125,
+                "width_80": 15.584681832045316,
+                "coverage_90": 0.8763671875,
+                "width_90": 21.51379627790302,
+                "num_series": 80,
+                "num_scored": 5120
+              }
+            }
+          }
+        }
+      },
+      {
+        "mode": "lora_temporal",
+        "lr": 0.003,
+        "seed": 1,
+        "replay_config": {
+          "replay_fraction": 0.0,
+          "distill_weight": 0.1,
+          "batch_size": null,
+          "sign_flip": null,
+          "cache_base_outputs": true,
+          "smooth_beta": 0.001
+        },
+        "wall_s": 48.21,
+        "best_step": 200,
+        "val": {
+          "wql": 0.1787962685292262,
+          "mase": 1.312442446315445
+        },
+        "test": {
+          "pinball": 0.0008676805037802489,
+          "wql": 0.21811301933304394,
+          "mase": 1.7749062852043955,
+          "coverage_80": 0.7448937908496732,
+          "width_80": 0.0062439214367627964,
+          "coverage_90": 0.8529411764705882,
+          "width_90": 0.008688365107219974,
+          "num_series": 153,
+          "num_scored": 4896
+        },
+        "forgetting": {
+          "macro_relative_delta_wql": 0.006299737357611887,
+          "macro_relative_delta_mase": 0.0272665916790622,
+          "per_domain": {
+            "ett1": {
+              "delta_pinball": 0.017903080739866795,
+              "relative_delta_pinball": 0.009816546108370119,
+              "delta_wql": 0.001691589482354594,
+              "relative_delta_wql": 0.009816546108369333,
+              "delta_mase": 0.004026354617474359,
+              "relative_delta_mase": 0.003705026462070671,
+              "tuned": {
+                "pinball": 1.841668847459147,
+                "wql": 0.1740118193962536,
+                "mase": 1.0907539822587906,
+                "coverage_80": 0.765625,
+                "width_80": 15.033336767793767,
+                "coverage_90": 0.8861607142857143,
+                "width_90": 20.399868154033488,
+                "num_series": 28,
+                "num_scored": 1792
+              },
+              "zero_shot": {
+                "pinball": 1.8237657667192801,
+                "wql": 0.172320229913899,
+                "mase": 1.0867276276413163,
+                "coverage_80": 0.7399553571428571,
+                "width_80": 14.073255628879581,
+                "coverage_90": 0.8666294642857143,
+                "width_90": 19.286059927062265,
+                "num_series": 28,
+                "num_scored": 1792
+              }
+            },
+            "jena_weather": {
+              "delta_pinball": -0.16685636616354493,
+              "relative_delta_pinball": -0.04208916077552194,
+              "delta_wql": -0.0020378655688676126,
+              "relative_delta_wql": -0.04208916077552264,
+              "delta_mase": -0.04068718470052479,
+              "relative_delta_mase": -0.026697345428906234,
+              "tuned": {
+                "pinball": 3.797498424692362,
+                "wql": 0.04637995819664574,
+                "mase": 1.483328931765917,
+                "coverage_80": 0.7107514880952381,
+                "width_80": 34.266408918831,
+                "coverage_90": 0.8069196428571429,
+                "width_90": 50.849231289069245,
+                "num_series": 84,
+                "num_scored": 5376
+              },
+              "zero_shot": {
+                "pinball": 3.964354790855907,
+                "wql": 0.04841782376551335,
+                "mase": 1.5240161164664419,
+                "coverage_80": 0.6904761904761905,
+                "width_80": 35.78914243768548,
+                "coverage_90": 0.7832961309523809,
+                "width_90": 50.55954084151478,
+                "num_series": 84,
+                "num_scored": 5376
+              }
+            },
+            "loop_seattle": {
+              "delta_pinball": 0.08827630106226692,
+              "relative_delta_pinball": 0.0511718267399893,
+              "delta_wql": 0.0029934606061433264,
+              "relative_delta_wql": 0.05117182673998897,
+              "delta_mase": 0.08519834778870006,
+              "relative_delta_mase": 0.10479209400402216,
+              "tuned": {
+                "pinball": 1.8133720556228823,
+                "wql": 0.06149167723916501,
+                "mase": 0.8982210151802873,
+                "coverage_80": 0.81640625,
+                "width_80": 17.204094893112778,
+                "coverage_90": 0.9046875,
+                "width_90": 23.976623325422405,
+                "num_series": 80,
+                "num_scored": 5120
+              },
+              "zero_shot": {
+                "pinball": 1.7250957545606154,
+                "wql": 0.05849821663302168,
+                "mase": 0.8130226673915872,
+                "coverage_80": 0.8111328125,
+                "width_80": 15.584681832045316,
+                "coverage_90": 0.8763671875,
+                "width_90": 21.51379627790302,
+                "num_series": 80,
+                "num_scored": 5120
+              }
+            }
+          }
+        }
+      },
+      {
+        "mode": "lora_temporal",
+        "lr": 0.003,
+        "seed": 2,
+        "replay_config": {
+          "replay_fraction": 0.0,
+          "distill_weight": 0.1,
+          "batch_size": null,
+          "sign_flip": null,
+          "cache_base_outputs": true,
+          "smooth_beta": 0.001
+        },
+        "wall_s": 47.93,
+        "best_step": 200,
+        "val": {
+          "wql": 0.17857794169910168,
+          "mase": 1.311172873567428
+        },
+        "test": {
+          "pinball": 0.0008685485223134926,
+          "wql": 0.2183312173244681,
+          "mase": 1.781431923908742,
+          "coverage_80": 0.7391748366013072,
+          "width_80": 0.006235704158742462,
+          "coverage_90": 0.8486519607843137,
+          "width_90": 0.008598611574544682,
+          "num_series": 153,
+          "num_scored": 4896
+        },
+        "forgetting": {
+          "macro_relative_delta_wql": -0.002714868540311314,
+          "macro_relative_delta_mase": 0.011978148542563233,
+          "per_domain": {
+            "ett1": {
+              "delta_pinball": 0.06807449542182376,
+              "relative_delta_pinball": 0.03732633689263781,
+              "delta_wql": 0.006432082955182994,
+              "relative_delta_wql": 0.037326336892637785,
+              "delta_mase": 0.007037809835678921,
+              "relative_delta_mase": 0.006476148812885256,
+              "tuned": {
+                "pinball": 1.891840262141104,
+                "wql": 0.178752312869082,
+                "mase": 1.0937654374769952,
+                "coverage_80": 0.7712053571428571,
+                "width_80": 15.728826784129653,
+                "coverage_90": 0.8800223214285714,
+                "width_90": 21.52847385912069,
+                "num_series": 28,
+                "num_scored": 1792
+              },
+              "zero_shot": {
+                "pinball": 1.8237657667192801,
+                "wql": 0.172320229913899,
+                "mase": 1.0867276276413163,
+                "coverage_80": 0.7399553571428571,
+                "width_80": 14.073255628879581,
+                "coverage_90": 0.8666294642857143,
+                "width_90": 19.286059927062265,
+                "num_series": 28,
+                "num_scored": 1792
+              }
+            },
+            "jena_weather": {
+              "delta_pinball": -0.1717660220954098,
+              "relative_delta_pinball": -0.04332761096247024,
+              "delta_wql": -0.0020978286317616043,
+              "relative_delta_wql": -0.043327610962470155,
+              "delta_mase": -0.025377762713684193,
+              "relative_delta_mase": -0.01665189917579392,
+              "tuned": {
+                "pinball": 3.7925887687604973,
+                "wql": 0.04631999513375175,
+                "mase": 1.4986383537527577,
+                "coverage_80": 0.7047991071428571,
+                "width_80": 33.59369400708302,
+                "coverage_90": 0.7946428571428571,
+                "width_90": 51.12298496461814,
+                "num_series": 84,
+                "num_scored": 5376
+              },
+              "zero_shot": {
+                "pinball": 3.964354790855907,
+                "wql": 0.04841782376551335,
+                "mase": 1.5240161164664419,
+                "coverage_80": 0.6904761904761905,
+                "width_80": 35.78914243768548,
+                "coverage_90": 0.7832961309523809,
+                "width_90": 50.55954084151478,
+                "num_series": 84,
+                "num_scored": 5376
+              }
+            },
+            "loop_seattle": {
+              "delta_pinball": -0.0036974521594208554,
+              "relative_delta_pinball": -0.0021433315511014068,
+              "delta_wql": -0.0001253810733927302,
+              "relative_delta_wql": -0.002143331551101573,
+              "delta_mase": 0.03748863453822515,
+              "relative_delta_mase": 0.04611019599059836,
+              "tuned": {
+                "pinball": 1.7213983024011945,
+                "wql": 0.05837283555962895,
+                "mase": 0.8505113019298124,
+                "coverage_80": 0.83515625,
+                "width_80": 17.322984172403814,
+                "coverage_90": 0.915625,
+                "width_90": 24.25537248067558,
                 "num_series": 80,
                 "num_scored": 5120
               },

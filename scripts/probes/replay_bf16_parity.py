@@ -25,7 +25,7 @@ import torch
 from timestral_tune._vendor.timestral.config import TimestralConfig
 from timestral_tune.config import ReplayConfig, TrainingConfig
 from timestral_tune.data import ColumnRoles, SeriesData, TimeSeriesDataset
-from timestral_tune.models import TuneTimestralModel, load_model
+from timestral_tune.models import DEFAULT_QUANTILE_LEVELS, TuneTimestralModel, load_model
 from timestral_tune.replay import SyntheticReplaySource
 from timestral_tune.trainer import TimestralTrainer
 
@@ -69,10 +69,11 @@ def _load_base(size: str) -> tuple[TuneTimestralModel, int, int]:
             d_model=32,
             num_heads=2,
             mlp_hidden_dim=64,
-            block_schedule=("time", "time", "time", "time+variate"),
+            block_schedule=("time", "time", "time", "time_variate"),
             patch_size=4,
             block_size=4,
             context_length=64,
+            quantile_knots=DEFAULT_QUANTILE_LEVELS,
             covariate_enabled=True,
         )
         return TuneTimestralModel(cfg), 32, 8

@@ -8,15 +8,15 @@
       "forward_parity": {
         "predict_block_uni": {
           "rel_l2_vs_cpu": 1.3862469526363844e-07,
-          "mps_ms": 135.0
+          "mps_ms": 127.5
         },
         "predict_block_cov": {
           "rel_l2_vs_cpu": 1.0930029611444344e-06,
-          "mps_ms": 99.6
+          "mps_ms": 101.4
         },
         "forecast_96_cov_cat": {
           "rel_l2_vs_cpu": 1.0942204795735332e-07,
-          "mps_ms": 291.5
+          "mps_ms": 307.8
         }
       },
       "gradient_parity": {
@@ -32,30 +32,30 @@
       "training_steps_ctx256_cov5_b8": {
         "head_only": {
           "ok": true,
-          "median_ms": 79.0,
+          "median_ms": 84.5,
           "allocated_gib": 0.513,
           "driver_gib": 0.59,
           "loss": 0.16244
         },
         "lora_variate": {
           "ok": true,
-          "median_ms": 182.3,
+          "median_ms": 192.2,
           "allocated_gib": 0.472,
           "driver_gib": 1.261,
-          "loss": 0.16447
+          "loss": 0.1646
         },
         "lora_temporal": {
           "ok": true,
-          "median_ms": 213.0,
-          "allocated_gib": 0.483,
+          "median_ms": 224.3,
+          "allocated_gib": 0.482,
           "driver_gib": 1.277,
-          "loss": 0.15348
+          "loss": 0.15528
         },
         "full_ft": {
           "ok": true,
-          "median_ms": 346.3,
-          "allocated_gib": 1.885,
-          "driver_gib": 2.605,
+          "median_ms": 361.9,
+          "allocated_gib": 1.89,
+          "driver_gib": 2.574,
           "loss": 0.1073
         }
       }
@@ -65,15 +65,15 @@
       "forward_parity": {
         "predict_block_uni": {
           "rel_l2_vs_cpu": 1.1846204817718767e-07,
-          "mps_ms": 96.4
+          "mps_ms": 110.6
         },
         "predict_block_cov": {
           "rel_l2_vs_cpu": 3.93234653096969e-07,
-          "mps_ms": 141.8
+          "mps_ms": 149.4
         },
         "forecast_96_cov_cat": {
           "rel_l2_vs_cpu": 9.509990514361883e-08,
-          "mps_ms": 434.2
+          "mps_ms": 462.3
         }
       },
       "gradient_parity": {
@@ -89,29 +89,29 @@
       "training_steps_ctx256_cov5_b8": {
         "head_only": {
           "ok": true,
-          "median_ms": 126.6,
+          "median_ms": 129.9,
           "allocated_gib": 0.836,
-          "driver_gib": 1.058,
+          "driver_gib": 1.05,
           "loss": 0.17462
         },
         "lora_variate": {
           "ok": true,
-          "median_ms": 293.8,
+          "median_ms": 318.1,
           "allocated_gib": 0.785,
           "driver_gib": 2.058,
-          "loss": 0.16722
+          "loss": 0.16654
         },
         "lora_temporal": {
           "ok": true,
-          "median_ms": 335.2,
+          "median_ms": 374.6,
           "allocated_gib": 0.836,
           "driver_gib": 2.043,
-          "loss": 0.15369
+          "loss": 0.15301
         },
         "full_ft": {
           "ok": true,
-          "median_ms": 545.4,
-          "allocated_gib": 3.215,
+          "median_ms": 663.6,
+          "allocated_gib": 3.209,
           "driver_gib": 4.074,
           "loss": 0.10277
         }
@@ -126,14 +126,14 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 3.763801511307448e-07,
-          "mps_ms": 21.6,
+          "mps_ms": 29.7,
           "allocated_gib": 0.107,
           "driver_gib": 4.074
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 86.3,
-          "allocated_gib": 0.229,
+          "mps_ms": 123.2,
+          "allocated_gib": 0.226,
           "driver_gib": 4.097,
           "loss": 0.05245
         }
@@ -144,14 +144,14 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 2.436700205507447e-07,
-          "mps_ms": 40.5,
+          "mps_ms": 54.2,
           "allocated_gib": 0.108,
           "driver_gib": 4.05
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 123.1,
-          "allocated_gib": 0.229,
+          "mps_ms": 151.5,
+          "allocated_gib": 0.226,
           "driver_gib": 4.113,
           "loss": 0.01839
         }
@@ -162,14 +162,14 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 1.0415624927022991e-07,
-          "mps_ms": 53.3,
+          "mps_ms": 68.1,
           "allocated_gib": 0.108,
           "driver_gib": 4.05
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 156.4,
-          "allocated_gib": 0.229,
+          "mps_ms": 155.0,
+          "allocated_gib": 0.227,
           "driver_gib": 4.183,
           "loss": 0.03128
         }
@@ -180,14 +180,14 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 4.777180510610621e-07,
-          "mps_ms": 78.6,
+          "mps_ms": 75.8,
           "allocated_gib": 0.108,
           "driver_gib": 4.05
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 244.6,
-          "allocated_gib": 0.229,
+          "mps_ms": 272.8,
+          "allocated_gib": 0.226,
           "driver_gib": 4.058,
           "loss": 0.00553
         }
@@ -195,25 +195,25 @@
       "extra": {
         "full_ft_32768_b1_uni": {
           "ok": true,
-          "mps_ms": 272.9,
-          "allocated_gib": 0.561,
+          "mps_ms": 294.2,
+          "allocated_gib": 0.565,
           "driver_gib": 4.113,
           "loss": 0.00553
         },
         "cov3_8192_b1": {
           "ok": true,
           "inf_rel_l2_vs_cpu": 1.0980521774766453e-05,
-          "inf_ms": 289.4,
-          "train_lora_t_ms": 691.9,
-          "allocated_gib": 0.22,
+          "inf_ms": 122.1,
+          "train_lora_t_ms": 185.5,
+          "allocated_gib": 0.219,
           "driver_gib": 4.062
         },
         "cov3_16384_b1": {
           "ok": true,
           "inf_rel_l2_vs_cpu": 3.4692409554356033e-07,
-          "inf_ms": 245.8,
-          "train_lora_t_ms": 594.8,
-          "allocated_gib": 0.221,
+          "inf_ms": 246.6,
+          "train_lora_t_ms": 335.4,
+          "allocated_gib": 0.22,
           "driver_gib": 4.062
         }
       }
@@ -225,13 +225,13 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 2.8847598990463877e-07,
-          "mps_ms": 55.1,
+          "mps_ms": 50.0,
           "allocated_gib": 0.47,
           "driver_gib": 0.523
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 113.8,
+          "mps_ms": 128.2,
           "allocated_gib": 0.95,
           "driver_gib": 1.156,
           "loss": 0.05259
@@ -243,13 +243,13 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 2.337909343356534e-07,
-          "mps_ms": 61.1,
+          "mps_ms": 65.6,
           "allocated_gib": 0.471,
           "driver_gib": 0.554
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 173.8,
+          "mps_ms": 181.9,
           "allocated_gib": 0.951,
           "driver_gib": 1.351,
           "loss": 0.01907
@@ -261,13 +261,13 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 8.091731541252338e-08,
-          "mps_ms": 108.5,
+          "mps_ms": 116.1,
           "allocated_gib": 0.471,
           "driver_gib": 0.554
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 322.4,
+          "mps_ms": 352.6,
           "allocated_gib": 0.952,
           "driver_gib": 2.0,
           "loss": 0.02799
@@ -279,13 +279,13 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 5.081671593812139e-07,
-          "mps_ms": 244.3,
+          "mps_ms": 257.0,
           "allocated_gib": 0.471,
           "driver_gib": 1.554
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 697.2,
+          "mps_ms": 759.3,
           "allocated_gib": 0.952,
           "driver_gib": 4.031,
           "loss": 0.00507
@@ -294,24 +294,24 @@
       "extra": {
         "full_ft_32768_b1_uni": {
           "ok": true,
-          "mps_ms": 863.6,
-          "allocated_gib": 2.348,
-          "driver_gib": 4.086,
+          "mps_ms": 935.5,
+          "allocated_gib": 2.354,
+          "driver_gib": 4.054,
           "loss": 0.00507
         },
         "cov3_8192_b1": {
           "ok": true,
           "inf_rel_l2_vs_cpu": 6.304450402459739e-06,
-          "inf_ms": 339.5,
-          "train_lora_t_ms": 530.6,
+          "inf_ms": 383.4,
+          "train_lora_t_ms": 494.8,
           "allocated_gib": 0.951,
           "driver_gib": 2.781
         },
         "cov3_16384_b1": {
           "ok": true,
           "inf_rel_l2_vs_cpu": 2.170662703426708e-07,
-          "inf_ms": 665.8,
-          "train_lora_t_ms": 915.9,
+          "inf_ms": 759.4,
+          "train_lora_t_ms": 1029.8,
           "allocated_gib": 0.953,
           "driver_gib": 4.562
         }
@@ -324,13 +324,13 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 3.6800922296578623e-07,
-          "mps_ms": 73.9,
+          "mps_ms": 73.2,
           "allocated_gib": 0.794,
           "driver_gib": 2.023
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 159.3,
+          "mps_ms": 165.3,
           "allocated_gib": 1.591,
           "driver_gib": 2.164,
           "loss": 0.05258
@@ -342,13 +342,13 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 2.9997398077879745e-07,
-          "mps_ms": 90.6,
+          "mps_ms": 95.7,
           "allocated_gib": 0.794,
           "driver_gib": 2.031
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 245.9,
+          "mps_ms": 265.7,
           "allocated_gib": 1.592,
           "driver_gib": 2.265,
           "loss": 0.01963
@@ -360,13 +360,13 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 6.749486984348512e-08,
-          "mps_ms": 164.8,
+          "mps_ms": 180.9,
           "allocated_gib": 0.794,
           "driver_gib": 2.023
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 467.1,
+          "mps_ms": 506.8,
           "allocated_gib": 1.591,
           "driver_gib": 3.039,
           "loss": 0.03317
@@ -378,13 +378,13 @@
         "inference": {
           "ok": true,
           "rel_l2_vs_cpu": 5.318118866113699e-07,
-          "mps_ms": 340.2,
+          "mps_ms": 375.0,
           "allocated_gib": 0.794,
           "driver_gib": 2.023
         },
         "train_lora_temporal_b1": {
           "ok": true,
-          "mps_ms": 1049.9,
+          "mps_ms": 1169.5,
           "allocated_gib": 1.59,
           "driver_gib": 5.07,
           "loss": 0.00507
@@ -393,24 +393,24 @@
       "extra": {
         "full_ft_32768_b1_uni": {
           "ok": true,
-          "mps_ms": 1309.9,
-          "allocated_gib": 4.056,
+          "mps_ms": 1469.4,
+          "allocated_gib": 4.059,
           "driver_gib": 6.086,
           "loss": 0.00507
         },
         "cov3_8192_b1": {
           "ok": true,
           "inf_rel_l2_vs_cpu": 1.6878418925865973e-06,
-          "inf_ms": 508.5,
-          "train_lora_t_ms": 730.7,
+          "inf_ms": 605.0,
+          "train_lora_t_ms": 825.4,
           "allocated_gib": 1.593,
           "driver_gib": 4.133
         },
         "cov3_16384_b1": {
           "ok": true,
           "inf_rel_l2_vs_cpu": 4.7165493054849985e-07,
-          "inf_ms": 1035.8,
-          "train_lora_t_ms": 1429.0,
+          "inf_ms": 1376.3,
+          "train_lora_t_ms": 1692.4,
           "allocated_gib": 1.597,
           "driver_gib": 6.101
         }
