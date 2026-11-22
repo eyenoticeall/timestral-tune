@@ -623,5 +623,10 @@ not started.
     retail forgetting on `5M`) across `README.md`, `TrainingConfig` docstring, `docs/SPEC.md` (§5.4, D19, §12),
     `docs/BENCHMARKS.md` §2.2, `docs/STATUS.md`, and Phase 3 notes.
 
-**Not done / open.** `phase-3` is unpushed and unmerged pending final review; PyPI release awaits maintainer
-approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.
+  - Re-ran full `bash scripts/cuda_check.sh` on an NVIDIA L4 VM at commit `542568c` (post dual-orientation
+    `head_only` cache; VM and disk deleted immediately after): **255 passed, 2 skipped** on device tests and
+    **538 passed, 3 skipped** overall (exit 0), exercising all 4 `bf16` CUDA modes, dual-orientation caching,
+    shape-bucketed `reduce-overhead` compile, and T1–T14.
+
+**Not done / open.** `phase-3` is unpushed and unmerged pending maintainer go-ahead; PyPI release awaits
+maintainer approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.

@@ -316,10 +316,10 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 | 2.4.0 | 3.12 | 411 passed, 26 skipped (`3fe5bc9`; network-free post-review-fix pass also verified). Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 CUDA-only `bf16` tests; 77 further Apple GPU cases are not generated at all |
 | 2.8.0 | 3.12 | 510 passed, 4 skipped (`3fe5bc9`; the 4 CUDA-only `bf16` tests), including every Apple GPU test and all 14 acceptance tests |
 | 2.14.1 | 3.10 | 510 passed, 4 skipped (`3fe5bc9`; `uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 526 passed, 4 skipped (includes all Phase 2 review-fix and mutation-guard tests) |
+| 2.15.0 | 3.13 | 536 passed, 5 skipped (includes all Phase 3 metrics, sign-flip, Lacuna, and mutation-guard tests) |
 
-These are the counts on `phase-2` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
-The CUDA run (§13) used Linux on the same branch (`6880061`) and passed all 4 `bf16` tests as well (528 passed, 2 skipped).
+These are the counts on `phase-3` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
+The CUDA run (§13) used Linux on the same branch (`542568c`) and passed all 4 `bf16` tests as well (538 passed, 3 skipped).
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
@@ -370,14 +370,14 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 ## 13. CUDA
 
 Run: `bash scripts/cuda_check.sh` on an NVIDIA L4 VM (`g2-standard-4`, Ubuntu 22.04, 4 CPU threads,
-PyTorch 2.15.0+cu132, Python 3.12) on `phase-2` at commit `6880061` (2026-11-22; `step_timing.py`
+PyTorch 2.15.0+cu132, Python 3.12) on `phase-3` at commit `542568c` (2026-11-22; `step_timing.py`
 `--bf16`/`--compile` probe rows from the same hardware at `b0980cb`). All gradient numbers here use the
 float64-RMSNorm reference of §6.
 
 | Check | Result |
 |---|---|
-| T14 and all other device-parametrised tests | 253 passed, 2 skipped (the Apple GPU tests) |
-| Whole suite (including T1–T14, all 4 `bf16` CUDA modes + head-cache autocast, shape-bucketed `reduce-overhead` compile, `load_lora` resume) | 528 passed, 2 skipped (only the 2 Apple GPU tests) |
+| T14 and all other device-parametrised tests | 255 passed, 2 skipped (the Apple GPU tests) |
+| Whole suite (including T1–T14, all 4 `bf16` CUDA modes + dual-orientation `head_only` cache, shape-bucketed `reduce-overhead` compile, `load_lora` resume, Phase 3 metrics/sign-flip/Lacuna) | 538 passed, 3 skipped (2 Apple GPU tests + 1 optional `lacuna` test) |
 | `head_only` gradients on CUDA against the reference | At most 1.7e-6 (bound 1e-5) |
 | Verifiers (`run_checks`) on CUDA | Pass (part of the suite) |
 | `step_timing.py --device cuda --bf16 --compile default` (`full_ft`, batch 32, ctx 1,024; `b0980cb`) | 5M uni 21 ms / 0.18 GiB, cov5 25 ms / 0.58 GiB; 28M uni 32 ms / 0.73 GiB, cov5 62 ms / 1.90 GiB |

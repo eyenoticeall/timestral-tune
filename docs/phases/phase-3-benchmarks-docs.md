@@ -43,8 +43,9 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
   `full_ft=1e-4`, D19), unified `sweeps_bracketed.json` (dropping `sweeps_extra.json`), re-ran all
   benchmarks, fresh train-only precision ablation, and `sig_v2.json` at shipped defaults on L4 (VM
   deleted immediately after), and added `docs/VERIFICATION.md` §14 backing all `[V]` claims.
-- 2026-11-22 (`40d29fe` and final `docs:` commit): closed the last 3 mutation-test gaps (staggered ACI
-  origin order, 2× dual-cache memory cap, unflipped post-`fit()` training evaluation) and documented the
-  maintainer decision keeping `full_ft=1e-4` as the single cross-size default while recommending `3e-4` for
-  `full_ft` on `5M` and `28M` (with exact provenance and forgetting cost) across `README.md`,
-  `TrainingConfig`, `SPEC.md`, `BENCHMARKS.md` §2.2, `STATUS.md`, and `DEVLOG.md`.
+- 2026-11-22 (`40d29fe`, `542568c`, and final CUDA verification): closed the last 3 mutation-test gaps
+  (staggered ACI origin order, 2× dual-cache memory cap, unflipped post-`fit()` training evaluation),
+  documented the maintainer decision keeping `full_ft=1e-4` as the single cross-size default while
+  recommending `3e-4` for `full_ft` on `5M` and `28M`, and verified `bash scripts/cuda_check.sh` on NVIDIA
+  L4 at `542568c`: **255 passed, 2 skipped** (device tests) and **538 passed, 3 skipped** (whole suite, exit 0;
+  VM deleted immediately after).
