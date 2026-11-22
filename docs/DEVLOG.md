@@ -825,3 +825,26 @@ around one chart, and a section on memory use and training time.
   `bench_123m_209m.json` (NVIDIA L4, `bf16`).
 
 **Not done / open.** The PyPI project page keeps the `0.1.0` README until the next release.
+
+---
+
+## 2026-11-23 — Document support for checkpoints of other sizes
+
+**Done.** The maintainer asked whether the library is tied to the four released sizes, and then to
+document that it is not. Checked before writing it:
+
+- The size names appear in non-vendored code only as pinned Hub revisions; every model dimension comes
+  from the checkpoint's `config.json`.
+- The four released configs differ only in width, depth, head count and MLP width. They share layer
+  kinds (`time`, `time_variate`), the `sdpa_sigmoid` gate and the 21 quantile knots. The claim is scoped
+  to that: the vendored config also allows `variate` and `variate_time` layers and an ungated
+  attention, which no released model uses and no test here trains.
+- New test `test_local_checkpoint_of_an_unreleased_shape_trains_and_exports`: a third shape, saved to
+  a directory, loaded by path in the trainer, trained in all four modes, exported, and reloaded by the
+  vendored upstream loader with `strict=True`. Until now the trainer's load-by-local-path route was
+  only exercised through `load_model`, not end to end.
+
+README gained an "Other model sizes" section; spec §3.1, `docs/VERIFICATION.md` §8 and STATUS updated.
+
+**Not done / open.** Nothing above 209M has been run. Full fine-tuning at that scale would need
+features the library lacks (multi-GPU, gradient accumulation, resumable runs).

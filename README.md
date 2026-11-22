@@ -17,7 +17,8 @@ data: fine-tune them, attach small LoRA adapters, or just recalibrate their pred
 
 The [official package](https://github.com/mistralai/timestral) runs the released models but cannot train
 them. `timestral-tune` adds the training side, for all four released sizes (5M, 28M, 123M and 209M
-parameters), in plain PyTorch on CUDA, CPU and Apple GPUs.
+parameters), in plain PyTorch on CUDA, CPU and Apple GPUs. Those sizes are not built in: a checkpoint
+of another size with the same architecture works too ([Other model sizes](#other-model-sizes)).
 
 - **Faithful to the paper and the official code.** The training forward pass, attention masks,
   normalisation and loss are tested against the official inference path on the released weights; in
@@ -276,6 +277,20 @@ LICENSE, NOTICE        Mistral AI's weights licence and a notice that the weight
 On a Mac the official package runs on CPU only; `load_forecaster(..., device="mps")` runs the same
 forecaster on the Apple GPU.
 
+## Other model sizes
+
+Nothing in the library is specific to the four released sizes. Width, depth, head count and patch size
+are read from the checkpoint's `config.json`, so a Timestral checkpoint of another size works the same
+way: point `model_name_or_path` at a local directory holding `config.json` and `model.safetensors`.
+
+- **The condition is the released architecture:** the same layer types, attention gate and 21 quantile
+  levels as the released models. A checkpoint with a new layer type, config field or parameter fails to
+  load with an error.
+- **What is tested:** small models of other shapes load from a directory, train in all four modes and
+  export to checkpoints the official loader accepts.
+- **What is not:** nothing larger than 209M has been run, and the default learning rates were tuned on
+  5M to 209M only.
+
 ## Hardware and versions
 
 | Device | Needs | Precision | Checked on |
@@ -289,7 +304,7 @@ Multi-GPU training is untested. Memory and timing figures are in [Memory and spe
 ## Limits
 
 - One training forward covers a forecast horizon of up to 1,024 steps and a context of up to 32,768.
-- It adapts the released checkpoints; it does not reproduce Mistral AI's pre-training.
+- It adapts existing checkpoints; it does not reproduce Mistral AI's pre-training.
 - Any public dataset may have been part of the models' training data, so benchmark gains are evidence,
   not proof.
 - The official code is vendored at a pinned commit. A change upstream can require a new release here.

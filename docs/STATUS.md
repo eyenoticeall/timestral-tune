@@ -43,7 +43,7 @@ All locally on Apple M4 (macOS, PyTorch 2.4/2.8/2.14/2.15) and on an NVIDIA L4 (
 
 - Real-dataset benchmarks and sweeps across all four checkpoints (`5M`, `28M`, `123M`, `209M`) on realised volatility (post-Oct 27, 2026), retail demand, and GIFT-Eval forgetting (`docs/BENCHMARKS.md`), `123M`/`209M` CUDA gradient accuracy and `fp32`/`math`/`bf16` training parity (`docs/VERIFICATION.md` §13), live `lacuna-quant==0.14.1` integration, Phase 4 replay/distillation forgetting ablations (`docs/BENCHMARKS.md` §5), and Apple GPU `123M`/`209M`/long-context (`4,096..32,768`) parity & training (`docs/VERIFICATION.md` §15).
 
-Not verified anywhere: multi-GPU, real general-domain replay datasets (only built-in synthetic replay was benchmarked), long-context (`4,096..32,768`) gradient parity on MPS.
+Not verified anywhere: multi-GPU, real general-domain replay datasets (only built-in synthetic replay was benchmarked), long-context (`4,096..32,768`) gradient parity on MPS, any checkpoint larger than 209M (other sizes are supported by design and tested only on small random models; spec §3.1).
 
 ## Next steps
 
