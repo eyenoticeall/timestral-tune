@@ -1,7 +1,7 @@
 # Project Status
 
 **Last updated:** 2026-11-22
-**Stage:** pre-alpha. Phases 0, 1, 2, and 3 are built and verified (`phase-3` branch off `main`; PyPI publish pending maintainer action).
+**Stage:** pre-alpha. Phases 0, 1, 2, and 3 are built, verified, and merged into `main` (PyPI publish pending maintainer action).
 **Next phase:** Phase 4 (Stretch: replay mixing, distillation, tiled training) or v0.1.0 PyPI release. See spec §10.
 
 ## What works today
@@ -21,7 +21,7 @@
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
 | Test suite | 536 passed, 5 skipped (4 CUDA-only `bf16`, 1 optional `lacuna`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; live `lacuna-quant==0.14.1`: 4/4 passed; NVIDIA L4 CUDA at `542568c`: **538 passed, 3 skipped**) |
-| CI | Green on `main` (run `44936917337`, Python 3.10–3.13 on Linux); `phase-3` pending PR/merge |
+| CI | Running/passing on `main` (Python 3.10–3.13 on Linux) |
 
 ## What does not exist yet
 
@@ -46,7 +46,7 @@ Not verified anywhere: Apple GPU on `123M`/`209M`, multi-GPU.
 
 ## Next steps
 
-1. **Review & merge `phase-3` into `main`**, then publish v0.1.0 to PyPI when ready.
+1. **Delete the merged `phase-3` branch** locally and on `origin` once confirmed (`AGENTS.md` §6), and publish v0.1.0 to PyPI when ready.
 2. **Optional Phase 4** (spec §10): replay mixing, built-in generators, distillation, tiled training.
 
 ## Open questions and known issues
@@ -60,7 +60,7 @@ Full list in spec §12. The ones that matter next:
 
 ## Branch state
 
-- `main`: Phases 0, 1, and 2 (`1b3dec1`, CI green).
-- `phase-3`: Phase 3 (raw-space metrics, forgetting metric, sign-flip augmentation, Lacuna integration, reproducible sweeps & 5M/28M benchmarks, sweep-backed defaults, `docs/BENCHMARKS.md`), open off `main`, unpushed.
+- `main`: Phases 0, 1, 2, and 3 (fast-forwarded from `phase-3` at `9c5817c` on 2026-11-22).
+- `phase-3`: merged into `main` at `9c5817c`, ready to delete per `AGENTS.md` §6.
 
 Branch policy is in `AGENTS.md` §6.

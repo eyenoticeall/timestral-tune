@@ -609,7 +609,7 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
 - [x] Lacuna integration: trial records and signal frames (`integrations/lacuna.py`, verified live against `lacuna-quant==0.14.1`).
 - [ ] Documentation, licence notices, release on PyPI (docs & packaging audited and ready; PyPI publish awaits maintainer action).
 
-**Exit:** published tables with code to reproduce them; each default in §5.4 is backed by a sweep. **Met on 2026-11-22 (branch `phase-3`; PyPI publish pending maintainer approval).**
+**Exit:** published tables with code to reproduce them; each default in §5.4 is backed by a sweep. **Met and merged into `main` on 2026-11-22 (PyPI publish pending maintainer approval).**
 
 ### Phase 4: Anti-forgetting and denser supervision (stretch)
 - [ ] Replay mixing, built-in generators, and base-model distillation.

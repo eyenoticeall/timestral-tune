@@ -1,6 +1,6 @@
 # Phase 3 — Benchmarks & Documentation
 
-**Status:** Complete on branch `phase-3` (2026-11-22; PyPI release pending maintainer approval).
+**Status:** Complete and merged into `main` (2026-11-22, fast-forwarded from `phase-3` at `9c5817c`; PyPI release pending maintainer approval).
 **Goal:** Evidence that the modes work, defaults backed by sweeps, the Lacuna integration, and a first release.
 **Spec sections:** `docs/SPEC.md` §5.3 (forgetting metric), §5.4, §5.5, §7.5, §8, §10, §12
 

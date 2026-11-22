@@ -628,5 +628,6 @@ not started.
     **538 passed, 3 skipped** overall (exit 0), exercising all 4 `bf16` CUDA modes, dual-orientation caching,
     shape-bucketed `reduce-overhead` compile, and T1–T14.
 
-**Not done / open.** `phase-3` is unpushed and unmerged pending maintainer go-ahead; PyPI release awaits
-maintainer approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.
+**Not done / open.** Phase 3 fast-forwarded into `main` at `9c5817c` and pushed to `origin/main`;
+`phase-3` awaits branch deletion (`AGENTS.md` §6). PyPI release awaits maintainer approval. Phase 4
+(stretch: replay, distillation, tiled training) has not started.
