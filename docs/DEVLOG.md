@@ -685,11 +685,36 @@ lengths) as exploratory due to token doubling (undoing D16), per-window categori
     plus `cov3` at `8,192` and `16,384` steps. Added network-marked MPS parity test in
     `tests/test_loader_device.py`.
 
-- **Verification:** full local pytest suite **561 passed, 5 skipped** (PyTorch 2.15.0 / Python 3.13);
-  PyTorch **2.4.0** floor (`-m "not network"`, Python 3.12): **307 passed, 15 skipped**; `ruff check`,
-  `ruff format --check`, `uv build`, `check_upstream_drift.py` (no drift), and tracked-privacy grep all
-  clean.
+- **Phase 4 review remediation (`258965d`, `4db0fa1`, `e3c6883`, and final `docs:` commit):**
+  - Changed `ReplayConfig()` default from `0.25 / 0.0` (which worsened `full_ft` forgetting) to light
+    label-free distillation (`replay_fraction=0.0, distill_weight=0.1, smooth_beta=1e-3`); wired
+    `ReplayConfig.smooth_beta` into both `distillation_loss` calls in `TimestralTrainer`; removed the
+    untested `bf16` round-off claim from `replay/distill.py`; rejected `replay_dataset is val_dataset`;
+    isolated `head_only` cache slots (`"train"`, `"val"`, `"replay"`) so a shared `train_dataset` never
+    silently ignores `ReplayConfig.sign_flip`; documented frozen-base semantics on resume; recorded
+    `replay_source` (type, sizes, fingerprint, synthetic seed/families) in `tune_metadata.json`; and
+    added tests for multi-target covariate replay, `smooth_beta`, val rejection, slot isolation,
+    `replay_source` export, and 9 CUDA `fp32`/`bf16`/`reduce-overhead` replay tests (39 tests total in
+    `tests/test_replay.py`).
+  - Added scientific controls to `run_replay_ablation.py` & `docs/benchmarks/replay_ablation.json`:
+    `head_only` `1e-3` lower-LR control (3 seeds on `5M`, 1 seed on `28M`), `full_ft` `2e-4` lower-LR
+    control, and `full_ft` 256-series (1,024-window) synthetic pool control. Findings (reported without
+    overclaiming in `docs/BENCHMARKS.md` §5 and `docs/SPEC.md` §5.3): plain `full_ft 2e-4` (`0.1995`,
+    worst `+1.3%`) matches or slightly beats `3e-4 + distill_0.1` (`0.1999`, worst `+1.3%`); expanding the
+    synthetic pool from 64 to 256 series lowers `full_ft` synthetic-pinball forgetting from `+4.1%` back to
+    `+2.8%` (showing small-pool memorisation drove the extra jump, while synthetic pinball still fails to
+    improve on plain `3e-4`'s `+2.8%`); `lora_temporal 3e-3 + replay_0.25` only recovers shipped `1e-3`
+    without beating it; and on `5M head_only` volatility `3e-3 + replay_0.25` beats plain `1e-3` at
+    matched wQL (`0.2231 / +5.0%` vs `0.2236 / +7.8%`), while on `28M` vol plain `1e-3` gives lower wQL.
+  - Ran `tests/test_replay.py`, a CUDA `bf16` `smooth_beta` diagnostic (`0.00e+00` cached-vs-live diff on
+    tiny across `{0.0, 1e-3, 1e-2}`), and full `bash scripts/cuda_check.sh` on a short-lived NVIDIA L4
+    Linux x86 VM (`e3c6883`; caught and fixed a Linux x86 fp32 merged-vs-unmerged tolerance in
+    `test_disable_lora`): **255 passed, 3 skipped** (device tests) and **577 passed, 4 skipped** (whole
+    suite, exit 0; VM and disk deleted immediately after and confirmed clean).
+  - Re-verified the full local macOS PyTorch matrix on `phase-4`: PyTorch `2.4.0` (`313/24`), `2.8.0`
+    (`356/14`), Python `3.10` / `2.14.1` (`356/14`), and `2.15.0` full suite (`567/14`); fixed every
+    remaining doc contradiction across `SPEC.md`, `BENCHMARKS.md`, `VERIFICATION.md`, `README.md`,
+    `STATUS.md`, and `phases/phase-4-stretch.md`.
 
-**Not done / open.** `phase-4` is unpushed and unmerged pending review; CUDA `bf16` has not been re-run
-specifically on the new replay path yet; PyPI publish awaits maintainer approval; tiled DHF remains
-deferred as exploratory.
+**Not done / open.** `phase-4` is unpushed and unmerged pending review; PyPI publish awaits maintainer
+approval; tiled DHF remains deferred as exploratory.

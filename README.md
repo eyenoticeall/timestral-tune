@@ -28,7 +28,7 @@ with a ladder of increasingly invasive options:
 | `head_only` | The quantile head |
 | `lora_variate` | Low-rank adapters on cross-series (variate) attention |
 | `lora_temporal` | Low-rank adapters on temporal attention |
-| `full_ft` | All weights, ideally with replay to limit forgetting |
+| `full_ft` | All weights; lower learning rate, or pair with distillation / real-data replay to limit forgetting |
 
 Design goals: reproduce the paper's objective, masks and normalisation exactly and prove it with tests
 against the official code; export checkpoints that load in the official package; make runs auditable.
@@ -113,7 +113,7 @@ for check in run_checks(trainer.model, batch):
 docs/SPEC.md                         Specification and overview guide (start here)
 AGENTS.md                            How to work in this repo: rules, commands, commit conventions
 docs/                                Also: status, development log, verification record, upstream and phase notes
-src/timestral_tune/                  The package (Phases 0-3 built, Phase 4 replay stubbed) and the vendored upstream code in _vendor/
+src/timestral_tune/                  The package (Phases 0-4 built) and the vendored upstream code in _vendor/
 tests/                               Unit tests and the acceptance tests of spec §9
 scripts/                             Vendoring, drift check, and verification probes
 papers/                              Reference papers (only the CC BY Timestral paper is tracked)

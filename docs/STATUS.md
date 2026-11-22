@@ -2,18 +2,18 @@
 
 **Last updated:** 2026-11-22
 **Stage:** pre-alpha. Phases 0, 1, 2, and 3 are merged into `main`; rescoped Phase 4 (replay mixing, frozen-base distillation, and Apple GPU `123M`/`209M`/long-context coverage) is built and verified on branch `phase-4` (tiled DHF deferred as exploratory; PyPI publish pending maintainer action).
-**Next phase:** Review & merge `phase-4` into `main`, optional CUDA check on `phase-4`, and v0.1.0 PyPI release. See spec §10.
+**Next phase:** Review & merge `phase-4` into `main` and v0.1.0 PyPI release. See spec §10.
 
 ## What works today
 
 | Area | State |
 |---|---|
 | Loading | `load_model` / `load_forecaster`: pinned Hub revisions, config from the checkpoint, any device |
-| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32, verified across `5M`–`209M` and contexts up to `32,768` steps), CUDA (verified on NVIDIA L4, PyTorch 2.15.0, fp32 and `bf16`; commit `542568c`) |
+| Devices | CPU (PyTorch 2.4+), Apple GPU (PyTorch 2.8+, fp32; `5M`/`28M` on 2.8 & 2.15, `123M`/`209M` & contexts up to `32,768` on 2.15), CUDA (verified on NVIDIA L4 Linux x86, PyTorch 2.15.0, fp32 and `bf16`; commit `e3c6883`) |
 | Data | `TimeSeriesDataset` from polars, pandas or pyarrow; point-in-time windows; time splits; `DHFDataCollator` (with power-of-two shape bucketing); per-window categorical encoding; `flip_batch_signs` |
 | Training forward and loss | Normalised-space forward (trimmed `L + 2h` covariate layout), both target frames, pinball loss, `compute_loss` |
 | Adaptation & training | `TimestralTrainer` across `head_only` (with dual-orientation `+x`/`-x` frozen-feature caching), `lora_variate` (with single-row guard), `lora_temporal`, and `full_ft`; `sign_flip=True` and sweep-backed single cross-size LR & LoRA defaults (D19; `full_ft` recommendation of `3e-4` on `5M`/`28M` documented in `docs/BENCHMARKS.md` §2.2); fp32 everywhere, `bf16` + fused AdamW + `torch.compile` on CUDA; early stopping, CPU best-state restore |
-| Replay & distillation | `ReplayConfig`, `SyntheticReplaySource` (5 classical families), `distillation_loss` (smooth L1 `smooth_beta=1e-3`, exact L1 at `0.0`), `disable_lora` zero-VRAM bypass, and CPU-cached frozen-base teacher outputs (D21); empirically ablated in `docs/BENCHMARKS.md` §5 |
+| Replay & distillation | `ReplayConfig` (default `replay_fraction=0.0, distill_weight=0.1, smooth_beta=1e-3`), `SyntheticReplaySource` (5 classical families), `distillation_loss`, `disable_lora` zero-VRAM bypass, CPU-cached frozen-base teacher outputs, and `replay_source` export provenance (D21); empirically ablated with lower-LR and pool-size controls in `docs/BENCHMARKS.md` §5 |
 | Conformal calibration | `ConformalCalibrator` (static split CQR), `OnlineConformalCalibrator` (online ACI, forecast-count rolling window, Lemma 4.1 anti-windup), and `collect_conformal_data` helper, with anchor-aware monotonicity repair and JSON persistence |
 | Evaluation & metrics | `utils/metrics.py`: raw-space `pinball_loss_raw`, `weighted_quantile_loss`, `mase`, `coverage`, `interval_width`, `evaluate_forecaster`, and `evaluate_forgetting` |
 | Benchmarks & sweeps | `scripts/benchmarks/` + `docs/BENCHMARKS.md`: `5M`–`209M` tables + raw JSONs (`docs/benchmarks/`) across all modes, forgetting metrics, 123M/209M 3-seed decision sweeps, and 28M significance & classical baselines |
@@ -21,7 +21,7 @@
 | Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters (`load_lora`), `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
-| Test suite | 561 passed, 5 skipped (4 CUDA-only `bf16`, 1 optional `lacuna`), on tiny, 5M, 28M, and 123M MPS parity (`phase-4`, PyTorch 2.15.0 on 3.13; PyTorch 2.4.0 floor `-m "not network"`: 307/15; live `lacuna-quant==0.14.1`: 4/4; NVIDIA L4 CUDA at `542568c`: 538/3) |
+| Test suite | 567 passed, 14 skipped (13 CUDA-only, 1 optional `lacuna`), on tiny, 5M, 28M, and 123M MPS parity (`phase-4`, PyTorch 2.15.0 on 3.13; PyTorch 2.4.0 `-m "not network"`: 313/24; PyTorch 2.8.0 & Python 3.10/2.14.1: 356/14; live `lacuna-quant==0.14.1`: 4/4; NVIDIA L4 Linux x86 CUDA at `e3c6883`: **577 passed, 4 skipped**) |
 | CI | Green on `main` (run `45006472178`, Python 3.10–3.13 on Linux); `phase-4` pending PR/merge |
 
 ## What does not exist yet
@@ -44,7 +44,7 @@ All locally on Apple M4 (macOS, PyTorch 2.4/2.8/2.14/2.15) and on an NVIDIA L4 (
 
 - Real-dataset benchmarks and sweeps across all four checkpoints (`5M`, `28M`, `123M`, `209M`) on realised volatility (post-Oct 27, 2026), retail demand, and GIFT-Eval forgetting (`docs/BENCHMARKS.md`), `123M`/`209M` CUDA gradient accuracy and `fp32`/`math`/`bf16` training parity (`docs/VERIFICATION.md` §13), live `lacuna-quant==0.14.1` integration, Phase 4 replay/distillation forgetting ablations (`docs/BENCHMARKS.md` §5), and Apple GPU `123M`/`209M`/long-context (`4,096..32,768`) parity & training (`docs/VERIFICATION.md` §15).
 
-Not verified anywhere: multi-GPU, Phase 4 replay code path under CUDA `bf16` (tested on CPU/MPS; existing CUDA `bf16` path verified at `542568c`).
+Not verified anywhere: multi-GPU, real general-domain replay datasets (only built-in synthetic replay was benchmarked), long-context (`4,096..32,768`) gradient parity on MPS.
 
 ## Next steps
 

@@ -24,6 +24,17 @@ Phase 4 was rescoped to **Item 1 (replay + distillation)** and **Item 4 (Apple G
 
 ## Log of what was done
 
-- 2026-11-22 (`68c64c5`, `7304681`): implemented `ReplayConfig`, `SyntheticReplaySource` (5 classical families), `distillation_loss` (Huber `smooth_beta=1e-3`, exact L1 at `0.0`), `disable_lora`, full `TimestralTrainer` integration across all 4 modes with low-VRAM teacher caching/bypass, `tune_metadata.json` `replay_config` export, and unit/parity/mutation tests (`tests/test_replay.py`: 25 passed).
-- 2026-11-22 (`e31a2b2`): ran empirical Apple GPU replay & distillation ablation (`scripts/benchmarks/run_replay_ablation.py`, `docs/benchmarks/replay_ablation.json`): cut `head_only` vol forgetting 2.5×–2.7× (`replay_0.25`) or to `+0.7%` (`distill_0.5`), eliminated `lora_temporal=3e-3`'s `+31.3%` worst-seed cliff down to `+1.1%` (`replay_0.25`), and halved `full_ft=3e-4` worst-seed retail forgetting (`+2.8% → +1.3%`) via `distill_0.1`.
-- 2026-11-22 (`3608c60`): added and ran `scripts/probes/mps_large_and_long_context.py` (`docs/benchmarks/mps_coverage.json`) and network-marked MPS parity tests in `tests/test_loader_device.py` covering `123M`, `209M`, and contexts up to `32,768` steps on 16 GiB Apple M4.
+- 2026-11-22 (`68c64c5`, `7304681`, `258965d`, `e3c6883`): implemented `ReplayConfig` (defaulting to
+  light label-free distillation `replay_fraction=0.0, distill_weight=0.1, smooth_beta=1e-3`),
+  `SyntheticReplaySource` (5 classical families), `distillation_loss` (Huber `smooth_beta=1e-3`, exact L1
+  at `0.0`), `disable_lora`, full `TimestralTrainer` integration across all 4 modes with low-VRAM teacher
+  caching/bypass, val-as-replay rejection, isolated head-cache slots (`"train"`, `"val"`, `"replay"`),
+  `tune_metadata.json` `replay_config` + `replay_source` export, and unit/parity/mutation/CUDA tests
+  (`tests/test_replay.py`: 39 tests total — 30 CPU + 9 CUDA `fp32`/`bf16`/`reduce-overhead`).
+- 2026-11-22 (`e31a2b2`, `4db0fa1`): ran empirical Apple GPU replay & distillation ablation with lower-LR
+  (`head_only 1e-3`, `full_ft 2e-4`) and 256-series pool controls (`scripts/benchmarks/run_replay_ablation.py`,
+  `docs/benchmarks/replay_ablation.json`).
+- 2026-11-22 (`3608c60`, `e3c6883`): added and ran `scripts/probes/mps_large_and_long_context.py`
+  (`docs/benchmarks/mps_coverage.json`) on 16 GiB Apple M4 (PyTorch 2.15.0) and ran full
+  `scripts/cuda_check.sh` on NVIDIA L4 Linux x86 (`255/3` device tests, `577/4` whole suite, exit 0; VM
+  deleted immediately after).

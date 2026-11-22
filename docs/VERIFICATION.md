@@ -313,13 +313,13 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 307 passed, 15 skipped on `phase-4` (`-m "not network"`, including all Phase 3 & Phase 4 replay/distillation tests); earlier full run at `3fe5bc9`: 411 passed, 26 skipped. Skipped: accelerator tests (MPS requires 2.8+), DataLoader-worker test (below), optional `lacuna`, and the 4 CUDA-only `bf16` tests |
-| 2.8.0 | 3.12 | 326 passed, 5 skipped on `main` (`-m "not network"`, including Apple GPU and all Phase 3 tests); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
-| 2.14.1 | 3.10 | 326 passed, 5 skipped on `main` (`-m "not network"`, `uv run --isolated --python 3.10 pytest -m "not network"`); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
-| 2.15.0 | 3.13 | 561 passed, 5 skipped (full suite on `phase-4`, including tiny, 5M, 28M, 123M MPS parity, and all Phase 3 & Phase 4 replay/distillation tests) |
+| 2.4.0 | 3.12 | 313 passed, 24 skipped on `phase-4` (`-m "not network"`, including all Phase 3 & Phase 4 replay/distillation tests); earlier full run at `3fe5bc9`: 411 passed, 26 skipped. Skipped: accelerator tests (MPS requires 2.8+), DataLoader-worker test (below), optional `lacuna`, and 13 CUDA-only tests |
+| 2.8.0 | 3.12 | 356 passed, 14 skipped on `phase-4` (`-m "not network"`, including Apple GPU and all Phase 3 & Phase 4 tests); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
+| 2.14.1 | 3.10 | 356 passed, 14 skipped on `phase-4` (`-m "not network"`, `uv run --isolated --python 3.10 pytest -m "not network"`); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
+| 2.15.0 | 3.13 | 567 passed, 14 skipped (full suite on `phase-4`, including tiny, 5M, 28M, 123M MPS parity, and all Phase 3 & Phase 4 replay/distillation tests) |
 
 These are the counts on `phase-4` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
-The CUDA run (§13) used Linux (`542568c`, merged into `main`) and passed all 4 `bf16` tests as well (538 passed, 3 skipped; not yet re-run on CUDA after Phase 4 replay changes).
+The CUDA run (§13) used Linux x86 on the same branch (`e3c6883`) and passed all 13 CUDA tests as well (577 passed, 4 skipped).
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
@@ -369,15 +369,15 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 
 ## 13. CUDA
 
-Run: `bash scripts/cuda_check.sh` on an NVIDIA L4 VM (`g2-standard-4`, Ubuntu 22.04, 4 CPU threads,
-PyTorch 2.15.0+cu132, Python 3.12) at commit `542568c` (2026-11-22, merged into `main`; `step_timing.py`
+Run: `bash scripts/cuda_check.sh` on an NVIDIA L4 VM (`g2-standard-4`, Ubuntu 22.04 x86_64, 4 CPU threads,
+PyTorch 2.15.0+cu132, Python 3.12) on `phase-4` at commit `e3c6883` (2026-11-22; `step_timing.py`
 `--bf16`/`--compile` probe rows from the same hardware at `b0980cb`). All gradient numbers here use the
 float64-RMSNorm reference of §6.
 
 | Check | Result |
 |---|---|
-| T14 and all other device-parametrised tests | 255 passed, 2 skipped (the Apple GPU tests) |
-| Whole suite (including T1–T14, all 4 `bf16` CUDA modes + dual-orientation `head_only` cache, shape-bucketed `reduce-overhead` compile, `load_lora` resume, Phase 3 metrics/sign-flip/Lacuna) | 538 passed, 3 skipped (2 Apple GPU tests + 1 optional `lacuna` test) |
+| T14 and all other device-parametrised tests | 255 passed, 3 skipped (the 3 Apple GPU tests) |
+| Whole suite (including T1–T14, all 4 `bf16` CUDA modes + dual-orientation `head_only` cache, shape-bucketed `reduce-overhead` compile, `load_lora` resume, Phase 3 metrics/sign-flip/Lacuna, and all 9 Phase 4 CUDA `fp32`/`bf16`/`reduce-overhead` replay & distillation tests) | 577 passed, 4 skipped (3 Apple GPU tests + 1 optional `lacuna` test) |
 | `head_only` gradients on CUDA against the reference | At most 1.7e-6 (bound 1e-5) |
 | Verifiers (`run_checks`) on CUDA | Pass (part of the suite) |
 | `step_timing.py --device cuda --bf16 --compile default` (`full_ft`, batch 32, ctx 1,024; `b0980cb`) | 5M uni 21 ms / 0.18 GiB, cov5 25 ms / 0.58 GiB; 28M uni 32 ms / 0.73 GiB, cov5 62 ms / 1.90 GiB |
@@ -535,14 +535,15 @@ Command: `uv run python scripts/benchmarks/run_replay_ablation.py --device mps -
 
 | Claim (`SPEC.md` §5.3, D21) | Artefact / Test | Verified result |
 |---|---|---|
-| `head_only` forgetting reduction at `3e-3` | `docs/benchmarks/replay_ablation.json` | Synthetic replay (`replay_fraction=0.25`) cuts vol forgetting `5M: +13.7% → +5.0%` and `28M: +10.3% → +4.1%` (retail `+5.0% → +3.8%` / `+7.0% → +5.3%`); `distill_weight=0.5` brings vol forgetting to `+0.7%` on both sizes (`+4–6%` wall-time overhead on `28M`). |
-| `lora_temporal=3e-3` forgetting cliff elimination (3 seeds) | `docs/benchmarks/replay_ablation.json` | Worst-seed macro forgetting drops from `+31.3%` (`none`) to `+1.1%` (`replay_fraction=0.25`; mean test wQL `0.2181` vs `0.2186` at `1e-3`) and `-0.4%` (`distill_weight=0.5`). |
-| `full_ft=3e-4` distillation vs synthetic pinball (3 seeds) | `docs/benchmarks/replay_ablation.json` | Pure synthetic pinball (`0.25`) worsens retail worst-seed forgetting (`+2.8% → +4.1%`); light distillation (`distill_weight=0.1`) halves it (`+2.8% → +1.3%`, mean test wQL `0.1999` vs `0.2016` at `1e-4`). |
-| Cached vs live teacher parity, label-free distillation, and dual cache cap | `tests/test_replay.py` (24 passed) | Direct teacher parity `< 1e-5` on `+x`/`-x`; 5-step trajectory parity `< 5e-4` rel L2 under `smooth_beta=1e-3`; unlabelled replay batches yield exact step-0 zero loss and finite non-zero gradients after perturbation; padding steps & dummy series excluded. |
+| `head_only` vs lower-LR `1e-3` control (`5M` 3 seeds; `28M` 1 seed) | `docs/benchmarks/replay_ablation.json` | On `5M` vol, `3e-3 + replay_0.25` matches plain `1e-3` wQL (`0.2231` vs `0.2236`) at lower worst-seed forgetting (`+5.0%` vs `+7.8%`). On `5M`/`28M` retail, `3e-3 + distill_0.5` lowers forgetting (`+1.9%` vs `+3.6%`, `+2.7%` vs `+4.2%`) for `+0.0005–0.0006` wQL. On `28M` vol (1 seed), plain `1e-3` gives lower wQL (`0.2169` vs `0.2195`). Single-run `28M` wall time ranged from `−6%` to `+16%` vs `none`. Most runs selected step `200`. |
+| `lora_temporal=3e-3` forgetting cliff vs shipped `1e-3` (3 seeds) | `docs/benchmarks/replay_ablation.json` | `replay_fraction=0.25` eliminates the non-default `3e-3` cliff (`+31.3%` worst-seed → `+1.1%`), landing at the same accuracy/forgetting point as shipped `1e-3` without replay (`0.2181 / +1.1%` vs `0.2186 / +1.6%`). |
+| `full_ft=3e-4` vs `1e-4` & `2e-4` controls and 256-series pool (3 seeds) | `docs/benchmarks/replay_ablation.json` | Plain `2e-4` (`0.1995`, worst `+1.3%`) matches or slightly beats `3e-4 + distill_0.1` (`0.1999`, worst `+1.3%`, mean `+0.9%` vs `+1.2%`). Expanding the synthetic pool from 64 to 256 series lowers synthetic-pinball worst-seed forgetting from `+4.1%` to `+2.8%` (still no better than plain `3e-4`'s `+2.8%`). |
+| Cached vs live teacher parity, label-free distillation, multi-target replay, slot isolation, and CUDA `fp32`/`bf16` + `reduce-overhead` | `tests/test_replay.py` (39 passed on Linux x86 + L4 CUDA at `e3c6883`; 30 passed + 9 CUDA skipped on macOS) | Direct teacher parity `< 1e-5` on `+x`/`-x`; 5-step trajectory parity `< 5e-4` rel L2 under `smooth_beta=1e-3`; CUDA `bf16` tiny diagnostic showed `0.00e+00` cached-vs-live divergence across `smooth_beta` `{0.0, 1e-3, 1e-2}` (`lora_temporal` & `full_ft`); unlabelled batches yield step-0 zero loss and finite non-zero gradients; val-as-replay rejected. |
 
 ### 15.2 Apple GPU (MPS) `123M`, `209M`, and long-context coverage (`docs/benchmarks/mps_coverage.json`)
 
 Command: `uv run python scripts/probes/mps_large_and_long_context.py --output docs/benchmarks/mps_coverage.json`.
+Measured on PyTorch **2.15.0** only (16 GiB Apple M4, `fp32`).
 
 **Large checkpoints (`123M` & `209M`, `fp32` on MPS):**
 
@@ -551,7 +552,8 @@ Command: `uv run python scripts/probes/mps_large_and_long_context.py --output do
 | **123M** | `1.39e-7` / `1.09e-6` | `1.09e-7` | `1.11e-4` / **`7.95e-6`** (`2.95e-11`) | `79 ms / 0.59` · `182 ms / 1.26` · `213 ms / 1.28` · `346 ms / 2.60` |
 | **209M** | `1.18e-7` / `3.93e-7` | `9.51e-8` | `2.00e-4` / **`4.54e-6`** (`9.17e-12`) | `127 ms / 1.06` · `294 ms / 2.06` · `335 ms / 2.04` · `545 ms / 4.07` |
 
-**Long contexts (`4,096` to `32,768` steps = `128..1,024` patches, `B=1`, `fp32` on 16 GiB M4 MPS):**
+**Long contexts (`4,096` to `32,768` steps = `128..1,024` patches, `B=1`, `fp32` on 16 GiB M4 MPS, PyTorch 2.15.0):**
+Training entries run **one optimiser step** and assert finite loss (no gradient parity check at `4,096..32,768` steps).
 
 | Model | Context (`steps / layout`) | Inference rel L2 vs CPU (`ms`) | Training mode (`ms` / alloc GiB / driver GiB) |
 |---|---|---|---|
