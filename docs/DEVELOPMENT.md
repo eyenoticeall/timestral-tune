@@ -27,6 +27,23 @@ uv run ruff format .                   # format
 uv build                               # build wheel and sdist
 ```
 
+## Releasing
+
+Releases are published by `.github/workflows/release.yml` through PyPI trusted publishing; no token is
+stored anywhere. Publishing happens only when the maintainer asks (`AGENTS.md` §6).
+
+1. Set `__version__` in `src/timestral_tune/__init__.py` and add a `## X.Y.Z — date` section to
+   `CHANGELOG.md`. Commit, push, and wait for CI to pass on that commit.
+2. Run the release workflow by hand (`gh workflow run release.yml`). This builds and checks the package
+   without publishing.
+3. Tag that same commit and push the tag by name: `git tag vX.Y.Z && git push origin vX.Y.Z`. Never push
+   all tags. The workflow checks that the tag matches the package version and the changelog, uploads the
+   build to PyPI, and creates the GitHub release from the changelog section.
+4. Install the published version in a clean environment and run the README quick start.
+
+A version number can never be reused on PyPI, so a broken release is fixed by publishing the next patch
+version.
+
 ## Layout
 
 ```

@@ -1,0 +1,74 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` builds the package once, publishes that build to PyPI through trusted publishing
+# (no token is stored), and creates the GitHub release. Running the workflow by hand builds and checks the
+# package without publishing anything. Procedure: docs/DEVELOPMENT.md, "Releasing".
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - name: Tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test -f "dist/timestral_tune-${version}-py3-none-any.whl"
+          test -f "dist/timestral_tune-${version}.tar.gz"
+      - name: Changelog has an entry for the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: grep -q "^## ${GITHUB_REF_NAME#v} " CHANGELOG.md
+      - name: Vendored licence is in the wheel
+        run: unzip -l dist/*.whl | grep "_vendor/timestral/LICENSE"
+      - name: Metadata and README render for PyPI
+        run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## " v " " {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          test -s notes.md
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
