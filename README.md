@@ -88,6 +88,11 @@ trainer.export()                 # writes upstream-loadable merged checkpoint + 
 Default settings (`sign_flip=True`, learning rates `head_only=3e-3`, `lora_variate=3e-3`,
 `lora_temporal=1e-3`, `full_ft=1e-4`, and LoRA `r=8, targets=("q","k","v","o")`) are backed by
 Phase 3 validation and forgetting sweeps across `5M`–`209M` in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+For `full_ft` on the two smaller checkpoints (`5M` and `28M`), we recommend setting
+`learning_rate=3e-4`: it achieved lower error in our benchmarks (three seeds on `5M`, one seed on
+`28M`), at the cost of about two percentage points more retail forgetting on `5M`. Keep the
+`1e-4` default on `123M` and `209M`, where the two rates tie or favour `1e-4` on validation and
+`1e-4` forgets less.
 
 To check your own data for leakage and parity with the official inference path:
 

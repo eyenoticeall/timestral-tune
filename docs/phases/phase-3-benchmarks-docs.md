@@ -36,10 +36,15 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - 2026-11-22 (`604d8d5`..`3f12fe2`, `cf0520c`): built `scripts/benchmarks/{datasets,run_sweeps,run_benchmarks,significance}.py`,
   ran 5M/28M sweeps + benchmarks, `123M`/`209M` CUDA gradient probes & benchmarks (`docs/VERIFICATION.md` §13),
   and 28M multi-seed / clustered CI / classical baseline checks (`docs/BENCHMARKS.md` §4).
-- 2026-11-22 (`55d57d2`, `1185f82`, `7ebe45d`, and final JSON/doc sync): closed the remaining 4
-  mutation-test gaps, added `load_signed_returns()` (`logret_20`) and full multi-seed CLI flags to
-  `run_sweeps.py`, ran the 144-run 3-seed `123M`/`209M` decision sweep (`sweeps_large_decisions.json`),
-  adopted Decisions 1–3 (`sign_flip=True` with dual-orientation `+x`/`-x` `head_only` cache,
-  `lora_temporal=1e-3`, `full_ft=1e-4`, D19), unified `sweeps_bracketed.json` (dropping `sweeps_extra.json`),
-  re-ran all benchmarks, fresh train-only precision ablation, and `sig_v2.json` at shipped defaults on L4
-  (VM deleted immediately after), and added `docs/VERIFICATION.md` §14 backing all `[V]` claims.
+- 2026-11-22 (`55d57d2`, `1185f82`, `7ebe45d`, `2556a7e`): closed the remaining 4 mutation-test gaps,
+  added `load_signed_returns()` (`logret_20`) and full multi-seed CLI flags to `run_sweeps.py`, ran the
+  144-run 3-seed `123M`/`209M` decision sweep (`sweeps_large_decisions.json`), adopted Decisions 1–3
+  (`sign_flip=True` with dual-orientation `+x`/`-x` `head_only` cache, `lora_temporal=1e-3`,
+  `full_ft=1e-4`, D19), unified `sweeps_bracketed.json` (dropping `sweeps_extra.json`), re-ran all
+  benchmarks, fresh train-only precision ablation, and `sig_v2.json` at shipped defaults on L4 (VM
+  deleted immediately after), and added `docs/VERIFICATION.md` §14 backing all `[V]` claims.
+- 2026-11-22 (`40d29fe` and final `docs:` commit): closed the last 3 mutation-test gaps (staggered ACI
+  origin order, 2× dual-cache memory cap, unflipped post-`fit()` training evaluation) and documented the
+  maintainer decision keeping `full_ft=1e-4` as the single cross-size default while recommending `3e-4` for
+  `full_ft` on `5M` and `28M` (with exact provenance and forgetting cost) across `README.md`,
+  `TrainingConfig`, `SPEC.md`, `BENCHMARKS.md` §2.2, `STATUS.md`, and `DEVLOG.md`.
