@@ -31,7 +31,8 @@ uv run python scripts/benchmarks/run_benchmarks.py \
 
 Uses the shipped defaults (D19): `sign_flip=True`, `head_only` `3e-3` (with dual-orientation `+x`/`-x`
 frozen-feature cache), `lora_variate` `3e-3`, `lora_temporal` `1e-3`, `full_ft` `1e-4`, LoRA
-`r=8, alpha=16, targets=("q","k","v","o"), dropout=0.05`, `restore_best=True`. Online ACI runs
+`r=8, alpha=16, targets=("q","k","v","o")`, and `restore_best=True`. Benchmark runs pass
+`dropout=0.05` explicitly (`LoraConfig.dropout` defaults to `0.0` in `config.py`). Online ACI runs
 strictly chronologically across all series with horizon-reveal delay (`t_end < t_origin`, D20).
 
 **GIFT-Eval zero-shot wQL baselines by domain:**
@@ -245,8 +246,8 @@ volatility `0.1735` vs `0.1758`; test wQL and macro forgetting below):
 
 | Model, dataset | `3e-4` test wQL | `1e-4` test wQL | Macro forgetting (`3e-4` vs `1e-4`) | Provenance |
 |---|---:|---:|---|---|
-| `5M` volatility | `0.2149 / 0.2162 / 0.2165` | `0.2203 / 0.2201 / 0.2204` | `-1.1% / -0.4% / +0.1%` vs `-1.0% / -0.5% / -1.5%` | Independent review run (3 seeds, `fp32`, Apple GPU; no committed JSON artefact) |
-| `5M` retail | `0.1983 / 0.1983 / 0.1995` | `0.2014 / 0.2012 / 0.2022` | `+2.8% / +2.0% / +2.1%` vs `+0.4% / +0.5% / +0.6%` | Independent review run (3 seeds, `fp32`, Apple GPU; no committed JSON artefact) |
+| `5M` volatility | `0.2149 / 0.2162 / 0.2165` | `0.2203 / 0.2201 / 0.2204` | `-1.1% / -0.4% / +0.1%` vs `-1.0% / -0.5% / -1.5%` | Apple GPU `fp32`, 3 seeds (`docs/benchmarks/bench_5m_full_ft_3e4_vs_1e4.json`) |
+| `5M` retail | `0.1983 / 0.1983 / 0.1995` | `0.2014 / 0.2012 / 0.2022` | `+2.8% / +2.0% / +2.1%` vs `+0.4% / +0.5% / +0.6%` | Apple GPU `fp32`, 3 seeds (`docs/benchmarks/bench_5m_full_ft_3e4_vs_1e4.json`) |
 | `28M` volatility | `0.2098` | `0.2163` | `+1.2%` vs `-0.7%` | L4 `bf16`, 1 seed each (`3e-4` from `docs/benchmarks/bench_5m_28m.json` at commit `3fe64e0`; `1e-4` from `HEAD`) |
 | `28M` retail | `0.1943` | `0.1946` | `+2.1%` vs `-1.2%` | L4 `bf16`, 1 seed each (`3e-4` from `docs/benchmarks/bench_5m_28m.json` at commit `3fe64e0`; `1e-4` from `HEAD`) |
 

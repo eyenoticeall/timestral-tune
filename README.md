@@ -10,7 +10,7 @@ Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral t
 > **Status: pre-alpha (Phases 0–3).** Loading, the data pipeline, all five adaptation modes (`conformal`,
 > `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), `bf16` + `torch.compile` on CUDA,
 > upstream-loadable checkpoint export, raw-space evaluation & forgetting metrics, optional Lacuna
-> integration, and real-dataset benchmarks (5M & 28M) are built and verified (14/14 acceptance tests
+> integration, and real-dataset benchmarks (5M–209M) are built and verified (14/14 acceptance tests
 > passing). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/STATUS.md](docs/STATUS.md).
 
 ## What this will be
@@ -46,7 +46,7 @@ is the project's overview guide and source of truth.
 | CUDA acceleration | Done: `bf16` autocast, fused `AdamW`, optional `torch.compile` (verified on NVIDIA L4) |
 | Conformal calibration | Done: `ConformalCalibrator` (CQR) and `OnlineConformalCalibrator` (ACI) |
 | Checkpoint export | Done: upstream-loadable `config.json` + merged `model.safetensors`, LoRA adapters, `conformal.json`, sidecar, `LICENSE`, `NOTICE` |
-| Benchmarks, metrics, Lacuna integration | Done: `utils/metrics.py`, `integrations/lacuna.py`, sweep-backed defaults, 5M & 28M tables in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) |
+| Benchmarks, metrics, Lacuna integration | Done: `utils/metrics.py`, `integrations/lacuna.py`, sweep-backed defaults, 5M–209M tables in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) |
 | Acceptance tests T1–T14 | All 14 of 14 implemented and passing on tiny, 5M and 28M (CPU, Apple GPU, CUDA) |
 | CI | Passing on `main` (Python 3.10–3.13 on Linux) |
 

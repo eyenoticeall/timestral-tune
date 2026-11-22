@@ -313,13 +313,13 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 411 passed, 26 skipped (`3fe5bc9`; network-free post-review-fix pass also verified). Skipped: 21 accelerator tests, one DataLoader-worker test (below) and the 4 CUDA-only `bf16` tests; 77 further Apple GPU cases are not generated at all |
-| 2.8.0 | 3.12 | 510 passed, 4 skipped (`3fe5bc9`; the 4 CUDA-only `bf16` tests), including every Apple GPU test and all 14 acceptance tests |
-| 2.14.1 | 3.10 | 510 passed, 4 skipped (`3fe5bc9`; `uv run --isolated --python 3.10 pytest`; NumPy 2.2.6, pandas 2.3.3, polars 2.0.0, pyarrow 25.0.1) |
-| 2.15.0 | 3.13 | 536 passed, 5 skipped (includes all Phase 3 metrics, sign-flip, Lacuna, and mutation-guard tests) |
+| 2.4.0 | 3.12 | 283 passed, 15 skipped on `main` (`-m "not network"`, including all Phase 3 metrics, sign-flip, dual head cache, and Lacuna tests); earlier full run at `3fe5bc9`: 411 passed, 26 skipped. Skipped: accelerator tests (MPS requires 2.8+), DataLoader-worker test (below), optional `lacuna`, and the 4 CUDA-only `bf16` tests |
+| 2.8.0 | 3.12 | 326 passed, 5 skipped on `main` (`-m "not network"`, including Apple GPU and all Phase 3 tests); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
+| 2.14.1 | 3.10 | 326 passed, 5 skipped on `main` (`-m "not network"`, `uv run --isolated --python 3.10 pytest -m "not network"`); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
+| 2.15.0 | 3.13 | 536 passed, 5 skipped (full suite on `main`, including tiny, 5M, 28M, and all Phase 3 tests) |
 
-These are the counts on `phase-3` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
-The CUDA run (§13) used Linux on the same branch (`542568c`) and passed all 4 `bf16` tests as well (538 passed, 3 skipped).
+These are the counts on `main` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
+The CUDA run (§13) used Linux (`542568c`, merged into `main`) and passed all 4 `bf16` tests as well (538 passed, 3 skipped).
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
@@ -370,7 +370,7 @@ that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
 ## 13. CUDA
 
 Run: `bash scripts/cuda_check.sh` on an NVIDIA L4 VM (`g2-standard-4`, Ubuntu 22.04, 4 CPU threads,
-PyTorch 2.15.0+cu132, Python 3.12) on `phase-3` at commit `542568c` (2026-11-22; `step_timing.py`
+PyTorch 2.15.0+cu132, Python 3.12) at commit `542568c` (2026-11-22, merged into `main`; `step_timing.py`
 `--bf16`/`--compile` probe rows from the same hardware at `b0980cb`). All gradient numbers here use the
 float64-RMSNorm reference of §6.
 
@@ -401,7 +401,7 @@ Forward, relative L2 difference from CPU (`device_parity.py --device cuda`):
 | `forecast`, horizon 96 | 1.4e-7 | 1.4e-7 |
 | `forecast`, horizon 2,100 | 1.5e-5 | 1.8e-6 |
 | `forecast`, numeric and categorical covariates | 1.2e-7 | 1.0e-7 |
-| Autocast `bfloat16` (not a supported mode yet) | 1.5e-2 | 5.7e-2 |
+| Autocast `bfloat16` (CUDA `bf16` training mode; fp32 only on CPU/MPS) | 1.5e-2 | 5.7e-2 |
 | Autocast `float16` | 2.0e-3 | 5.9e-3 |
 
 Float32 training-loss gradients against the reference, by attention kernel (`gradient_accuracy.py --device

@@ -629,5 +629,10 @@ not started.
     shape-bucketed `reduce-overhead` compile, and T1–T14.
 
 **Not done / open.** Phase 3 fast-forwarded into `main` at `9c5817c`, pushed to `origin/main` (CI run
-`45006472178` green across Python 3.10–3.13), and `phase-3` deleted locally and on `origin`. PyPI
-release awaits maintainer approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.
+`45006472178` green across Python 3.10–3.13), and `phase-3` deleted locally and on `origin`. Post-merge
+polish on `main`: re-verified Phase 3 network-free tests on PyTorch 2.4.0 (`283/15`), PyTorch 2.8.0
+(`326/5`), and Python 3.10 / PyTorch 2.14.1 (`326/5`); committed `docs/benchmarks/bench_5m_full_ft_3e4_vs_1e4.json`
+(reproducing all 6 Apple GPU 5M `full_ft` `3e-4` vs `1e-4` runs); clarified explicit `dropout=0.05` vs
+`LoraConfig.dropout=0.0` in `docs/BENCHMARKS.md` §1; and cleaned stale wording in `__init__.py`,
+`README.md`, and `docs/VERIFICATION.md`. PyPI release awaits maintainer approval. Phase 4 (stretch:
+replay, distillation, tiled training) has not started.
