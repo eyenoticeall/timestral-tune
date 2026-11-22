@@ -65,3 +65,7 @@ Full list in spec §12. The ones that matter next:
 - `main`: Phases 0–4 (rescoped Phase 4 fast-forwarded from `phase-4` at `9261c75` on 2026-11-22). All prior branches (`phase-1`, `perf/phase1-kernels`, `fix/math-sdpa-backend`, `phase-2`, `phase-3`, `phase-4`) are closed and deleted locally and on `origin`.
 
 Branch policy is in `AGENTS.md` §6.
+
+## Multi-GPU training proposal
+
+A documentation-only design proposal for single-node multi-process training exists (`docs/SPEC.md` §5.6, §7.4, §9 T15, §10 Phase 5, D22–D35; `docs/phases/phase-5-multi-gpu.md`), backed by a standalone CPU/`gloo` prototype probe outside `src/` (`scripts/probes/distributed_parity.py`, `docs/VERIFICATION.md` §16). T15 is specified in `docs/SPEC.md` §9 and not implemented; the 14-of-14 acceptance-test count above refers to T1–T14. Nothing is implemented in `src/` or `tests/`; go/no-go and sequencing against gradient accumulation await a maintainer decision.

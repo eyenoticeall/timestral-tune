@@ -848,3 +848,114 @@ README gained an "Other model sizes" section; spec §3.1, `docs/VERIFICATION.md`
 
 **Not done / open.** Nothing above 209M has been run. Full fine-tuning at that scale would need
 features the library lacks (multi-GPU, gradient accumulation, resumable runs).
+
+---
+
+## 2026-11-23 — Multi-process training design proposal (documentation only)
+
+**Done.** Added a standalone CPU/`gloo` prototype probe (`scripts/probes/distributed_parity.py`) and wrote a
+documentation-only design proposal for single-node multi-process / multi-GPU training for a maintainer
+go/no-go decision. Nothing in `src/`, `tests/`, `README.md`, or `CHANGELOG.md` changed.
+
+- `scripts/probes/distributed_parity.py`: standalone CPU/`gloo` prototype (`torch.multiprocessing.spawn`)
+  comparing `ddp.module` bypass against explicit flat-buffer `all_reduce(ReduceOp.SUM)` and count-weighted
+  loss-share scaling across domain-loss edge cases (`equal`, `unequal`, `zero_scored`, `empty_shard` with
+  empty-rank-0 delivery at `N=2` and multi-rank sum at `N=4`, `all_zero_skip`, single-rank `non_finite`),
+  all four adaptation modes (including `CachedHeadBatch` and LoRA step-0/1 invariants), four replay and
+  distillation regimes, 10-active-step (+1 zero-scored skip) AdamW trajectories (`wd=0.01`, `warmup=3` +
+  cosine, `clip=1.0`, `full_ft` and `lora_variate`), and `DistributedSampler` behaviour, graded against both
+  a union-batch `probe_ref` and an independent one-process `TimestralTrainer` (`shipped_trainer`, on
+  `tiny_random`).
+- `docs/SPEC.md`: added proposed §5.6 (step-level contract, collective boundaries, explicit flat-buffer
+  `ReduceOp.SUM` reduction instead of DDP, five-stage step and collective-safety invariant, count-weighting
+  derivation, balanced trailing split with a global-iteration-driven loop and main-process batch sampler,
+  per-rank `batch_size` with a warning on default LRs above effective batch 32, backend-driven device
+  resolution inside `TimestralTrainer.__init__`, startup failure-status collective before the rank-0
+  all-parameter/all-buffer broadcast without a download barrier, rank-0 callbacks / best-loss / restore
+  ownership with equal `TrainingResult` fields, separate internal sharded validation, collective-free
+  `evaluate()` and `export()`, rank-offset RNG streams, timeouts, and Stage 1 restrictions), proposed
+  `tune_metadata.json` fields (`world_size`, `effective_batch_size`) in §7.4, proposed acceptance test T15
+  (`test_t15_*`, cases `(a)–(i)`, with `(a)` anchoring its `1e-10`/`1e-4` trajectory tiers at ~10 optimiser
+  steps across >1 epoch and `(i)` covering both `__init__` and `fit()` single-rank failures) in §9 with
+  released-weights bounds deferred to Stage 3, proposed Phase 5 checklist (three stages plus the
+  gradient-accumulation alternative/prerequisite option) in §10, proposed decisions D22–D35 in §11, and
+  multi-process risks in §12.
+- `docs/VERIFICATION.md`: added the one-off `ReduceOp.AVG` vs `ReduceOp.SUM` CPU/`gloo` check in §11 and
+  §16 recording all three runs of `scripts/probes/distributed_parity.py`, keeping enforced checks and
+  ungraded `[INFO]` `Timestral-5M` body-backprop values strictly separate and marking every row as a
+  prototype outside `src/`.
+- `docs/phases/phase-5-multi-gpu.md`: documented single-L4 benchmark wall times and peak VRAM re-derived
+  from `docs/BENCHMARKS.md` (`4.4 s`–`53.2 s` / `0.08`–`4.91 GiB` across main `bf16` tables, up to `53.7 s`
+  with §3's `fp32` precision-ablation rows; `run_benchmarks.py`'s `ms/step` qualified as upper bounds),
+  linear-scaling arithmetic estimates for large jobs, the gradient-accumulation option sharing `(loss_sum,
+  count)` helpers, function-level trainer touch points, the Stage 3 2-GPU/4-GPU CUDA/NCCL verification
+  plan, and cloud cost estimates (Google Cloud `us-central1` on-demand retrieved `2026-11-23`).
+- `docs/STATUS.md`: added a short subsection noting the pending proposal and clarifying that T15 is
+  unimplemented (the 14-of-14 acceptance-test count refers to T1–T14), while keeping multi-GPU training in
+  the does-not-exist list.
+
+**Decisions.** Proposed D22–D35 (all `[D]`, awaiting sign-off): explicit flat-buffer
+`all_reduce(ReduceOp.SUM)` after backward instead of DDP (revisit if NCCL measurements show overlap
+matters); five-stage internal distributed step (`ReduceOp.SUM` only) with an 8-scalar `float64` stats
+collective, count-weighted loss-share scaling, and best-effort unprototyped single-rank exception
+propagation for `__init__` startup and `fit()` local/validation/callback stages (excluding backward
+failures, post-broadcast `__init__` steps, and unavailable device contexts, which fall under D35);
+collectives confined to `TimestralTrainer.__init__` and `fit()`, keeping `models/loader.py`,
+`resolve_device()`, `evaluate()`, `export()`, and public `training_step()` collective-free (`training_step()`
+raises `RuntimeError` in a multi-process group; non-zero-rank `export()` validates, logs, no-ops, and
+returns `Path`); no rank-0 download barrier (relying on `huggingface_hub`'s per-file `WeakFileLock`, with
+a Stage 1 check at the `>=0.23` floor), with `__init__` running rank-local setup/validation before a
+startup failure-status collective and broadcasting all parameters and buffers from rank 0 only if all ranks
+succeed; backend-driven device resolution in `__init__` (`nccl`→CUDA, `gloo`→CPU, `gloo`+CUDA and MPS
+refused, explicit indexed > `LOCAL_RANK` > `rank`, `torch.cuda.set_device` before
+`torch.cuda.is_bf16_supported()`); balanced trailing split and global-iteration-driven loop with a
+main-process batch sampler instead of `DistributedSampler`; per-rank `batch_size` with no automatic LR
+scaling; rank-0 ownership of callbacks, best-loss tracking, early stopping, and restore decisions with
+end-of-`fit()` record and conditional trainable-weight broadcast; Stage 1 restrictions following D13
+(`head_only` streaming fallback, `reduce-overhead` `ValueError`, `ReplayConfig` `NotImplementedError`);
+rank-offset augmentation/dropout streams; and rejection of `nn.DataParallel`, `accelerate`,
+`lightning-fabric`, multi-node training, and benchmark-script edits.
+
+**Design-shaping facts checked against existing code and prototype runs:**
+
+- Adding the independent one-process `TimestralTrainer` reference (`shipped_trainer`) exposed and fixed a
+  `float64 → float32` state-dict truncation in the prototype's `_load_model` helper (casting to `dtype` now
+  precedes `load_state_dict`) and confirmed that `TimeSeriesDataset` enforces `np.float32`, so shipped
+  cached `head_only` runs in `float32` only (`float64` `head_only_cached` reported `n/a`).
+- Inspecting existing trainer and data code established that `DHFDataCollator` raises `ValueError` on an
+  empty list (`data/collator.py:155-156`), motivating the global-iteration-driven loop and non-empty batch
+  sampler; `torch.cuda.is_bf16_supported()` queries the current CUDA device (`trainer/trainer.py:292`),
+  requiring `torch.cuda.set_device` on every CUDA device before precision checks; `early_stopping_patience`
+  and callback validation (`trainer/trainer.py:375-383`) can move ahead of `__init__`'s startup status
+  collective while `_setup_replay_teacher()` and `torch.compile` must stay after the startup broadcast; and
+  one-process `fit()` skips zero-scored batches before advancing `replay_iter`
+  (`trainer/trainer.py:1013-1025`), leaving Stage 2 skip ordering open (current leaning: a replay-only
+  pre-forward count collective, leaving Stage 1 unaffected).
+
+**Evidence.** Ran `scripts/probes/distributed_parity.py` on macOS arm64 CPU/`gloo`:
+
+- PyTorch `2.15.0` (Python `3.12.13`), `tiny_random`: `326/326` passed, `0` failed (`probe_ref` and
+  `shipped_trainer`, `0.00e+00` cross-rank).
+- PyTorch `2.4.0` (Python `3.12`), `tiny_random`: `326/326` passed, `0` failed (`probe_ref` and
+  `shipped_trainer`, `0.00e+00` cross-rank).
+- PyTorch `2.15.0`, `--sizes 5M`: `516/516` passed (`326` `tiny_random` + `190` enforced `Timestral-5M`:
+  cross-rank `0.00e+00`, scalar global loss `<= 6.77e-16` f64 / `<= 4.75e-07` f32, `N=2 empty_shard`
+  `empty_r0_recv_ok=True`, global skip, non-finite, `head_only` live/cached `<= 1.12e-15` f64 /
+  `<= 4.00e-07` f32, LoRA step-0/1 invariants, and `[5]` clipping and skipped-step no-op invariants), `0`
+  failed, plus `68` ungraded `[INFO]` `Timestral-5M` body-backprop values (single-step up to `2.42e-12` f64
+  / `1.58e-03` f32; 10-step `full_ft` `param_update` up to `7.40e-10` f64 / `4.80e-02` f32; `lora_variate`
+  up to `1.22e-04` `final_params` / `1.06e-02` `param_update` in f32).
+- One-off CPU/`gloo` check (`docs/VERIFICATION.md` §11): PyTorch `2.4.0` raises
+  `RuntimeError: Cannot use ReduceOp.AVG with Gloo` while `ReduceOp.SUM` succeeds; PyTorch `2.15.0` accepts
+  both.
+- Verified PyTorch `2.15.0` / `2.4.0` source citations (`DistributedDataParallel` hooks, `nn.DataParallel`
+  / `scatter_gather.scatter`, `init_process_group` timeout defaults of `10 min` NCCL / `30 min` other
+  backends), `huggingface_hub 2.4.0` `WeakFileLock` citations (`file_download.py:1258, 1273, 1485, 1503`),
+  and PyPI dependency metadata (`2026-11-23`) for `accelerate` (`1.16.0`: `python >= 3.11`, `torch >= 2.6.0`)
+  and `lightning-fabric` (`2.6.6`: 4 extra dependencies).
+
+**Not done / open.** Maintainer go/no-go and sequencing against gradient accumulation; Stage 2 open
+decisions (replay skip ordering, teacher output caching across ranks, and whether a multi-process
+`head_only` cache is worth having); and unverified items (`docs/SPEC.md` §12): CUDA/NCCL, `bf16`,
+`torch.compile`, `torchrun` on Linux, released-weights T15 bounds, `huggingface_hub==0.23` lock behaviour,
+large-batch LR sweeps, unprototyped single-rank exception propagation, and NCCL rank-failure behaviour.
