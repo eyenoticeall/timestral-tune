@@ -36,12 +36,10 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - 2026-11-22 (`604d8d5`..`3f12fe2`, `cf0520c`): built `scripts/benchmarks/{datasets,run_sweeps,run_benchmarks,significance}.py`,
   ran 5M/28M sweeps + benchmarks, `123M`/`209M` CUDA gradient probes & benchmarks (`docs/VERIFICATION.md` §13),
   and 28M multi-seed / clustered CI / classical baseline checks (`docs/BENCHMARKS.md` §4).
-- 2026-11-22 (`ae120e2`, `ecbd2d8`, and follow-up review remediation): fixed chronological horizon-delayed
-  online ACI evaluation (`_apply_online_chronological`, D20), closed all 9 review mutation-test gaps,
-  fixed retail series-selection leakage (ranked strictly on first 70 train days), switched benchmark
-  forgetting to equal-weighted 3-domain macro relative % with explicit zero-shot baselines, added full
-  reproducibility CLI flags (`--modes`, `--eval-batch-size`, `--full-ft-batch-size`, `--attention-backend`,
-  peak VRAM) to `run_benchmarks.py`, ran properly bracketed LR sweeps on 5M/28M/123M (`head_only=3e-3`,
-  `lora_variate=3e-3`, `lora_temporal=3e-3`, `full_ft=3e-4`, D19), re-ran all 5M/28M/123M/209M benchmarks
-  and 28M significance checks on L4 CUDA (VM deleted immediately after), committed raw JSON artifacts in
-  `docs/benchmarks/`, and tightened all claims and date ranges (`2026-11-03` to `2026-11-20`) in `docs/BENCHMARKS.md`.
+- 2026-11-22 (`55d57d2`, `1185f82`, `7ebe45d`, and final JSON/doc sync): closed the remaining 4
+  mutation-test gaps, added `load_signed_returns()` (`logret_20`) and full multi-seed CLI flags to
+  `run_sweeps.py`, ran the 144-run 3-seed `123M`/`209M` decision sweep (`sweeps_large_decisions.json`),
+  adopted Decisions 1–3 (`sign_flip=True` with dual-orientation `+x`/`-x` `head_only` cache,
+  `lora_temporal=1e-3`, `full_ft=1e-4`, D19), unified `sweeps_bracketed.json` (dropping `sweeps_extra.json`),
+  re-ran all benchmarks, fresh train-only precision ablation, and `sig_v2.json` at shipped defaults on L4
+  (VM deleted immediately after), and added `docs/VERIFICATION.md` §14 backing all `[V]` claims.

@@ -85,9 +85,9 @@ print(result.best_eval_loss)
 trainer.export()                 # writes upstream-loadable merged checkpoint + adapters + NOTICE/LICENSE
 ```
 
-Default learning rates (`head_only=3e-3`, `lora_*=3e-3`, `full_ft=3e-4`) and LoRA defaults
-(`r=8, targets=("q","k","v","o")`) are backed by bracketed Phase 3 validation sweeps in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md). Set `sign_flip=True` when fine-tuning on strictly non-negative targets.
+Default settings (`sign_flip=True`, learning rates `head_only=3e-3`, `lora_variate=3e-3`,
+`lora_temporal=1e-3`, `full_ft=1e-4`, and LoRA `r=8, targets=("q","k","v","o")`) are backed by
+Phase 3 validation and forgetting sweeps across `5M`–`209M` in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 To check your own data for leakage and parity with the official inference path:
 

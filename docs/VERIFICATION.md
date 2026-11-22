@@ -499,11 +499,27 @@ Large checkpoints — `Timestral-123M` (122.6M params, `d_model=640`, 20 layers)
 
 Both large checkpoints have 3×–4× lower peak attention logits than 5M (404k) and 28M (503k), and 10×–45×
 smaller CUDA default-SDPA gradient error (`2.6e-4`–`6.9e-4`, cosine `>= 0.9999997`). Real 120-step
-`retail_demand` `lora_temporal` training on `123M` and `209M` showed `fp32` default SDPA, `fp32` math
-SDPA, and `bf16` default SDPA agreeing within `0.0002–0.0007` test wQL (`docs/BENCHMARKS.md` §3).
+`retail_demand` `lora_temporal` training on `123M` and `209M` (train-only series selection,
+`docs/benchmarks/precision_ablation_123m_209m.json`) gave `fp32` default / `fp32` math / `bf16` default
+test wQL of `0.1982 / 0.1978 / 0.1981` on `123M` and `0.1980 / 0.1951 / 0.1947` on `209M` (`docs/BENCHMARKS.md` §3).
 
 Environment requirement found on the way. With the VM's system Python 3.10 (PyTorch 2.14.1+cu130), every
 CUDA test failed: PyTorch routed an operation in upstream's attention layer through a Triton kernel, and
 Triton compiles a C helper on first use, which stopped at `fatal error: Python.h: No such file or directory`.
 With a uv-managed Python 3.12, which ships its headers, everything passed. `scripts/cuda_check.sh` now
 checks for the headers and a compiler first and stops with advice (verified on the VM: exit code 4).
+
+## 14. Phase 3 defaults, sign-flip augmentation, and large-checkpoint sweeps
+
+Backs the `[V]` claims in spec §5.3, §5.4, and D19. All sweeps ran on an NVIDIA L4 (`bf16`, PyTorch
+2.15.0+cu132, Python 3.12, 2026-11-22), scored strictly on validation wQL and equal-weighted 3-domain
+macro GIFT-Eval forgetting (`ett1`, `jena_weather`, `loop_seattle`; raw JSON in `docs/benchmarks/`):
+
+| Claim (`SPEC.md`) | Command / artefact | Verified result |
+|---|---|---|
+| `TrainingConfig.sign_flip=True` default (§5.3, §5.4, D19) | `run_sweeps.py --device cuda --sizes 123M 209M --bf16 --batch-size 16 --eval-batch-size 32 --datasets realised_volatility retail_demand signed_returns --modes lora_temporal full_ft --mode-lrs lora_temporal=1e-3,3e-3 full_ft=1e-4,3e-4 --sign-flip-modes off on --seeds 0 1 2 --check-forgetting --skip-lora-sweep` (`docs/benchmarks/sweeps_large_decisions.json`) | On signed `logret_20`, flipping stayed within seed spread on both `123M` and `209M` (improved 5/6 cells; worst delta `+0.0008` vs `0.0025` spread). On retail, cut validation wQL by 5.9%–6.7%; improved volatility on 3/3 seeds on both sizes. |
+| `lora_temporal=1e-3` default (§5.4, D19) | Same command (`docs/benchmarks/sweeps_large_decisions.json`) | `3e-3` never beat `1e-3` by more than seed spread on `123M`/`209M`, lost outright on 3/6 splits, and hit `+19.6%`–`+23.8%` worst-seed forgetting on signed returns (vs `+0.3%`–`+0.7%` at `1e-3`). |
+| `full_ft=1e-4` default (§5.4, D19) | Same command (`docs/benchmarks/sweeps_large_decisions.json`) | On `123M`/`209M`, `1e-4` won 3/6 splits outright (including both `209M` volatility and retail), `3e-4` never beat `1e-4` by more than seed spread on the other 3, and `1e-4` halved worst-seed retail forgetting (`+1.6%`/`+2.1%` vs `+4.0%`/`+4.2%`). |
+| `head_only=3e-3`, `lora_variate=3e-3`, LoRA `r=8, targets=("q","k","v","o")` (§5.4, D19) | `run_sweeps.py --device cuda --sizes 5M 28M --bf16 --max-steps 120 --batch-size 32 --sign-flip-modes on --check-forgetting` (`docs/benchmarks/sweeps_bracketed.json`) | Full `head_only` (`3e-5..3e-2`) and `lora_variate` (`3e-4..3e-2`) grids bracket `3e-3` cleanly on `28M`; `r=8, ("q","k","v","o")` beat `("q","v")` across 3/4 5M LoRA comparisons. |
+| Dual-orientation `head_only` cache parity with `sign_flip=True` (§5.4) | `tests/test_trainer.py::test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass` | 3 frozen-body passes across 4 epochs (`+x` train, `-x` train, val) matching streaming `sign_flip=True` head weights within `< 1e-4` L2. |
+| `123M`/`209M` `fp32` default vs `fp32` math vs `bf16` on train-only retail (D15) | `run_benchmarks.py --datasets retail_demand --modes lora_temporal --max-steps 120 --batch-size 16 --eval-batch-size 16` (`docs/benchmarks/precision_ablation_123m_209m.json`) | `123M`: `0.1982 / 0.1978 / 0.1981` test wQL; `209M`: `0.1980 / 0.1951 / 0.1947` (`bf16` 1.8× faster, `2.79 GiB` VRAM). |

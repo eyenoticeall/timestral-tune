@@ -541,8 +541,8 @@ not started.
     hourly series, 9 rows/series), and `Salesforce/GiftEval@30841734ac5c` (Apache-2.0; 48 hourly energy,
     weather, and traffic series for the forgetting metric).
   - Ran LR, LoRA rank/targets, and sign-flip sweeps on 5M and 28M plus the full 5M + 28M 7-mode benchmark
-    matrix and 200-step 28M `bf16` vs `fp32` check on a short-lived NVIDIA L4 VM (`asia-northeast3-a`, deleted
-    and verified gone immediately afterwards).
+    matrix and 200-step 28M `bf16` vs `fp32` check on a short-lived NVIDIA L4 VM (deleted and verified gone
+    immediately afterwards).
   - Updated `DEFAULT_LEARNING_RATES` (`head_only=3e-4`, `lora_*=1e-3`, `full_ft=5e-5`) and `LoraConfig`
     default `targets=("q", "k", "v", "o")` (`r=8, alpha=16`) in `config.py` and `SPEC.md` §5.4 from sweep
     evidence.
@@ -595,9 +595,27 @@ not started.
     `--attention-backend`, peak VRAM, per-block ACI coverage, equal-weighted 3-domain macro forgetting) to
     `run_benchmarks.py`, re-ran `5M`, `28M`, `123M`, `209M` benchmarks and `28M` significance checks on L4,
     committed raw JSON outputs in `docs/benchmarks/`, added D19/D20 to `SPEC.md` §11, fixed stale `STATUS.md`
-    wording, and corrected all claims in `docs/BENCHMARKS.md` (including per-block ACI overshoot on volatility,
-    `head_only`'s `+5.0%–13.9%` macro forgetting, `full_ft` leading 6/8 cells at `3e-4`, and pre-release
-    contamination on the 10-month volatility holdout).
+    wording, and corrected claims in `docs/BENCHMARKS.md`.
+- **Large-checkpoint 3-seed decision runs & final Phase 3 defaults (`55d57d2`, `1185f82`, `7ebe45d`, and final docs/JSONs, short-lived L4 VM deleted and verified gone immediately after):**
+  - Closed the remaining 4 mutation-test gaps (`55d57d2`: `sign_flip` `p=0.5` vs `p=1.0`, `evaluate_forecaster`
+    `seasonality` forwarding, exact chronological array order in `_SpyOnline`, and overlapping-stride horizon-reveal
+    delay).
+  - Added reproducible `load_signed_returns()` (`logret_20`) to `datasets.py` and `--datasets`/`--modes`/`--mode-lrs`/
+    `--sign-flip-modes`/`--seeds` flags to `run_sweeps.py` (`1185f82`), then ran the full 144-run 3-seed factorial on
+    `123M` and `209M` (`docs/benchmarks/sweeps_large_decisions.json`).
+  - Applied Decisions 1–3 (`7ebe45d`, D19):
+    1. `TrainingConfig.sign_flip = True` (Option B: within seed spread on signed `logret_20` on both `123M` and `209M`,
+       improving 5/6 cells, and cutting retail val wQL 5.9%–6.7%), with dual-orientation `+x`/`-x` frozen-feature caching
+       in `head_only` (3 body passes across 4 epochs, `< 1e-4` L2 parity vs streaming).
+    2. `lora_temporal` default LR → `1e-3` (`3e-3` never beat `1e-3` by more than seed spread on `123M`/`209M` and hit
+       `+19.6%`/`+23.8%` worst-seed forgetting on signed returns).
+    3. `full_ft` default LR → `1e-4` (won 3/6 `123M`/`209M` splits outright, `3e-4` never exceeded seed spread on the
+       other 3, and `1e-4` halved worst-seed retail forgetting to `+1.6%`/`+2.1%`; `5M`/`28M` preference for `3e-4`
+       noted in D19 and `docs/BENCHMARKS.md`).
+  - Re-ran unified `sweeps_bracketed.json` (removing split `sweeps_extra.json`), `bench_5m_28m.json`,
+    `bench_123m_209m.json`, `precision_ablation_123m_209m.json` (on train-only retail selection), and `sig_v2.json`
+    at the final shipped defaults, added §14 to `docs/VERIFICATION.md` for all new `[V]` claims, fixed all four
+    report claims, and removed the GCP zone string from earlier devlog prose.
 
 **Not done / open.** `phase-3` is unpushed and unmerged pending final review; PyPI release awaits maintainer
 approval. Phase 4 (stretch: replay, distillation, tiled training) has not started.
