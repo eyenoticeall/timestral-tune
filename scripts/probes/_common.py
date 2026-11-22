@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 
 import timestral_tune._vendor.timestral.layers as layers
+from timestral_tune._vendor.timestral import TimestralConfig
 from timestral_tune._vendor.timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET
 from timestral_tune.data import TrainingBatch
 from timestral_tune.models import TuneTimestralForecaster, TuneTimestralModel, load_forecaster
@@ -28,6 +29,26 @@ PATCH = 32
 def load(size: str, device: str = "cpu", **forecaster_kwargs) -> TuneTimestralForecaster:
     """Load a released checkpoint at its pinned revision."""
     return load_forecaster(f"mistralai/Timestral-{size}", device=device, **forecaster_kwargs)
+
+
+def tiny_random_forecaster(seed: int = 0) -> TuneTimestralForecaster:
+    """A small randomly initialised model with the released patch size, for network-free probes."""
+    torch.manual_seed(seed)
+    levels = (0.01, *(round(0.05 * i, 2) for i in range(1, 20)), 0.99)
+    config = TimestralConfig(
+        patch_size=PATCH,
+        d_model=64,
+        num_heads=2,
+        mlp_hidden_dim=128,
+        block_schedule=("time", "time_variate", "time", "time_variate"),
+        quantile_knots=levels,
+        block_size=32,
+        context_length=32768,
+    )
+    model = TuneTimestralModel(config)
+    with torch.no_grad():
+        model.representation.forecast_query.normal_(std=0.5)
+    return TuneTimestralForecaster(model.eval())
 
 
 def rel(a: Tensor, b: Tensor) -> float:

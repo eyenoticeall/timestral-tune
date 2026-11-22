@@ -40,12 +40,20 @@ import math
 
 import torch
 import torch.nn.functional as F
-from _common import SIZES, load, loss_gradient, make_batch, on_device, reference_gradient, rel
+from _common import (
+    SIZES,
+    load,
+    loss_gradient,
+    make_batch,
+    on_device,
+    reference_gradient,
+    rel,
+    tiny_random_forecaster,
+)
 
 import timestral_tune._vendor.timestral.layers as layers
-from timestral_tune._vendor.timestral import TimestralConfig
 from timestral_tune._vendor.timestral.layers import Attention, TwoStreamMask, _apply_rotary
-from timestral_tune.models import TuneTimestralForecaster, TuneTimestralModel
+from timestral_tune.models import TuneTimestralModel
 from timestral_tune.models.forward import attention_context
 from timestral_tune.trainer import compute_loss
 
@@ -56,26 +64,6 @@ LAYOUTS = (
     ("covariates", 5, True, True),
     ("past-only", 3, True, False),
 )
-
-
-def tiny_random_forecaster() -> TuneTimestralForecaster:
-    """A small randomly initialised model with the released patch size, to separate architecture from weights."""
-    torch.manual_seed(0)
-    levels = (0.01, *(round(0.05 * i, 2) for i in range(1, 20)), 0.99)
-    config = TimestralConfig(
-        patch_size=32,
-        d_model=64,
-        num_heads=2,
-        mlp_hidden_dim=128,
-        block_schedule=("time", "time_variate", "time", "time_variate"),
-        quantile_knots=levels,
-        block_size=32,
-        context_length=32768,
-    )
-    model = TuneTimestralModel(config)
-    with torch.no_grad():
-        model.representation.forecast_query.normal_(std=0.5)
-    return TuneTimestralForecaster(model.eval())
 
 
 def manual_sdpa(query, key, value, mask, is_causal=False):
