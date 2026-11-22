@@ -12,7 +12,7 @@ license-files = ["LICENSE", "NOTICE", "src/timestral_tune/_vendor/timestral/LICE
 requires-python = ">=3.10"
 keywords = ["time-series", "forecasting", "fine-tuning", "lora", "conformal-prediction", "timestral"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -29,6 +29,13 @@ dependencies = [
     "safetensors>=0.4",
     "torch>=2.4",
 ]
+
+[project.urls]
+Homepage = "https://github.com/eyenoticeall/timestral-tune"
+Repository = "https://github.com/eyenoticeall/timestral-tune"
+Documentation = "https://github.com/eyenoticeall/timestral-tune/blob/main/docs/SPEC.md"
+Changelog = "https://github.com/eyenoticeall/timestral-tune/blob/main/CHANGELOG.md"
+Issues = "https://github.com/eyenoticeall/timestral-tune/issues"
 
 [project.optional-dependencies]
 # Optional Lacuna integration (spec §7.5). Lacuna itself requires Python 3.11+.
@@ -50,7 +57,7 @@ path = "src/timestral_tune/__init__.py"
 packages = ["src/timestral_tune"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "scripts", "docs", "README.md", "NOTICE", "LICENSE"]
+include = ["src", "tests", "scripts", "docs", "README.md", "CHANGELOG.md", "NOTICE", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" width="100%"
+  <img src="https://raw.githubusercontent.com/eyenoticeall/timestral-tune/main/assets/banner.png" width="100%"
        alt="timestral-tune: fine-tuning, selective LoRA and conformal calibration for Timestral time-series models">
 </p>
 
@@ -7,19 +7,19 @@
 
 Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
 
-> **Status: pre-alpha (Phases 0–4).** Loading, the data pipeline, all five adaptation modes (`conformal`,
+> **Status: alpha (v0.1).** Loading, the data pipeline, all five adaptation modes (`conformal`,
 > `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), anti-forgetting replay mixing and frozen-base
 > distillation (`ReplayConfig`, `SyntheticReplaySource`), `bf16` + `torch.compile` on CUDA, full Apple GPU
 > coverage (`5M`–`209M`, contexts up to `32,768`), upstream-loadable checkpoint export, raw-space evaluation
 > & forgetting metrics, optional Lacuna integration, and real-dataset benchmarks (5M–209M) are built and
-> verified (14/14 acceptance tests passing). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and
-> [docs/STATUS.md](docs/STATUS.md).
+> verified (14/14 acceptance tests passing). See [docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md) and
+> [docs/STATUS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/STATUS.md).
 
-## What this will be
+## What it is
 
 [Timestral](https://arxiv.org/abs/2610.37585) is Mistral AI's family of time-series foundation models
 (5M, 28M, 123M and 209M parameters). The [official repository](https://github.com/mistralai/timestral)
-provides inference only. `timestral-tune` aims to be an open adaptation toolkit for the released weights,
+provides inference only. `timestral-tune` is an open adaptation toolkit for the released weights,
 with a ladder of increasingly invasive options:
 
 | Mode | What changes |
@@ -33,7 +33,7 @@ with a ladder of increasingly invasive options:
 Design goals: reproduce the paper's objective, masks and normalisation exactly and prove it with tests
 against the official code; export checkpoints that load in the official package; make runs auditable.
 
-The full design is in **[docs/SPEC.md](docs/SPEC.md)**, which
+The full design is in **[docs/SPEC.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/SPEC.md)**, which
 is the project's overview guide and source of truth.
 
 ## What exists today
@@ -49,9 +49,22 @@ is the project's overview guide and source of truth.
 | CUDA acceleration | Done: `bf16` autocast, fused `AdamW`, optional `torch.compile` (verified on NVIDIA L4) |
 | Conformal calibration | Done: `ConformalCalibrator` (CQR) and `OnlineConformalCalibrator` (ACI) |
 | Checkpoint export | Done: upstream-loadable `config.json` + merged `model.safetensors`, LoRA adapters, `conformal.json`, sidecar, `LICENSE`, `NOTICE` |
-| Benchmarks, metrics, Lacuna integration | Done: `utils/metrics.py`, `integrations/lacuna.py`, sweep-backed defaults, 5M–209M tables in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) |
+| Benchmarks, metrics, Lacuna integration | Done: `utils/metrics.py`, `integrations/lacuna.py`, sweep-backed defaults, 5M–209M tables in [docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md) |
 | Acceptance tests T1–T14 | All 14 of 14 implemented and passing on tiny, 5M and 28M (CPU, Apple GPU, CUDA) |
 | CI | Passing on `main` (Python 3.10–3.13 on Linux) |
+
+## Install
+
+```bash
+pip install timestral-tune        # or: uv add timestral-tune
+```
+
+Requires Python 3.10+ and PyTorch 2.4+ (2.8+ for the Apple GPU). The data layer reads polars, pandas and
+pyarrow frames, so install whichever you use; none is a dependency. Model weights are downloaded from the
+Hugging Face Hub on first use, under Mistral AI's licence (see [below](#licence-and-important-restrictions)).
+
+The API may change between 0.x releases; changes are listed in the
+[changelog](https://github.com/eyenoticeall/timestral-tune/blob/main/CHANGELOG.md).
 
 ## Quick start
 
@@ -90,12 +103,26 @@ trainer.export()                 # writes upstream-loadable merged checkpoint + 
 
 Default settings (`sign_flip=True`, learning rates `head_only=3e-3`, `lora_variate=3e-3`,
 `lora_temporal=1e-3`, `full_ft=1e-4`, and LoRA `r=8, targets=("q","k","v","o")`) are backed by
-Phase 3 validation and forgetting sweeps across `5M`–`209M` in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Phase 3 validation and forgetting sweeps across `5M`–`209M` in [docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md).
 For `full_ft` on the two smaller checkpoints (`5M` and `28M`), we recommend setting
 `learning_rate=3e-4`: it achieved lower error in our benchmarks (three seeds on `5M`, one seed on
 `28M`, where the gain is mainly on volatility), at the cost of roughly two to three percentage
 points more forgetting. Keep the `1e-4` default on `123M` and `209M`, where the two rates tie or
 favour `1e-4` on validation and `1e-4` forgets less.
+
+To limit forgetting of the pretrained behaviour, pass a `ReplayConfig`. Its default adds a light
+distillation term that pulls forecasts on built-in synthetic series towards the frozen base model; it
+needs no extra data and no labels:
+
+```python
+from timestral_tune import ReplayConfig
+
+trainer = TimestralTrainer(config, train, validation, lora_config=lora, replay_config=ReplayConfig())
+```
+
+Measured effects and their limits are in
+[docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md) §5: it
+helped most for `head_only`, and for `full_ft` a lower learning rate did as well.
 
 To check your own data for leakage and parity with the official inference path:
 
@@ -139,13 +166,13 @@ uv run python scripts/probes/model_facts.py
 uv run python scripts/probes/device_parity.py --device mps    # or cuda
 ```
 
-More in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Contributors and coding agents should read
-[AGENTS.md](AGENTS.md) first.
+More in [docs/DEVELOPMENT.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/DEVELOPMENT.md). Contributors and coding agents should read
+[AGENTS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/AGENTS.md) first.
 
 ## Licence and important restrictions
 
-- **This software** is licensed under [Apache 2.0](LICENSE). It includes a vendored copy of Mistral AI's
-  Apache-2.0 `timestral` package; see [NOTICE](NOTICE).
+- **This software** is licensed under [Apache 2.0](https://github.com/eyenoticeall/timestral-tune/blob/main/LICENSE). It includes a vendored copy of Mistral AI's
+  Apache-2.0 `timestral` package; see [NOTICE](https://github.com/eyenoticeall/timestral-tune/blob/main/NOTICE).
 - **Timestral model weights are not covered by Apache 2.0.** They are downloaded from the Hugging Face Hub
   under Mistral AI's Modified MIT License. That licence grants no rights to anyone whose company (or
   employer) had global consolidated revenue above **$20 million** in the preceding month, and it applies to
