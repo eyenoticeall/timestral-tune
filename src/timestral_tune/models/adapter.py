@@ -18,10 +18,11 @@ while merged).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "LoRASliceLinear",
+    "disable_lora",
     "extract_lora_state_dict",
     "has_lora",
     "inject_lora",
@@ -107,6 +109,7 @@ class LoRASliceLinear(nn.Module):
         self.scaling = self.lora_alpha / self.r
         self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
         self.merged = False
+        self.disabled = False
         self._saved_base_slices: dict[str, Tensor] | None = None
 
         device, dtype = base.weight.device, base.weight.dtype
@@ -183,7 +186,7 @@ class LoRASliceLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         out = self.base(x)
-        if self.merged:
+        if self.merged or self.disabled:
             return out
 
         x_in = self.dropout(x)
@@ -370,6 +373,28 @@ def unmerge_lora(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, LoRASliceLinear):
             module.unmerge()
+
+
+@contextlib.contextmanager
+def disable_lora(model: nn.Module) -> Iterator[None]:
+    """Temporarily bypass all `LoRASliceLinear` deltas so `model` runs with frozen base weights.
+
+    Handles both unmerged adapters (setting `disabled=True`) and merged adapters (unmerging for
+    the block and re-merging on exit). Restores exact prior state on exit or exception.
+    """
+    modules = [module for module in model.modules() if isinstance(module, LoRASliceLinear)]
+    saved = [(module, module.disabled, module.merged) for module in modules]
+    try:
+        for module, _, was_merged in saved:
+            if was_merged:
+                module.unmerge()
+            module.disabled = True
+        yield
+    finally:
+        for module, was_disabled, was_merged in saved:
+            module.disabled = was_disabled
+            if was_merged:
+                module.merge()
 
 
 def _clean_compiled_key(key: str) -> str:

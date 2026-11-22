@@ -5,6 +5,7 @@ See spec §3 (model facts), §4.3 (normalised space) and §5 (adaptation modes).
 
 from .adapter import (
     LoRASliceLinear,
+    disable_lora,
     extract_lora_state_dict,
     has_lora,
     inject_lora,
@@ -46,6 +47,7 @@ __all__ = [
     "TuneTimestralModel",
     "collect_conformal_data",
     "denormalise_quantiles",
+    "disable_lora",
     "extract_lora_state_dict",
     "has_lora",
     "inject_lora",

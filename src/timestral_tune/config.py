@@ -1,11 +1,10 @@
 """Configuration dataclasses.
 
-`TrainingConfig` holds everything the trainer needs apart from the data, and `LoraConfig`
-configures selective slice LoRA on attention projections (spec §5.1).
+`TrainingConfig` holds everything the trainer needs apart from the data, `LoraConfig`
+configures selective slice LoRA on attention projections (spec §5.1), and `ReplayConfig`
+configures anti-forgetting replay mixing and frozen-base distillation (spec §5.3).
 
-`ReplayConfig` (roadmap Phase 4) is not defined yet.
-
-- Spec: `docs/SPEC.md` §5 (modes), §5.1 (LoRA), §5.4 (trainer), §7.1 (API example)
+- Spec: `docs/SPEC.md` §5 (modes), §5.1 (LoRA), §5.3 (replay), §5.4 (trainer), §7.1 (API example)
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ __all__ = [
     "LoraAxis",
     "LoraConfig",
     "LoraTarget",
+    "ReplayConfig",
     "TrainingConfig",
 ]
 
@@ -118,6 +118,104 @@ class LoraConfig:
         unknown = set(data) - known
         if unknown:
             raise ValueError(f"unknown LoraConfig keys: {sorted(unknown)}")
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class ReplayConfig:
+    """Settings for anti-forgetting replay mixing and frozen-base distillation (spec §5.3).
+
+    At each training step the trainer combines the domain pinball loss with a replay micro-batch:
+
+    `loss = (1 - replay_fraction) * L_domain + replay_fraction * L_replay + distill_weight * L_distill`
+
+    where `L_replay` is the pinball loss on labelled replay windows (skipped when
+    `replay_fraction == 0`) and `L_distill` is the mean absolute difference between the tuned
+    model's and the frozen base model's normalised quantiles on replay windows (skipped when
+    `distill_weight == 0`, and needs no labels).
+
+    Attributes:
+        replay_fraction: Weight of replay pinball loss relative to domain pinball loss, in
+            `[0.0, 1.0)`. Set to `0.0` with `distill_weight > 0` for distillation-only anchoring.
+        distill_weight: Non-negative weight on frozen-base L1 quantile distillation over replay
+            windows. At least one of `replay_fraction` or `distill_weight` must be positive.
+        batch_size: Replay windows per training step. `None` picks
+            `max(1, round(train_batch_size * replay_fraction))` when `replay_fraction > 0`, or
+            `max(1, train_batch_size // 4)` for distillation-only replay.
+        sign_flip: Whether to apply random per-series sign flips (`p=0.5`) to replay batches.
+            `None` inherits `TrainingConfig.sign_flip`. When distillation is enabled, both the
+            tuned and frozen base models see the same orientation.
+        cache_base_outputs: When `distill_weight > 0`, precompute the frozen base model's
+            normalised quantiles on CPU (up to 256 MiB) before training starts so `full_ft` and
+            LoRA avoid both a second copy of the base model in accelerator memory and a second
+            forward pass every step. Falls back to live frozen-base evaluation above the cap or
+            when False.
+    """
+
+    replay_fraction: float = 0.25
+    distill_weight: float = 0.0
+    batch_size: int | None = None
+    sign_flip: bool | None = None
+    cache_base_outputs: bool = True
+
+    def __post_init__(self) -> None:
+        if isinstance(self.replay_fraction, bool) or not (
+            isinstance(self.replay_fraction, numbers.Real)
+            and math.isfinite(self.replay_fraction)
+            and 0.0 <= self.replay_fraction < 1.0
+        ):
+            raise ValueError(f"replay_fraction must be in [0, 1), got {self.replay_fraction!r}")
+        object.__setattr__(self, "replay_fraction", float(self.replay_fraction))
+
+        if isinstance(self.distill_weight, bool) or not (
+            isinstance(self.distill_weight, numbers.Real)
+            and math.isfinite(self.distill_weight)
+            and self.distill_weight >= 0.0
+        ):
+            raise ValueError(f"distill_weight must be non-negative and finite, got {self.distill_weight!r}")
+        object.__setattr__(self, "distill_weight", float(self.distill_weight))
+
+        if self.replay_fraction == 0.0 and self.distill_weight == 0.0:
+            raise ValueError("at least one of replay_fraction or distill_weight must be positive")
+
+        if self.batch_size is not None:
+            if (
+                not isinstance(self.batch_size, numbers.Integral)
+                or isinstance(self.batch_size, bool)
+                or self.batch_size < 1
+            ):
+                raise ValueError(f"batch_size must be a positive integer or None, got {self.batch_size!r}")
+            object.__setattr__(self, "batch_size", int(self.batch_size))
+
+        if self.sign_flip is not None and not isinstance(self.sign_flip, bool):
+            raise ValueError(f"sign_flip must be a bool or None, got {self.sign_flip!r}")
+
+        if not isinstance(self.cache_base_outputs, bool):
+            raise ValueError(f"cache_base_outputs must be a bool, got {self.cache_base_outputs!r}")
+
+    def resolved_batch_size(self, train_batch_size: int) -> int:
+        """Number of replay windows drawn per training step."""
+        if self.batch_size is not None:
+            return self.batch_size
+        if self.replay_fraction > 0.0:
+            return max(1, round(train_batch_size * self.replay_fraction))
+        return max(1, train_batch_size // 4)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "replay_fraction": self.replay_fraction,
+            "distill_weight": self.distill_weight,
+            "batch_size": self.batch_size,
+            "sign_flip": self.sign_flip,
+            "cache_base_outputs": self.cache_base_outputs,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReplayConfig:
+        known = {"replay_fraction", "distill_weight", "batch_size", "sign_flip", "cache_base_outputs"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown ReplayConfig keys: {sorted(unknown)}")
         return cls(**data)
 
 
