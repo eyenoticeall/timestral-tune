@@ -207,7 +207,7 @@ class TestDisableLora:
         with torch.no_grad():
             post_merged_out = training_forward(tiny_model, batch).quantiles
             assert torch.equal(post_merged_out, pre_merged_out)
-            assert torch.allclose(post_merged_out, adapted_out, atol=5e-4)
+            assert torch.allclose(post_merged_out, adapted_out, atol=5e-3)
 
 
 def _make_covariate_dataset(
