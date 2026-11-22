@@ -38,7 +38,6 @@ LoraTarget = Literal["q", "k", "v", "o", "gate"]
 
 LORA_AXES: tuple[str, ...] = get_args(LoraAxis)
 LORA_TARGETS: tuple[str, ...] = get_args(LoraTarget)
-SINGLE_ROW_ALLOWED_TARGETS: tuple[str, ...] = ("v", "o", "gate")
 
 # Sweep-backed default learning rates (bracketed Phase 3 validation sweeps on 5M, 28M, 123M, and
 # 209M across realised volatility, retail demand, and signed returns; see `docs/BENCHMARKS.md` §2

@@ -55,6 +55,8 @@ __all__ = [
 logger = logging.getLogger("timestral_tune.lora")
 
 _QKV_SLICES: dict[str, int] = {"q": 0, "k": 1, "v": 2}
+# The one definition of this set. It lives here, not in `config.py`, because `config.py` imports this
+# package and a module-level import the other way would be circular.
 _SINGLE_ROW_ALLOWED_TARGETS: tuple[str, ...] = ("v", "o", "gate")
 
 
