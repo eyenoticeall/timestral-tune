@@ -313,13 +313,13 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 313 passed, 24 skipped on `phase-4` (`-m "not network"`, including all Phase 3 & Phase 4 replay/distillation tests); earlier full run at `3fe5bc9`: 411 passed, 26 skipped. Skipped: accelerator tests (MPS requires 2.8+), DataLoader-worker test (below), optional `lacuna`, and 14 non-network CUDA-only tests |
-| 2.8.0 | 3.12 | 356 passed, 14 skipped on `phase-4` (`-m "not network"`, including Apple GPU and all Phase 3 & Phase 4 tests); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
-| 2.14.1 | 3.10 | 356 passed, 14 skipped on `phase-4` (`-m "not network"`, `uv run --isolated --python 3.10 pytest -m "not network"`); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
-| 2.15.0 | 3.13 | 567 passed, 17 skipped (full suite on `phase-4`, including tiny, 5M, 28M, 123M MPS parity, and all Phase 3 & Phase 4 replay/distillation tests; 16 CUDA-only + 1 optional `lacuna` skipped) |
+| 2.4.0 | 3.12 | 313 passed, 24 skipped on `main` (`-m "not network"`, including all Phase 3 & Phase 4 replay/distillation tests); earlier full run at `3fe5bc9`: 411 passed, 26 skipped. Skipped: accelerator tests (MPS requires 2.8+), DataLoader-worker test (below), optional `lacuna`, and 14 non-network CUDA-only tests |
+| 2.8.0 | 3.12 | 356 passed, 14 skipped on `main` (`-m "not network"`, including Apple GPU and all Phase 3 & Phase 4 tests); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
+| 2.14.1 | 3.10 | 356 passed, 14 skipped on `main` (`-m "not network"`, `uv run --isolated --python 3.10 pytest -m "not network"`); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
+| 2.15.0 | 3.13 | 567 passed, 17 skipped (full suite on `main`, including tiny, 5M, 28M, 123M MPS parity, and all Phase 3 & Phase 4 replay/distillation tests; 16 CUDA-only + 1 optional `lacuna` skipped) |
 
-These are the counts on `phase-4` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
-The CUDA run (§13) used Linux x86 on the same branch (`89ac249`) and passed all 16 CUDA tests as well (580 passed, 4 skipped).
+These are the counts on `main` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
+The CUDA run (§13) used Linux x86 (`89ac249`, merged into `main`) and passed all 16 CUDA tests as well (580 passed, 4 skipped).
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):

@@ -618,7 +618,7 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
   - [ ] Tiled training with a fixed block length: upstream's `build_two_stream_time_mask` takes `min_context` and `block_size` **[U masks.py:56-101]**, but tiling undoes D16's `L + 2h` token saving (roughly doubling tokens), conflicts with per-window categorical encoding (D1, §6.3 rule 4), requires whole-span known-future covariates, and requires a separate multi-origin batch/collator/frame pipeline whose payoff on small fine-tuning datasets is unproven.
   - [ ] Sampled block lengths within a sequence **[P §3.1]**: depends on tiled training and an unpublished block-length distribution.
 
-**Exit (rescoped Phase 4):** replay + distillation implemented, parity-tested, and empirically evaluated against the forgetting metric; Apple GPU verified on `123M`, `209M`, and contexts up to `32,768`. **Met on 2026-11-22 (branch `phase-4`).**
+**Exit (rescoped Phase 4):** replay + distillation implemented, parity-tested, and empirically evaluated against the forgetting metric; Apple GPU verified on `123M`, `209M`, and contexts up to `32,768`. **Met and merged into `main` on 2026-11-22.**
 
 ---
 

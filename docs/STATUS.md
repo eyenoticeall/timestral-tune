@@ -1,8 +1,8 @@
 # Project Status
 
 **Last updated:** 2026-11-22
-**Stage:** pre-alpha. Phases 0, 1, 2, and 3 are merged into `main`; rescoped Phase 4 (replay mixing, frozen-base distillation, and Apple GPU `123M`/`209M`/long-context coverage) is built and verified on branch `phase-4` (tiled DHF deferred as exploratory; PyPI publish pending maintainer action).
-**Next phase:** Review & merge `phase-4` into `main` and v0.1.0 PyPI release. See spec §10.
+**Stage:** pre-alpha. Phases 0, 1, 2, 3, and rescoped Phase 4 (replay mixing, frozen-base distillation, and Apple GPU `123M`/`209M`/long-context coverage) are built, verified, and merged into `main` (tiled DHF deferred as exploratory; PyPI publish pending maintainer action).
+**Next phase:** v0.1.0 PyPI release (when ready), or exploratory evaluation of tiled DHF. See spec §10.
 
 ## What works today
 
@@ -21,8 +21,8 @@
 | Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters (`load_lora`), `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
-| Test suite | 567 passed, 17 skipped (16 CUDA-only, 1 optional `lacuna`), on tiny, 5M, 28M, and 123M MPS parity (`phase-4`, PyTorch 2.15.0 on 3.13; PyTorch 2.4.0 `-m "not network"`: 313/25; PyTorch 2.8.0 & Python 3.10/2.14.1: 356/15; live `lacuna-quant==0.14.1`: 4/4; NVIDIA L4 Linux x86 CUDA at `89ac249`: **580 passed, 4 skipped**) |
-| CI | Green on `main` (run `45006472178`, Python 3.10–3.13 on Linux); `phase-4` pending PR/merge |
+| Test suite | 567 passed, 17 skipped (16 CUDA-only, 1 optional `lacuna`), on tiny, 5M, 28M, and 123M MPS parity (`main`, PyTorch 2.15.0 on 3.13; PyTorch 2.4.0 `-m "not network"`: 313/25; PyTorch 2.8.0 & Python 3.10/2.14.1: 356/15; live `lacuna-quant==0.14.1`: 4/4; NVIDIA L4 Linux x86 CUDA at `89ac249`: **580 passed, 4 skipped**) |
+| CI | Running on `main` (Python 3.10–3.13 on Linux) |
 
 ## What does not exist yet
 
@@ -48,7 +48,7 @@ Not verified anywhere: multi-GPU, real general-domain replay datasets (only buil
 
 ## Next steps
 
-1. **Review & merge `phase-4` into `main`**, then publish v0.1.0 to PyPI when ready.
+1. **Publish v0.1.0 to PyPI** when ready.
 2. **Optional exploratory work:** evaluate whether fixed-length tiled DHF warrants its token and categorical-encoding trade-offs on long fine-tuning series.
 
 ## Open questions and known issues
@@ -62,7 +62,6 @@ Full list in spec §12. The ones that matter next:
 
 ## Branch state
 
-- `main`: Phases 0–3 (`638e9c1`, CI green).
-- `phase-4`: Rescoped Phase 4 (replay mixing, synthetic generators, frozen-base distillation, Apple GPU `123M`/`209M`/long-context verification), open off `main`, unpushed.
+- `main`: Phases 0–4 (rescoped Phase 4 fast-forwarded from `phase-4` at `9261c75` on 2026-11-22). All prior branches (`phase-1`, `perf/phase1-kernels`, `fix/math-sdpa-backend`, `phase-2`, `phase-3`, `phase-4`) are closed and deleted locally and on `origin`.
 
 Branch policy is in `AGENTS.md` §6.

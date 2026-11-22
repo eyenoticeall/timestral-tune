@@ -710,8 +710,8 @@ lengths) as exploratory due to token doubling (undoing D16), per-window categori
     `0.00e+00` cached-vs-live diff across `{0.0, 1e-3, 1e-2}`), and full `bash scripts/cuda_check.sh` on a
     short-lived NVIDIA L4 Linux x86 VM (`e3c6883`; caught and fixed a Linux x86 fp32 merged-vs-unmerged
     tolerance in `test_disable_lora`): **255 passed, 3 skipped** (device tests) and **577 passed, 4 skipped**
-    (whole suite, exit 0; VM and disk deleted immediately after). Note: `gcloud compute ssh` added a
-    project-wide `ssh-keys` metadata entry that remains to be removed with maintainer confirmation.
+    (whole suite, exit 0; VM and disk deleted immediately after). The earlier project-wide `ssh-keys`
+    metadata entry was subsequently removed via `gcloud compute project-info remove-metadata --keys=ssh-keys`.
   - Re-verified the full local macOS PyTorch matrix on `phase-4`: PyTorch `2.4.0` (`313/24`), `2.8.0`
     (`356/14`), Python `3.10` / `2.14.1` (`356/14`), and `2.15.0` full suite (`567/14`); fixed every
     remaining doc contradiction across `SPEC.md`, `BENCHMARKS.md`, `VERIFICATION.md`, `README.md`,
@@ -734,5 +734,6 @@ lengths) as exploratory due to token doubling (undoing D16), per-window categori
        `ssh-keys` added; VM and disk deleted immediately after): **42/42** in `tests/test_replay.py`,
        **255 passed, 3 skipped** (device tests), and **580 passed, 4 skipped** (whole suite, exit 0).
 
-**Not done / open.** `phase-4` is unpushed and unmerged pending review; PyPI publish awaits maintainer
-approval; tiled DHF remains deferred as exploratory.
+**Not done / open.** Phase 4 fast-forwarded into `main` at `9261c75`, pushed to `origin/main`, and
+`phase-4` deleted locally and on `origin`. PyPI publish awaits maintainer approval; tiled DHF remains
+deferred as exploratory.

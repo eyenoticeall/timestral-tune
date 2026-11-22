@@ -1,6 +1,6 @@
 # Phase 4 — Anti-forgetting and Apple GPU Scaling (rescoped)
 
-**Status:** Complete on branch `phase-4` (2026-11-22; Items 1 & 4 done; Items 2 & 3 deferred as exploratory).
+**Status:** Complete and merged into `main` (2026-11-22, fast-forwarded from `phase-4` at `9261c75`; Items 1 & 4 done; Items 2 & 3 deferred as exploratory).
 **Goal:** Replay mixing, built-in synthetic generators, frozen-base distillation, and Apple GPU (MPS) coverage for `123M`, `209M`, and contexts up to `32,768`.
 **Spec sections:** `docs/SPEC.md` §5.3, §5.4, §10, decisions D1, D7, D21
 
