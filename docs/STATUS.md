@@ -21,7 +21,7 @@
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
 | Acceptance tests | **14 of 14 implemented and passing**: T1–T14 (zero placeholders remaining) |
 | Test suite | 536 passed, 5 skipped (4 CUDA-only `bf16`, 1 optional `lacuna`), on tiny, 5M and 28M (PyTorch 2.15.0 on 3.13; live `lacuna-quant==0.14.1`: 4/4 passed; NVIDIA L4 CUDA at `542568c`: **538 passed, 3 skipped**) |
-| CI | Running/passing on `main` (Python 3.10–3.13 on Linux) |
+| CI | Green on `main` (run `45006472178`, Python 3.10–3.13 on Linux: lint, build, and network-free tests) |
 
 ## What does not exist yet
 
@@ -46,7 +46,7 @@ Not verified anywhere: Apple GPU on `123M`/`209M`, multi-GPU.
 
 ## Next steps
 
-1. **Delete the merged `phase-3` branch** locally and on `origin` once confirmed (`AGENTS.md` §6), and publish v0.1.0 to PyPI when ready.
+1. **Publish v0.1.0 to PyPI** when ready.
 2. **Optional Phase 4** (spec §10): replay mixing, built-in generators, distillation, tiled training.
 
 ## Open questions and known issues
@@ -60,7 +60,6 @@ Full list in spec §12. The ones that matter next:
 
 ## Branch state
 
-- `main`: Phases 0, 1, 2, and 3 (fast-forwarded from `phase-3` at `9c5817c` on 2026-11-22).
-- `phase-3`: merged into `main` at `9c5817c`, ready to delete per `AGENTS.md` §6.
+- `main`: Phases 0, 1, 2, and 3 (fast-forwarded from `phase-3` at `9c5817c` on 2026-11-22). All prior branches (`phase-1`, `perf/phase1-kernels`, `fix/math-sdpa-backend`, `phase-2`, `phase-3`) are closed and deleted locally and on `origin`.
 
 Branch policy is in `AGENTS.md` §6.
