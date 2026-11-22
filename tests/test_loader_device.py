@@ -170,6 +170,59 @@ def test_every_float64_site_runs_on_the_device(checkpoint_dir, device):
     assert max_rel(ours, expected) < 1e-4
 
 
+@pytest.mark.network
+@needs_mps
+def test_mps_long_context_and_large_checkpoint_parity():
+    """Phase 4 MPS coverage: 8,192-step context on 28M and covariate forward+backward on 123M."""
+    from timestral_tune.trainer import compute_loss
+
+    from .helpers import upstream_batch
+
+    # 1. Long context (8,192 steps = 256 patches) on 28M
+    f28_cpu = load_forecaster("mistralai/Timestral-28M", device="cpu", quantile_real_cap_k=0)
+    f28_mps = load_forecaster("mistralai/Timestral-28M", device="mps", quantile_real_cap_k=0)
+    raw_8k = make_raw(7, series=1, targets=1, past=0, known=0, context_len=8192, horizon=96)
+    batch_8k, _, _ = upstream_batch(f28_cpu, raw_8k)
+    with torch.no_grad():
+        exp_8k = f28_cpu.model.predict_block(batch_8k.context, batch_8k.context_mask, batch_8k.group_ids, 3)
+        act_8k = f28_mps.model.predict_block(
+            batch_8k.context.to("mps"), batch_8k.context_mask.to("mps"), batch_8k.group_ids.to("mps"), 3
+        )
+    assert act_8k.device.type == "mps"
+    assert max_rel(act_8k, exp_8k) < 1e-4
+
+    # 2. Large checkpoint (123M) covariate forward parity + finite backward on MPS
+    f123_cpu = load_forecaster("mistralai/Timestral-123M", device="cpu", quantile_real_cap_k=0)
+    f123_mps = load_forecaster("mistralai/Timestral-123M", device="mps", quantile_real_cap_k=0)
+    raw_cov = make_raw(9, series=1, targets=1, past=1, known=1, context_len=256, horizon=64)
+    batch_cov, _, _ = upstream_batch(f123_cpu, raw_cov)
+    with torch.no_grad():
+        exp_123 = f123_cpu.model.predict_block(
+            batch_cov.context,
+            batch_cov.context_mask,
+            batch_cov.group_ids,
+            2,
+            batch_cov.role_ids,
+            batch_cov.known_future,
+            batch_cov.known_future_mask,
+        )
+        b_mps = batch_cov.to("mps")
+        act_123 = f123_mps.model.predict_block(
+            b_mps.context,
+            b_mps.context_mask,
+            b_mps.group_ids,
+            2,
+            b_mps.role_ids,
+            b_mps.known_future,
+            b_mps.known_future_mask,
+        )
+    assert max_rel(act_123, exp_123) < 1e-4
+    loss = compute_loss(f123_mps.model, b_mps).loss
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in f123_mps.model.head.parameters())
+
+
 def test_from_upstream_copies_float64_weights_exactly():
     """A float64 model must come back with the same float64 weights, not ones rounded through float32."""
     torch.manual_seed(3)
