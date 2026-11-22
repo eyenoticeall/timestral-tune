@@ -130,15 +130,22 @@ class ReplayConfig:
     `loss = (1 - replay_fraction) * L_domain + replay_fraction * L_replay + distill_weight * L_distill`
 
     where `L_replay` is the pinball loss on labelled replay windows (skipped when
-    `replay_fraction == 0`) and `L_distill` is the mean absolute difference between the tuned
-    model's and the frozen base model's normalised quantiles on replay windows (skipped when
-    `distill_weight == 0`, and needs no labels).
+    `replay_fraction == 0`) and `L_distill` is the smooth L1 (Huber, controlled by `smooth_beta`)
+    difference between the tuned model's and the frozen base model's normalised quantiles on
+    replay windows (skipped when `distill_weight == 0`, and needs no labels).
+
+    Defaults to light label-free distillation (`replay_fraction=0.0`, `distill_weight=0.1`), which
+    avoids fitting synthetic generator labels in `full_ft` while anchoring predictions toward the
+    base model across all adaptation modes. For LoRA modes, the frozen base is always the
+    unadapted base model (`disable_lora`), even when resuming from a `load_lora` checkpoint; for
+    `head_only` and `full_ft`, it is the starting `model` passed to `TimestralTrainer`.
 
     Attributes:
         replay_fraction: Weight of replay pinball loss relative to domain pinball loss, in
-            `[0.0, 1.0)`. Set to `0.0` with `distill_weight > 0` for distillation-only anchoring.
-        distill_weight: Non-negative weight on frozen-base L1 quantile distillation over replay
-            windows. At least one of `replay_fraction` or `distill_weight` must be positive.
+            `[0.0, 1.0)`. Defaults to `0.0` (distillation-only anchoring).
+        distill_weight: Non-negative weight on frozen-base quantile distillation over replay
+            windows. Defaults to `0.1`. At least one of `replay_fraction` or `distill_weight`
+            must be positive.
         batch_size: Replay windows per training step. `None` picks
             `max(1, round(train_batch_size * replay_fraction))` when `replay_fraction > 0`, or
             `max(1, train_batch_size // 4)` for distillation-only replay.
@@ -148,15 +155,20 @@ class ReplayConfig:
         cache_base_outputs: When `distill_weight > 0`, precompute the frozen base model's
             normalised quantiles on CPU (up to 256 MiB) before training starts so `full_ft` and
             LoRA avoid both a second copy of the base model in accelerator memory and a second
-            forward pass every step. Falls back to live frozen-base evaluation above the cap or
-            when False.
+            forward pass every step. Falls back to live frozen-base evaluation (`disable_lora`
+            for LoRA; a frozen model copy on the device for `full_ft`) above the cap or when
+            False.
+        smooth_beta: Huber/Smooth-L1 transition threshold passed to `distillation_loss` (`>= 0`).
+            Default `1e-3` avoids `+/-1` subgradient kicks from `~1e-7` fp32 GEMM tiling
+            round-off at step 0; set to `0.0` for exact unsmoothed L1.
     """
 
-    replay_fraction: float = 0.25
-    distill_weight: float = 0.0
+    replay_fraction: float = 0.0
+    distill_weight: float = 0.1
     batch_size: int | None = None
     sign_flip: bool | None = None
     cache_base_outputs: bool = True
+    smooth_beta: float = 1e-3
 
     def __post_init__(self) -> None:
         if isinstance(self.replay_fraction, bool) or not (
@@ -193,6 +205,12 @@ class ReplayConfig:
         if not isinstance(self.cache_base_outputs, bool):
             raise ValueError(f"cache_base_outputs must be a bool, got {self.cache_base_outputs!r}")
 
+        if isinstance(self.smooth_beta, bool) or not (
+            isinstance(self.smooth_beta, numbers.Real) and math.isfinite(self.smooth_beta) and self.smooth_beta >= 0.0
+        ):
+            raise ValueError(f"smooth_beta must be non-negative and finite, got {self.smooth_beta!r}")
+        object.__setattr__(self, "smooth_beta", float(self.smooth_beta))
+
     def resolved_batch_size(self, train_batch_size: int) -> int:
         """Number of replay windows drawn per training step."""
         if self.batch_size is not None:
@@ -208,11 +226,12 @@ class ReplayConfig:
             "batch_size": self.batch_size,
             "sign_flip": self.sign_flip,
             "cache_base_outputs": self.cache_base_outputs,
+            "smooth_beta": self.smooth_beta,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReplayConfig:
-        known = {"replay_fraction", "distill_weight", "batch_size", "sign_flip", "cache_base_outputs"}
+        known = {"replay_fraction", "distill_weight", "batch_size", "sign_flip", "cache_base_outputs", "smooth_beta"}
         unknown = set(data) - known
         if unknown:
             raise ValueError(f"unknown ReplayConfig keys: {sorted(unknown)}")

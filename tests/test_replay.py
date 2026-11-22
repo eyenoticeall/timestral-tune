@@ -29,20 +29,21 @@ def _fresh_tiny_model(seed: int = 0) -> TuneTimestralModel:
 class TestReplayConfig:
     def test_defaults_and_roundtrip(self) -> None:
         cfg = ReplayConfig()
-        assert cfg.replay_fraction == 0.25
-        assert cfg.distill_weight == 0.0
+        assert cfg.replay_fraction == 0.0
+        assert cfg.distill_weight == 0.1
         assert cfg.batch_size is None
         assert cfg.sign_flip is None
         assert cfg.cache_base_outputs is True
+        assert cfg.smooth_beta == 1e-3
         assert cfg.resolved_batch_size(32) == 8
         assert cfg.resolved_batch_size(1) == 1
         assert ReplayConfig.from_dict(cfg.to_dict()) == cfg
 
-    def test_distill_only_config(self) -> None:
-        cfg = ReplayConfig(replay_fraction=0.0, distill_weight=0.5, batch_size=None)
+    def test_distill_only_and_mix_configs(self) -> None:
+        cfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.0, batch_size=None)
         assert cfg.resolved_batch_size(32) == 8
         assert cfg.resolved_batch_size(2) == 1
-        explicit = ReplayConfig(replay_fraction=0.0, distill_weight=0.5, batch_size=6, sign_flip=False)
+        explicit = ReplayConfig(replay_fraction=0.0, distill_weight=0.5, batch_size=6, sign_flip=False, smooth_beta=0.0)
         assert explicit.resolved_batch_size(32) == 6
         assert ReplayConfig.from_dict(explicit.to_dict()) == explicit
 
@@ -58,6 +59,9 @@ class TestReplayConfig:
         for bad_bs in (0, -4, True, 1.5):
             with pytest.raises(ValueError, match="batch_size"):
                 ReplayConfig(replay_fraction=0.2, batch_size=bad_bs)  # type: ignore[arg-type]
+        for bad_beta in (-1e-3, float("nan"), float("inf"), True):
+            with pytest.raises(ValueError, match="smooth_beta"):
+                ReplayConfig(distill_weight=0.2, smooth_beta=bad_beta)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="sign_flip"):
             ReplayConfig(replay_fraction=0.2, sign_flip="yes")  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="cache_base_outputs"):
@@ -300,6 +304,9 @@ class TestTrainerReplayAndDistillation:
         out_dir = trainer.export(tmp_path / f"exp_{mode}")
         meta = json.loads((out_dir / "tune_metadata.json").read_text())
         assert meta["replay_config"] == replay_cfg.to_dict()
+        assert meta["replay_source"]["type"] == "SyntheticReplaySource"
+        assert meta["replay_source"]["seed"] == 3
+        assert meta["replay_source"]["data_fingerprint"].startswith("sha256:")
         # Official upstream loader still loads config.json + model.safetensors with strict=True.
         loaded = TimestralForecaster.from_pretrained(out_dir, device="cpu")
         assert loaded.model.config.d_model == trainer.model.config.d_model
@@ -602,3 +609,221 @@ class TestTrainerReplayAndDistillation:
         assert h1 == h2
         for a, b in zip(w1, w2, strict=True):
             assert torch.equal(a, b)
+
+    def test_val_dataset_rejected_as_replay_and_shared_train_slot_isolated(self) -> None:
+        train_ds = _make_covariate_dataset(num_series=3, length=64, context_length=32, forecast_horizon=8, seed=40)
+        val_ds = _make_covariate_dataset(num_series=2, length=64, context_length=32, forecast_horizon=8, seed=41)
+        cfg = TrainingConfig(
+            model_name_or_path="tiny", mode="head_only", batch_size=2, max_steps=2, device="cpu", sign_flip=True
+        )
+        with pytest.raises(ValueError, match="val_dataset"):
+            TimestralTrainer(
+                cfg, train_ds, val_ds, replay_config=ReplayConfig(), replay_dataset=val_ds, model=_fresh_tiny_model()
+            )
+
+        # Passing the same dataset object for train and replay in head_only must respect ReplayConfig.sign_flip=False.
+        trainer = TimestralTrainer(
+            cfg,
+            train_ds,
+            val_ds,
+            replay_config=ReplayConfig(replay_fraction=0.2, distill_weight=0.5, sign_flip=False, batch_size=2),
+            replay_dataset=train_ds,
+            model=_fresh_tiny_model(),
+        )
+        trainer.fit()
+        assert trainer._train_head_cache is not None and trainer._train_head_cache.negated is not None
+        assert trainer._replay_head_cache is not None and trainer._replay_head_cache.negated is None
+        assert trainer._replay_head_cache is not trainer._train_head_cache
+
+    def test_smooth_beta_reaches_distillation_loss_and_custom_replay_export(self, tmp_path: Path) -> None:
+        train_ds = _make_covariate_dataset(num_series=2, length=64, context_length=32, forecast_horizon=8, seed=42)
+        custom_replay = _make_covariate_dataset(num_series=2, length=64, context_length=32, forecast_horizon=8, seed=43)
+        cfg = TrainingConfig(
+            model_name_or_path="tiny", mode="full_ft", batch_size=2, max_steps=1, device="cpu", sign_flip=False
+        )
+        t_l1 = TimestralTrainer(
+            cfg,
+            train_ds,
+            replay_config=ReplayConfig(
+                replay_fraction=0.0, distill_weight=1.0, smooth_beta=0.0, cache_base_outputs=False
+            ),
+            replay_dataset=custom_replay,
+            model=_fresh_tiny_model(seed=44),
+        )
+        t_huber = TimestralTrainer(
+            cfg,
+            train_ds,
+            replay_config=ReplayConfig(
+                replay_fraction=0.0, distill_weight=1.0, smooth_beta=1.0, cache_base_outputs=False
+            ),
+            replay_dataset=custom_replay,
+            model=_fresh_tiny_model(seed=44),
+        )
+        with torch.no_grad():
+            for p1, p2 in zip(t_l1.model.head.parameters(), t_huber.model.head.parameters(), strict=True):
+                p1.add_(0.05)
+                p2.add_(0.05)
+        batch = DHFDataCollator.for_model(t_l1.model.config, custom_replay.context_length)([custom_replay[0]])
+        _, d_l1 = t_l1._compute_replay_terms(batch, real_series=1, teacher_quantiles=None, validate=False)
+        _, d_huber = t_huber._compute_replay_terms(batch, real_series=1, teacher_quantiles=None, validate=False)
+        assert d_l1 is not None and d_huber is not None
+        assert d_l1.item() > d_huber.item() * 2.0  # large smooth_beta quadratically shrinks small errors
+
+        out_dir = t_l1.export(tmp_path / "custom_replay_exp")
+        meta = json.loads((out_dir / "tune_metadata.json").read_text())
+        assert meta["replay_config"]["smooth_beta"] == 0.0
+        assert meta["replay_source"]["type"] == "TimeSeriesDataset"
+        assert "seed" not in meta["replay_source"]
+        assert meta["replay_source"]["data_fingerprint"].startswith("sha256:")
+
+    @pytest.mark.parametrize("mode", ["head_only", "lora_variate", "lora_temporal", "full_ft"])
+    def test_multi_target_covariate_replay_cached_vs_live_parity(self, mode: str) -> None:
+        # Multi-target (2 targets + 1 past + 1 known = 4 rows/series) replay dataset.
+        rng = np.random.default_rng(50)
+        length = 64
+        ts = np.arange(length, dtype=np.int64)
+        empty_cat = np.empty((0, length), dtype=np.float64)
+        mt_series = []
+        for i in range(3):
+            t = np.linspace(0.0, 3.0 * np.pi, length, dtype=np.float32)
+            past = np.cos(t + i)[None, :].astype(np.float32)
+            known = np.sin(t + i)[None, :].astype(np.float32)
+            y = np.stack(
+                [np.sin(t + i) + rng.normal(0, 0.1, length), np.cos(2 * t + i) + rng.normal(0, 0.1, length)]
+            ).astype(np.float32)
+            mt_series.append(
+                SeriesData(
+                    series_id=f"mt_{i}",
+                    timestamps=ts,
+                    targets=y,
+                    past=past,
+                    known=known,
+                    categorical_past=empty_cat,
+                    categorical_known=empty_cat,
+                )
+            )
+        replay_mt = TimeSeriesDataset(
+            mt_series,
+            context_length=32,
+            forecast_horizon=6,
+            stride=6,
+            min_context=32,
+            roles=ColumnRoles(targets=("y0", "y1"), past=("p0",), known=("k0",)),
+        )
+        train_ds = _make_covariate_dataset(num_series=3, length=64, context_length=32, forecast_horizon=8, seed=51)
+        lr = 3e-4 if mode == "full_ft" else 1e-3
+        cfg = TrainingConfig(
+            model_name_or_path="tiny",
+            mode=mode,  # type: ignore[arg-type]
+            learning_rate=lr,
+            batch_size=3,
+            max_steps=4,
+            device="cpu",
+            seed=52,
+            sign_flip=True,
+        )
+        t_cached = TimestralTrainer(
+            cfg,
+            train_ds,
+            replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=True),
+            replay_dataset=replay_mt,
+            model=_fresh_tiny_model(seed=53),
+        )
+        t_live = TimestralTrainer(
+            TrainingConfig(
+                model_name_or_path="tiny",
+                mode=mode,  # type: ignore[arg-type]
+                learning_rate=lr,
+                batch_size=3,
+                max_steps=4,
+                device="cpu",
+                seed=52,
+                sign_flip=True,
+                cache_frozen_features=False,
+            ),
+            train_ds,
+            replay_config=ReplayConfig(
+                replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False
+            ),
+            replay_dataset=replay_mt,
+            model=_fresh_tiny_model(seed=53),
+        )
+        rc, rl = t_cached.fit(), t_live.fit()
+        for (_, lc), (_, ll) in zip(rc.train_history, rl.train_history, strict=True):
+            assert lc == pytest.approx(ll, abs=5e-4)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(), reason="requires bf16 CUDA"
+    )
+    @pytest.mark.parametrize("mode", ["head_only", "lora_variate", "lora_temporal", "full_ft"])
+    @pytest.mark.parametrize("mixed_precision", ["fp32", "bf16"])
+    def test_cuda_replay_and_distillation_all_modes(self, mode: str, mixed_precision: str) -> None:
+        train_ds = _make_covariate_dataset(num_series=3, length=64, context_length=32, forecast_horizon=8, seed=60)
+        replay_ds = SyntheticReplaySource(num_series=4, context_length=32, forecast_horizon=6, seed=61)
+        lr = 3e-4 if mode == "full_ft" else 1e-3
+        cfg = TrainingConfig(
+            model_name_or_path="tiny",
+            mode=mode,  # type: ignore[arg-type]
+            learning_rate=lr,
+            batch_size=3,
+            max_steps=4,
+            mixed_precision=mixed_precision,  # type: ignore[arg-type]
+            device="cuda",
+            seed=62,
+            sign_flip=True,
+        )
+        t_cached = TimestralTrainer(
+            cfg,
+            train_ds,
+            replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=True),
+            replay_dataset=replay_ds,
+            model=_fresh_tiny_model(seed=63),
+        )
+        t_live = TimestralTrainer(
+            cfg,
+            train_ds,
+            replay_config=ReplayConfig(
+                replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False
+            ),
+            replay_dataset=replay_ds,
+            model=_fresh_tiny_model(seed=63),
+        )
+        rc = t_cached.fit()
+        rl = t_live.fit()
+        assert rc.steps == 4 and rc.final_train_loss is not None and np.isfinite(rc.final_train_loss)
+        assert rl.steps == 4 and rl.final_train_loss is not None and np.isfinite(rl.final_train_loss)
+        tol = 5e-4 if mixed_precision == "fp32" else 2e-2
+        for (_, lc), (_, ll) in zip(rc.train_history, rl.train_history, strict=True):
+            assert lc == pytest.approx(ll, abs=tol)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(), reason="requires bf16 CUDA"
+    )
+    def test_cuda_bf16_replay_with_reduce_overhead_compile(self) -> None:
+        # Non-divisible train (5 windows, B=4) and replay (3 windows, B=2) exercise bucket_to_max on both loaders.
+        train_ds = _make_covariate_dataset(num_series=5, length=48, context_length=32, forecast_horizon=8, seed=70)
+        replay_ds = SyntheticReplaySource(
+            num_series=3, context_length=32, forecast_horizon=6, series_length=38, seed=71
+        )
+        cfg = TrainingConfig(
+            model_name_or_path="tiny",
+            mode="lora_temporal",
+            learning_rate=1e-3,
+            batch_size=4,
+            max_steps=4,
+            mixed_precision="bf16",
+            device="cuda",
+            compile_model=True,
+            compile_mode="reduce-overhead",
+            seed=72,
+            sign_flip=True,
+        )
+        trainer = TimestralTrainer(
+            cfg,
+            train_ds,
+            replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2),
+            replay_dataset=replay_ds,
+            model=_fresh_tiny_model(seed=73),
+        )
+        res = trainer.fit()
+        assert res.steps == 4 and res.final_train_loss is not None and np.isfinite(res.final_train_loss)

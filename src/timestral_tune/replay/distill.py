@@ -2,8 +2,8 @@
 
 Smooth L1 (Huber) difference between the tuned model's and the frozen base model's normalised
 quantiles on replay samples (default transition `smooth_beta=1e-3`, falling back to exact L1 when
-`smooth_beta=0.0`). Smoothing the kink at zero prevents floating-point round-off (`~1e-7` in
-fp32 GEMMs or `bf16` autocast) from firing full-strength `+/-1` subgradients at step 0 when the
+`smooth_beta=0.0`). Smoothing the kink at zero prevents `~1e-7` fp32 GEMM tiling round-off
+between cached and live teachers from firing full-strength `+/-1` subgradients at step 0 when the
 student still equals the frozen base. Because supervision comes from the base model's own
 forecast distribution, distillation requires no target labels.
 

@@ -16,7 +16,7 @@ import math
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
@@ -257,11 +257,13 @@ class TimestralTrainer:
         lora_config: Optional `LoraConfig` for `lora_variate` and `lora_temporal` (defaults to a
             mode-appropriate config when omitted; rejected for `head_only` and `full_ft`).
         replay_config: Optional `ReplayConfig` enabling replay mixing and/or frozen-base
-            distillation (spec §5.3).
+            distillation (spec §5.3). When distilling, the frozen base is the unadapted base model
+            (via `disable_lora`) for LoRA modes even when resuming a `load_lora` checkpoint, and
+            the starting `model` weights at construction time for `head_only` and `full_ft`.
         replay_dataset: Optional `TimeSeriesDataset` supplying replay windows when `replay_config`
-            is set. When omitted and `replay_config` is set, a deterministic
-            `SyntheticReplaySource` matching `train_dataset`'s context and horizon is created.
-            May have a different covariate layout or horizon from `train_dataset`.
+            is set. Must not be `val_dataset`. When omitted and `replay_config` is set, a
+            deterministic `SyntheticReplaySource` matching `train_dataset`'s context and horizon
+            is created. May have a different covariate layout or horizon from `train_dataset`.
         callbacks: Extra `Callback` instances, run after the built-in progress logger and early stopping.
         model: An already loaded model to train, instead of loading `config.model_name_or_path`.
             It is moved to the configured device and modified in place. For LoRA modes, a model
@@ -302,6 +304,8 @@ class TimestralTrainer:
             raise ValueError("replay_dataset requires a ReplayConfig")
         if replay_dataset is not None and not isinstance(replay_dataset, TimeSeriesDataset):
             raise TypeError(f"replay_dataset must be a TimeSeriesDataset or None, got {type(replay_dataset).__name__}")
+        if val_dataset is not None and replay_dataset is val_dataset:
+            raise ValueError("replay_dataset must not be the same object as val_dataset")
         self.replay_config = replay_config
 
         self._model_provided_directly = model is not None
@@ -595,23 +599,36 @@ class TimestralTrainer:
             self.model.train(was_training)
         return torch.cat(outputs, dim=0)
 
-    def _get_head_cache(self, dataset: TimeSeriesDataset) -> _CachedHeadDataset | None:
+    def _get_head_cache(
+        self,
+        dataset: TimeSeriesDataset,
+        *,
+        slot: Literal["train", "val", "replay"] | None = None,
+    ) -> _CachedHeadDataset | None:
         if self.config.mode != "head_only" or not self.config.cache_frozen_features:
             return None
-        if dataset is self.train_dataset:
+        if slot is None:
+            if dataset is self.train_dataset:
+                slot = "train"
+            elif dataset is self.val_dataset:
+                slot = "val"
+            elif dataset is self.replay_dataset:
+                slot = "replay"
+            else:
+                return None
+
+        if slot == "train":
             dual = self.config.sign_flip
             if self._train_head_cache is not None:
                 return self._train_head_cache
-        elif dataset is self.val_dataset:
+        elif slot == "val":
             dual = False
             if self._val_head_cache is not None:
                 return self._val_head_cache
-        elif dataset is self.replay_dataset:
+        else:
             dual = self._replay_sign_flip
             if self._replay_head_cache is not None:
                 return self._replay_head_cache
-        else:
-            return None
 
         estimated = self._estimate_head_cache_bytes(dataset) * (2 if dual else 1)
         if estimated > _MAX_HEAD_CACHE_BYTES:
@@ -625,9 +642,9 @@ class TimestralTrainer:
         cache = self._build_head_cache(dataset, negate=False)
         if dual:
             cache.negated = self._build_head_cache(dataset, negate=True)
-        if dataset is self.train_dataset:
+        if slot == "train":
             self._train_head_cache = cache
-        elif dataset is self.val_dataset:
+        elif slot == "val":
             self._val_head_cache = cache
         else:
             self._replay_head_cache = cache
@@ -731,7 +748,10 @@ class TimestralTrainer:
         )
 
     def _loader(self, dataset: TimeSeriesDataset, *, training: bool) -> DataLoader:
-        cache = self._get_head_cache(dataset)
+        slot: Literal["train", "val", "replay"] | None = (
+            "train" if dataset is self.train_dataset else ("val" if dataset is self.val_dataset else None)
+        )
+        cache = self._get_head_cache(dataset, slot=slot)
         if cache is None:
             return self._raw_loader(dataset, training=training)
         config = self.config
@@ -760,7 +780,7 @@ class TimestralTrainer:
         replay_batch_size = self.replay_config.resolved_batch_size(config.batch_size)
         shuffle_gen = torch.Generator().manual_seed(config.seed + 2_000_009)
 
-        cache = self._get_head_cache(dataset)
+        cache = self._get_head_cache(dataset, slot="replay")
         if cache is not None:
             flip_gen = self._replay_flip_generator
             collate_fn = (
@@ -849,7 +869,9 @@ class TimestralTrainer:
                 teacher_q = self._frozen_head(replay_batch.horizon_hidden)
             student_q = student_quantiles
             distill_mask = step_mask.unsqueeze(0).expand(student_q.shape[0], horizon_steps)
-            return replay_pinball, distillation_loss(student_q, teacher_q, distill_mask)
+            return replay_pinball, distillation_loss(
+                student_q, teacher_q, distill_mask, smooth_beta=self.replay_config.smooth_beta
+            )
 
         rows_per_series = sum(self.replay_dataset.series[0].layout)
         real_row_limit = replay_batch.num_rows if real_series is None else real_series * rows_per_series
@@ -880,7 +902,9 @@ class TimestralTrainer:
                 self.model.train(was_training)
 
         distill_mask = step_mask.unsqueeze(0).expand(student_q.shape[0], horizon_steps)
-        return replay_pinball, distillation_loss(student_q, teacher_q, distill_mask)
+        return replay_pinball, distillation_loss(
+            student_q, teacher_q, distill_mask, smooth_beta=self.replay_config.smooth_beta
+        )
 
     # ------------------------------------------------------------------ loop
 
@@ -1149,6 +1173,20 @@ class TimestralTrainer:
         if target is None:
             raise ValueError("no output directory: pass output_dir to export() or set TrainingConfig.output_dir")
         fingerprint = data_fingerprint if data_fingerprint is not None else dataset_fingerprint(self.train_dataset)
+        replay_source: dict[str, Any] | None = None
+        if self.replay_dataset is not None:
+            replay_source = {
+                "type": type(self.replay_dataset).__name__,
+                "num_series": len(self.replay_dataset.series),
+                "num_windows": len(self.replay_dataset),
+                "context_length": self.replay_dataset.context_length,
+                "forecast_horizon": self.replay_dataset.forecast_horizon,
+                "data_fingerprint": dataset_fingerprint(self.replay_dataset),
+            }
+            if isinstance(self.replay_dataset, SyntheticReplaySource):
+                replay_source["seed"] = self.replay_dataset.seed
+                replay_source["families"] = list(self.replay_dataset.families)
+                replay_source["missing_rate"] = self.replay_dataset.missing_rate
         return export_checkpoint(
             self.model,
             target,
@@ -1158,6 +1196,7 @@ class TimestralTrainer:
             training_config=self.config,
             lora_config=self.lora_config,
             replay_config=self.replay_config,
+            replay_source=replay_source,
             calibrator=calibrator,
             metrics=metrics,
             data_fingerprint=fingerprint,
