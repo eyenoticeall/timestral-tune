@@ -1,8 +1,8 @@
 # Project Status
 
-**Last updated:** 2026-11-22
-**Stage:** pre-alpha. Phases 0, 1, 2, 3, and rescoped Phase 4 (replay mixing, frozen-base distillation, and Apple GPU `123M`/`209M`/long-context coverage) are built, verified, and merged into `main` (tiled DHF deferred as exploratory; PyPI publish pending maintainer action).
-**Next phase:** v0.1.0 PyPI release (when ready), or exploratory evaluation of tiled DHF. See spec §10.
+**Last updated:** 2026-11-23
+**Stage:** alpha, version `0.1.0` prepared for release (not yet on PyPI). Phases 0, 1, 2, 3, and rescoped Phase 4 (replay mixing, frozen-base distillation, and Apple GPU `123M`/`209M`/long-context coverage) are built, verified, and merged into `main` (tiled DHF deferred as exploratory). The repository is public.
+**Next phase:** tag `v0.1.0` and publish to PyPI (`docs/DEVELOPMENT.md`, "Releasing"), then exploratory evaluation of tiled DHF. See spec §10.
 
 ## What works today
 
@@ -28,7 +28,7 @@
 
 - Deferred exploratory items: fixed-length tiled DHF training and sampled block lengths (`docs/phases/phase-4-stretch.md`).
 - Multi-GPU training.
-- PyPI release (packaged and audited via `uv build`; publishing requires maintainer approval).
+- The PyPI release itself. Version `0.1.0`, the changelog and the release workflow are in place; the wheel was installed into a clean environment and ran the README quick start against `Timestral-5M` (`docs/VERIFICATION.md` §10). Publishing needs a PyPI trusted publisher for this repository and the maintainer's go-ahead.
 
 ## What has been verified, and where
 
@@ -48,7 +48,7 @@ Not verified anywhere: multi-GPU, real general-domain replay datasets (only buil
 
 ## Next steps
 
-1. **Publish v0.1.0 to PyPI** when ready.
+1. **Publish v0.1.0 to PyPI**: register the trusted publisher on PyPI, then tag and push `v0.1.0` (`docs/DEVELOPMENT.md`, "Releasing").
 2. **Optional exploratory work:** evaluate whether fixed-length tiled DHF warrants its token and categorical-encoding trade-offs on long fine-tuning series.
 
 ## Open questions and known issues
@@ -58,6 +58,7 @@ Full list in spec §12. The ones that matter next:
 - **CUDA needs a C compiler and Python headers** with recent PyTorch (spec §12). `scripts/cuda_check.sh` checks for them.
 - **Multi-GPU training** remains untested (`123M`, `209M`, and contexts up to `32,768` are now verified on Apple GPU in `fp32`, and `123M`/`209M` on NVIDIA L4 CUDA in `fp32`/`bf16`).
 - **PyTorch 2.4.0 on macOS hangs at exit when a DataLoader uses worker processes.** Gone by 2.8.0 (`docs/VERIFICATION.md` §10). `num_workers` defaults to 0.
+- **`compile_model=True` on PyTorch 2.4.0 with Python older than 3.12 needs `setuptools` installed.** That PyTorch wheel does not declare it (`docs/VERIFICATION.md` §10).
 - **CI actions use a deprecated Node.js version.** GitHub warns that `actions/checkout@v4` and `astral-sh/setup-uv@v5` target Node.js 20. They still run.
 
 ## Branch state

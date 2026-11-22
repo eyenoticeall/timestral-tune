@@ -737,3 +737,34 @@ lengths) as exploratory due to token doubling (undoing D16), per-window categori
 **Not done / open.** Phase 4 fast-forwarded into `main` at `9261c75`, pushed to `origin/main` (CI run
 `45046304547` green across Python 3.10–3.13), and `phase-4` deleted locally and on `origin`. PyPI
 publish awaits maintainer approval; tiled DHF remains deferred as exploratory.
+
+---
+
+## 2026-11-23 — Release preparation for v0.1.0
+
+**Done.** The maintainer made the repository public and asked for a first release. It is `0.1.0`, not
+`1.0`: the tests are thorough, but nobody outside the project has used the API yet and upstream is a
+first release with no stability promise, so the API must stay free to change.
+
+- Version `0.1.0`, classifier Alpha, and "pre-alpha" wording removed from the README, `AGENTS.md`,
+  `STATUS.md` and the package docstring.
+- README made fit to be the PyPI page: absolute links and banner URL, an install section, and a
+  `ReplayConfig` example. `pyproject.toml` gained `[project.urls]`; `CHANGELOG.md` added and shipped in
+  the sdist.
+- `.github/workflows/release.yml`: a `v*` tag builds once, checks tag, changelog and metadata, publishes
+  through PyPI trusted publishing, and creates the GitHub release. Run by hand it builds and checks
+  without publishing. Procedure in `docs/DEVELOPMENT.md`, "Releasing".
+
+**Evidence** (`docs/VERIFICATION.md` §10).
+
+- The wheel, installed into a clean environment outside the repository, runs the README quick start as
+  written against `Timestral-5M`, and the `ReplayConfig()` example.
+- The declared dependency floors pass the network-free suite together on Python 3.10 (313 passed,
+  25 skipped). One finding: on torch 2.4.0 with Python 3.10, `torch.compile` needs `setuptools`, which
+  that wheel does not declare. Recorded as a known issue (spec §12); no code changed.
+- Tracked files and all commit messages were scanned for private details and secrets before release:
+  none found.
+
+**Not done / open.** Not yet published: PyPI needs a trusted publisher registered for this repository,
+and the tag and upload wait for the maintainer's go-ahead. The spec §10 release box stays unticked until
+the upload has happened. Tiled DHF remains deferred as exploratory.

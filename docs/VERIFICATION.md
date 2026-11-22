@@ -313,13 +313,22 @@ Test suite: `uv run --isolated --python 3.12 --with "torch==<version>" pytest`.
 
 | PyTorch | Python | Result |
 |---|---|---|
-| 2.4.0 | 3.12 | 313 passed, 24 skipped on `main` (`-m "not network"`, including all Phase 3 & Phase 4 replay/distillation tests); earlier full run at `3fe5bc9`: 411 passed, 26 skipped. Skipped: accelerator tests (MPS requires 2.8+), DataLoader-worker test (below), optional `lacuna`, and 14 non-network CUDA-only tests |
-| 2.8.0 | 3.12 | 356 passed, 14 skipped on `main` (`-m "not network"`, including Apple GPU and all Phase 3 & Phase 4 tests); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
-| 2.14.1 | 3.10 | 356 passed, 14 skipped on `main` (`-m "not network"`, `uv run --isolated --python 3.10 pytest -m "not network"`); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
+| 2.4.0 | 3.12 | 313 passed, 25 skipped on `main` (`-m "not network"`, including all Phase 3 & Phase 4 replay/distillation tests); earlier full run at `3fe5bc9`: 411 passed, 26 skipped. Skipped: accelerator tests (MPS requires 2.8+), DataLoader-worker test (below), optional `lacuna`, and 14 non-network CUDA-only tests |
+| 2.8.0 | 3.12 | 356 passed, 15 skipped on `main` (`-m "not network"`, including Apple GPU and all Phase 3 & Phase 4 tests); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
+| 2.14.1 | 3.10 | 356 passed, 15 skipped on `main` (`-m "not network"`, `uv run --isolated --python 3.10 pytest -m "not network"`); earlier full run at `3fe5bc9`: 510 passed, 4 skipped |
 | 2.15.0 | 3.13 | 567 passed, 17 skipped (full suite on `main`, including tiny, 5M, 28M, 123M MPS parity, and all Phase 3 & Phase 4 replay/distillation tests; 16 CUDA-only + 1 optional `lacuna` skipped) |
 
-These are the counts on `main` (2026-11-22), all on macOS. Zero acceptance test placeholders remain.
+These are the counts on `main` (2026-11-23), all on macOS. Zero acceptance test placeholders remain.
 The CUDA run (§13) used Linux x86 (`89ac249`, merged into `main`) and passed all 16 CUDA tests as well (580 passed, 4 skipped).
+
+**Declared dependency floors and the built package (2026-11-23, version `0.1.0`).**
+
+| Check | Command | Result |
+|---|---|---|
+| Lowest declared versions together (Python 3.10: torch 2.4.0, numpy 1.24.0, safetensors 0.4.0, huggingface_hub 0.23.0) | `uv run --isolated --python 3.10 --resolution lowest-direct --with "setuptools==75.1.0" pytest -m "not network"` | 313 passed, 25 skipped |
+| The same without `setuptools` | `uv run --isolated --python 3.10 --resolution lowest-direct pytest -m "not network"` | 310 passed, 25 skipped, 3 failed: the three `torch.compile` tests raise `ModuleNotFoundError: No module named 'setuptools'` inside PyTorch's compiler. The Python 3.10 wheel of torch 2.4.0 declares no `setuptools` requirement; the Python 3.12 wheel does. With torch 2.8.0 on Python 3.10 the same tests pass |
+| Package metadata | `uv build && uvx twine check --strict dist/*` | Both files pass; the wheel holds only `timestral_tune/` and the three licence files |
+| Clean install | Wheel installed into a fresh Python 3.12 environment outside the repository, then the README quick start run as written on synthetic hourly data | `Timestral-5M` loads from the Hub, `lora_variate` trains 12 steps on the Apple GPU, the export loads in the vendored upstream loader, `run_checks` reports six passes, and the `ReplayConfig()` example trains and exports |
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):
