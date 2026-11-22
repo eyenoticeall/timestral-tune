@@ -18,7 +18,8 @@ When you add a `[V]` claim to the spec, add its probe or test and a row here in 
 CUDA results (§13) come from a second machine: a Google Cloud VM with one NVIDIA L4 (23 GB), 4 CPU threads,
 Ubuntu 22.04, PyTorch 2.15.0+cu132, Python 3.12.16.
 
-Not verified anywhere: the 123M and 209M checkpoints.
+The 123M and 209M checkpoints were measured later and separately: on CUDA in §13 and §14, and on the
+Apple GPU in §15. Sections that do not name them used 5M and 28M only.
 
 ## 1. Model structure
 

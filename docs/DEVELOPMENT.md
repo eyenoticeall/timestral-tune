@@ -49,7 +49,7 @@ version.
 ```
 src/timestral_tune/
   _vendor/timestral/     Official inference package at a pinned commit (generated; do not edit)
-  config.py              TrainingConfig, LoraConfig
+  config.py              TrainingConfig, LoraConfig, ReplayConfig
   data/                  Batch layout, dataset, collator, categorical encoders
   models/                Loader, device shims, training forward, slice LoRA adapter, conformal calibrators
   losses/                Pinball loss
@@ -57,7 +57,7 @@ src/timestral_tune/
   export.py              Upstream-loadable checkpoint export, adapters, conformal, sidecar, LICENSE/NOTICE
   utils/                 Verifiers and raw-space evaluation / forgetting metrics
   integrations/          Optional Lacuna integration (`timestral-tune[lacuna]`, Python 3.11+)
-  replay/                Stub for Phase 4 (stretch)
+  replay/                Replay sources and distillation to the frozen base model
 tests/
   conftest.py, helpers.py   Fixtures and builders shared by all tests
   test_*.py                 Unit tests per module
@@ -66,10 +66,13 @@ scripts/
   vendor_upstream.py     Regenerates _vendor/timestral
   check_upstream_drift.py
   probes/                Verification probes behind the [V] tags
+  benchmarks/            Benchmark, sweep and significance runs behind docs/BENCHMARKS.md
+  make_banner.py, make_results_chart.py   Draw the README images in assets/
+  cuda_check.sh          Runs the device tests and the whole suite on a CUDA machine
 ```
 
-Every stub module's docstring names its spec section, roadmap phase, acceptance tests and planned public
-names. Start there when implementing a module.
+No stub modules remain. Every module's docstring names the spec section it implements; start there when
+changing a module.
 
 ## Implementing a module
 

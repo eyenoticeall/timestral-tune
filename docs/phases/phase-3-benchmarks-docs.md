@@ -21,8 +21,9 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - **Lacuna:** `LacunaExporter` uses `AttemptRecord.trial_id` (not `attempt_id`) in `record_selection`, and
   `write_signal_frame` emits `pyarrow.Table` / `polars.DataFrame` with `("time", "instrument", "signal")`
   verified live against `lacuna-quant==0.14.1`.
-- **Sign-flip augmentation:** `TrainingConfig.sign_flip=True` bypasses the training `head_only` cache
-  (keeping validation caching) and improved one-signed benchmarks (up to −4.0% wQL on retail `full_ft`).
+- **Sign-flip augmentation:** `TrainingConfig.sign_flip=True` improved one-signed benchmarks (up to −4.0%
+  wQL on retail `full_ft`). It first bypassed the `head_only` training cache; that was replaced by a
+  dual-orientation cache holding both `+x` and `-x` features, so `head_only` stays cached with it on.
 - **Release:** Wheel + sdist verified with `uv build`; vendored Apache-2.0 `LICENSE` and `NOTICE` included.
   PyPI names `timestral-tune` and `timestral` were unclaimed on 2026-11-21 and still on 2026-11-23; version `0.1.0` was published on 2026-11-23 through the release workflow (`docs/DEVELOPMENT.md`, "Releasing").
 
