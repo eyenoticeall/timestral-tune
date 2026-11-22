@@ -4,10 +4,10 @@
         --output docs/benchmarks/replay_bf16_parity.json
 
 Compares `ReplayConfig(cache_base_outputs=True)` against `cache_base_outputs=False` under CUDA
-`bf16` autocast across `smooth_beta` in `(0.0, 1e-3, 1e-2)` for `lora_temporal` and `full_ft`
-(plus `head_only` cached vs streaming) on both the tiny random model and a released checkpoint
-(`Timestral-5M`). Records direct step-0 teacher output difference, max 5-step training loss
-difference, and relative L2 parameter difference.
+`bf16` autocast across `smooth_beta` in `(0.0, 1e-3, 1e-2)` for `lora_temporal` and `full_ft` on both
+the tiny random model and a released checkpoint (`Timestral-5M`). Records, between the two runs, the
+largest training-loss difference over the steps and the relative L2 and largest absolute difference of
+the trained parameters. `--device cpu` runs the same comparison in `fp32`.
 """
 
 from __future__ import annotations
