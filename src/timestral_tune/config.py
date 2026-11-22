@@ -133,8 +133,8 @@ class TrainingConfig:
         mode: Which parameters are trained (spec §5).
         learning_rate: Peak learning rate. None picks the default for `mode`. For `full_ft` on
             `5M` and `28M`, setting `learning_rate=3e-4` is recommended for lower error (three
-            seeds on `5M`, one on `28M`), at the cost of about two percentage points more retail
-            forgetting on `5M`; keep `1e-4` on `123M` and `209M` (see `docs/BENCHMARKS.md` §2.2).
+            seeds on `5M`, one on `28M`), at the cost of roughly two to three percentage points
+            more forgetting; keep `1e-4` on `123M` and `209M` (see `docs/BENCHMARKS.md` §2.2).
         weight_decay: AdamW weight decay.
         batch_size: Series windows per training batch.
         epochs: Passes over the training set. Ignored when `max_steps` is set.

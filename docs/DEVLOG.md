@@ -619,8 +619,8 @@ not started.
   - Closed the last three mutation-test gaps (`40d29fe`: staggered ACI timestamps, dual-cache 2× memory cap,
     and unflipped post-`fit()` training-set evaluation) and documented the maintainer decision to keep
     `full_ft=1e-4` as the single cross-size default while recommending `learning_rate=3e-4` for `full_ft` on
-    `5M` and `28M` (three seeds on `5M`, one seed on `28M`, at the cost of about two percentage points more
-    retail forgetting on `5M`) across `README.md`, `TrainingConfig` docstring, `docs/SPEC.md` (§5.4, D19, §12),
+    `5M` and `28M` (three seeds on `5M`, one seed on `28M`, at the cost of roughly two to three percentage
+    points more forgetting) across `README.md`, `TrainingConfig` docstring, `docs/SPEC.md` (§5.4, D19, §12),
     `docs/BENCHMARKS.md` §2.2, `docs/STATUS.md`, and Phase 3 notes.
 
   - Re-ran full `bash scripts/cuda_check.sh` on an NVIDIA L4 VM at commit `542568c` (post dual-orientation

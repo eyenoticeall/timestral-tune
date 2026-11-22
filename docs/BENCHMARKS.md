@@ -234,9 +234,10 @@ single unified JSON file.
 at `3e-4`). On `5M`, `full_ft` is still improving at the top grid edge `1e-3` (with `+5.0%–+7.9%`
 forgetting). We keep `full_ft=1e-4` as the single cross-size default (D19), and **all §1 tables use
 `1e-4`**. As a user recommendation (not a default), setting `learning_rate=3e-4` for `full_ft` on
-`5M` and `28M` gave lower error (three seeds on `5M`, one seed on `28M`), at the cost of about two
-percentage points more retail forgetting on `5M`. Do not extend this recommendation to `123M` or
-`209M`, where `3e-4` ties or trails `1e-4` on validation and `1e-4` forgets less (§2.1).
+`5M` and `28M` gave lower error (three seeds on `5M`, one seed on `28M` — where the gain is the ~3%
+drop on volatility, while `28M` retail is essentially flat at `0.1943` vs `0.1946`), at the cost of
+roughly two to three percentage points more forgetting. Do not extend this recommendation to `123M`
+or `209M`, where `3e-4` ties or trails `1e-4` on validation and `1e-4` forgets less (§2.1).
 
 **Evidence for the `5M` / `28M` `full_ft=3e-4` recommendation** (validation in committed
 `docs/benchmarks/sweeps_bracketed.json`, one seed: `5M` retail `0.2098` vs `0.2162`, `28M`
