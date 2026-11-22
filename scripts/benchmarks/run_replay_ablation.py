@@ -7,12 +7,14 @@ Evaluates replay mixing (`replay_fraction`) and frozen-base quantile distillatio
 (`distill_weight`) using the built-in `SyntheticReplaySource` across the three high-forgetting
 regimes measured in Phase 3:
 
-1. `head_only` at shipped `3e-3` (`5M` & `28M`, realised volatility & retail demand), where
-   baseline macro GIFT-Eval forgetting reached `+5.0%` to `+14.0%`.
-2. `lora_temporal` at higher LR `3e-3` (`5M`, realised volatility, 3 seeds), where baseline
-   macro forgetting spiked up to `+37.2%` on Apple GPU (`fp32`).
-3. `full_ft` at higher LR `3e-4` (`5M`, retail demand, 3 seeds), where `3e-4` improved test wQL
-   over `1e-4` at the cost of `+2.0%`–`+2.8%` retail forgetting.
+1. `head_only` at shipped `3e-3` vs lower-LR `1e-3` control (`5M` across 3 seeds & `28M` seed 0,
+   realised volatility & retail demand), where baseline macro GIFT-Eval forgetting reached `+5.0%`
+   to `+13.7%`.
+2. `lora_temporal` at higher LR `3e-3` vs shipped `1e-3` (`5M`, realised volatility, 3 seeds),
+   where baseline macro forgetting spiked up to `+31.3%` in this harness on Apple GPU (`fp32`).
+3. `full_ft` at higher LR `3e-4` vs `1e-4` and `2e-4` lower-LR controls, plus a 256-series
+   (1,024-window) replay pool control (`5M`, retail demand, 3 seeds), where `3e-4` improved test
+   wQL over `1e-4` at the cost of `+1.9%`–`+2.8%` retail forgetting.
 
 Every run reports raw-space validation & test wQL/MASE through upstream `TimestralForecaster`
 and equal-weighted 3-domain macro GIFT-Eval forgetting (`ett1`, `jena_weather`, `loop_seattle`).
@@ -197,43 +199,48 @@ def main(argv: list[str] | None = None) -> int:
         }
         del m_dev, fc
 
-    # 1. head_only at 3e-3 (5M & 28M, vol & retail, seed 0)
-    head_variants: list[tuple[str, ReplayConfig | None]] = [
-        ("none", None),
-        ("replay_0.25", ReplayConfig(replay_fraction=0.25, distill_weight=0.0)),
-        ("distill_0.5", ReplayConfig(replay_fraction=0.0, distill_weight=0.5)),
-        ("distill_1.0", ReplayConfig(replay_fraction=0.0, distill_weight=1.0)),
-        ("both_0.2_0.5", ReplayConfig(replay_fraction=0.2, distill_weight=0.5)),
+    # 1. head_only at 3e-3 vs 1e-3 lower-LR control (5M across all seeds; 28M seed 0)
+    head_variants: list[tuple[str, float, ReplayConfig | None]] = [
+        ("lr1e-3_none", 1e-3, None),
+        ("none", 3e-3, None),
+        ("replay_0.25", 3e-3, ReplayConfig(replay_fraction=0.25, distill_weight=0.0)),
+        ("distill_0.5", 3e-3, ReplayConfig(replay_fraction=0.0, distill_weight=0.5)),
+        ("distill_1.0", 3e-3, ReplayConfig(replay_fraction=0.0, distill_weight=1.0)),
+        ("both_0.2_0.5", 3e-3, ReplayConfig(replay_fraction=0.2, distill_weight=0.5)),
     ]
-    print("\n== 1. head_only (lr=3e-3) on 5M & 28M ==", flush=True)
+    print("\n== 1. head_only (lr=3e-3 vs lr=1e-3 control) on 5M (multi-seed) & 28M (seed 0) ==", flush=True)
     for size in ("5M", "28M"):
         model_id = f"mistralai/Timestral-{size}"
+        size_seeds = args.seeds if size == "5M" else [args.seeds[0]]
         report["head_only"][size] = {}
         for ds_name, splits in datasets_map.items():
             report["head_only"][size][ds_name] = {}
-            for label, rcfg in head_variants:
-                row = _run_one(
-                    models_cpu[size],
-                    splits,
-                    gen_by_domain,
-                    zs_by_size[size],
-                    model_id=model_id,
-                    mode="head_only",
-                    lr=3e-3,
-                    replay_cfg=rcfg,
-                    device=args.device,
-                    mixed_precision=mp,
-                    max_steps=args.max_steps,
-                    batch_size=args.batch_size,
-                    eval_batch_size=args.eval_batch_size,
-                    seed=0,
-                    replay_series=args.replay_series,
-                )
-                report["head_only"][size][ds_name][label] = row
+            for label, lr, rcfg in head_variants:
+                rows = [
+                    _run_one(
+                        models_cpu[size],
+                        splits,
+                        gen_by_domain,
+                        zs_by_size[size],
+                        model_id=model_id,
+                        mode="head_only",
+                        lr=lr,
+                        replay_cfg=rcfg,
+                        device=args.device,
+                        mixed_precision=mp,
+                        max_steps=args.max_steps,
+                        batch_size=args.batch_size,
+                        eval_batch_size=args.eval_batch_size,
+                        seed=s,
+                        replay_series=args.replay_series,
+                    )
+                    for s in size_seeds
+                ]
+                report["head_only"][size][ds_name][label] = rows if len(rows) > 1 else rows[0]
+                wqls = " / ".join(f"{r['test']['wql']:.4f}" for r in rows)
+                forgs = " / ".join(f"{r['forgetting']['macro_relative_delta_wql']:+.1%}" for r in rows)
                 print(
-                    f"  [head_only {size} | {ds_name:19s} | {label:12s}] "
-                    f"val={row['val']['wql']:.4f} test={row['test']['wql']:.4f} "
-                    f"forg={row['forgetting']['macro_relative_delta_wql']:+.1%} ({row['wall_s']:.1f}s)",
+                    f"  [head_only {size} | {ds_name:19s} | {label:12s}] test={wqls} | forg={forgs}",
                     flush=True,
                 )
 
@@ -274,18 +281,20 @@ def main(argv: list[str] | None = None) -> int:
         worst = max(r["forgetting"]["macro_relative_delta_wql"] for r in rows)
         print(f"  [lora_temporal 5M vol | {label:19s}] test={wqls} | forg={forgs} (worst {worst:+.1%})", flush=True)
 
-    # 3. full_ft at 3e-4 vs 1e-4 (5M retail demand, 3 seeds)
-    ft_variants: list[tuple[str, float, ReplayConfig | None]] = [
-        ("lr1e-4_none", 1e-4, None),
-        ("lr3e-4_none", 3e-4, None),
-        ("lr3e-4_replay_0.25", 3e-4, ReplayConfig(replay_fraction=0.25, distill_weight=0.0)),
-        ("lr3e-4_distill_0.1", 3e-4, ReplayConfig(replay_fraction=0.0, distill_weight=0.1)),
-        ("lr3e-4_distill_0.5", 3e-4, ReplayConfig(replay_fraction=0.0, distill_weight=0.5)),
-        ("lr3e-4_distill_1.0", 3e-4, ReplayConfig(replay_fraction=0.0, distill_weight=1.0)),
-        ("lr3e-4_both_0.2_0.5", 3e-4, ReplayConfig(replay_fraction=0.2, distill_weight=0.5)),
+    # 3. full_ft at 3e-4 vs 1e-4 & 2e-4 lower-LR controls + 256-series pool control (5M retail, 3 seeds)
+    ft_variants: list[tuple[str, float, ReplayConfig | None, int]] = [
+        ("lr1e-4_none", 1e-4, None, args.replay_series),
+        ("lr2e-4_none", 2e-4, None, args.replay_series),
+        ("lr3e-4_none", 3e-4, None, args.replay_series),
+        ("lr3e-4_replay_0.25", 3e-4, ReplayConfig(replay_fraction=0.25, distill_weight=0.0), args.replay_series),
+        ("lr3e-4_replay_0.25_256s", 3e-4, ReplayConfig(replay_fraction=0.25, distill_weight=0.0), 256),
+        ("lr3e-4_distill_0.1", 3e-4, ReplayConfig(replay_fraction=0.0, distill_weight=0.1), args.replay_series),
+        ("lr3e-4_distill_0.5", 3e-4, ReplayConfig(replay_fraction=0.0, distill_weight=0.5), args.replay_series),
+        ("lr3e-4_distill_1.0", 3e-4, ReplayConfig(replay_fraction=0.0, distill_weight=1.0), args.replay_series),
+        ("lr3e-4_both_0.2_0.5", 3e-4, ReplayConfig(replay_fraction=0.2, distill_weight=0.5), args.replay_series),
     ]
-    print("\n== 3. full_ft (3e-4 retail forgetting) on 5M retail (3 seeds) ==", flush=True)
-    for label, lr, rcfg in ft_variants:
+    print("\n== 3. full_ft (3e-4 vs 1e-4 & 2e-4 controls + 256-series pool) on 5M retail (3 seeds) ==", flush=True)
+    for label, lr, rcfg, r_series in ft_variants:
         rows = []
         for seed in args.seeds:
             row = _run_one(
@@ -303,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 eval_batch_size=args.eval_batch_size,
                 seed=seed,
-                replay_series=args.replay_series,
+                replay_series=r_series,
             )
             rows.append(row)
         report["full_ft_3e4"][label] = rows

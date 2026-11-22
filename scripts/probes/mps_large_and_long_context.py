@@ -259,6 +259,7 @@ def _probe_long_contexts(sizes: tuple[str, ...], contexts: tuple[int, ...], *, s
                 loss.backward()
                 opt.step()
                 _mps_sync()
+                assert torch.isfinite(loss), f"non-finite loss at ctx={ctx_len}: {loss.item()}"
                 ms = (time.perf_counter() - t0) * 1000.0
                 cur_gib, drv_gib = _mps_mem_gib()
                 entry["train_lora_temporal_b1"] = {
@@ -299,6 +300,7 @@ def _probe_long_contexts(sizes: tuple[str, ...], contexts: tuple[int, ...], *, s
             loss.backward()
             opt.step()
             _mps_sync()
+            assert torch.isfinite(loss), f"non-finite full_ft loss at ctx=32768: {loss.item()}"
             ms = (time.perf_counter() - t0) * 1000.0
             cur_gib, drv_gib = _mps_mem_gib()
             extra["full_ft_32768_b1_uni"] = {
@@ -348,6 +350,7 @@ def _probe_long_contexts(sizes: tuple[str, ...], contexts: tuple[int, ...], *, s
                 loss.backward()
                 opt.step()
                 _mps_sync()
+                assert torch.isfinite(loss), f"non-finite cov3 loss at ctx={cov_ctx}: {loss.item()}"
                 trn_ms = (time.perf_counter() - t0) * 1000.0
                 cur_gib, drv_gib = _mps_mem_gib()
                 extra[key] = {
