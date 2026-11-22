@@ -56,20 +56,22 @@ class BenchmarkSplits:
     test: TimeSeriesDataset
 
 
-def load_realised_volatility(
+def _load_twelvedata_1h(
     *,
+    target_col: str,
+    name: str,
     context_length: int = 256,
     forecast_horizon: int = 32,
     train_stride: int = 32,
     eval_stride: int = 32,
 ) -> BenchmarkSplits:
-    """Load the 51-equity 1-hour realised-volatility benchmark with a post-Oct 27, 2026 test split."""
+    """Shared loader for 51-equity 1-hour Twelvedata benchmarks (`rv_20` or signed `logret_20`)."""
     p_val = hf_hub_download(TWELVEDATA_REPO, "bars_1h/val.parquet", repo_type="dataset", revision=TWELVEDATA_REV)
     p_test = hf_hub_download(TWELVEDATA_REPO, "bars_1h/test.parquet", repo_type="dataset", revision=TWELVEDATA_REV)
     cols = [
         "symbol",
         "datetime",
-        "rv_20",
+        target_col,
         "volume",
         "vix_level",
         "spy_logret_1",
@@ -84,8 +86,6 @@ def load_realised_volatility(
         pl.col("datetime").dt.weekday().cast(pl.Float32).alias("day_of_week"),
     )
 
-    # Assign contiguous trading-bar indices per symbol so windows sit on a clean regular trading grid
-    # (no overnight / weekend gaps), while tracking exact UTC timestamps for the split cutoffs.
     val_cutoff_ns = int(np.datetime64("2026-06-01T00:00:00", "ns").astype(np.int64))
     test_cutoff_ns = int(np.datetime64("2026-10-28T00:00:00", "ns").astype(np.int64))
 
@@ -101,10 +101,8 @@ def load_realised_volatility(
             continue
         dt_by_series.append(grp["dt_utc"].to_numpy())
 
-        # Align every symbol on the exact same bar coordinate relative to the post-Oct-28 cutoff
-        # so global `split_by_time` cutoffs correspond to exact calendar dates across all 51 symbols.
         bar_idx = np.arange(n, dtype=np.int64) - test_pos
-        targets = grp["rv_20"].to_numpy().astype(np.float32)[None, :]
+        targets = grp[target_col].to_numpy().astype(np.float32)[None, :]
         past = np.stack(
             [
                 grp["log_volume"].to_numpy().astype(np.float32),
@@ -135,11 +133,10 @@ def load_realised_volatility(
         )
 
     roles = ColumnRoles(
-        targets=("rv_20",),
+        targets=(target_col,),
         past=("log_volume", "vix_level", "spy_logret_1", "sector_logret_1", "atr_14"),
         known=("hour_of_day", "day_of_week"),
     )
-    # Bar 0 is 2026-10-28 (strictly post-Timestral release); val covers bars [-700, 0) (~mid-Jun to Oct 27).
     val_start_bar = -700
     full_train = TimeSeriesDataset(
         series_list,
@@ -161,7 +158,6 @@ def load_realised_volatility(
     pre_test, test_ds = full_eval.split_by_time(cutoff=0)
     _, val_ds = pre_test.split_by_time(cutoff=val_start_bar)
 
-    # Record the exact scored target calendar span across all test windows (never approximate).
     scored_starts = [dt_by_series[int(test_ds._series_index[i])][int(test_ds._origins[i])] for i in range(len(test_ds))]
     scored_ends = [
         dt_by_series[int(test_ds._series_index[i])][int(test_ds._origins[i]) + forecast_horizon - 1]
@@ -170,18 +166,54 @@ def load_realised_volatility(
     test_range = f"{str(min(scored_starts))[:10]} to {str(max(scored_ends))[:10]}"
 
     return BenchmarkSplits(
-        name="realised_volatility",
+        name=name,
         license="MIT",
-        source=f"{TWELVEDATA_REPO}@{TWELVEDATA_REV} (bars_1h)",
+        source=f"{TWELVEDATA_REPO}@{TWELVEDATA_REV} (bars_1h, target={target_col})",
         contamination_note=(
             f"Scored test targets span {test_range} (strictly after Timestral's 2026-10-27 release; "
             "no pretraining contamination on test targets). Training/validation bars precede release."
         ),
         test_date_range=test_range,
-        seasonality=7,  # 7 hourly trading bars per US equity session
+        seasonality=7,
         train=train_ds,
         val=val_ds,
         test=test_ds,
+    )
+
+
+def load_realised_volatility(
+    *,
+    context_length: int = 256,
+    forecast_horizon: int = 32,
+    train_stride: int = 32,
+    eval_stride: int = 32,
+) -> BenchmarkSplits:
+    """Load the 51-equity 1-hour realised-volatility (`rv_20`) benchmark with post-release test split."""
+    return _load_twelvedata_1h(
+        target_col="rv_20",
+        name="realised_volatility",
+        context_length=context_length,
+        forecast_horizon=forecast_horizon,
+        train_stride=train_stride,
+        eval_stride=eval_stride,
+    )
+
+
+def load_signed_returns(
+    *,
+    context_length: int = 256,
+    forecast_horizon: int = 32,
+    train_stride: int = 32,
+    eval_stride: int = 32,
+) -> BenchmarkSplits:
+    """Load the 51-equity 1-hour signed 20-bar log-returns (`logret_20`) benchmark for sign-flip checks."""
+    return _load_twelvedata_1h(
+        target_col="logret_20",
+        name="signed_returns",
+        context_length=context_length,
+        forecast_horizon=forecast_horizon,
+        train_stride=train_stride,
+        eval_stride=eval_stride,
     )
 
 

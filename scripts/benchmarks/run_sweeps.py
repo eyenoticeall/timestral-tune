@@ -1,13 +1,18 @@
 """Phase 3 hyperparameter & sign-flip sweeps to back the defaults in spec §5.4.
 
-    uv run python scripts/benchmarks/run_sweeps.py --device cuda --sizes 5M 28M --bf16 --output /tmp/sweeps.json
+    # Full unified 5M/28M sweep:
+    uv run python scripts/benchmarks/run_sweeps.py \
+        --device cuda --sizes 5M 28M --bf16 --check-forgetting --output docs/benchmarks/sweeps_bracketed.json
 
-Sweeps (scored strictly on validation splits — never on test sets):
-1. Properly bracketed learning-rate grids for `head_only`, `lora_variate`, `lora_temporal`, and
-   `full_ft` across realised volatility and retail demand, plus macro GIFT-Eval forgetting so
-   aggressive LRs can be weighed against forgetting without touching the test split.
-2. LoRA rank (`r in {4, 8, 16}`) and targets (`("q", "v")` vs `("q", "k", "v", "o")`).
-3. Sign-flip augmentation (`sign_flip=False` vs `True`) on both one-signed domains.
+    # Targeted 123M/209M 3-seed decision sweep (lora_temporal, full_ft, sign_flip on/off, signed target):
+    uv run python scripts/benchmarks/run_sweeps.py \
+        --device cuda --sizes 123M 209M --bf16 --batch-size 16 --eval-batch-size 16 \
+        --datasets realised_volatility retail_demand signed_returns \
+        --modes lora_temporal full_ft --mode-lrs lora_temporal=1e-3,3e-3 full_ft=1e-4,3e-4 \
+        --sign-flip-modes off on --seeds 0 1 2 --check-forgetting --skip-lora-sweep \
+        --output docs/benchmarks/sweeps_large_decisions.json
+
+Sweeps are scored strictly on validation splits and GIFT-Eval general forgetting — never on test sets.
 """
 
 from __future__ import annotations
@@ -22,7 +27,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import load_general_forgetting_by_domain, load_realised_volatility, load_retail_demand
+from datasets import (
+    load_general_forgetting_by_domain,
+    load_realised_volatility,
+    load_retail_demand,
+    load_signed_returns,
+)
 
 from timestral_tune import LoraConfig, TimestralTrainer, TrainingConfig
 from timestral_tune.models import TuneTimestralForecaster, load_model, merged_state_dict
@@ -34,6 +44,12 @@ LR_GRID: dict[str, tuple[float, ...]] = {
     "lora_variate": (3e-4, 1e-3, 3e-3, 1e-2, 3e-2),
     "lora_temporal": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
     "full_ft": (1e-5, 3e-5, 1e-4, 3e-4, 1e-3),
+}
+
+DATASET_LOADERS = {
+    "realised_volatility": load_realised_volatility,
+    "retail_demand": load_retail_demand,
+    "signed_returns": load_signed_returns,
 }
 
 
@@ -61,12 +77,16 @@ def _train_and_eval(
     mixed_precision: str,
     max_steps: int,
     batch_size: int,
+    eval_batch_size: int | None = None,
     lora_config: LoraConfig | None = None,
-    sign_flip: bool = True,
+    sign_flip: bool = False,
     seed: int = 0,
     gen_by_domain: dict[str, Any] | None = None,
     zs_by_domain: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    eval_bs = eval_batch_size or batch_size
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     model = copy.deepcopy(base_model)
     cfg = TrainingConfig(
@@ -74,6 +94,7 @@ def _train_and_eval(
         mode=mode,  # type: ignore[arg-type]
         learning_rate=lr,
         batch_size=batch_size,
+        eval_batch_size=eval_bs,
         max_steps=max_steps,
         warmup_steps=max(5, max_steps // 10),
         mixed_precision=mixed_precision,  # type: ignore[arg-type]
@@ -86,6 +107,8 @@ def _train_and_eval(
     )
     trainer = TimestralTrainer(cfg, splits.train, splits.val, lora_config=lora_config, model=model)
     res = trainer.fit()
+    peak_gib = (torch.cuda.max_memory_allocated() / (1024**3)) if device == "cuda" else 0.0
+
     ev_m = copy.deepcopy(base_model)
     ev_m.load_state_dict(merged_state_dict(trainer.model), strict=True)
     del trainer, model
@@ -95,9 +118,9 @@ def _train_and_eval(
     ev_m.to(device).eval()
     ev_m.transformer.rope.rebuild_inv_freq()
     fc = TuneTimestralForecaster(ev_m)
-    metrics = evaluate_forecaster(fc, splits.val, seasonality=splits.seasonality, batch_size=batch_size)
+    metrics = evaluate_forecaster(fc, splits.val, seasonality=splits.seasonality, batch_size=eval_bs)
     forg = (
-        _eval_macro_forgetting(fc, zs_by_domain, gen_by_domain, batch_size)
+        _eval_macro_forgetting(fc, zs_by_domain, gen_by_domain, eval_bs)
         if (gen_by_domain is not None and zs_by_domain is not None)
         else None
     )
@@ -108,39 +131,77 @@ def _train_and_eval(
     return {
         "mode": mode,
         "lr": lr,
+        "seed": seed,
+        "batch_size": batch_size,
         "lora": None if lora_config is None else lora_config.to_dict(),
         "sign_flip": sign_flip,
         "steps": res.steps,
         "best_step": res.best_step,
         "elapsed_s": round(time.perf_counter() - t0, 2),
+        "peak_vram_gib": round(peak_gib, 2),
         "val_metrics": metrics.to_dict(),
         "forgetting": forg,
     }
+
+
+def _parse_mode_lrs(specs: list[str] | None) -> dict[str, tuple[float, ...]]:
+    overrides: dict[str, tuple[float, ...]] = {}
+    for spec in specs or ():
+        if "=" not in spec:
+            raise ValueError(f"--mode-lrs entry must look like 'mode=1e-3,3e-3', got {spec!r}")
+        mode, vals = spec.split("=", 1)
+        if mode not in LR_GRID:
+            raise ValueError(f"unknown mode {mode!r} in --mode-lrs")
+        overrides[mode] = tuple(float(v) for v in vals.split(",") if v.strip())
+    return overrides
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--device", default="auto")
     parser.add_argument("--sizes", nargs="+", default=["5M", "28M"], choices=["5M", "28M", "123M", "209M"])
-    parser.add_argument("--bf16", action="store_true")
     parser.add_argument(
-        "--sign-flip", action="store_true", help="Enable sign-flip during LR/LoRA sweeps (default: False)"
+        "--datasets",
+        nargs="+",
+        default=["realised_volatility", "retail_demand"],
+        choices=list(DATASET_LOADERS),
     )
+    parser.add_argument("--modes", nargs="+", default=list(LR_GRID), choices=list(LR_GRID))
+    parser.add_argument(
+        "--mode-lrs",
+        nargs="+",
+        default=None,
+        help="Optional per-mode LR subsets, e.g. lora_temporal=1e-3,3e-3 full_ft=1e-4,3e-4",
+    )
+    parser.add_argument(
+        "--sign-flip-modes",
+        nargs="+",
+        default=["off"],
+        choices=["off", "on"],
+        help="Sign-flip settings to sweep across the LR grid (default: ['off']).",
+    )
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0])
+    parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--max-steps", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--check-forgetting", action="store_true")
+    parser.add_argument("--skip-lora-sweep", action="store_true")
+    parser.add_argument("--skip-sign-flip-ablation", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
     precision = "bf16" if args.bf16 else "fp32"
     eval_bs = args.eval_batch_size or args.batch_size
-    datasets = [load_realised_volatility(), load_retail_demand()]
+    lr_overrides = _parse_mode_lrs(args.mode_lrs)
+    sf_flags = [m == "on" for m in args.sign_flip_modes]
+    datasets = [DATASET_LOADERS[name]() for name in args.datasets]
     gen_by_domain = load_general_forgetting_by_domain() if args.check_forgetting else None
 
     all_results: dict[str, Any] = {
         "precision": precision,
-        "sign_flip": args.sign_flip,
+        "sign_flip_modes": list(args.sign_flip_modes),
+        "seeds": list(args.seeds),
         "max_steps": args.max_steps,
         "batch_size": args.batch_size,
         "eval_batch_size": eval_bs,
@@ -165,68 +226,84 @@ def main() -> None:
             else None
         )
 
-        size_res: dict[str, Any] = {"datasets": {}}
+        size_res: dict[str, Any] = {
+            "general_zero_shot_by_domain": None
+            if zs_by_domain is None
+            else {dom: m.to_dict() for dom, m in zs_by_domain.items()},
+            "datasets": {},
+        }
         for splits in datasets:
-            print(f"\n--- {size} | {splits.name} (train={len(splits.train)}, val={len(splits.val)}) ---", flush=True)
+            print(
+                f"\n--- {size} | {splits.name} (train={len(splits.train)}, val={len(splits.val)}) ---",
+                flush=True,
+            )
             zs = evaluate_forecaster(zs_fc, splits.val, seasonality=splits.seasonality, batch_size=eval_bs)
             print(f"  zero_shot val: wQL={zs.wql:.4f} | MASE={zs.mase:.4f} | cov80={zs.coverage_80:.3f}", flush=True)
 
             ds_res: dict[str, Any] = {"zero_shot_val": zs.to_dict(), "lr_sweep": [], "lora_sweep": [], "sign_flip": []}
 
-            # 1. Properly bracketed learning-rate sweep per mode (at args.sign_flip, default False).
             best_lr: dict[str, float] = {}
-            for mode, lrs in LR_GRID.items():
+            for mode in args.modes:
+                lrs = lr_overrides.get(mode, LR_GRID[mode])
                 best_wql = float("inf")
-                for lr in lrs:
-                    lora = (
-                        LoraConfig(
-                            r=8,
-                            lora_alpha=16.0,
-                            axes=("variate" if mode == "lora_variate" else "time",),
-                            targets=("q", "k", "v", "o"),
+                for sf in sf_flags:
+                    for lr in lrs:
+                        lora = (
+                            LoraConfig(
+                                r=8,
+                                lora_alpha=16.0,
+                                axes=("variate" if mode == "lora_variate" else "time",),
+                                targets=("q", "k", "v", "o"),
+                            )
+                            if mode.startswith("lora_")
+                            else None
                         )
-                        if mode.startswith("lora_")
-                        else None
-                    )
-                    run_bs = (
-                        min(args.batch_size, 16)
-                        if (size in ("123M", "209M") and mode == "full_ft")
-                        else args.batch_size
-                    )
-                    row = _train_and_eval(
-                        base_model,
-                        splits,
-                        mode=mode,
-                        lr=lr,
-                        device=eval_dev,
-                        mixed_precision=precision,
-                        max_steps=args.max_steps,
-                        batch_size=run_bs,
-                        lora_config=lora,
-                        sign_flip=args.sign_flip,
-                        gen_by_domain=gen_by_domain,
-                        zs_by_domain=zs_by_domain,
-                    )
-                    ds_res["lr_sweep"].append(row)
-                    wql = row["val_metrics"]["wql"]
-                    mase_v = row["val_metrics"]["mase"]
-                    f_str = (
-                        f" | macro_forg={row['forgetting']['macro_relative_delta_wql']:+.1%}"
-                        if row["forgetting"] is not None
-                        else ""
-                    )
-                    print(
-                        f"  [LR] {mode:13s} lr={lr:.0e} | wQL={wql:.4f} | "
-                        f"MASE={mase_v:.4f}{f_str} | {row['elapsed_s']:.1f}s",
-                        flush=True,
-                    )
-                    if wql < best_wql:
-                        best_wql = wql
-                        best_lr[mode] = lr
+                        run_bs = (
+                            min(args.batch_size, 16)
+                            if (size in ("123M", "209M") and mode == "full_ft")
+                            else args.batch_size
+                        )
+                        seed_wqls = []
+                        for seed in args.seeds:
+                            row = _train_and_eval(
+                                base_model,
+                                splits,
+                                mode=mode,
+                                lr=lr,
+                                device=eval_dev,
+                                mixed_precision=precision,
+                                max_steps=args.max_steps,
+                                batch_size=run_bs,
+                                eval_batch_size=eval_bs,
+                                lora_config=lora,
+                                sign_flip=sf,
+                                seed=seed,
+                                gen_by_domain=gen_by_domain,
+                                zs_by_domain=zs_by_domain,
+                            )
+                            ds_res["lr_sweep"].append(row)
+                            wql = row["val_metrics"]["wql"]
+                            mase_v = row["val_metrics"]["mase"]
+                            seed_wqls.append(wql)
+                            f_str = (
+                                f" | macro_forg={row['forgetting']['macro_relative_delta_wql']:+.1%}"
+                                if row["forgetting"] is not None
+                                else ""
+                            )
+                            print(
+                                f"  [LR] {mode:13s} sf={int(sf)} lr={lr:.0e} s={seed} | "
+                                f"wQL={wql:.4f} | MASE={mase_v:.4f}{f_str} | {row['elapsed_s']:.1f}s",
+                                flush=True,
+                            )
+                        mean_wql = sum(seed_wqls) / len(seed_wqls)
+                        if mean_wql < best_wql:
+                            best_wql = mean_wql
+                            best_lr[mode] = lr
 
-            # 2. LoRA rank and targets sweep + sign-flip ablation on 5M.
-            if size == "5M":
+            if size == "5M" and not args.skip_lora_sweep:
                 for mode in ("lora_variate", "lora_temporal"):
+                    if mode not in best_lr:
+                        continue
                     axis = "variate" if mode == "lora_variate" else "time"
                     for r, targets in [
                         (4, ("q", "v")),
@@ -244,8 +321,10 @@ def main() -> None:
                             mixed_precision=precision,
                             max_steps=args.max_steps,
                             batch_size=args.batch_size,
+                            eval_batch_size=eval_bs,
                             lora_config=lora,
-                            sign_flip=True,
+                            sign_flip=sf_flags[-1],
+                            seed=args.seeds[0],
                         )
                         ds_res["lora_sweep"].append(row)
                         print(
@@ -254,7 +333,10 @@ def main() -> None:
                             flush=True,
                         )
 
-                for mode in ("head_only", "lora_variate", "lora_temporal", "full_ft"):
+            if size == "5M" and not args.skip_sign_flip_ablation and len(sf_flags) == 1:
+                for mode in args.modes:
+                    if mode not in best_lr:
+                        continue
                     lora = (
                         LoraConfig(
                             r=8,
@@ -275,8 +357,10 @@ def main() -> None:
                             mixed_precision=precision,
                             max_steps=args.max_steps,
                             batch_size=args.batch_size,
+                            eval_batch_size=eval_bs,
                             lora_config=lora,
                             sign_flip=sf,
+                            seed=args.seeds[0],
                         )
                         ds_res["sign_flip"].append(row)
                         print(
