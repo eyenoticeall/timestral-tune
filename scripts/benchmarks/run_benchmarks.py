@@ -291,10 +291,12 @@ def main() -> None:
     parser.add_argument("--lr-full", type=float, default=DEFAULT_LEARNING_RATES["full_ft"])
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-targets", nargs="+", default=["q", "k", "v", "o"])
-    parser.add_argument("--sign-flip", action="store_true")
+    parser.add_argument("--no-sign-flip", action="store_true", help="Disable sign-flip (enabled by default)")
+    parser.add_argument("--sign-flip", action="store_true", help="Explicitly enable sign-flip (default)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
+    use_sign_flip = not args.no_sign_flip
 
     precision = "bf16" if args.bf16 else "fp32"
     eval_bs = args.eval_batch_size or args.batch_size
@@ -326,7 +328,7 @@ def main() -> None:
         "lrs": lrs,
         "lora_rank": args.lora_rank,
         "lora_targets": list(args.lora_targets),
-        "sign_flip": args.sign_flip,
+        "sign_flip": use_sign_flip,
         "seed": args.seed,
         "results": {},
     }
@@ -350,7 +352,7 @@ def main() -> None:
                 lrs=lrs,
                 lora_rank=args.lora_rank,
                 lora_targets=tuple(args.lora_targets),
-                sign_flip=args.sign_flip,
+                sign_flip=use_sign_flip,
                 seed=args.seed,
             )
 

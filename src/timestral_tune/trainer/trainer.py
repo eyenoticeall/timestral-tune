@@ -56,6 +56,7 @@ class _CachedHeadDataset(Dataset[int]):
         normalised_targets: Tensor | None,
         frame_loc: Tensor | None,
         frame_scale: Tensor | None,
+        negated: _CachedHeadDataset | None = None,
     ) -> None:
         self.horizon_hidden = horizon_hidden
         self.anchor_loc = anchor_loc
@@ -66,6 +67,7 @@ class _CachedHeadDataset(Dataset[int]):
         self.normalised_targets = normalised_targets
         self.frame_loc = frame_loc
         self.frame_scale = frame_scale
+        self.negated = negated
 
     def __len__(self) -> int:
         return self.horizon_hidden.shape[0]
@@ -90,6 +92,46 @@ class _CachedHeadDataset(Dataset[int]):
             anchor_scale=scale,
             targets=targets,
             loss_weight=weight,
+            context_welford=welford,
+            normalised_targets=normalised,
+            frame_loc=f_loc,
+            frame_scale=f_scale,
+        )
+
+    def collate_sign_flipped(self, indices: Sequence[int], generator: torch.Generator) -> CachedHeadBatch:
+        """Collate `indices`, randomly selecting per-window from `+x` or cached `-x` with `p=0.5`."""
+        if self.negated is None:
+            return self.collate(indices)
+        idx = torch.as_tensor(indices, dtype=torch.long)
+        flip = torch.rand((idx.numel(),), generator=generator) < 0.5  # (B,)
+
+        def _pick(pos_t: Tensor, neg_t: Tensor) -> Tensor:
+            p_sel = pos_t[idx]
+            n_sel = neg_t[idx]
+            mask = flip.view(-1, *([1] * (p_sel.ndim - 1)))
+            return torch.where(mask, n_sel, p_sel).flatten(0, 1)
+
+        neg = self.negated
+        welford = (
+            None
+            if self.context_welford is None or neg.context_welford is None
+            else tuple(_pick(pt, nt) for pt, nt in zip(self.context_welford, neg.context_welford, strict=True))
+        )
+        normalised = (
+            None
+            if self.normalised_targets is None or neg.normalised_targets is None
+            else _pick(self.normalised_targets, neg.normalised_targets)
+        )
+        f_loc = None if self.frame_loc is None or neg.frame_loc is None else _pick(self.frame_loc, neg.frame_loc)
+        f_scale = (
+            None if self.frame_scale is None or neg.frame_scale is None else _pick(self.frame_scale, neg.frame_scale)
+        )
+        return CachedHeadBatch(
+            horizon_hidden=_pick(self.horizon_hidden, neg.horizon_hidden),
+            anchor_loc=_pick(self.anchor_loc, neg.anchor_loc),
+            anchor_scale=_pick(self.anchor_scale, neg.anchor_scale),
+            targets=_pick(self.targets, neg.targets),
+            loss_weight=_pick(self.loss_weight, neg.loss_weight),
             context_welford=welford,
             normalised_targets=normalised,
             frame_loc=f_loc,
@@ -252,6 +294,7 @@ class TimestralTrainer:
         self.should_stop = False
         self._train_head_cache: _CachedHeadDataset | None = None
         self._val_head_cache: _CachedHeadDataset | None = None
+        self._fit_flip_generator: torch.Generator | None = None
         self._val_loader: DataLoader | None = None
 
     # ----------------------------------------------------------------- setup
@@ -383,9 +426,8 @@ class TimestralTrainer:
     def _get_head_cache(self, dataset: TimeSeriesDataset) -> _CachedHeadDataset | None:
         if self.config.mode != "head_only" or not self.config.cache_frozen_features:
             return None
+        dual = dataset is self.train_dataset and self.config.sign_flip
         if dataset is self.train_dataset:
-            if self.config.sign_flip:
-                return None
             if self._train_head_cache is not None:
                 return self._train_head_cache
         elif dataset is self.val_dataset:
@@ -394,7 +436,7 @@ class TimestralTrainer:
         else:
             return None
 
-        estimated = self._estimate_head_cache_bytes(dataset)
+        estimated = self._estimate_head_cache_bytes(dataset) * (2 if dual else 1)
         if estimated > _MAX_HEAD_CACHE_BYTES:
             logger.info(
                 "skipping frozen-feature cache for %d windows (estimated %.1f MiB exceeds %.0f MiB cap)",
@@ -403,7 +445,9 @@ class TimestralTrainer:
                 _MAX_HEAD_CACHE_BYTES / (1024 * 1024),
             )
             return None
-        cache = self._build_head_cache(dataset)
+        cache = self._build_head_cache(dataset, negate=False)
+        if dual:
+            cache.negated = self._build_head_cache(dataset, negate=True)
         if dataset is self.train_dataset:
             self._train_head_cache = cache
         else:
@@ -411,7 +455,7 @@ class TimestralTrainer:
         return cache
 
     @torch.no_grad()
-    def _build_head_cache(self, dataset: TimeSeriesDataset) -> _CachedHeadDataset:
+    def _build_head_cache(self, dataset: TimeSeriesDataset, *, negate: bool = False) -> _CachedHeadDataset:
         model_config = self.model.config
         patch = model_config.patch_size
         n_targets = dataset.series[0].layout[0]
@@ -437,6 +481,8 @@ class TimestralTrainer:
         total_series = len(dataset)
         try:
             for batch in self._raw_loader(dataset, training=False):
+                if negate:
+                    batch = flip_batch_signs(batch, p=1.0)
                 batch.validate(patch)
                 on_device = batch.to(self.device, non_blocking=non_blocking)
                 with self._autocast():
@@ -512,11 +558,17 @@ class TimestralTrainer:
         config = self.config
         generator = torch.Generator().manual_seed(config.seed) if training else None
         batch_size = config.batch_size if training else (config.eval_batch_size or config.batch_size)
+        flip_gen = self._fit_flip_generator if training else None
+        collate_fn = (
+            (lambda idx: cache.collate_sign_flipped(idx, flip_gen))
+            if (flip_gen is not None and cache.negated is not None)
+            else cache.collate
+        )
         return DataLoader(
             cache,
             batch_size=batch_size,
             shuffle=training and config.shuffle,
-            collate_fn=cache.collate,
+            collate_fn=collate_fn,
             num_workers=0,
             pin_memory=self.device.type == "cuda",
             generator=generator,
@@ -561,6 +613,8 @@ class TimestralTrainer:
         config = self.config
         torch.manual_seed(config.seed)
         self.scheduler = self._new_schedule()
+        flip_generator = torch.Generator().manual_seed(config.seed + 1_000_003) if config.sign_flip else None
+        self._fit_flip_generator = flip_generator
         loader = self._loader(self.train_dataset, training=True)
         train_history: list[tuple[int, float]] = []
         eval_history: list[tuple[int, float]] = []
@@ -588,7 +642,6 @@ class TimestralTrainer:
 
         patch = self.model.config.patch_size
         non_blocking = self.device.type == "cuda"
-        flip_generator = torch.Generator().manual_seed(config.seed + 1_000_003) if config.sign_flip else None
         for callback in self.callbacks:
             callback.on_fit_start(self)
         self.model.train()

@@ -35,7 +35,8 @@ def config_for(device: str = "cpu", **overrides) -> TrainingConfig:
 
 
 def fixed_batch_config(dataset, device: str, **overrides) -> TrainingConfig:
-    """Every step sees the same batch: the whole dataset, unshuffled."""
+    """Every step sees the same batch: the whole dataset, unshuffled and unflipped (unless overridden)."""
+    overrides.setdefault("sign_flip", False)
     return config_for(device, batch_size=len(dataset), shuffle=False, **overrides)
 
 
@@ -568,12 +569,12 @@ def test_config_accepts_numpy_integers_and_stores_python_ints(tiny_forecaster):
 def test_config_defaults_follow_the_spec():
     config = TrainingConfig(model_name_or_path="mistralai/Timestral-28M")
     assert config.mode == "head_only" and config.target_frame == "median_folded" and config.mixed_precision == "fp32"
-    assert config.cache_frozen_features is True and config.sign_flip is False
+    assert config.cache_frozen_features is True and config.sign_flip is True
     assert config.gradient_clip_val == 1.0 and config.lr_schedule == "cosine"
     assert config.resolved_learning_rate == 3e-3
     assert dataclasses.replace(config, mode="lora_variate").resolved_learning_rate == 3e-3
-    assert dataclasses.replace(config, mode="lora_temporal").resolved_learning_rate == 3e-3
-    assert dataclasses.replace(config, mode="full_ft").resolved_learning_rate == 3e-4
+    assert dataclasses.replace(config, mode="lora_temporal").resolved_learning_rate == 1e-3
+    assert dataclasses.replace(config, mode="full_ft").resolved_learning_rate == 1e-4
     assert dataclasses.replace(config, mode="full_ft", learning_rate=5e-6).resolved_learning_rate == 5e-6
     assert LoraConfig().r == 8 and LoraConfig().targets == ("q", "k", "v", "o")
     assert TrainingConfig(model_name_or_path="x", gradient_clip_val=None).gradient_clip_val is None
@@ -599,6 +600,7 @@ def test_head_only_cache_matches_uncached_training(tiny_forecaster, device, cova
             learning_rate=1e-2,
             target_frame=frame,
             seed=5,
+            sign_flip=False,
             cache_frozen_features=cached,
         )
         trainer = TimestralTrainer(config, train, val, model=model)
@@ -630,7 +632,12 @@ def test_head_only_cache_runs_transformer_once_per_dataset(tiny_forecaster, devi
         handle = model.transformer.register_forward_hook(bump)
         try:
             config = config_for(
-                device, batch_size=len(train), epochs=5, learning_rate=1e-2, cache_frozen_features=cached
+                device,
+                batch_size=len(train),
+                epochs=5,
+                learning_rate=1e-2,
+                sign_flip=False,
+                cache_frozen_features=cached,
             )
             trainer = TimestralTrainer(config, train, val, model=model)
             trainer.fit()
@@ -1015,22 +1022,47 @@ def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny
         flipped = torch.equal(f1.context[sl], -batch.context[sl])
         assert same or flipped, "rows within one series got inconsistent signs"
 
-    # With sign_flip=True in head_only, training bypasses the frozen-feature cache while validation still caches.
+    # With sign_flip=True in head_only, training builds a dual-orientation (+x/-x) cache matching streaming
+    # training while running the frozen transformer body only twice for train (+1/-1) + once for val.
     train, val = dataset.split_by_time(12 * tiny_forecaster.patch_size)
-    model = fresh_model(tiny_forecaster)
-    cfg = config_for(
-        "cpu",
-        mode="head_only",
-        batch_size=len(train),
-        max_steps=3,
-        learning_rate=1e-2,
-        sign_flip=True,
-        cache_frozen_features=True,
-        shuffle=False,
-    )
-    trainer = TimestralTrainer(cfg, train, val, model=model)
-    assert trainer._get_head_cache(train) is None
-    assert trainer._get_head_cache(val) is not None
+    heads_sf = {}
+    calls_cached = 0
+    for cached in (False, True):
+        model = fresh_model(tiny_forecaster)
+        handle = None
+        if cached:
+
+            def _bump(*_):
+                nonlocal calls_cached
+                calls_cached += 1
+
+            handle = model.transformer.register_forward_hook(_bump)
+        try:
+            cfg = config_for(
+                "cpu",
+                mode="head_only",
+                batch_size=len(train),
+                epochs=4,
+                learning_rate=1e-2,
+                sign_flip=True,
+                cache_frozen_features=cached,
+                shuffle=False,
+                seed=9,
+            )
+            trainer = TimestralTrainer(cfg, train, val, model=model)
+            if cached:
+                train_cache = trainer._get_head_cache(train)
+                val_cache = trainer._get_head_cache(val)
+                assert train_cache is not None and train_cache.negated is not None
+                assert val_cache is not None and val_cache.negated is None
+            trainer.fit()
+        finally:
+            if handle is not None:
+                handle.remove()
+        heads_sf[cached] = torch.cat([p.detach().cpu().flatten() for p in model.head.parameters()])
+    assert calls_cached == 3, f"expected 3 body passes (pos train + neg train + val), got {calls_cached}"
+    assert l2_rel(heads_sf[True], heads_sf[False]) < 1e-4
+    torch.testing.assert_close(heads_sf[True], heads_sf[False], rtol=1e-2, atol=1e-4)
 
     # p=0.0 is a no-op; p=0.5 actually produces BOTH flipped and unflipped series across 16 series;
     # known_future=None also works cleanly.

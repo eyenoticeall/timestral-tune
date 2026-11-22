@@ -40,13 +40,14 @@ LORA_AXES: tuple[str, ...] = get_args(LoraAxis)
 LORA_TARGETS: tuple[str, ...] = get_args(LoraTarget)
 SINGLE_ROW_ALLOWED_TARGETS: tuple[str, ...] = ("v", "o", "gate")
 
-# Sweep-backed default learning rates (bracketed Phase 3 validation sweeps on 5M, 28M, and 123M
-# across realised volatility and retail demand; see `docs/BENCHMARKS.md` §2 and `docs/SPEC.md` D19).
+# Sweep-backed default learning rates (bracketed Phase 3 validation sweeps on 5M, 28M, 123M, and
+# 209M across realised volatility, retail demand, and signed returns; see `docs/BENCHMARKS.md` §2
+# and `docs/SPEC.md` D19).
 DEFAULT_LEARNING_RATES: dict[AdaptationMode, float] = {
     "head_only": 3e-3,
     "lora_variate": 3e-3,
-    "lora_temporal": 3e-3,
-    "full_ft": 3e-4,
+    "lora_temporal": 1e-3,
+    "full_ft": 1e-4,
 }
 
 
@@ -154,8 +155,9 @@ class TrainingConfig:
         log_every: Log training progress every this many steps.
         shuffle: Shuffle the training windows each epoch.
         sign_flip: Randomly negate whole series (targets and covariates together, p=0.5 per series)
-            during training so fine-tuning on one-signed data stays coherent with upstream's
-            symmetric averaging (spec §5.3). Bypasses frozen-feature caching for training batches.
+            during training so fine-tuning stays coherent with upstream's symmetric averaging
+            (default True; spec §5.3, D19). In `head_only` with `cache_frozen_features=True`, both
+            `+x` and `-x` orientations are cached up to the 256 MiB cap.
         cache_frozen_features: In `head_only` mode, cache the frozen transformer's per-window
             horizon representations on CPU (up to 256 MiB per dataset) so multi-epoch training and
             repeated evaluations skip re-running the frozen body. Ignored in other modes, and falls
@@ -189,7 +191,7 @@ class TrainingConfig:
     restore_best: bool = True
     log_every: int = 50
     shuffle: bool = True
-    sign_flip: bool = False
+    sign_flip: bool = True
     cache_frozen_features: bool = True
     compile_model: bool = False
     compile_mode: CompileMode = "default"

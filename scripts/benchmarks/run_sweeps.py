@@ -176,9 +176,9 @@ def main() -> None:
     parser.add_argument(
         "--sign-flip-modes",
         nargs="+",
-        default=["off"],
+        default=["on"],
         choices=["off", "on"],
-        help="Sign-flip settings to sweep across the LR grid (default: ['off']).",
+        help="Sign-flip settings to sweep across the LR grid (default: ['on'], matching TrainingConfig.sign_flip).",
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
     parser.add_argument("--bf16", action="store_true")
