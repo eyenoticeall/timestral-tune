@@ -421,3 +421,63 @@ post-release). It is included for multi-regime time-block statistical power (`k 
    defaults, `full_ft` / `lora_temporal` beat `seasonal_ridge` by **−9.2% to −10.4% wQL** on retail,
    beat `har_rv` by **−8.2% to −8.3% wQL** across 2026, and beat `har_rv` by **−3.6% to −4.1% wQL**
    on the post-release volatility slice.
+
+---
+
+## 5. Phase 4: Replay mixing & frozen-base distillation ablation (`docs/benchmarks/replay_ablation.json`)
+
+Reproduce (Apple M4 GPU, `fp32`, `max_steps=200`, `batch_size=32`, built-in `SyntheticReplaySource` with 64 series):
+
+```bash
+uv run python scripts/benchmarks/run_replay_ablation.py \
+  --device mps --output docs/benchmarks/replay_ablation.json
+```
+
+Evaluates `ReplayConfig` (`replay_fraction` and `distill_weight`) across the three high-forgetting regimes
+identified in Phase 3:
+
+### 5.1 `head_only` at shipped `3e-3` (`5M` & `28M`, seed `0`)
+
+| Size | Dataset | Variant (`replay_fraction` / `distill_weight`) | Val wQL | Test wQL | Macro Forg wQL | Wall time |
+|---|---|---|---:|---:|---:|---:|
+| 5M | Volatility | `none` | 0.1812 | 0.2196 | +13.7% | 22.7 s |
+| 5M | Volatility | `replay_0.25` (`0.25 / 0.0`) | 0.1829 | 0.2232 | **+5.0%** | 24.2 s |
+| 5M | Volatility | `distill_0.5` (`0.0 / 0.5`) | 0.1861 | 0.2302 | **+0.7%** | 24.1 s |
+| 5M | Volatility | `both_0.2_0.5` (`0.2 / 0.5`) | 0.1865 | 0.2308 | +1.1% | 26.0 s |
+| 5M | Retail | `none` | 0.2253 | 0.2098 | +5.0% | 11.5 s |
+| 5M | Retail | `replay_0.25` (`0.25 / 0.0`) | 0.2260 | **0.2099** | **+3.8%** | 13.6 s |
+| 5M | Retail | `distill_0.5` (`0.0 / 0.5`) | 0.2279 | 0.2123 | **+1.9%** | 14.2 s |
+| 28M | Volatility | `none` | 0.1794 | 0.2165 | +10.3% | 101.5 s |
+| 28M | Volatility | `replay_0.25` (`0.25 / 0.0`) | 0.1805 | 0.2195 | **+4.1%** | 105.1 s |
+| 28M | Volatility | `distill_0.5` (`0.0 / 0.5`) | 0.1822 | 0.2235 | **+0.7%** | 107.1 s |
+| 28M | Retail | `none` | 0.2256 | 0.2072 | +7.0% | 48.4 s |
+| 28M | Retail | `replay_0.25` (`0.25 / 0.0`) | 0.2262 | **0.2075** | **+5.3%** | 49.3 s |
+| 28M | Retail | `distill_0.5` (`0.0 / 0.5`) | 0.2279 | 0.2095 | **+2.7%** | 45.8 s |
+
+### 5.2 `lora_temporal` at higher LR `3e-3` (`5M` volatility, 3 seeds `0 / 1 / 2`)
+
+| Variant (`lr`, `replay_fraction / distill_weight`) | Test wQL (`s0 / s1 / s2`; mean) | Macro Forg wQL (`s0 / s1 / s2`; **worst**) |
+|---|---|---|
+| `lr1e-3_none` (shipped default) | `0.2175 / 0.2185 / 0.2198` (0.2186) | `-0.2% / -1.2% / +1.6%` (**+1.6%**) |
+| `lr3e-3_none` (forgetting cliff) | `0.2167 / 0.2167 / 0.2161` (0.2165) | `+20.8% / +31.3% / +7.6%` (**+31.3%**) |
+| `lr3e-3_replay_0.25` (`0.25 / 0.0`) | `0.2201 / 0.2155 / 0.2186` (**0.2181**) | `+0.1% / +1.1% / -0.2%` (**+1.1%**) |
+| `lr3e-3_distill_0.5` (`0.0 / 0.5`) | `0.2209 / 0.2227 / 0.2221` (0.2219) | `-1.2% / -1.3% / -0.4%` (**-0.4%**) |
+| `lr3e-3_distill_1.0` (`0.0 / 1.0`) | `0.2252 / 0.2254 / 0.2248` (0.2251) | `-0.4% / -1.5% / +0.4%` (**+0.4%**) |
+| `lr3e-3_both_0.2_0.5` (`0.2 / 0.5`) | `0.2231 / 0.2247 / 0.2223` (0.2234) | `+1.4% / -1.5% / +0.4%` (**+1.4%**) |
+
+### 5.3 `full_ft` at higher LR `3e-4` (`5M` retail demand, 3 seeds `0 / 1 / 2`)
+
+| Variant (`lr`, `replay_fraction / distill_weight`) | Test wQL (`s0 / s1 / s2`; mean) | Macro Forg wQL (`s0 / s1 / s2`; **worst**) |
+|---|---|---|
+| `lr1e-4_none` (shipped default) | `0.2014 / 0.2012 / 0.2022` (0.2016) | `+0.4% / +0.5% / +0.6%` (**+0.6%**) |
+| `lr3e-4_none` | `0.1983 / 0.1981 / 0.1998` (**0.1987**) | `+2.8% / +1.9% / +2.1%` (**+2.8%**) |
+| `lr3e-4_replay_0.25` (`0.25 / 0.0`) | `0.1988 / 0.1986 / 0.2004` (0.1993) | `+4.1% / +3.1% / +3.7%` (**+4.1%**) |
+| `lr3e-4_distill_0.1` (`0.0 / 0.1`) | `0.1993 / 0.1993 / 0.2010` (**0.1999**) | `+1.3% / +0.6% / +0.9%` (**+1.3%**) |
+| `lr3e-4_distill_0.5` (`0.0 / 0.5`) | `0.2011 / 0.2017 / 0.2020` (0.2016) | `+1.0% / +0.4% / +1.1%` (**+1.1%**) |
+| `lr3e-4_distill_1.0` (`0.0 / 1.0`) | `0.2046 / 0.2036 / 0.2037` (0.2040) | `+1.2% / +0.4% / +0.6%` (**+1.2%**) |
+| `lr3e-4_both_0.2_0.5` (`0.2 / 0.5`) | `0.2026 / 0.2027 / 0.2027` (0.2027) | `+0.5% / +0.6% / +0.8%` (**+0.8%**) |
+
+**Key takeaways:**
+- **`head_only`:** dual-cached replay + distillation adds only ~4–6% wall time on `28M`, cuts volatility forgetting by 2.5×–2.7× (`replay_fraction=0.25`), and brings forgetting below `1%` (`distill_weight=0.5`, with a correspondingly larger domain accuracy trade-off).
+- **`lora_temporal` at `3e-3`:** synthetic replay (`replay_fraction=0.25`) eliminates the `+31.3%` worst-seed forgetting cliff down to **`+1.1%`** while preserving accuracy (`0.2181` mean vs `0.2186` at `1e-3`).
+- **`full_ft` at `3e-4`:** pure synthetic pinball replay slightly increases forgetting (`+2.8% → +4.1%`) because full fine-tuning adapts to the synthetic generator's simplified priors (D7). By contrast, **light frozen-base distillation (`distill_weight=0.1`)** anchors directly to Timestral's pretrained quantiles without fitting synthetic labels, halving worst-seed forgetting (`+2.8% → +1.3%`) while retaining most of `3e-4`'s wQL gain over `1e-4` (`0.1999` vs `0.2016`).

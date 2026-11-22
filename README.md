@@ -7,11 +7,13 @@
 
 Fine-tuning, selective LoRA, and conformal calibration for Mistral's Timestral time-series foundation models in PyTorch.
 
-> **Status: pre-alpha (Phases 0–3).** Loading, the data pipeline, all five adaptation modes (`conformal`,
-> `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), `bf16` + `torch.compile` on CUDA,
-> upstream-loadable checkpoint export, raw-space evaluation & forgetting metrics, optional Lacuna
-> integration, and real-dataset benchmarks (5M–209M) are built and verified (14/14 acceptance tests
-> passing). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/STATUS.md](docs/STATUS.md).
+> **Status: pre-alpha (Phases 0–4).** Loading, the data pipeline, all five adaptation modes (`conformal`,
+> `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), anti-forgetting replay mixing and frozen-base
+> distillation (`ReplayConfig`, `SyntheticReplaySource`), `bf16` + `torch.compile` on CUDA, full Apple GPU
+> coverage (`5M`–`209M`, contexts up to `32,768`), upstream-loadable checkpoint export, raw-space evaluation
+> & forgetting metrics, optional Lacuna integration, and real-dataset benchmarks (5M–209M) are built and
+> verified (14/14 acceptance tests passing). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and
+> [docs/STATUS.md](docs/STATUS.md).
 
 ## What this will be
 
@@ -39,10 +41,11 @@ is the project's overview guide and source of truth.
 | Piece | State |
 |---|---|
 | Specification | Written and verified against the paper, the official code and the released checkpoints |
-| Loading on any device | Done: CUDA, CPU, Apple GPU (PyTorch 2.8+) |
+| Loading on any device | Done: CUDA, CPU, Apple GPU (`5M`–`209M` and contexts up to `32,768`, PyTorch 2.8+) |
 | Data pipeline | Done: polars / pandas / pyarrow frames, point-in-time windows, time splits, collation |
 | Training forward and loss | Done; trimmed covariate layout (`L + 2h` tokens), equal to official inference (`<= 1e-12` fp64) |
 | Adaptation modes | Done: `head_only` (with frozen-feature caching), `lora_variate` (with single-row guard), `lora_temporal`, `full_ft` |
+| Anti-forgetting replay & distillation | Done: `ReplayConfig`, `SyntheticReplaySource`, `distillation_loss` (low-VRAM teacher caching & `disable_lora`) |
 | CUDA acceleration | Done: `bf16` autocast, fused `AdamW`, optional `torch.compile` (verified on NVIDIA L4) |
 | Conformal calibration | Done: `ConformalCalibrator` (CQR) and `OnlineConformalCalibrator` (ACI) |
 | Checkpoint export | Done: upstream-loadable `config.json` + merged `model.safetensors`, LoRA adapters, `conformal.json`, sidecar, `LICENSE`, `NOTICE` |

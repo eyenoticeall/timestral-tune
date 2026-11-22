@@ -630,9 +630,66 @@ not started.
 
 **Not done / open.** Phase 3 fast-forwarded into `main` at `9c5817c`, pushed to `origin/main` (CI run
 `45006472178` green across Python 3.10–3.13), and `phase-3` deleted locally and on `origin`. Post-merge
-polish on `main`: re-verified Phase 3 network-free tests on PyTorch 2.4.0 (`283/15`), PyTorch 2.8.0
-(`326/5`), and Python 3.10 / PyTorch 2.14.1 (`326/5`); committed `docs/benchmarks/bench_5m_full_ft_3e4_vs_1e4.json`
-(reproducing all 6 Apple GPU 5M `full_ft` `3e-4` vs `1e-4` runs); clarified explicit `dropout=0.05` vs
-`LoraConfig.dropout=0.0` in `docs/BENCHMARKS.md` §1; and cleaned stale wording in `__init__.py`,
-`README.md`, and `docs/VERIFICATION.md`. PyPI release awaits maintainer approval. Phase 4 (stretch:
-replay, distillation, tiled training) has not started.
+polish on `main` (`638e9c1`, pushed): re-verified Phase 3 network-free tests on PyTorch 2.4.0 (`283/15`),
+PyTorch 2.8.0 (`326/5`), and Python 3.10 / PyTorch 2.14.1 (`326/5`); committed
+`docs/benchmarks/bench_5m_full_ft_3e4_vs_1e4.json`; clarified explicit `dropout=0.05` vs
+`LoraConfig.dropout=0.0` in `docs/BENCHMARKS.md` §1; and cleaned stale wording.
+
+---
+
+## 2026-11-22 — Phase 4 (rescoped): replay mixing, frozen-base distillation, and Apple GPU scaling
+
+**Done (branch `phase-4`, unpushed/unmerged).** Rescoped Phase 4 per maintainer direction to **Item 1**
+(replay mixing, built-in synthetic generators, frozen-base distillation) and **Item 4** (Apple GPU `123M`,
+`209M`, and long-context coverage), deferring Items 2 & 3 (fixed-length tiled DHF and sampled block
+lengths) as exploratory due to token doubling (undoing D16), per-window categorical encoding conflict
+(D1), whole-span known-future normalisation, and separate batch/collator complexity.
+
+- **Item 1 — Replay & distillation (`68c64c5`, `7304681`):**
+  - Implemented `ReplayConfig` (`config.py`), `SyntheticReplaySource` (`replay/generators.py`, 5 classical
+    families subclassing `TimeSeriesDataset`), `distillation_loss` (`replay/distill.py`), and `disable_lora`
+    (`models/adapter.py`).
+  - Wired into `TimestralTrainer` (`trainer/trainer.py`) and `export_checkpoint` (`export.py`, recording
+    `replay_config` in `tune_metadata.json` while keeping `config.json` strictly upstream-compatible).
+  - **Key finding / Decision D21:** running replay as a separate micro-batch allows heterogeneous covariate
+    layouts and horizons between domain and replay datasets. On our first cached-vs-live teacher parity
+    test, raw L1 (`|student - teacher|`) exhibited a real `+/-1` subgradient kink at `0`: `~3.5e-7` fp32
+    GEMM tiling round-off between cached and live teachers at step 0 flipped AdamW step signs (`2*lr`
+    divergence). Switching `distillation_loss` to Huber/Smooth-L1 (`smooth_beta=1e-3`, with `0.0`
+    preserving exact L1) eliminated the kink while remaining exact L1 for real drift (`>= 1e-3`), bringing
+    5-step cached-vs-live trajectories within `< 5e-4` rel L2 and direct teacher outputs within `< 1e-5`.
+  - Low-VRAM frozen-base teacher: frozen `model.head` in `head_only` (preserving dual `+x`/`-x` head
+    caching), CPU-cached base quantiles up to 256 MiB in `lora_*`/`full_ft`, and zero-VRAM `disable_lora`
+    (LoRA) or frozen base copy (`full_ft`) fallbacks.
+  - Added 24 unit/parity/mutation tests in `tests/test_replay.py` (all passing).
+
+- **Empirical replay ablation (`e31a2b2`, `docs/benchmarks/replay_ablation.json`, `docs/BENCHMARKS.md` §5):**
+  - Ran `scripts/benchmarks/run_replay_ablation.py` on Apple M4 GPU (`fp32`) across the three high-forgetting
+    regimes from Phase 3:
+    1. `head_only` at `3e-3` (`5M` & `28M`): `replay_fraction=0.25` cuts vol forgetting 2.5×–2.7×
+       (`+13.7% → +5.0%` on 5M, `+10.3% → +4.1%` on 28M) and retail forgetting (`+5.0% → +3.8%`,
+       `+7.0% → +5.3%`) at `+4–6%` wall time on 28M; `distill_weight=0.5` brings vol forgetting to `+0.7%`.
+    2. `lora_temporal` at `3e-3` (`5M` vol, 3 seeds): `replay_fraction=0.25` eliminates the `+31.3%`
+       worst-seed forgetting cliff down to `+1.1%` while keeping mean test wQL `0.2181` (vs `0.2186` at `1e-3`).
+    3. `full_ft` at `3e-4` (`5M` retail, 3 seeds): pure synthetic pinball replay slightly increases
+       forgetting (`+2.8% → +4.1%`) as full FT adapts to the synthetic generator, whereas light frozen-base
+       distillation (`distill_weight=0.1`) halves worst-seed forgetting (`+2.8% → +1.3%`) while retaining
+       most of `3e-4`'s test wQL gain over `1e-4` (`0.1999` vs `0.2016`).
+
+- **Item 4 — Apple GPU (MPS) `123M`, `209M`, and long-context coverage (`3608c60`, `docs/benchmarks/mps_coverage.json`, `docs/VERIFICATION.md` §15):**
+  - Added and ran `scripts/probes/mps_large_and_long_context.py` on a 16 GiB Apple M4 (`fp32`, PyTorch
+    2.15.0): `123M` and `209M` match CPU to `9.5e-8..1.1e-6` forward and `4.5e-6..8.0e-6` gradient vs
+    float64-RMSNorm reference (cleaner than CPU fp32); all four modes run cleanly at `ctx=256 cov5 B=8`;
+    and contexts `4,096..32,768` steps (`128..1,024` patches) pass inference (`6.8e-8..5.3e-7` vs CPU),
+    `lora_temporal`, and `full_ft` (`209M full_ft` at `32,768` steps `B=1`: `1.31 s/step`, `6.09 GiB` driver)
+    plus `cov3` at `8,192` and `16,384` steps. Added network-marked MPS parity test in
+    `tests/test_loader_device.py`.
+
+- **Verification:** full local pytest suite **561 passed, 5 skipped** (PyTorch 2.15.0 / Python 3.13);
+  PyTorch **2.4.0** floor (`-m "not network"`, Python 3.12): **307 passed, 15 skipped**; `ruff check`,
+  `ruff format --check`, `uv build`, `check_upstream_drift.py` (no drift), and tracked-privacy grep all
+  clean.
+
+**Not done / open.** `phase-4` is unpushed and unmerged pending review; CUDA `bf16` has not been re-run
+specifically on the new replay path yet; PyPI publish awaits maintainer approval; tiled DHF remains
+deferred as exploratory.

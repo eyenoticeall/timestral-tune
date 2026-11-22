@@ -1,9 +1,10 @@
 """timestral-tune: fine-tuning, selective LoRA and conformal calibration for Timestral models.
 
-Status: pre-alpha (Phases 0-3). Supports loading on CPU/CUDA/MPS, leak-free datasets and
-collation, normalised-space training across `head_only`, `lora_variate`, `lora_temporal`, and
-`full_ft`, sign-flip augmentation, post-hoc CQR/ACI conformal calibration, raw-space evaluation
-and forgetting metrics, optional Lacuna integration, and upstream-loadable checkpoint export.
+Status: pre-alpha (Phases 0-4). Supports loading on CPU/CUDA/MPS (5M-209M, contexts up to 32,768),
+leak-free datasets and collation, normalised-space training across `head_only`, `lora_variate`,
+`lora_temporal`, and `full_ft`, sign-flip augmentation, replay mixing and frozen-base distillation,
+post-hoc CQR/ACI conformal calibration, raw-space evaluation and forgetting metrics, optional Lacuna
+integration, and upstream-loadable checkpoint export.
 See `README.md`, `docs/STATUS.md` and `docs/SPEC.md`.
 """
 

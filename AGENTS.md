@@ -5,8 +5,8 @@ Guide for anyone, human or coding agent, picking up work in this repository.
 ## 1. Orientation
 
 `timestral-tune` is an adaptation toolkit (fine-tuning, LoRA, conformal calibration) for Mistral's
-Timestral time-series models. It is **pre-alpha**: Phases 0, 1, 2 and 3 of the roadmap are built, and
-Phase 4 (`replay/`) is a documented stub.
+Timestral time-series models. It is **pre-alpha**: Phases 0–4 (rescoped: replay/distillation and
+Apple GPU 123M/209M/long-context coverage) are built; tiled DHF training is deferred as exploratory.
 
 Read in this order before changing anything:
 
