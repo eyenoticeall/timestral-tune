@@ -361,7 +361,7 @@ included, all tests passed on 2.4.0 and the process then never exited.
 
 ## 11. One-off results not covered by a probe or test
 
-Measured once in throwaway scripts on 2026-11-21 and not reproduced by anything in the repository.
+Measured once in throwaway scripts on 2026-11-21 (unless dated otherwise) and not reproduced by anything in the repository.
 Re-measure before relying on them.
 
 | Result | Value |
@@ -373,6 +373,7 @@ Re-measure before relying on them.
 | The 5M past-only-covariates case with explicit attention, against the earlier (float32-RMSNorm) reference | CPU 2.6e-3, Apple GPU 5.9e-3; the error sat in layers 0 to 4 and the patch embedding, with the same distribution on both devices |
 | Why `attention_context("math")` regresses on T14's 5M `past_only_covariates` batch on CPU | 100% of layer 5 decoder `dq` squared error sits at one query `(row=3, head=2, query=11)` whose top-2 keys sit at ~351,272 with true float64 gap 3.4577 (float32 ULP 0.03125): `default` quantized the gap to 3.4375 (`p2` +2.0%, grad rel L2 2.24e-3), `explicit` to 3.46875 (`p2` −1.1%, 1.16e-3), and `math` to 3.375 (`p2` +8.3%, 9.02e-3) |
 | 25-seed CPU sweep on T14-shaped 5M `past_only_covariates` batches | `default` median 1.89e-3 (max 3.67e-3); `math` median 2.12e-5 (max 5.38e-3); `explicit` median 2.31e-5 (max 1.40e-2 on seed 8, where `math` gave 9.57e-4) |
+| `ReduceOp.AVG` vs `ReduceOp.SUM` on CPU `gloo` (2026-11-23, macOS arm64; 1-rank `gloo` group on `tcp://127.0.0.1:<free port>`, `all_reduce` on a 1-element `float64` tensor, run under `uv run python -c ...` and `uv run --isolated --python 3.12 --with "torch==2.4.0" python -c ...`) | PyTorch 2.4.0: `ReduceOp.SUM` succeeds (`[2.0]`); `ReduceOp.AVG` raises `RuntimeError: Cannot use ReduceOp.AVG with Gloo`. PyTorch 2.15.0: both `ReduceOp.SUM` and `ReduceOp.AVG` succeed (`[2.0]`) |
 
 ## 12. Facts read from sources, not measured
 
@@ -577,3 +578,72 @@ Training entries run **one optimiser step** and assert `torch.isfinite(loss)` (n
 | **209M** | `8,192` / `16,384` `cov3` | `1.7e-6` (`605 ms`) / `4.7e-7` (`1,376 ms`) | `lora_t`: `825 ms` (`1.59 / 4.13`) / `1,692 ms` (`1.60 / 6.10`) |
 
 Also covered in pytest by `tests/test_loader_device.py::test_mps_long_context_and_large_checkpoint_parity` (`@pytest.mark.network`).
+
+## 16. Distributed training-step parity prototype (proposed, §5.6)
+
+Backs the `[V]` claims in spec §5.6 (proposed) and §9 T15 (proposed) (referenced by D22, D24, and D26). Every number below
+measures a **standalone prototype outside `src/`** (`scripts/probes/distributed_parity.py`) run with
+`torch.multiprocessing.spawn` on loopback (`127.0.0.1`), CPU, `gloo` backend, on `2026-11-23` (macOS
+arm64). Nothing in `src/` or `tests/` implements multi-process training.
+
+The prototype checks distributed steps against two single-process references: `probe_ref` (a union-batch
+`_local_step`, run for every case and model) and independent `shipped_trainer` (a one-process
+`TimestralTrainer`, run on `tiny_random` only: `training_step()` for `[2] unequal`, `[3] head_only`,
+`lora_variate_step1`, `lora_temporal_step1`, and all four `[4]` replay/distillation regimes in `float64`
+and `float32`; `fit()` with `cache_frozen_features=True` for `[3] head_only_cached` in `float32`, while
+`float64` `head_only_cached` is reported `n/a` because `TimeSeriesDataset` enforces `np.float32`).
+
+Commands run:
+
+```bash
+uv run python scripts/probes/distributed_parity.py
+uv run --isolated --python 3.12 --with "torch==2.4.0" python scripts/probes/distributed_parity.py
+uv run python scripts/probes/distributed_parity.py --sizes 5M
+```
+
+### 16.1 Tiny random model across PyTorch 2.15.0 (Python 3.12.13) and PyTorch 2.4.0 (Python 3.12)
+
+| Probe section & check | Scope | Bound | PyTorch 2.15.0 (`CPU`/`gloo`) | PyTorch 2.4.0 (`CPU`/`gloo`) |
+|---|---|---:|---|---|
+| `[1]` `ddp.module` bypass cross-rank grad rel L2 (`N=2`, ungraded control) | Prototype outside `src/` | — | `2.46e+00` (`max_abs=5.49e-02`, `identical=False`, f64 & f32) | `2.46e+00` (`max_abs=5.49e-02`, `identical=False`, f64 & f32) |
+| `[1]` Proposed step (`N=2`, 6 checks: xrank, `probe_ref` grad & loss) | Prototype outside `src/` | `0.0e+00` / `1.0e-12` f64 / `1.0e-05` f32 | xrank `0.00e+00`; `probe_ref` grad `4.37e-16` f64, `2.32e-07` f32; loss `0.00e+00` f64, `1.29e-07` f32 | xrank `0.00e+00`; `probe_ref` grad `4.37e-16` f64, `2.43e-07` f32; loss `0.00e+00` f64, `6.46e-08` f32 |
+| `[2]` Domain-loss parity (`equal`, `unequal`, `zero_scored`, `empty_shard`, `N=2` & `N=4`; 48 vs `probe_ref` + 8 vs `shipped_trainer` on `unequal`) | Prototype outside `src/` | `0.0e+00` / `1.0e-12` f64 / `1.0e-05` f32 | `plain_avg` `3.72e-01`–`9.85e-01` (non-equal); `N=2 empty_shard` (`W_d=[0, 112]`) `empty_r0_recv_ok=True`, loss `0.00e+00`, xrank `0.00e+00`; multi-rank `probe_ref` grad `3.31e-16`–`4.72e-16` f64 (`N=4 empty_shard` `4.72e-16`), `1.68e-07`–`2.82e-07` f32 (`N=4 empty_shard` `2.58e-07`); loss `0.00e+00`–`3.01e-16` f64, `0.00e+00`–`1.08e-07` f32; xrank `0.00e+00`; `shipped_trainer` (`unequal`) grad `3.86e-16`–`4.53e-16` f64 / `2.14e-07`–`2.82e-07` f32, loss `0.00e+00` f64 / `1.91e-08`–`9.73e-08` f32 | `plain_avg` `3.72e-01`–`9.85e-01` (non-equal); `N=2 empty_shard` (`W_d=[0, 112]`) `empty_r0_recv_ok=True`, loss `0.00e+00`, xrank `0.00e+00`; multi-rank `probe_ref` grad `3.11e-16`–`4.58e-16` f64 (`N=4 empty_shard` `4.16e-16`), `1.64e-07`–`2.69e-07` f32 (`N=4 empty_shard` `2.69e-07`); loss `0.00e+00`–`3.01e-16` f64, `0.00e+00`–`1.47e-07` f32; xrank `0.00e+00`; `shipped_trainer` (`unequal`) grad `4.03e-16`–`4.58e-16` f64 / `2.24e-07`–`2.45e-07` f32, loss `0.00e+00`–`1.68e-16` f64 / `1.74e-08`–`2.16e-08` f32 |
+| `[2]` `all_zero_skip` & single-rank `non_finite` (`N=2` & `N=4`, f64 & f32; 8 checks) | Prototype outside `src/` | `0.0e+00` | `all_ranks_skipped=True`, `all_ranks_raised=True` (`no_grad=N/N`, `ref_raised=True`, clean follow-up collective) | `all_ranks_skipped=True`, `all_ranks_raised=True` (`no_grad=N/N`, `ref_raised=True`, clean follow-up collective) |
+| `[3]` All four modes under unequal counts (`head_only`, `head_only_cached`, `lora_variate` step 0/1, `lora_temporal` step 0/1, `full_ft`, `N=2` & `N=4`; 100 vs `probe_ref`/LoRA inv + 28 vs `shipped_trainer`, f64 `head_only_cached` `n/a`) | Prototype outside `src/` | `0.0e+00` / `1.0e-12` f64 / `1.0e-05` f32 | `plain_avg` `6.75e-01`–`2.78e+00`; `probe_ref` grad `2.82e-16`–`6.89e-16` f64, `2.01e-07`–`4.41e-07` f32; loss `0.00e+00`–`2.28e-16` f64, `6.53e-09`–`1.04e-07` f32; xrank `0.00e+00`; LoRA step-0/1 invariants `0.00e+00`; `shipped_trainer` grad `2.82e-16`–`6.64e-16` f64 / `2.01e-07`–`3.67e-07` f32, loss `0.00e+00`–`2.28e-16` f64 / `6.53e-09`–`1.04e-07` f32 | `plain_avg` `6.75e-01`–`2.78e+00`; `probe_ref` grad `2.75e-16`–`7.51e-16` f64, `1.45e-07`–`3.76e-07` f32; loss `0.00e+00`–`2.30e-16` f64, `1.78e-08`–`1.48e-07` f32; xrank `0.00e+00`; LoRA step-0/1 invariants `0.00e+00`; `shipped_trainer` grad `2.75e-16`–`7.44e-16` f64 / `1.45e-07`–`3.48e-07` f32, loss `0.00e+00`–`2.30e-16` f64 / `1.78e-08`–`1.48e-07` f32 |
+| `[4]` Replay & distillation parity (4 regimes, `N=2` & `N=4`; 48 vs `probe_ref` + 32 vs `shipped_trainer`) | Prototype outside `src/` | `0.0e+00` / `1.0e-12` f64 / `1.0e-05` f32 | `plain_avg` `8.97e-02`–`3.39e-01`; `probe_ref` and `shipped_trainer` (matching at 2 d.p.): grad `1.49e-16`–`1.92e-16` f64, `1.01e-07`–`5.57e-07` f32; loss `0.00e+00`–`1.37e-16` f64, `9.18e-09`–`9.98e-08` f32; xrank `0.00e+00` | `plain_avg` `8.97e-02`–`3.39e-01`; `probe_ref` and `shipped_trainer` (matching at 2 d.p.): grad `1.53e-16`–`7.41e-16` f64, `1.00e-07`–`2.27e-07` f32; loss `0.00e+00`–`2.13e-16` f64, `7.82e-09`–`1.28e-07` f32; xrank `0.00e+00` |
+| `[5]` 10-active-step (+1 zero-scored skip) AdamW trajectories (`wd=0.01`, `warmup=3` + cosine, `clip=1.0`, `full_ft` & `lora_variate`, `N=2` & `N=4`; 48 checks) | Prototype outside `src/` | `1.0e-10` f64 / `1.0e-04` f32; xrank/clip/skip `0.0e+00` | `full_ft`: `final_params` `1.16e-16`–`1.52e-16` f64, `6.26e-08`–`6.52e-08` f32; `param_update` `2.69e-15`–`3.31e-15` f64, `1.37e-06`–`1.50e-06` f32; clipped `2/10` (`N=2`), `0/10` (`N=4`). `lora_variate`: `final_params` `1.34e-16`–`2.23e-16` f64, `7.75e-08`–`3.01e-07` f32; `param_update` `5.31e-15`–`7.73e-15` f64, `2.79e-06`–`1.26e-05` f32; clipped `0/10`. All: xrank `0.00e+00`, `clipped_vs_ref=0`, `clipped_xrank=0`, `skip_noop=True` | `full_ft`: `final_params` `9.50e-17`–`1.09e-16` f64, `5.27e-08`–`8.34e-08` f32; `param_update` `2.07e-15`–`2.52e-15` f64, `1.22e-06`–`1.82e-06` f32; clipped `2/10` (`N=2`), `0/10` (`N=4`). `lora_variate`: `final_params` `1.09e-16`–`5.32e-16` f64, `4.23e-08`–`2.28e-07` f32; `param_update` `4.33e-15`–`1.84e-14` f64, `1.52e-06`–`9.50e-06` f32; clipped `0/10`. All: xrank `0.00e+00`, `clipped_vs_ref=0`, `clipped_xrank=0`, `skip_noop=True` |
+| `[6]` `DistributedSampler` (10 items, 4 replicas, `shuffle=False`) | Prototype outside `src/` | observation | `drop_last=False`: `duplicated=[0, 1]`, `dropped=[]`; `drop_last=True`: `duplicated=[]`, `dropped=[8, 9]` | identical |
+| **Summary (`tiny_random`)** | Prototype outside `src/` | all enforced | **`326/326` passed, `0` failed** | **`326/326` passed, `0` failed** |
+
+### 16.2 Released `Timestral-5M` run (`--sizes 5M`, PyTorch 2.15.0, Python 3.12.13, `CPU`/`gloo`)
+
+The `--sizes 5M` run reports `516/516 passed, 0 failed, 68 info (ungraded)`: the `516` enforced passes are
+the `326` `tiny_random` checks (values identical to §16.1) plus **`190` enforced `Timestral-5M` checks**
+(cross-rank agreement across `[1]`–`[5]`, scalar global loss parity across `[1]`–`[4]`, `N=2 empty_shard`
+empty-rank-0 delivery, global skip and non-finite control flow, `head_only` & `head_only_cached` gradients,
+LoRA step-0/1 invariants, and `[5]` clipping-parity and skipped-step no-op invariants). All **`68`
+`Timestral-5M` body-backprop gradient and parameter-trajectory comparisons against `probe_ref` are ungraded
+`[INFO]` values** with no pass/fail verdict (`shipped_trainer` runs on `tiny_random` only); `516/516` does
+**not** mean released-weights body-backprop parity passed a bound.
+
+| Probe section & check | Scope & grading | Bound | Measured (`Timestral-5M`, `CPU`/`gloo`, PyTorch 2.15.0) |
+|---|---|---:|---|
+| `[1]` `ddp.module` bypass cross-rank grad rel L2 (`N=2`) | Prototype outside `src/` (control) | — | `1.04e+00` (`max_abs=7.52e-01` f64 / `7.53e-01` f32, `identical=False`) |
+| `[1]`–`[4]` Cross-rank grad rel L2 (`N=2` & `N=4`, 62 checks) | Prototype outside `src/` (**enforced**) | `0.0e+00` | `0.00e+00` (`[1]` 2, `[2]` 16, `[3]` 28, `[4]` 16; f64 & f32; 62 PASS) |
+| `[1]`–`[4]` Scalar global loss vs `probe_ref` (`N=2` & `N=4`, 62 checks) | Prototype outside `src/` (**enforced**) | `1.0e-12` f64 / `1.0e-05` f32 | `0.00e+00`–`6.77e-16` f64, `0.00e+00`–`4.75e-07` f32 (`[1]` `3.84e-16` / `2.06e-07`; `[2]` `0.00e+00`–`6.77e-16` / `0.00e+00`–`4.75e-07`; `[3]` `0.00e+00`–`3.80e-16` / `2.14e-08`–`2.72e-07`; `[4]` `0.00e+00`–`5.52e-16` / `1.33e-08`–`1.69e-07`; 62 PASS) |
+| `[2]` `N=2 empty_shard` (`W_d=[0, 112]`), `all_zero_skip`, & `non_finite` (`N=2` & `N=4`, 10 checks) | Prototype outside `src/` (**enforced**) | `0.0e+00` | `empty_r0_recv_ok=True` (2 PASS), `all_ranks_skipped=True` (4 PASS), `all_ranks_raised=True` (`no_grad=N/N`, `ref_raised=True`, 4 PASS) |
+| `[3]` `head_only` & `head_only_cached` grad under unequal counts (`N=2` & `N=4`, 8 checks) | Prototype outside `src/` (**enforced**) | `1.0e-12` f64 / `1.0e-05` f32 | `plain_avg` `7.89e-01`–`1.79e+00`; proposed `5.20e-16`–`1.12e-15` f64, `3.59e-07`–`4.00e-07` f32 (8 PASS) |
+| `[3]` LoRA step-0/1 invariants (`lora_variate` & `lora_temporal`, `N=2` & `N=4`, 16 checks) | Prototype outside `src/` (**enforced**) | `0.0e+00` | `0.00e+00` (step-0 `|B|_max=0.0e+00, ||gA||=0.0e+00, ||gB|| > 0`; step-1 all `> 0`; 16 PASS) |
+| `[5]` 10-active-step (+1 skip) trajectory invariants (`full_ft` & `lora_variate`, `N=2` & `N=4`, 32 checks) | Prototype outside `src/` (**enforced**) | `0.0e+00` | cross-rank params `0.00e+00` (8 PASS), `clipped_vs_ref=0` (`full_ft`: `4/10` at `N=2`, `3/10` at `N=4`; `lora_variate`: `0/10`; 8 PASS), `clipped_xrank=0` (8 PASS), `skip_noop=True` (8 PASS) |
+| `[1]` Proposed step vs `probe_ref`, body backprop (`N=2`, 2 values) | Prototype outside `src/` (**ungraded `[INFO]`**) | none | `1.97e-12` f64, `7.55e-04` f32 |
+| `[2]` Domain-loss body backprop vs `probe_ref` (`N=2` & `N=4`, 14 values) | Prototype outside `src/` (**ungraded `[INFO]`**) | none | `plain_avg` `3.66e-01`–`1.78e+00` (non-equal); proposed `1.13e-12`–`2.42e-12` f64 (`N=4 empty_shard` `1.24e-12`), `6.64e-04`–`1.43e-03` f32 (`N=4 empty_shard` `1.16e-03`) |
+| `[3]` `lora_variate` step 0/1, `lora_temporal` step 0/1, `full_ft` vs `probe_ref` (`N=2` & `N=4`, 20 values) | Prototype outside `src/` (**ungraded `[INFO]`**) | none | `plain_avg` `4.63e-01`–`1.35e+00`; proposed `2.22e-14`–`1.91e-12` f64, `1.62e-04`–`1.58e-03` f32 |
+| `[4]` Replay & distillation body backprop vs `probe_ref` (`N=2` & `N=4`, 16 values) | Prototype outside `src/` (**ungraded `[INFO]`**) | none | `plain_avg` `2.39e-01`–`7.38e-01`; proposed `3.00e-13`–`2.16e-12` f64, `3.24e-04`–`1.31e-03` f32 |
+| `[5]` 10-active-step (+1 skip) trajectories vs `probe_ref` (`full_ft` & `lora_variate`, `N=2` & `N=4`, 16 values) | Prototype outside `src/` (**ungraded `[INFO]`**) | none | `full_ft`: `final_params` `3.37e-13`–`4.48e-13` f64 / `2.85e-05`–`3.02e-05` f32, `param_update` `5.35e-10`–`7.40e-10` f64 / `4.70e-02`–`4.80e-02` f32; `lora_variate`: `final_params` `2.70e-14`–`1.12e-13` f64 / `5.25e-05`–`1.22e-04` f32, `param_update` `2.33e-12`–`9.60e-12` f64 / `4.57e-03`–`1.06e-02` f32 |
+| **Summary (`tiny_random` + `Timestral-5M`)** | Prototype outside `src/` | enforced only | **`516/516` passed (`326` tiny + `190` `5M`), `0` failed, `68` `[INFO]` (ungraded `5M` body backprop)** |
+
+**Not verified anywhere (all design choices `[D]`, spec §12):** CUDA, NCCL, `cuda:{LOCAL_RANK}` / `cuda:{rank}` device
+binding, `bf16` autocast, `torch.compile`, `torchrun` on Linux, released checkpoints `28M`/`123M`/`209M`,
+multi-GPU throughput or scaling efficiency, and rank-failure behaviour under NCCL. The `ReduceOp.AVG` vs
+`ReduceOp.SUM` check on CPU `gloo` across PyTorch 2.4.0 and 2.15.0 is recorded as a one-off result in §11
+(not covered by this probe).
