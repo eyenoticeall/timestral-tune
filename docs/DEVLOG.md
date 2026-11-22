@@ -706,11 +706,12 @@ lengths) as exploratory due to token doubling (undoing D16), per-window categori
     improve on plain `3e-4`'s `+2.8%`); `lora_temporal 3e-3 + replay_0.25` only recovers shipped `1e-3`
     without beating it; and on `5M head_only` volatility `3e-3 + replay_0.25` beats plain `1e-3` at
     matched wQL (`0.2231 / +5.0%` vs `0.2236 / +7.8%`), while on `28M` vol plain `1e-3` gives lower wQL.
-  - Ran `tests/test_replay.py`, a CUDA `bf16` `smooth_beta` diagnostic (`0.00e+00` cached-vs-live diff on
-    tiny across `{0.0, 1e-3, 1e-2}`), and full `bash scripts/cuda_check.sh` on a short-lived NVIDIA L4
-    Linux x86 VM (`e3c6883`; caught and fixed a Linux x86 fp32 merged-vs-unmerged tolerance in
-    `test_disable_lora`): **255 passed, 3 skipped** (device tests) and **577 passed, 4 skipped** (whole
-    suite, exit 0; VM and disk deleted immediately after and confirmed clean).
+  - Ran `tests/test_replay.py`, a one-off tiny-model CUDA `bf16` `smooth_beta` check (no committed script;
+    `0.00e+00` cached-vs-live diff across `{0.0, 1e-3, 1e-2}`), and full `bash scripts/cuda_check.sh` on a
+    short-lived NVIDIA L4 Linux x86 VM (`e3c6883`; caught and fixed a Linux x86 fp32 merged-vs-unmerged
+    tolerance in `test_disable_lora`): **255 passed, 3 skipped** (device tests) and **577 passed, 4 skipped**
+    (whole suite, exit 0; VM and disk deleted immediately after). Note: `gcloud compute ssh` added a
+    project-wide `ssh-keys` metadata entry that remains to be removed with maintainer confirmation.
   - Re-verified the full local macOS PyTorch matrix on `phase-4`: PyTorch `2.4.0` (`313/24`), `2.8.0`
     (`356/14`), Python `3.10` / `2.14.1` (`356/14`), and `2.15.0` full suite (`567/14`); fixed every
     remaining doc contradiction across `SPEC.md`, `BENCHMARKS.md`, `VERIFICATION.md`, `README.md`,
