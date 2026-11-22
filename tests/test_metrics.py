@@ -186,6 +186,17 @@ def test_evaluate_forecaster_window_context_alignment_and_conformal(tiny_forecas
     m_base = evaluate_forecaster(tiny_forecaster, ds, batch_size=2)
     assert m_base.mase == pytest.approx(float(np.mean(expected_mases)), rel=1e-6)
 
+    # Verify evaluate_forecaster actually forwards `seasonality` into mase() (catches ignoring seasonality).
+    expected_mases_s2 = []
+    for i in range(len(ds)):
+        ctx_i = ds[i].target_context[0].astype(np.float64)
+        denom_s2 = float(np.mean(np.abs(ctx_i[2:] - ctx_i[:-2])))
+        mae_i = float(np.mean(np.abs(actuals[i] - preds[i, :, med_i])))
+        expected_mases_s2.append(mae_i / denom_s2)
+    m_s2 = evaluate_forecaster(tiny_forecaster, ds, seasonality=2, batch_size=2)
+    assert m_s2.mase == pytest.approx(float(np.mean(expected_mases_s2)), rel=1e-6)
+    assert m_s2.mase != pytest.approx(m_base.mase, rel=1e-3)
+
     # Static CQR calibrator actually changes evaluated forecasts to match cqr.transform(preds, scale).
     cal = ConformalCalibrator(target_coverage="all", bucket_size=patch).fit(preds, actuals, scale)
     m_cal = evaluate_forecaster(tiny_forecaster, ds, calibrator=cal, batch_size=2)
@@ -211,7 +222,9 @@ def test_evaluate_forecaster_window_context_alignment_and_conformal(tiny_forecas
 
 
 def test_evaluate_forecaster_online_aci_is_chronological_and_never_peeks(tiny_forecaster):
-    """Online ACI must run strictly in origin-time order across series and never peek before transform."""
+    """Online ACI must run strictly in origin-time order across series, never peek before transform,
+    and delay updates until a prior window's full horizon has completed (`t_end < t_origin`).
+    """
     dataset = make_toy_dataset(tiny_forecaster.patch_size, series=3, covariates=True)
     # Dataset stores windows series-by-series: verify we actually have multiple origins per series.
     origins = [
@@ -219,29 +232,69 @@ def test_evaluate_forecaster_online_aci_is_chronological_and_never_peeks(tiny_fo
     ]
     assert len(set(origins)) >= 2 and origins != sorted(origins), "test requires non-chronological dataset ordering"
 
+    preds_raw, actuals_raw, _ = collect_conformal_data(tiny_forecaster, dataset, batch_size=4)
+
     class _SpyOnline(OnlineConformalCalibrator):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
-            self.events: list[tuple[str, int, float]] = []
+            self.events: list[tuple[str, int, float, np.ndarray]] = []
 
         def transform(self, predictions, context_scale=None):
             h = predictions.shape[1]
             off_sum = float(np.sum(np.abs(self.current_offsets(h)))) if self.alpha_t.size > 0 else 0.0
-            self.events.append(("transform", int(predictions.shape[0]), off_sum))
+            self.events.append(("transform", int(predictions.shape[0]), off_sum, predictions.copy()))
             return super().transform(predictions, context_scale=context_scale)
 
         def update(self, predictions, actuals, context_scale=None):
-            self.events.append(("update", int(predictions.shape[0]), float(np.mean(actuals))))
+            self.events.append(("update", int(predictions.shape[0]), float(np.mean(actuals)), actuals.copy()))
             return super().update(predictions, actuals, context_scale=context_scale)
 
     spy = _SpyOnline(target_coverage=0.80, gamma=0.05, window=50, bucket_size=tiny_forecaster.patch_size)
     evaluate_forecaster(tiny_forecaster, dataset, calibrator=spy, online_update=True, batch_size=4)
 
-    # First event MUST be transform with zero offsets (no peeking before first forecast!),
-    # and all series at each unique origin must be transformed together as one chronological block!
+    # 1. Verify exact chronological grouping: each transform call receives the EXACT windows at
+    #    that sorted origin timestamp across all 3 series (catches dataset-order processing!).
+    unique_origins = sorted(set(origins))
+    transforms = [ev for ev in spy.events if ev[0] == "transform"]
+    updates = [ev for ev in spy.events if ev[0] == "update"]
+    assert len(transforms) == len(unique_origins) and len(updates) == len(unique_origins)
     assert spy.events[0][0] == "transform" and spy.events[0][2] == 0.0
-    transform_counts = [cnt for kind, cnt, _ in spy.events if kind == "transform"]
-    assert len(transform_counts) == len(set(origins))
-    assert sum(transform_counts) == len(dataset)
-    # Later transforms must see non-zero offsets after earlier completed horizons are flushed.
-    assert any(off > 0.0 for kind, _, off in spy.events[1:] if kind == "transform")
+    for block_idx, orig in enumerate(unique_origins):
+        idxs = [i for i, o in enumerate(origins) if o == orig]
+        np.testing.assert_allclose(transforms[block_idx][3], preds_raw[idxs])
+        np.testing.assert_allclose(updates[block_idx][3], actuals_raw[idxs])
+        # For non-overlapping stride == horizon, events strictly alternate: transform(k), update(k).
+        assert spy.events[2 * block_idx][0] == "transform"
+        assert spy.events[2 * block_idx + 1][0] == "update"
+    assert any(ev[2] > 0.0 for ev in transforms[1:])
+
+    # 2. Overlapping stride (`stride < forecast_horizon`): verify `update` is delayed until
+    #    `t_end < t_origin` (catches updating a window before its full horizon finishes!).
+    patch = tiny_forecaster.patch_size
+    horizon = 2 * patch
+    stride = patch  # overlaps by `patch` steps!
+    overlap_ds = TimeSeriesDataset(
+        dataset.series[:2],
+        context_length=dataset.context_length,
+        forecast_horizon=horizon,
+        stride=stride,
+        min_context=dataset.context_length,
+        roles=dataset.roles,
+    )
+    ov_origins = sorted(
+        {
+            int(overlap_ds.series[overlap_ds._series_index[i]].timestamps[overlap_ds._origins[i]])
+            for i in range(len(overlap_ds))
+        }
+    )
+    assert len(ov_origins) >= 3 and ov_origins[1] < ov_origins[0] + horizon - 1
+    spy_ov = _SpyOnline(target_coverage=0.80, gamma=0.05, window=50, bucket_size=patch)
+    evaluate_forecaster(tiny_forecaster, overlap_ds, calibrator=spy_ov, online_update=True, batch_size=4)
+    # Origin 0 has t_end = orig0 + horizon - 1 >= orig1, so origin 1 MUST be transformed BEFORE any update!
+    assert spy_ov.events[0][0] == "transform" and spy_ov.events[0][2] == 0.0
+    assert spy_ov.events[1][0] == "transform" and spy_ov.events[1][2] == 0.0, (
+        f"overlapping window updated before its horizon finished: events={[e[:3] for e in spy_ov.events[:4]]}"
+    )
+    # Origin 2 (`orig0 + 2*patch`) is strictly after `t_end` (`orig0 + 2*patch - 1`), so origin 0's
+    # update fires right before origin 2's transform!
+    assert spy_ov.events[2][0] == "update" and spy_ov.events[3][0] == "transform" and spy_ov.events[3][2] > 0.0

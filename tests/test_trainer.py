@@ -991,7 +991,7 @@ def test_trainer_resumes_from_load_lora_and_rejects_mismatched_pre_injected_mode
 
 
 def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny_forecaster):
-    from timestral_tune.data import flip_batch_signs
+    from timestral_tune.data import TimeSeriesDataset, flip_batch_signs
 
     dataset = make_toy_dataset(tiny_forecaster.patch_size, series=4, covariates=True)
     batch = dataset.collator(tiny_forecaster.model.config)([dataset[i] for i in range(6)])
@@ -1075,4 +1075,30 @@ def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny
     noflip_state = merged_state_dict(m_noflip)
     assert any(not torch.equal(states[0][k], noflip_state[k]) for k in states[0]), (
         "sign_flip=True produced weights identical to sign_flip=False"
+    )
+
+    # Also prove sign_flip=True (p=0.5) differs from flipping EVERY series every step (p=1.0),
+    # catching a broken trainer that always negates every batch unconditionally.
+    neg_series = [
+        dataclasses.replace(
+            s,
+            targets=-s.targets,
+            past=-s.past,
+            known=-s.known,
+        )
+        for s in train.series
+    ]
+    neg_train = TimeSeriesDataset(
+        neg_series,
+        context_length=train.context_length,
+        forecast_horizon=train.forecast_horizon,
+        stride=train.stride,
+        min_context=train.min_context,
+        roles=train.roles,
+    )
+    m_allneg = fresh_model(tiny_forecaster)
+    TimestralTrainer(c_noflip, neg_train, model=m_allneg).fit()
+    allneg_state = merged_state_dict(m_allneg)
+    assert any(not torch.equal(states[0][k], allneg_state[k]) for k in states[0]), (
+        "sign_flip=True (p=0.5) produced weights identical to negating every series every step"
     )

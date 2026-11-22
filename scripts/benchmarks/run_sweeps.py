@@ -121,22 +121,29 @@ def _train_and_eval(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--sizes", nargs="+", default=["5M", "28M"], choices=["5M", "28M"])
+    parser.add_argument("--sizes", nargs="+", default=["5M", "28M"], choices=["5M", "28M", "123M", "209M"])
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument(
+        "--sign-flip", action="store_true", help="Enable sign-flip during LR/LoRA sweeps (default: False)"
+    )
     parser.add_argument("--max-steps", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--check-forgetting", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
     precision = "bf16" if args.bf16 else "fp32"
+    eval_bs = args.eval_batch_size or args.batch_size
     datasets = [load_realised_volatility(), load_retail_demand()]
     gen_by_domain = load_general_forgetting_by_domain() if args.check_forgetting else None
 
     all_results: dict[str, Any] = {
         "precision": precision,
+        "sign_flip": args.sign_flip,
         "max_steps": args.max_steps,
         "batch_size": args.batch_size,
+        "eval_batch_size": eval_bs,
         "sizes": {},
     }
 
@@ -151,7 +158,7 @@ def main() -> None:
         zs_fc = TuneTimestralForecaster(zs_m)
         zs_by_domain = (
             {
-                dom: evaluate_forecaster(zs_fc, ds, seasonality=24, batch_size=args.batch_size)
+                dom: evaluate_forecaster(zs_fc, ds, seasonality=24, batch_size=eval_bs)
                 for dom, ds in gen_by_domain.items()
             }
             if gen_by_domain is not None
@@ -161,12 +168,12 @@ def main() -> None:
         size_res: dict[str, Any] = {"datasets": {}}
         for splits in datasets:
             print(f"\n--- {size} | {splits.name} (train={len(splits.train)}, val={len(splits.val)}) ---", flush=True)
-            zs = evaluate_forecaster(zs_fc, splits.val, seasonality=splits.seasonality, batch_size=args.batch_size)
+            zs = evaluate_forecaster(zs_fc, splits.val, seasonality=splits.seasonality, batch_size=eval_bs)
             print(f"  zero_shot val: wQL={zs.wql:.4f} | MASE={zs.mase:.4f} | cov80={zs.coverage_80:.3f}", flush=True)
 
             ds_res: dict[str, Any] = {"zero_shot_val": zs.to_dict(), "lr_sweep": [], "lora_sweep": [], "sign_flip": []}
 
-            # 1. Properly bracketed learning-rate sweep per mode (sign_flip=True on one-signed domains).
+            # 1. Properly bracketed learning-rate sweep per mode (at args.sign_flip, default False).
             best_lr: dict[str, float] = {}
             for mode, lrs in LR_GRID.items():
                 best_wql = float("inf")
@@ -181,6 +188,11 @@ def main() -> None:
                         if mode.startswith("lora_")
                         else None
                     )
+                    run_bs = (
+                        min(args.batch_size, 16)
+                        if (size in ("123M", "209M") and mode == "full_ft")
+                        else args.batch_size
+                    )
                     row = _train_and_eval(
                         base_model,
                         splits,
@@ -189,9 +201,9 @@ def main() -> None:
                         device=eval_dev,
                         mixed_precision=precision,
                         max_steps=args.max_steps,
-                        batch_size=args.batch_size,
+                        batch_size=run_bs,
                         lora_config=lora,
-                        sign_flip=True,
+                        sign_flip=args.sign_flip,
                         gen_by_domain=gen_by_domain,
                         zs_by_domain=zs_by_domain,
                     )
