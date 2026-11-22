@@ -1,6 +1,6 @@
 # Phase 3 — Benchmarks & Documentation
 
-**Status:** Complete and merged into `main` (2026-11-22, fast-forwarded from `phase-3` at `9c5817c`; PyPI release pending maintainer approval).
+**Status:** Complete and merged into `main` (2026-11-22, fast-forwarded from `phase-3` at `9c5817c`; released on PyPI as `0.1.0` on 2026-11-23).
 **Goal:** Evidence that the modes work, defaults backed by sweeps, the Lacuna integration, and a first release.
 **Spec sections:** `docs/SPEC.md` §5.3 (forgetting metric), §5.4, §5.5, §7.5, §8, §10, §12
 
@@ -24,7 +24,7 @@ implements the phase. Add to it as you learn things; do not copy the checklist h
 - **Sign-flip augmentation:** `TrainingConfig.sign_flip=True` bypasses the training `head_only` cache
   (keeping validation caching) and improved one-signed benchmarks (up to −4.0% wQL on retail `full_ft`).
 - **Release:** Wheel + sdist verified with `uv build`; vendored Apache-2.0 `LICENSE` and `NOTICE` included.
-  PyPI names `timestral-tune` and `timestral` were unclaimed on 2026-11-21 and still on 2026-11-23; version `0.1.0` and the release workflow were prepared on 2026-11-23 (`docs/DEVELOPMENT.md`, "Releasing").
+  PyPI names `timestral-tune` and `timestral` were unclaimed on 2026-11-21 and still on 2026-11-23; version `0.1.0` was published on 2026-11-23 through the release workflow (`docs/DEVELOPMENT.md`, "Releasing").
 
 ## Log of what was done
 

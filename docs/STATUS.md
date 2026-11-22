@@ -1,8 +1,8 @@
 # Project Status
 
 **Last updated:** 2026-11-23
-**Stage:** alpha, version `0.1.0` prepared for release (not yet on PyPI). Phases 0, 1, 2, 3, and rescoped Phase 4 (replay mixing, frozen-base distillation, and Apple GPU `123M`/`209M`/long-context coverage) are built, verified, and merged into `main` (tiled DHF deferred as exploratory). The repository is public.
-**Next phase:** tag `v0.1.0` and publish to PyPI (`docs/DEVELOPMENT.md`, "Releasing"), then exploratory evaluation of tiled DHF. See spec §10.
+**Stage:** alpha. Version `0.1.0` is published on PyPI (`pip install timestral-tune`, tag `v0.1.0`, 2026-11-23). Phases 0, 1, 2, 3, and rescoped Phase 4 (replay mixing, frozen-base distillation, and Apple GPU `123M`/`209M`/long-context coverage) are built, verified, and merged into `main` (tiled DHF deferred as exploratory). The repository is public.
+**Next phase:** respond to first outside use of `0.1.0`; exploratory evaluation of tiled DHF. See spec §10.
 
 ## What works today
 
@@ -28,7 +28,6 @@
 
 - Deferred exploratory items: fixed-length tiled DHF training and sampled block lengths (`docs/phases/phase-4-stretch.md`).
 - Multi-GPU training.
-- The PyPI release itself. Version `0.1.0`, the changelog and the release workflow are in place; the wheel was installed into a clean environment and ran the README quick start against `Timestral-5M` (`docs/VERIFICATION.md` §10). Publishing needs a PyPI trusted publisher for this repository and the maintainer's go-ahead.
 
 ## What has been verified, and where
 
@@ -48,7 +47,7 @@ Not verified anywhere: multi-GPU, real general-domain replay datasets (only buil
 
 ## Next steps
 
-1. **Publish v0.1.0 to PyPI**: register the trusted publisher on PyPI, then tag and push `v0.1.0` (`docs/DEVELOPMENT.md`, "Releasing").
+1. **Watch for issues from first users of `0.1.0`**; fixes go out as patch releases (`docs/DEVELOPMENT.md`, "Releasing").
 2. **Optional exploratory work:** evaluate whether fixed-length tiled DHF warrants its token and categorical-encoding trade-offs on long fine-tuning series.
 
 ## Open questions and known issues

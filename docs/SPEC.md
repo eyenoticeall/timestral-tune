@@ -607,9 +607,9 @@ Perturbation tests use non-constant noise. A constant offset is absorbed by the 
 - [x] Learning-rate and rank sweeps to replace the placeholder defaults of §5.4 (`config.py`, `docs/BENCHMARKS.md` §2).
 - [x] Evaluate sign-flip augmentation (`TrainingConfig.sign_flip`, `docs/BENCHMARKS.md` §2).
 - [x] Lacuna integration: trial records and signal frames (`integrations/lacuna.py`, verified live against `lacuna-quant==0.14.1`).
-- [ ] Documentation, licence notices, release on PyPI (version `0.1.0`, changelog and release workflow prepared on 2026-11-23; not yet published).
+- [x] Documentation, licence notices, release on PyPI: `timestral-tune` `0.1.0` published on 2026-11-23 from tag `v0.1.0` through the release workflow; installed from PyPI into a clean environment, it runs the README quick start (`docs/VERIFICATION.md` §10).
 
-**Exit:** published tables with code to reproduce them; each default in §5.4 is backed by a sweep. **Met and merged into `main` on 2026-11-22 (PyPI publish pending maintainer approval).**
+**Exit:** published tables with code to reproduce them; each default in §5.4 is backed by a sweep. **Met and merged into `main` on 2026-11-22; released on PyPI as `0.1.0` on 2026-11-23.**
 
 ### Phase 4: Anti-forgetting and Apple GPU scaling (rescoped)
 - [x] Replay mixing, built-in synthetic generators (`SyntheticReplaySource`), and frozen-base distillation (`distillation_loss`, `ReplayConfig`, `disable_lora`), verified with unit tests and real-dataset forgetting ablations (`docs/BENCHMARKS.md` §5, `docs/VERIFICATION.md` §15).

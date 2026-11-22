@@ -329,6 +329,7 @@ The CUDA run (§13) used Linux x86 (`89ac249`, merged into `main`) and passed al
 | The same without `setuptools` | `uv run --isolated --python 3.10 --resolution lowest-direct pytest -m "not network"` | 310 passed, 25 skipped, 3 failed: the three `torch.compile` tests raise `ModuleNotFoundError: No module named 'setuptools'` inside PyTorch's compiler. The Python 3.10 wheel of torch 2.4.0 declares no `setuptools` requirement; the Python 3.12 wheel does. With torch 2.8.0 on Python 3.10 the same tests pass |
 | Package metadata | `uv build && uvx twine check --strict dist/*` | Both files pass; the wheel holds only `timestral_tune/` and the three licence files |
 | Clean install | Wheel installed into a fresh Python 3.12 environment outside the repository, then the README quick start run as written on synthetic hourly data | `Timestral-5M` loads from the Hub, `lora_variate` trains 12 steps on the Apple GPU, the export loads in the vendored upstream loader, `run_checks` reports six passes, and the `ReplayConfig()` example trains and exports |
+| Published package | `uv pip install "timestral-tune==0.1.0"` from PyPI into a fresh Python 3.12 environment, then the README quick start as written | Version `0.1.0` installs with its four dependencies; the quick start gives the same losses and six `run_checks` passes as the local wheel, and the export loads upstream |
 
 **The Apple GPU needs PyTorch 2.8.** `torch.Tensor.cummax` on that backend, which upstream's input assembly
 calls. Probe (it imports nothing from this library):

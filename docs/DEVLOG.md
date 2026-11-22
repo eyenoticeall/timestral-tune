@@ -768,3 +768,19 @@ first release with no stability promise, so the API must stay free to change.
 **Not done / open.** Not yet published: PyPI needs a trusted publisher registered for this repository,
 and the tag and upload wait for the maintainer's go-ahead. The spec §10 release box stays unticked until
 the upload has happened. Tiled DHF remains deferred as exploratory.
+
+---
+
+## 2026-11-23 — v0.1.0 published
+
+**Done.** With the maintainer's go-ahead, a PyPI trusted publisher was registered for this repository and
+tag `v0.1.0` was pushed. The release workflow built the package, uploaded the wheel and sdist to PyPI, and
+created the GitHub release from the changelog. This was the first run of its publish and release jobs.
+
+**Evidence.** PyPI serves `timestral-tune` `0.1.0` with both files. Installed from PyPI into a clean
+environment, the package runs the README quick start against `Timestral-5M` with the same results as the
+local wheel (`docs/VERIFICATION.md` §10). CI and a build-only run of the release workflow were green on
+the tagged commit before tagging.
+
+**Not done / open.** `main` still carries version `0.1.0`; set the next version when the next change to
+the package lands. Tiled DHF remains deferred as exploratory.
