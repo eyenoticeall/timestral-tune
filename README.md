@@ -284,10 +284,12 @@ are read from the checkpoint's `config.json`, so a Timestral checkpoint of anoth
 way: point `model_name_or_path` at a local directory holding `config.json` and `model.safetensors`.
 
 - **The condition is the released architecture:** the same layer types, attention gate and 21 quantile
-  levels as the released models. A checkpoint with a new layer type, config field or parameter fails to
-  load with an error.
-- **What is tested:** small models of other shapes load from a directory, train in all four modes and
-  export to checkpoints the official loader accepts.
+  levels as the released models. A checkpoint with a layer type, config field or parameter that the
+  official code does not know fails to load with an error. The official code does accept a few variants
+  that no released model uses (other layer orders, ungated attention, other quantile levels); those
+  load, but are untested here.
+- **What is tested:** a small model of a non-released shape, loaded from a directory, trained in all
+  four modes and exported to a checkpoint the official loader accepts.
 - **What is not:** nothing larger than 209M has been run, and the default learning rates were tuned on
   5M to 209M only.
 
