@@ -999,3 +999,24 @@ README proposals from the benchmark report (interval width, serving latency) wer
 **Not done / open.** `main` is not pushed. The README on PyPI does not change until a release. The
 result files (`docs/benchmarks`, 14.7 MB) are included in the source package through the `docs` entry
 in `pyproject.toml`; excluding them is undecided.
+
+## 2026-11-24 — README results shortened; detail moved to a Summary in `docs/BENCHMARKS.md`
+
+**Done.** At the maintainer's request to make the README quicker to use, the Results section went from
+56 lines to 20 (README from 360 to 324). It keeps the headline, the chart and four sentences. The
+"these gains are not noise" evidence, "what else we found" and the fine print moved unchanged to a new
+unnumbered `## Summary` at the top of `docs/BENCHMARKS.md`, with the chart; the file's original opening
+paragraph now sits under `## Measurement setup`. Section numbers §1–§6 are unchanged. Every number in
+the old README section appears in the new section or in the Summary (checked by script).
+
+**Decisions.** The maintainer suggested omitting results altogether. The section was shortened instead,
+because it sits fourth, after Install and Quick start, so it does not delay a first use, and a
+fine-tuning library with no evidence on its front page is a weaker pitch. The rule applied: any number
+left in the README keeps its caveat beside it, so the short text says the gain is against the released
+model, that fine-tuned `28M` is level with tuned gradient boosting on post-release data, and that both
+charted test periods mostly predate the release. Removing the section entirely remains a small edit.
+This supersedes the longer README bullet described in the previous entry; the `5M`-against-GBT sentence
+now lives only in the Summary.
+
+**Not done / open.** `main` is not pushed. Other long README sections (Quick start, Choosing how much
+to change, Memory and speed, Calibrate intervals) were left as they are.
