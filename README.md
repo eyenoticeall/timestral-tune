@@ -168,7 +168,7 @@ What else we found:
   mostly predate the models' release. On four test sets taken entirely from after the release (18 days
   of stock volatility, German wind and solar power, air pollution in Indian cities and wave heights off
   Sri Lanka) the two were level: no difference was larger than its margin of error. The fine-tuned 5M
-  model was behind gradient boosting on all four, clearly so on three.
+  model did not beat gradient boosting on any of the four, and was clearly behind on German power.
 
 The fine print:
 
