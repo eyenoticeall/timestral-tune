@@ -502,17 +502,7 @@ def _sc_guards_logs_and_export(rank: int, world_size: int) -> dict[str, Any]:
     return out
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_trainer_distributed_startup_guards_and_export(world_size: int) -> None:
-    scenarios = {
-        "startup_broadcast": _sc_startup_broadcast_all_modes,
-        "consistency_mismatches": _sc_consistency_mismatches,
-        "startup_failures": _sc_startup_failure_propagation,
-        "stage1_refusals": _sc_stage1_refusals,
-        "guards_logs_export": _sc_guards_logs_and_export,
-    }
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=5.0, wall_timeout=30.0)
-
+def _assert_startup_guards_and_export(outcomes: dict[str, Any], world_size: int) -> None:
     # 1. Initial-state broadcast across all modes (including frozen weights and custom buffers).
     sb = unwrap_results(outcomes["startup_broadcast"])
     for mode in ("head_only", "lora_variate", "full_ft"):
@@ -949,14 +939,7 @@ def _sc_step_level_and_non_finite(rank: int, world_size: int) -> dict[str, Any]:
     return out
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_trainer_distributed_parity_and_step(world_size: int) -> None:
-    scenarios = {
-        "fit_parity": _sc_fit_parity_all_modes,
-        "step_level": _sc_step_level_and_non_finite,
-    }
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=5.0, wall_timeout=30.0)
-
+def _assert_parity_and_step(outcomes: dict[str, Any], world_size: int) -> None:
     # 1. Multi-epoch fit() parity against 1-process fit() at batch_size = world_size * 2.
     fp = unwrap_results(outcomes["fit_parity"])
     per_rank_bs = 2
@@ -1428,17 +1411,82 @@ def _sc_fit_failure_propagation(rank: int, world_size: int) -> dict[str, Any]:
     return out
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_trainer_distributed_lifecycle_validation_and_failures(world_size: int) -> None:
-    scenarios = {
-        "zero_scored": _sc_zero_scored_and_empty_epoch,
-        "stop_restore": _sc_stop_restore_and_callbacks,
-        "sampling_flips": _sc_sampling_flips_and_workers,
-        "validation": _sc_validation_and_evaluate,
-        "failures": _sc_fit_failure_propagation,
-    }
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=5.0, wall_timeout=30.0)
+class _StepLrCallback(Callback):
+    def __init__(self) -> None:
+        self.runs: list[list[tuple[int, float]]] = []
 
+    def on_fit_start(self, trainer: TimestralTrainer) -> None:
+        self.runs.append([])
+
+    def on_step_end(self, trainer: TimestralTrainer, step: int, loss: float, learning_rate: float) -> None:
+        self.runs[-1].append((step, learning_rate))
+
+
+def _sc_repeated_fit(rank: int, world_size: int) -> dict[str, Any]:
+    """Calling `fit()` twice continues weights/steps with a fresh LR schedule and identical batch order."""
+    per_rank_bs = 2
+    num_windows = 2 * world_size * per_rank_bs + 1  # 3 global steps/epoch with trailing partial batch < N
+    ds = _make_unequal_dataset(num_windows, seed=97, covariates=True)
+    val_ds = _make_unequal_dataset(world_size + 2, seed=98, covariates=True)
+    lr_cb = _StepLrCallback()
+    trainer = TimestralTrainer(
+        _base_config(
+            mode="head_only",
+            batch_size=per_rank_bs,
+            epochs=1,
+            max_steps=None,
+            warmup_steps=1,
+            lr_schedule="cosine",
+            learning_rate=5e-3,
+            shuffle=True,
+            sign_flip=False,
+            seed=77,
+        ),
+        ds,
+        val_ds,
+        callbacks=[lr_cb],
+        model=_fresh_model(99),
+    )
+
+    recorded_batches: list[list[torch.Tensor]] = []
+    orig_prepare = trainer._prepare_domain_batch
+
+    def _spy_prepare(batch: Any, flip_gen: Any) -> Any:
+        prepared = orig_prepare(batch, flip_gen)
+        if prepared is not None:
+            recorded_batches[-1].append(prepared.batch.targets.detach().cpu().clone())
+        return prepared
+
+    trainer._prepare_domain_batch = _spy_prepare  # type: ignore[method-assign]
+
+    recorded_batches.append([])
+    res1 = trainer.fit()
+    step1, fit_start1 = trainer.global_step, trainer.fit_start_step
+    params1 = _flat_trainable(trainer).clone()
+
+    recorded_batches.append([])
+    res2 = trainer.fit()
+    step2, fit_start2 = trainer.global_step, trainer.fit_start_step
+    params2 = _flat_trainable(trainer).clone()
+
+    same_batch_order = len(recorded_batches[0]) == len(recorded_batches[1]) > 0 and all(
+        torch.equal(a, b) for a, b in zip(recorded_batches[0], recorded_batches[1], strict=True)
+    )
+    return {
+        "res1": _result_as_dict(res1),
+        "res2": _result_as_dict(res2),
+        "step1": step1,
+        "step2": step2,
+        "fit_start1": fit_start1,
+        "fit_start2": fit_start2,
+        "params1": params1,
+        "params2": params2,
+        "lr_runs": lr_cb.runs,
+        "same_batch_order": same_batch_order,
+    }
+
+
+def _assert_lifecycle_validation_and_failures(outcomes: dict[str, Any], world_size: int) -> None:
     # 1. Zero-scored global skip and empty epoch RuntimeError.
     zs = unwrap_results(outcomes["zero_scored"])
     global_bs = world_size * 2
@@ -1594,6 +1642,51 @@ def test_trainer_distributed_lifecycle_validation_and_failures(world_size: int) 
                 assert cf["exc_type"] is RankFailureError
                 assert cf["failing_ranks"] == (0,) and cf["stage"] == hook
 
+    # 6. Repeated fit() on the same trainer: fresh schedule, identical batch order, cross-rank parity.
+    rf = unwrap_results(outcomes["repeated_fit"])
+    r0 = rf[0]
+    assert r0["step1"] == 3 and r0["fit_start1"] == 0
+    assert r0["step2"] == 6 and r0["fit_start2"] == 3
+    assert [s for s, _ in r0["res1"]["train_history"]] == [1, 2, 3]
+    assert [s for s, _ in r0["res2"]["train_history"]] == [4, 5, 6]
+    assert len(r0["lr_runs"]) == 2
+    lrs1 = [lr for _, lr in r0["lr_runs"][0]]
+    lrs2 = [lr for _, lr in r0["lr_runs"][1]]
+    assert lrs1 == lrs2 and lrs1[0] < lrs1[1]  # warmup restarted identically on second fit()
+    assert not torch.equal(r0["params1"], r0["params2"])
+    for r in range(world_size):
+        assert rf[r]["same_batch_order"] is True
+        assert rf[r]["res1"] == r0["res1"]
+        assert rf[r]["res2"] == r0["res2"]
+        assert torch.equal(rf[r]["params1"], r0["params1"])
+        assert torch.equal(rf[r]["params2"], r0["params2"])
+        if r > 0:
+            assert rf[r]["lr_runs"] == []
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_trainer_distributed_scenarios(world_size: int) -> None:
+    """Run all multi-process trainer scenarios in one spawned `gloo` process group per `world_size`."""
+    scenarios = {
+        "startup_broadcast": _sc_startup_broadcast_all_modes,
+        "consistency_mismatches": _sc_consistency_mismatches,
+        "startup_failures": _sc_startup_failure_propagation,
+        "stage1_refusals": _sc_stage1_refusals,
+        "guards_logs_export": _sc_guards_logs_and_export,
+        "fit_parity": _sc_fit_parity_all_modes,
+        "step_level": _sc_step_level_and_non_finite,
+        "zero_scored": _sc_zero_scored_and_empty_epoch,
+        "stop_restore": _sc_stop_restore_and_callbacks,
+        "sampling_flips": _sc_sampling_flips_and_workers,
+        "validation": _sc_validation_and_evaluate,
+        "failures": _sc_fit_failure_propagation,
+        "repeated_fit": _sc_repeated_fit,
+    }
+    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=5.0, wall_timeout=30.0)
+    _assert_startup_guards_and_export(outcomes, world_size)
+    _assert_parity_and_step(outcomes, world_size)
+    _assert_lifecycle_validation_and_failures(outcomes, world_size)
+
 
 def _worker_num_workers_fit(rank: int, world_size: int) -> dict[str, Any]:
     per_rank_bs = 2
@@ -1618,18 +1711,14 @@ def _worker_num_workers_fit(rank: int, world_size: int) -> dict[str, Any]:
 
 
 @pytest.mark.skipif(WORKERS_HANG_AT_EXIT, reason="PyTorch below 2.8 on macOS: a DataLoader worker hangs the exit")
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_trainer_distributed_num_workers(world_size: int) -> None:
+def test_trainer_distributed_num_workers() -> None:
     """Multi-process `fit()` with `num_workers=2` and `persistent_workers=True` across uneven trailing shards.
 
-    Runs in its own group (not followed by a tight post-scenario barrier) because on macOS
+    Runs in its own 2-rank group (not followed by a tight post-scenario barrier) because on macOS
     PyTorch's DataLoader worker shutdown waits `MP_STATUS_CHECK_INTERVAL` (5s) per active worker.
     Because `_run_fit_loop` runs `strategy.cleanup()` after `finalize_best()` and `on_fit_end()`,
     `fit()` itself stays safe under a 5s process-group timeout.
     """
-    results = unwrap_results(
-        run_distributed(_worker_num_workers_fit, world_size=world_size, pg_timeout=5.0, wall_timeout=45.0)
-    )
-    for r in range(1, world_size):
-        assert results[r]["result"] == results[0]["result"]
-        assert torch.equal(results[r]["params"], results[0]["params"])
+    results = unwrap_results(run_distributed(_worker_num_workers_fit, world_size=2, pg_timeout=5.0, wall_timeout=45.0))
+    assert results[1]["result"] == results[0]["result"]
+    assert torch.equal(results[1]["params"], results[0]["params"])
