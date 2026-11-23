@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
+import hashlib
+import json
 import logging
 import math
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -26,7 +29,7 @@ from ..config import LoraConfig, ReplayConfig, TrainingConfig
 from ..data.batch import TrainingBatch, flip_batch_signs
 from ..data.collator import DHFDataCollator, Window
 from ..data.dataset import TimeSeriesDataset
-from ..export import dataset_fingerprint, export_checkpoint
+from ..export import _validate_export_inputs, dataset_fingerprint, export_checkpoint
 from ..models.adapter import disable_lora, has_lora, inject_lora, lora_parameters, unmerge_lora, validate_lora_for_rows
 from ..models.conformal import ConformalCalibrator, OnlineConformalCalibrator
 from ..models.device import TuneTimestralModel, supports_float64
@@ -34,6 +37,13 @@ from ..models.forward import context_welford_state, normalise_targets, target_fr
 from ..models.loader import load_model, resolve_device
 from ..replay import SyntheticReplaySource, distillation_loss
 from .callbacks import Callback, EarlyStopping, ProgressLogger
+from .distributed import (
+    DistributedContext,
+    RankFailureError,
+    broadcast_module_state,
+    is_oom_error,
+    steps_per_epoch,
+)
 from .step import CachedHeadBatch, compute_loss
 
 __all__ = ["EvalResult", "TimestralTrainer", "TrainingResult"]
@@ -534,6 +544,20 @@ class TimestralTrainer:
         model: TuneTimestralModel | None = None,
     ) -> None:
         self.config = config
+        self._dist: DistributedContext | None = DistributedContext.detect(config.device)
+        if self._dist is not None:
+            self._init_distributed(
+                self._dist,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                lora_config=lora_config,
+                replay_config=replay_config,
+                replay_dataset=replay_dataset,
+                callbacks=callbacks,
+                model=model,
+            )
+            return
+
         self.device = resolve_device(config.device)
         if config.mixed_precision == "bf16":
             if self.device.type != "cuda":
@@ -644,6 +668,241 @@ class TimestralTrainer:
         self._val_loader: DataLoader | None = None
 
     # ----------------------------------------------------------------- setup
+
+    def _init_distributed(
+        self,
+        dist_ctx: DistributedContext,
+        *,
+        train_dataset: TimeSeriesDataset,
+        val_dataset: TimeSeriesDataset | None,
+        lora_config: LoraConfig | None,
+        replay_config: ReplayConfig | None,
+        replay_dataset: TimeSeriesDataset | None,
+        callbacks: Sequence[Callback],
+        model: TuneTimestralModel | None,
+    ) -> None:
+        """Multi-process startup sequence (spec §5.6, D28–D29, steps (a)–(e)).
+
+        Backend check and device resolution/binding have already run in `DistributedContext.detect()`
+        outside failure propagation.
+
+        Ranks: all ranks must call in lockstep.
+        Collectives: 1 (`propagate_failure` in step (b)) + 2 (`check_consistency` in step (c))
+            + `P + B` (`broadcast_module_state` in step (d), one per unique parameter/buffer).
+        """
+        config = self.config
+        self.device = dist_ctx.device
+
+        # Step (a): rank-local validation, model load/setup, dataset checks, trainable selection, callbacks.
+        local_error: Exception | None = None
+        try:
+            if config.mixed_precision == "bf16":
+                if self.device.type != "cuda":
+                    raise ValueError(
+                        "mixed_precision='bf16' is supported on CUDA only (MPS runs fp32 only); "
+                        f"got {self.device.type!r}"
+                    )
+                if not torch.cuda.is_bf16_supported():
+                    raise ValueError("mixed_precision='bf16' requested, but this CUDA device does not support bfloat16")
+
+            if config.compile_model and config.compile_mode == "reduce-overhead":
+                raise ValueError(
+                    "compile_mode='reduce-overhead' is not supported in multi-process mode; "
+                    "use compile_mode='default' or compile_model=False"
+                )
+
+            if lora_config is not None and not isinstance(lora_config, LoraConfig):
+                raise TypeError(f"lora_config must be a LoraConfig or None, got {type(lora_config).__name__}")
+            explicit_lora_config = lora_config is not None
+            self.lora_config = self._resolve_lora_config(config.mode, lora_config)
+            self._explicit_lora_config = explicit_lora_config
+
+            if replay_config is not None and not isinstance(replay_config, ReplayConfig):
+                raise TypeError(f"replay_config must be a ReplayConfig or None, got {type(replay_config).__name__}")
+            if replay_dataset is not None and replay_config is None:
+                raise ValueError("replay_dataset requires a ReplayConfig")
+            if replay_dataset is not None and not isinstance(replay_dataset, TimeSeriesDataset):
+                raise TypeError(
+                    f"replay_dataset must be a TimeSeriesDataset or None, got {type(replay_dataset).__name__}"
+                )
+            if val_dataset is not None and replay_dataset is val_dataset:
+                raise ValueError("replay_dataset must not be the same object as val_dataset")
+            if replay_config is not None:
+                raise NotImplementedError(
+                    "multi-process training with replay_config is not implemented yet (planned for Stage 2)"
+                )
+            self.replay_config = None
+
+            self._model_provided_directly = model is not None
+            if model is None:
+                model = load_model(config.model_name_or_path, device=self.device, revision=config.revision)
+            elif not isinstance(model, TuneTimestralModel):
+                raise TypeError("model must be a TuneTimestralModel; convert with TuneTimestralModel.from_upstream")
+            else:
+                dtype = next(model.parameters()).dtype
+                if not supports_float64(self.device) and dtype != torch.float32:
+                    raise ValueError(f"the {self.device.type} backend supports float32 weights only, got {dtype}")
+                model.to(self.device)
+                model.transformer.rope.rebuild_inv_freq()
+            self.model = model
+
+            self.train_dataset = train_dataset
+            self.val_dataset = val_dataset
+            self._check_dataset(train_dataset, "train_dataset")
+            if val_dataset is not None:
+                self._check_dataset(val_dataset, "val_dataset")
+                if (val_dataset.series[0].layout, val_dataset.forecast_horizon) != (
+                    train_dataset.series[0].layout,
+                    train_dataset.forecast_horizon,
+                ):
+                    raise ValueError(
+                        "val_dataset must have the same columns per role and forecast horizon as train_dataset"
+                    )
+            self.replay_dataset = None
+
+            self._trainable = self._select_trainable()
+            if not self._trainable:
+                raise ValueError("no trainable parameters selected for multi-process training")
+            trainable_dtypes = {parameter.dtype for parameter in self._trainable}
+            if len(trainable_dtypes) != 1:
+                dtype_list = ", ".join(sorted(str(d) for d in trainable_dtypes))
+                raise ValueError(
+                    f"multi-process training requires all trainable parameters to share one dtype; got {dtype_list}"
+                )
+            if any(parameter.device != self.device for parameter in self._trainable):
+                raise ValueError(f"all trainable parameters must reside on {self.device}")
+
+            built_callbacks: list[Callback] = [ProgressLogger(config.log_every)]
+            if config.early_stopping_patience is not None:
+                if val_dataset is None:
+                    raise ValueError("early_stopping_patience needs a val_dataset")
+                built_callbacks.append(EarlyStopping(config.early_stopping_patience))
+            for callback in callbacks:
+                if not isinstance(callback, Callback):
+                    raise TypeError(f"callbacks must be Callback instances, got {type(callback).__name__}")
+            built_callbacks.extend(callbacks)
+            self.callbacks = built_callbacks
+        except Exception as exc:
+            if is_oom_error(exc):
+                raise
+            local_error = exc
+
+        # Step (b): startup failure collective.
+        dist_ctx.propagate_failure(local_error, stage="startup")
+
+        # Step (c): consistency digest check across ranks (raises ValueError on every rank on mismatch).
+        try:
+            dist_ctx.check_consistency(self._startup_consistency_digest(), stage="startup_consistency")
+        except RankFailureError as exc:
+            ranks = ", ".join(str(r) for r in exc.failing_ranks)
+            raise ValueError(
+                f"startup consistency check failed: ranks [{ranks}] differed from rank 0 "
+                "in model, configuration, or datasets"
+            ) from exc
+
+        # Step (d): broadcast all parameters and all buffers from rank 0.
+        broadcast_module_state(dist_ctx, self.model)
+
+        # Step (e): post-broadcast setup (teacher, compile, optimiser, global total_steps, scheduler, logs).
+        self._frozen_head = None
+        self._frozen_base = None
+        self._replay_base_pos = None
+        self._replay_base_neg = None
+        if self.replay_config is not None:
+            self._setup_replay_teacher()
+
+        if config.compile_model:
+            self.model.transformer = torch.compile(self.model.transformer, mode=config.compile_mode)
+
+        use_fused = self.device.type == "cuda" and all(p.is_cuda and p.is_floating_point() for p in self._trainable)
+        adamw_kwargs: dict[str, object] = {
+            "lr": config.resolved_learning_rate,
+            "weight_decay": config.weight_decay,
+        }
+        if use_fused:
+            adamw_kwargs["fused"] = True
+        self.optimizer = torch.optim.AdamW(self._trainable, **adamw_kwargs)
+        epoch_steps = steps_per_epoch(len(train_dataset), dist_ctx.world_size, config.batch_size)
+        self.total_steps = config.max_steps if config.max_steps is not None else config.epochs * epoch_steps
+        self.scheduler = self._new_schedule()
+
+        self.global_step = 0
+        self.fit_start_step = 0
+        self.should_stop = False
+        self._train_head_cache = None
+        self._val_head_cache = None
+        self._replay_head_cache = None
+        self._fit_flip_generator = None
+        self._replay_flip_generator = None
+        self._val_loader = None
+
+        if dist_ctx.is_rank_zero:
+            effective_batch = dist_ctx.world_size * config.batch_size
+            logger.info(
+                "multi-process training enabled: world_size=%d backend=%s per_rank_batch_size=%d "
+                "effective_batch_size=%d",
+                dist_ctx.world_size,
+                dist_ctx.backend,
+                config.batch_size,
+                effective_batch,
+            )
+            if config.learning_rate is None and effective_batch > 32:
+                logger.warning(
+                    "effective batch size is %d (%d ranks x %d per rank) with the default learning rate %g "
+                    "(defaults were swept at batch sizes 16-32 and are not scaled automatically; set "
+                    "learning_rate explicitly if needed)",
+                    effective_batch,
+                    dist_ctx.world_size,
+                    config.batch_size,
+                    config.resolved_learning_rate,
+                )
+            if config.mode == "head_only" and config.cache_frozen_features:
+                logger.info(
+                    "multi-process mode skips the head_only frozen-feature cache (cache_frozen_features=True "
+                    "is ignored); running the uncached forward path"
+                )
+
+    def _startup_consistency_digest(self) -> bytes:
+        """Compute a 32-byte SHA-256 digest over model schema, config, and dataset fingerprints."""
+        config_fields: dict[str, Any] = {}
+        for field_info in dataclasses.fields(self.config):
+            if field_info.name in ("device", "output_dir"):
+                continue
+            value = getattr(self.config, field_info.name)
+            if isinstance(value, Path):
+                value = str(value)
+            elif hasattr(value, "item") and callable(value.item):
+                value = value.item()
+            config_fields[field_info.name] = value
+
+        param_names_by_id = {id(parameter): name for name, parameter in self.model.named_parameters()}
+        trainable_names = [param_names_by_id[id(parameter)] for parameter in self._trainable]
+
+        def _dataset_entry(dataset: TimeSeriesDataset | None) -> dict[str, Any] | None:
+            if dataset is None:
+                return None
+            return {"length": len(dataset), "fingerprint": dataset_fingerprint(dataset)}
+
+        payload = {
+            "model_config": self.model.config.to_dict(),
+            "parameters": [
+                [name, list(parameter.shape), str(parameter.dtype)]
+                for name, parameter in sorted(self.model.named_parameters(), key=lambda item: item[0])
+            ],
+            "buffers": [
+                [name, list(buf.shape), str(buf.dtype)]
+                for name, buf in sorted(self.model.named_buffers(), key=lambda item: item[0])
+            ],
+            "trainable": trainable_names,
+            "training_config": config_fields,
+            "lora_config": None if self.lora_config is None else self.lora_config.to_dict(),
+            "replay_config": None if self.replay_config is None else self.replay_config.to_dict(),
+            "train_dataset": _dataset_entry(self.train_dataset),
+            "val_dataset": _dataset_entry(self.val_dataset),
+            "replay_dataset": _dataset_entry(self.replay_dataset),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).digest()
 
     @staticmethod
     def _resolve_lora_config(mode: str, lora_config: LoraConfig | None) -> LoraConfig | None:
@@ -856,7 +1115,7 @@ class TimestralTrainer:
         *,
         slot: Literal["train", "val", "replay"] | None = None,
     ) -> _CachedHeadDataset | None:
-        if self.config.mode != "head_only" or not self.config.cache_frozen_features:
+        if self._dist is not None or self.config.mode != "head_only" or not self.config.cache_frozen_features:
             return None
         if slot is None:
             if dataset is self.train_dataset:
@@ -1333,6 +1592,11 @@ class TimestralTrainer:
         replay_teacher_quantiles: Tensor | None = None,
     ) -> float:
         """One optimiser step on `batch` (already on the device), with optional replay micro-batch."""
+        if self._dist is not None:
+            raise RuntimeError(
+                "training_step() is single-process only and cannot be called on a multi-process trainer; "
+                "call fit() instead to run synchronised multi-process training"
+            )
         self._mark_cudagraph_step_begin()
         self.optimizer.zero_grad(set_to_none=True)
         replay = (
@@ -1357,6 +1621,8 @@ class TimestralTrainer:
 
     def _make_fit_strategy(self) -> _FitStrategy:
         """Select the execution strategy for `fit()`."""
+        if self._dist is not None:
+            raise NotImplementedError("multi-process fit() strategy is not wired yet")
         return _SingleProcessStrategy(self)
 
     def _run_fit_loop(self, strategy: _FitStrategy) -> TrainingResult:
@@ -1429,6 +1695,8 @@ class TimestralTrainer:
         Calling `fit` again continues from the current weights and optimiser state with a fresh
         learning-rate schedule and the same batch order. It seeds PyTorch's global generator.
         """
+        if self._dist is not None:
+            self._dist.check_active()
         return self._run_fit_loop(self._make_fit_strategy())
 
     @torch.no_grad()
@@ -1523,6 +1791,28 @@ class TimestralTrainer:
                 replay_source["seed"] = self.replay_dataset.seed
                 replay_source["families"] = list(self.replay_dataset.families)
                 replay_source["missing_rate"] = self.replay_dataset.missing_rate
+        world_size = None if self._dist is None else self._dist.world_size
+        effective_batch_size = None if self._dist is None else self._dist.world_size * self.config.batch_size
+        if self._dist is not None and not self._dist.is_rank_zero:
+            _validate_export_inputs(
+                self.model,
+                lora_config=self.lora_config,
+                calibrator=calibrator,
+                metrics=metrics,
+                license_path=license_path,
+                replay_source=replay_source,
+                data_fingerprint=fingerprint,
+                world_size=world_size,
+                effective_batch_size=effective_batch_size,
+            )
+            logger.info(
+                "skipping checkpoint write on rank %d/%d; rank 0 writes %s",
+                self._dist.rank,
+                self._dist.world_size,
+                Path(target),
+            )
+            return Path(target)
+
         return export_checkpoint(
             self.model,
             target,
@@ -1538,4 +1828,6 @@ class TimestralTrainer:
             data_fingerprint=fingerprint,
             license_path=license_path,
             model_provided_directly=self._model_provided_directly,
+            world_size=world_size,
+            effective_batch_size=effective_batch_size,
         )

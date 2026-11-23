@@ -4,6 +4,7 @@ See spec §5.4.
 """
 
 from .callbacks import Callback, EarlyStopping, ProgressLogger
+from .distributed import RankFailureError
 from .step import LossOutput, compute_loss
 from .trainer import EvalResult, TimestralTrainer, TrainingResult
 
@@ -13,6 +14,7 @@ __all__ = [
     "EvalResult",
     "LossOutput",
     "ProgressLogger",
+    "RankFailureError",
     "TimestralTrainer",
     "TrainingResult",
     "compute_loss",
