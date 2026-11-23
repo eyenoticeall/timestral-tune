@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import zipfile
 from collections.abc import Mapping
@@ -79,50 +80,113 @@ def _flip_zip_member_byte(src: Path, dst: Path, member: str = "tensors/0000.bin"
 
 
 def _list_matching_pids(tag: str) -> list[str]:
-    """Return live non-zombie process command lines containing `tag` (excluding this process)."""
-    self_pid = str(os.getpid())
-    ps_bin = shutil.which("ps") or ("/bin/ps" if os.path.isfile("/bin/ps") else None)
+    """Return live non-zombie process entries matching `tag` in argv or `_TT_TEST_LEFTOVER_TAG` env."""
+    self_pid = os.getpid()
+    env_needle = f"_TT_TEST_LEFTOVER_TAG={tag}"
+    hits_by_pid: dict[int, str] = {}
+
+    if os.path.isdir("/proc"):
+        saw_proc_pid = False
+        try:
+            proc_entries = os.listdir("/proc")
+        except OSError:
+            proc_entries = []
+        env_needle_b = env_needle.encode("utf-8")
+        for entry in proc_entries:
+            if not (entry.isascii() and entry.isdigit()):
+                continue
+            saw_proc_pid = True
+            pid = int(entry)
+            if pid == self_pid:
+                continue
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_bytes()
+                rparen = stat.rfind(b")")
+                if rparen >= 0:
+                    fields = stat[rparen + 2 :].split()
+                    if fields and fields[0] == b"Z":
+                        continue
+                cmd_bytes = Path(f"/proc/{pid}/cmdline").read_bytes()
+                cmd = cmd_bytes.replace(b"\0", b" ").decode(errors="replace").strip()
+                matched = tag in cmd
+                if not matched:
+                    try:
+                        env_bytes = Path(f"/proc/{pid}/environ").read_bytes()
+                        matched = env_needle_b in env_bytes.split(b"\0")
+                    except OSError:
+                        pass
+                if matched:
+                    hits_by_pid[pid] = f"{pid} {cmd}"
+            except OSError:
+                continue
+        if saw_proc_pid:
+            return [hits_by_pid[p] for p in sorted(hits_by_pid)]
+
+    ps_bin = DRIVER._resolve_ps_bin()
     if ps_bin is not None:
-        out = subprocess.run(
-            [ps_bin, "-axo", "pid=,stat=,command="],
+        # Pass 1: untruncated argv only (no unrelated env noise).
+        out_cmd = subprocess.run(
+            [ps_bin, "-ww", "-axo", "pid=,stat=,command="],
             check=False,
             capture_output=True,
             text=True,
             timeout=10.0,
         )
-        if out.returncode == 0:
-            hits: list[str] = []
-            for line in out.stdout.splitlines():
+        if out_cmd.returncode == 0:
+            for line in out_cmd.stdout.splitlines():
                 parts = line.strip().split(None, 2)
-                if len(parts) < 3 or parts[0] == self_pid or parts[1].startswith("Z"):
+                if len(parts) < 3 or not (parts[0].isascii() and parts[0].isdigit()):
                     continue
-                if tag in parts[2] and "ps -axo" not in parts[2]:
-                    hits.append(line.strip())
-            return hits
-    if os.path.isdir("/proc"):
-        hits = []
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit() or entry == self_pid:
-                continue
-            try:
-                stat = Path(f"/proc/{entry}/stat").read_bytes()
-                rparen = stat.rfind(b")")
-                if rparen >= 0 and stat[rparen + 2 :].split()[0] == b"Z":
+                pid = int(parts[0])
+                if pid == self_pid or parts[1].startswith("Z"):
                     continue
-                cmd = Path(f"/proc/{entry}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
-                if tag in cmd:
-                    hits.append(f"{entry} {cmd}")
-            except OSError:
-                continue
-        return hits
-    return []
+                if tag in parts[2] and "pid=,stat=,command=" not in parts[2]:
+                    hits_by_pid[pid] = f"{pid} {parts[2]}"
+        # Pass 2: environment tokens via `ps eww`, matching exact `_TT_TEST_LEFTOVER_TAG=<tag>` assignment.
+        out_env = subprocess.run(
+            [ps_bin, "eww", "-axo", "pid=,stat=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+        if out_env.returncode == 0:
+            for line in out_env.stdout.splitlines():
+                parts = line.strip().split(None, 2)
+                if len(parts) < 3 or not (parts[0].isascii() and parts[0].isdigit()):
+                    continue
+                pid = int(parts[0])
+                if pid == self_pid or pid in hits_by_pid or parts[1].startswith("Z"):
+                    continue
+                if env_needle in parts[2].split():
+                    hits_by_pid[pid] = f"{pid} {parts[2]}"
+    return [hits_by_pid[p] for p in sorted(hits_by_pid)]
 
 
-def _wait_for_path(path: Path, proc: subprocess.Popen[Any], *, timeout: float = 20.0) -> None:
+def _cleanup_tagged_processes(tag: str) -> None:
+    """Best-effort SIGKILL sweep for any live processes matching `tag` in argv or `_TT_TEST_LEFTOVER_TAG`."""
+    deadline = time.monotonic() + 1.0
+    while True:
+        hits = _list_matching_pids(tag)
+        if not hits:
+            return
+        for entry in hits:
+            pid_str = entry.split(None, 1)[0]
+            if pid_str.isascii() and pid_str.isdigit():
+                try:
+                    os.kill(int(pid_str), signal.SIGKILL)
+                except OSError:
+                    pass
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.02)
+
+
+def _wait_for_path(path: Path, proc: subprocess.Popen[Any] | None = None, *, timeout: float = 20.0) -> None:
     """Wait until `path` exists or fail fast if `proc` exits prematurely or `timeout` elapses."""
     deadline = time.monotonic() + timeout
     while not path.exists():
-        if proc.poll() is not None:
+        if proc is not None and proc.poll() is not None:
             out = proc.stdout.read() if proc.stdout is not None else ""
             raise AssertionError(f"process exited early (rc={proc.returncode}) before {path.name} appeared:\n{out}")
         if time.monotonic() >= deadline:
@@ -729,6 +793,8 @@ def test_stage_timeout_kills_sigterm_ignoring_child_and_new_session_grandchild(t
     _symlink_python_dir(bin_dir)
     tag = f"tt_pytest_timeout_{os.getpid()}"
     grandchild_ready = tmp_path / "grandchild.ready"
+    reparented_ready = tmp_path / "reparented.ready"
+    reparented_pidfile = tmp_path / "reparented.pid"
     dump_sentinel = "SHUTDOWN_DUMP_COMPLETE_SENTINEL"
 
     stub_body = f"""\
@@ -745,7 +811,7 @@ if "tree_state_method=" in joined:
     print("tree_state_method=content_hash tree_state_sig=000000000000")
     sys.exit(0)
 if "--write-reference" in argv:
-    # Spawn a grandchild in its own new session that ignores SIGTERM and inherits _TIMESTRAL_STAGE_TOKEN.
+    # 1. New-session grandchild still parented by the stage process, ignoring SIGTERM.
     gc_code = (
         "import pathlib, signal, time; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
@@ -753,12 +819,28 @@ if "--write-reference" in argv:
         "time.sleep(60)"
     )
     subprocess.Popen([sys.executable, "-c", gc_code, {tag!r}], start_new_session=True)
+    # 2. Truly reparented new-session worker (intermediate parent exits immediately so PPID leaves stage tree),
+    #    reachable only via the inherited `_TIMESTRAL_STAGE_TOKEN` scan.
+    rep_worker_code = (
+        "import os, pathlib, signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"pathlib.Path({str(reparented_pidfile)!r}).write_text(str(os.getpid())); "
+        f"pathlib.Path({str(reparented_ready)!r}).write_text('ready'); "
+        "time.sleep(60)"
+    )
+    helper_code = (
+        "import os, subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {{rep_worker_code!r}}], start_new_session=True); "
+        "os._exit(0)"
+    )
+    helper = subprocess.Popen([sys.executable, "-c", helper_code])
+    helper.wait()
     # Parent ignores SIGTERM after dumping >128 KiB to stdout (larger than OS pipe buffer).
     def _on_term(_sig, _frame):
         sys.stdout.write(("X" * 1024 + "\\n") * 160 + {dump_sentinel!r} + "\\n")
         sys.stdout.flush()
     signal.signal(signal.SIGTERM, _on_term)
-    while not pathlib.Path({str(grandchild_ready)!r}).exists():
+    while not (pathlib.Path({str(grandchild_ready)!r}).exists() and pathlib.Path({str(reparented_ready)!r}).exists()):
         time.sleep(0.01)
     time.sleep(60)
     sys.exit(0)
@@ -769,7 +851,7 @@ sys.exit(0)
 """
     _write_stub_uv(bin_dir, stub_body)
     log_dir = tmp_path / "logs"
-    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "_TT_TEST_LEFTOVER_TAG": tag})
 
     proc = subprocess.Popen(
         [
@@ -793,11 +875,22 @@ sys.exit(0)
     )
     try:
         out, _ = proc.communicate(timeout=30)
+        assert proc.returncode == 1, out
+        assert grandchild_ready.exists(), "grandchild never started"
+        assert reparented_ready.exists(), "reparented worker never started"
+        rep_pid = int(reparented_pidfile.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(rep_pid, 0)
+        assert _list_matching_pids(tag) == []
     finally:
         _kill_process_group_quiet(proc)
+        if reparented_pidfile.exists():
+            try:
+                os.kill(int(reparented_pidfile.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        _cleanup_tagged_processes(tag)
 
-    assert proc.returncode == 1, out
-    assert grandchild_ready.exists(), "grandchild never started"
     summary = (log_dir / "summary.txt").read_text(encoding="utf-8")
     assert "03_ref_gloo_tiny_n2                  124 " in summary
     assert "04_gloo_tiny_n2                      SKIPPED (ref failed)" in summary
@@ -807,7 +900,6 @@ sys.exit(0)
     assert "timed out after 1s" in ref_log
     assert not (log_dir / "03_ref_gloo_tiny_n2.done").exists()
     assert not (log_dir / "refs" / "ref_gloo_tiny_n2.zip").exists()
-    assert _list_matching_pids(tag) == []
 
 
 # --------------------------------------------------------------------------- 7. early exits write summary
@@ -968,8 +1060,9 @@ if "--write-reference" in argv:
             # Verify POSIX SIG_IGN inheritance inside the child stage itself when ignored on entry.
             if {ignored_on_entry!r}:
                 assert signal.getsignal(signal.{sig.name}) == signal.SIG_IGN
-            # Write a partial .tmp file to verify interrupted stages clean up partial artifacts.
+            # Write both a partial archive and a partial .tmp file so interrupt cleanup is verified on both.
             ref_path.parent.mkdir(parents=True, exist_ok=True)
+            ref_path.write_bytes(b"partial-zip")
             pathlib.Path(f"{{ref_path}}.tmp").write_bytes(b"partial")
             ready.write_text("ready")
             _wait_go()
@@ -1005,7 +1098,7 @@ sys.exit(0)
     # Tag environment so leftover-process check matches any orphaned child from this test.
     env["_TT_TEST_LEFTOVER_TAG"] = tag
 
-    stage_timeout = "1" if moment == "timeout_teardown" else "30"
+    stage_timeout = "0.3" if moment == "timeout_teardown" else "30"
     ranks_args = ["--ranks", "2", "4"] if moment == "timeout_teardown" else ["--ranks", "2"]
 
     def _preexec() -> None:
@@ -1044,10 +1137,12 @@ sys.exit(0)
             go_file.write_text("go", encoding="utf-8")
         out, _ = proc.communicate(timeout=30.0)
         rc = proc.returncode
+        leftovers = _list_matching_pids(tag)
+        assert leftovers == [], f"leftover processes after {moment}/{sig.name}: {leftovers}"
     finally:
         _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
 
-    assert _list_matching_pids(tag) == []
     return rc, log_dir, later_stage_file, out
 
 
@@ -1218,17 +1313,27 @@ def test_post_exit_survivor_descendant_is_killed_and_logged(tmp_path: Path) -> N
 def test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order(tmp_path: Path) -> None:
     ps_bin = DRIVER._resolve_ps_bin()
     base_token = f"tt_exact_{os.getpid()}"
+    exact_ready = tmp_path / "exact.ready"
+    ext_ready = tmp_path / "ext.ready"
     p_exact = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(15)"],
+        [
+            sys.executable,
+            "-c",
+            f"import pathlib, time; pathlib.Path({str(exact_ready)!r}).write_text('ready'); time.sleep(15)",
+        ],
         env=dict(os.environ, _TIMESTRAL_STAGE_TOKEN=base_token),
     )
     p_extended = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(15)"],
+        [
+            sys.executable,
+            "-c",
+            f"import pathlib, time; pathlib.Path({str(ext_ready)!r}).write_text('ready'); time.sleep(15)",
+        ],
         env=dict(os.environ, _TIMESTRAL_STAGE_TOKEN=f"{base_token}_suffix"),
     )
     try:
-        # Wait briefly for both children to exec with their updated environment.
-        time.sleep(0.1)
+        _wait_for_path(exact_ready, p_exact, timeout=10.0)
+        _wait_for_path(ext_ready, p_extended, timeout=10.0)
         needle = f"_TIMESTRAL_STAGE_TOKEN={base_token}"
         hits = DRIVER.find_token_pids(needle, self_pid=os.getpid(), ps_bin=ps_bin)
         assert p_exact.pid in hits
@@ -1399,57 +1504,74 @@ def test_interruptible_capture_drains_large_stdout_and_enforces_deadline_and_int
 
     # Grandchild holding stdout open past parent exit must still respect timeout and be killed.
     pidfile_to = tmp_path / "gc_timeout.pid"
+    gc_to_ready = tmp_path / "gc_timeout.ready"
+    gc_to_code = f"import pathlib, time; pathlib.Path({str(gc_to_ready)!r}).write_text('ready'); time.sleep(20)"
     t0 = time.monotonic()
-    res_to = runner._run_interruptible_capture(
-        [
-            sys.executable,
-            "-c",
-            "import subprocess, sys; "
-            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); "
-            f"open({str(pidfile_to)!r}, 'w').write(str(p.pid))",
-        ],
-        timeout=0.35,
-    )
-    dt_to = time.monotonic() - t0
-    assert res_to.timed_out and res_to.returncode == 124
-    assert dt_to < 2.5, f"capture ignored deadline on grandchild holding stdout: {dt_to:.2f}s"
-    gc_pid_to = int(pidfile_to.read_text(encoding="utf-8").strip())
-    with pytest.raises(ProcessLookupError):
-        os.kill(gc_pid_to, 0)
+    try:
+        res_to = runner._run_interruptible_capture(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess, sys; "
+                f"p = subprocess.Popen([sys.executable, '-c', {gc_to_code!r}]); "
+                f"open({str(pidfile_to)!r}, 'w').write(str(p.pid))",
+            ],
+            timeout=0.45,
+        )
+        dt_to = time.monotonic() - t0
+        assert res_to.timed_out and res_to.returncode == 124
+        assert dt_to < 2.5, f"capture ignored deadline on grandchild holding stdout: {dt_to:.2f}s"
+        assert gc_to_ready.exists(), "timeout grandchild never started"
+        gc_pid_to = int(pidfile_to.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(gc_pid_to, 0)
+    finally:
+        if pidfile_to.exists():
+            try:
+                os.kill(int(pidfile_to.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
 
     # Grandchild holding stdout open must also abort promptly on session interrupt and be killed.
     runner_int = DRIVER.SessionRunner(config=cfg, repo_root=tmp_path, env=_clean_tracked_env())
     pidfile_int = tmp_path / "gc_int.pid"
+    gc_int_ready = tmp_path / "gc_int.ready"
+    gc_int_code = f"import pathlib, time; pathlib.Path({str(gc_int_ready)!r}).write_text('ready'); time.sleep(20)"
 
     def _trigger_int() -> None:
-        deadline = time.monotonic() + 5.0
-        while not pidfile_int.exists() and time.monotonic() < deadline:
+        deadline = time.monotonic() + 10.0
+        while not (pidfile_int.exists() and gc_int_ready.exists()) and time.monotonic() < deadline:
             time.sleep(0.01)
-        time.sleep(0.05)
         runner_int.interrupted_sig_num = int(signal.SIGTERM)
-
-    import threading
 
     th = threading.Thread(target=_trigger_int, daemon=True)
     th.start()
     t1 = time.monotonic()
-    res_int = runner_int._run_interruptible_capture(
-        [
-            sys.executable,
-            "-c",
-            "import subprocess, sys; "
-            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); "
-            f"open({str(pidfile_int)!r}, 'w').write(str(p.pid))",
-        ],
-        timeout=10.0,
-    )
-    dt_int = time.monotonic() - t1
-    th.join(timeout=5.0)
-    assert res_int.interrupted and res_int.returncode == 143
-    assert dt_int < 2.5, f"capture ignored interrupt on grandchild holding stdout: {dt_int:.2f}s"
-    gc_pid_int = int(pidfile_int.read_text(encoding="utf-8").strip())
-    with pytest.raises(ProcessLookupError):
-        os.kill(gc_pid_int, 0)
+    try:
+        res_int = runner_int._run_interruptible_capture(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess, sys; "
+                f"p = subprocess.Popen([sys.executable, '-c', {gc_int_code!r}]); "
+                f"open({str(pidfile_int)!r}, 'w').write(str(p.pid))",
+            ],
+            timeout=10.0,
+        )
+        dt_int = time.monotonic() - t1
+        th.join(timeout=5.0)
+        assert res_int.interrupted and res_int.returncode == 143
+        assert dt_int < 2.5, f"capture ignored interrupt on grandchild holding stdout: {dt_int:.2f}s"
+        gc_pid_int = int(pidfile_int.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(gc_pid_int, 0)
+    finally:
+        th.join(timeout=2.0)
+        if pidfile_int.exists():
+            try:
+                os.kill(int(pidfile_int.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
 
 
 def test_tree_state_git_interrupt_aborts_without_content_hash_fallback(tmp_path: Path) -> None:
@@ -1477,8 +1599,6 @@ def test_tree_state_git_interrupt_aborts_without_content_hash_fallback(tmp_path:
     env = _clean_tracked_env({"PATH": f"{fake_git_dir}:{bin_dir}:{os.environ.get('PATH', '')}"})
     runner = DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env)
 
-    import threading
-
     def _interrupt_git() -> None:
         deadline = time.monotonic() + 10.0
         while not git_ready.exists() and time.monotonic() < deadline:
@@ -1488,20 +1608,28 @@ def test_tree_state_git_interrupt_aborts_without_content_hash_fallback(tmp_path:
     th = threading.Thread(target=_interrupt_git, daemon=True)
     th.start()
     t0 = time.monotonic()
-    with mock.patch.object(
-        DRIVER,
-        "_content_hash_tree_state",
-        side_effect=AssertionError("must not fall back to content_hash when interrupted"),
-    ):
-        rc = runner.run()
-    dt = time.monotonic() - t0
-    th.join(timeout=5.0)
+    try:
+        with mock.patch.object(
+            DRIVER,
+            "_content_hash_tree_state",
+            side_effect=AssertionError("must not fall back to content_hash when interrupted"),
+        ):
+            rc = runner.run()
+        dt = time.monotonic() - t0
+        th.join(timeout=5.0)
 
-    assert rc == 143
-    assert dt < 3.0, f"git interrupt waited too long: {dt:.2f}s"
-    git_pid = int(git_pidfile.read_text(encoding="utf-8").strip())
-    with pytest.raises(ProcessLookupError):
-        os.kill(git_pid, 0)
+        assert rc == 143
+        assert dt < 3.0, f"git interrupt waited too long: {dt:.2f}s"
+        git_pid = int(git_pidfile.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(git_pid, 0)
+    finally:
+        th.join(timeout=2.0)
+        if git_pidfile.exists():
+            try:
+                os.kill(int(git_pidfile.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
     summary = (cfg.log_dir / "summary.txt").read_text(encoding="utf-8")
     assert "INTERRUPTED by SIGTERM (exit 143)" in summary
 
@@ -1606,7 +1734,7 @@ sys.exit(0)
 
 
 def test_failed_timeout_and_corrupt_ref_stages_remove_partial_archive_and_tmp(tmp_path: Path) -> None:
-    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs", stage_timeout=0.35)
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs", stage_timeout=0.8)
     runner = DRIVER.SessionRunner(
         config=cfg, repo_root=tmp_path, env=_clean_tracked_env(), teardown_grace_s=0.25, teardown_reap_s=0.5
     )
@@ -1616,6 +1744,7 @@ def test_failed_timeout_and_corrupt_ref_stages_remove_partial_archive_and_tmp(tm
 
     ref_zip = runner.refs_dir / "ref_gloo_tiny_n2.zip"
     ref_tmp = Path(f"{ref_zip}.tmp")
+    ready_to = tmp_path / "ref_timeout.ready"
 
     # 1. Stage timeout (124) after writing partial .zip and .tmp must remove both.
     out_to = runner.run_stage(
@@ -1625,9 +1754,11 @@ def test_failed_timeout_and_corrupt_ref_stages_remove_partial_archive_and_tmp(tm
             sys.executable,
             "-c",
             f"import pathlib, time; pathlib.Path({str(ref_zip)!r}).write_bytes(b'corrupt'); "
-            f"pathlib.Path({str(ref_tmp)!r}).write_bytes(b'partial'); time.sleep(10)",
+            f"pathlib.Path({str(ref_tmp)!r}).write_bytes(b'partial'); "
+            f"pathlib.Path({str(ready_to)!r}).write_text('ready'); time.sleep(10)",
         ],
     )
+    assert ready_to.exists(), "timeout stage exited before writing partial files"
     assert not out_to.ok and out_to.returncode == 124
     assert not ref_zip.exists() and not ref_tmp.exists()
 
@@ -1928,3 +2059,645 @@ def test_main_installs_signal_handlers_immediately_after_parse_args(tmp_path: Pa
     summary = (log_dir / "summary.txt").read_text(encoding="utf-8")
     assert "INTERRUPTED by SIGTERM (exit 143)" in summary
     assert "01_env" not in summary
+
+
+# --------------------------------------------------------------------------- 13. harness & full behaviour coverage
+
+
+def test_leftover_detector_catches_env_only_process_and_cleanup_reaps_it(tmp_path: Path) -> None:
+    tag = f"tt_env_only_{os.getpid()}"
+    ready = tmp_path / "env_only.ready"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"import pathlib, time; pathlib.Path({str(ready)!r}).write_text('ready'); time.sleep(30)",
+        ],
+        env=dict(os.environ, _TT_TEST_LEFTOVER_TAG=tag),
+        start_new_session=True,
+    )
+    try:
+        _wait_for_path(ready, proc, timeout=10.0)
+        hits = _list_matching_pids(tag)
+        assert any(entry.split()[0] == str(proc.pid) for entry in hits), hits
+        assert _list_matching_pids(f"{tag}_other") == []
+
+        _cleanup_tagged_processes(tag)
+        proc.wait(timeout=5.0)
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+
+
+def test_timeout_teardown_signal_deterministic_via_hook(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    later_file = tmp_path / "later_hook.started"
+    stub_body = f"""\
+import pathlib, signal, sys, time
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "--write-reference" in argv:
+    ws = int(argv[argv.index("--world-size") + 1])
+    if ws == 2:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(30)
+    pathlib.Path({str(later_file)!r}).write_text("started")
+    sys.exit(0)
+if "distributed_rank_failure_check.py" in joined:
+    pathlib.Path({str(later_file)!r}).write_text("started")
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+
+    # 1. Default disposition: SIGTERM delivered inside on_timeout_teardown hook interrupts cleanly.
+    prev_term = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        cfg1 = DRIVER.SessionConfig(
+            backend="gloo", sizes=(), ranks=(2, 4), ranks_specified=True, log_dir=tmp_path / "l1", stage_timeout=0.15
+        )
+        runner1 = DRIVER.SessionRunner(
+            config=cfg1,
+            repo_root=repo,
+            env=env,
+            teardown_grace_s=0.3,
+            teardown_reap_s=0.5,
+            on_timeout_teardown=lambda _st: os.kill(os.getpid(), signal.SIGTERM),
+        )
+        rc1 = runner1.run()
+    finally:
+        signal.signal(signal.SIGTERM, prev_term)
+    assert rc1 == 143
+    assert not later_file.exists()
+    s1 = (cfg1.log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "INTERRUPTED by SIGTERM (exit 143)" in s1
+    assert "143 (interrupted:SIGTERM)" in s1
+    assert "during timeout teardown" in (cfg1.log_dir / "03_ref_gloo_tiny_n2.log").read_text(encoding="utf-8")
+
+    # 2. Ignored disposition: SIGHUP=SIG_IGN delivered inside on_timeout_teardown must NOT interrupt.
+    prev_hup = signal.getsignal(signal.SIGHUP)
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        cfg2 = DRIVER.SessionConfig(
+            backend="gloo", sizes=(), ranks=(2, 4), ranks_specified=True, log_dir=tmp_path / "l2", stage_timeout=0.15
+        )
+        runner2 = DRIVER.SessionRunner(
+            config=cfg2,
+            repo_root=repo,
+            env=env,
+            teardown_grace_s=0.3,
+            teardown_reap_s=0.5,
+            on_timeout_teardown=lambda _st: os.kill(os.getpid(), signal.SIGHUP),
+        )
+        rc2 = runner2.run()
+    finally:
+        signal.signal(signal.SIGHUP, prev_hup)
+    assert rc2 == 1
+    assert later_file.exists()
+    s2 = (cfg2.log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "INTERRUPTED" not in s2
+    assert "03_ref_gloo_tiny_n2                  124 " in s2
+
+
+def test_stage_runs_in_isolated_session_shielded_from_orchestrator_group_signals(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    tag = f"tt_sess_{os.getpid()}"
+    ready_file = tmp_path / "sess.ready"
+    go_file = tmp_path / "sess.go"
+    ids_file = tmp_path / "sess.ids"
+
+    stub_body = f"""\
+import json, os, pathlib, signal, sys, time, uuid, zipfile
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "--write-reference" in argv:
+    # Explicitly reset SIGHUP to SIG_DFL inside the child: only session/pgid isolation protects it
+    # when SIGHUP is sent to the orchestrator's process group under an ignored-SIGHUP session.
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    pid = os.getpid()
+    pathlib.Path({str(ids_file)!r}).write_text(f"{{pid}} {{os.getpgid(pid)}} {{os.getsid(pid)}}")
+    pathlib.Path({str(ready_file)!r}).write_text("ready")
+    deadline = time.monotonic() + 20.0
+    while not pathlib.Path({str(go_file)!r}).exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    ref_path = pathlib.Path(argv[argv.index("--write-reference") + 1])
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_doc = {{"spec": {{"schema_version": 5}}, "environment": {{"archive_id": uuid.uuid4().hex}}}}
+    entries_doc = {{
+        "tiny_random:s": {{"tensor_member": "tensors/0000.bin", "tensor_dtype": "float32", "tensor_shape": [4]}}
+    }}
+    with zipfile.ZipFile(ref_path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("tensors/0000.bin", b"\\x00" * 16)
+        zf.writestr("spec.json", json.dumps(spec_doc).encode())
+        zf.writestr("entries.json", json.dumps(entries_doc).encode())
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "_TT_TEST_LEFTOVER_TAG": tag})
+    log_dir = tmp_path / "logs"
+
+    def _preexec() -> None:
+        os.setsid()
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    proc = subprocess.Popen(
+        [
+            "/bin/bash",
+            str(repo / "scripts" / "multi_gpu_check.sh"),
+            "--backend",
+            "gloo",
+            "--ranks",
+            "2",
+            "--log-dir",
+            str(log_dir),
+        ],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        preexec_fn=_preexec,
+    )
+    try:
+        _wait_for_path(ready_file, proc, timeout=20.0)
+        child_pid, child_pgid, child_sid = (int(x) for x in ids_file.read_text(encoding="utf-8").split())
+        assert child_pgid == child_pid and child_sid == child_pid
+        assert child_pgid != proc.pid and child_sid != proc.pid
+        # Send SIGHUP to the orchestrator's process group; child has SIGHUP=SIG_DFL so it survives
+        # ONLY because start_new_session=True isolated it into its own session/process group.
+        os.killpg(proc.pid, signal.SIGHUP)
+        time.sleep(0.1)
+        go_file.write_text("go", encoding="utf-8")
+        out, _ = proc.communicate(timeout=30.0)
+        assert proc.returncode == 0, out
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+
+
+def test_cli_options_and_session_env_propagated_to_stages(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    call_log = tmp_path / "calls.jsonl"
+
+    stub_body = f"""\
+import json, os, pathlib, sys, uuid, zipfile
+argv = sys.argv[1:]
+joined = " ".join(argv)
+rec = {{
+    "argv": argv,
+    "TMPDIR": os.environ.get("TMPDIR"),
+    "PYTHONFAULTHANDLER": os.environ.get("PYTHONFAULTHANDLER"),
+    "NCCL_MULTI_RANK_GPU_ENABLE": os.environ.get("NCCL_MULTI_RANK_GPU_ENABLE"),
+}}
+with open({str(call_log)!r}, "a", encoding="utf-8") as cf:
+    cf.write(json.dumps(rec) + "\\n")
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "torch.cuda.device_count()" in joined and "tree_state_method=" not in joined: print("1"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "--write-reference" in argv:
+    ref_path = pathlib.Path(argv[argv.index("--write-reference") + 1])
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_doc = {{"spec": {{"schema_version": 5}}, "environment": {{"archive_id": uuid.uuid4().hex}}}}
+    entries_doc = {{
+        "tiny_random:s": {{"tensor_member": "tensors/0000.bin", "tensor_dtype": "float32", "tensor_shape": [4]}}
+    }}
+    with zipfile.ZipFile(ref_path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("tensors/0000.bin", b"\\x00" * 16)
+        zf.writestr("spec.json", json.dumps(spec_doc).encode())
+        zf.writestr("entries.json", json.dumps(entries_doc).encode())
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+
+    cfg = DRIVER.parse_args(
+        [
+            "--backend",
+            "nccl",
+            "--shared-gpu",
+            "--ranks",
+            "2",
+            "--sizes",
+            "5M",
+            "--python",
+            "3.12",
+            "--reference-mode",
+            "sketch",
+            "--pg-timeout",
+            "7",
+            "--step-timeout",
+            "42",
+            "--only",
+            "domain_head_only_f32",
+            "--skip",
+            "workers_uneven_f32",
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ]
+    )
+    long_tmp = "/" + "t" * 70
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "TMPDIR": long_tmp})
+    env.pop("PYTHONFAULTHANDLER", None)
+    env.pop("NCCL_MULTI_RANK_GPU_ENABLE", None)
+
+    runner = DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env)
+    rc = runner.run()
+    assert rc == 0
+
+    records = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    assert records, "no stage invocations recorded"
+    # Verify _prepare_session_env effects reached every spawned stage process.
+    for rec in records:
+        assert rec["TMPDIR"] == "/tmp"
+        assert rec["PYTHONFAULTHANDLER"] == "1"
+        assert rec["NCCL_MULTI_RANK_GPU_ENABLE"] == "1"
+
+    argvs = [r["argv"] for r in records]
+    sync_cmds = [a for a in argvs if a and a[0] == "sync"]
+    ref_cmds = [a for a in argvs if "--write-reference" in a]
+    tr_cmds = [a for a in argvs if "torchrun" in a]
+    rf_cmds = [a for a in argvs if any("distributed_rank_failure_check.py" in tok for tok in a)]
+    assert sync_cmds and ref_cmds and tr_cmds and rf_cmds
+
+    for cmd in (*sync_cmds, *ref_cmds, *tr_cmds, *rf_cmds):
+        idx = cmd.index("--python")
+        assert cmd[idx + 1] == "3.12"
+    for cmd in ref_cmds:
+        assert cmd[cmd.index("--reference-mode") + 1] == "sketch"
+        assert cmd[cmd.index("--only") + 1] == "domain_head_only_f32"
+        assert cmd[cmd.index("--skip") + 1] == "workers_uneven_f32"
+    for cmd in tr_cmds:
+        assert cmd[cmd.index("--timeout") + 1] == "42"
+        assert cmd[cmd.index("--only") + 1] == "domain_head_only_f32"
+        assert cmd[cmd.index("--skip") + 1] == "workers_uneven_f32"
+    for cmd in rf_cmds:
+        assert cmd[cmd.index("--pg-timeout") + 1] == "7"
+
+
+def test_env_stage_rebinds_done_marker_when_runtime_identity_changes_after_sync(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    synced_flag = tmp_path / "venv.synced"
+    sync_count = tmp_path / "sync.count"
+
+    stub_body = f"""\
+import json, pathlib, sys, uuid, zipfile
+argv = sys.argv[1:]
+joined = " ".join(argv)
+synced = pathlib.Path({str(synced_flag)!r})
+count_f = pathlib.Path({str(sync_count)!r})
+if argv and argv[0] == "sync":
+    n = int(count_f.read_text()) + 1 if count_f.exists() else 1
+    count_f.write_text(str(n))
+    synced.write_text("yes")
+    sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined:
+    if not synced.exists():
+        # Fresh environment before first `uv sync`: pre-sync probe fails (uninitialized).
+        sys.exit(1)
+    print("post-sync-runtime-sig-v2")
+    sys.exit(0)
+if "tree_state_method=" in joined:
+    print("tree_state_method=content_hash tree_state_sig=000000000000")
+    sys.exit(0)
+if "--write-reference" in argv:
+    ref_path = pathlib.Path(argv[argv.index("--write-reference") + 1])
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_doc = {{"spec": {{"schema_version": 5}}, "environment": {{"archive_id": uuid.uuid4().hex}}}}
+    entries_doc = {{
+        "tiny_random:s": {{"tensor_member": "tensors/0000.bin", "tensor_dtype": "float32", "tensor_shape": [4]}}
+    }}
+    with zipfile.ZipFile(ref_path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("tensors/0000.bin", b"\\x00" * 16)
+        zf.writestr("spec.json", json.dumps(spec_doc).encode())
+        zf.writestr("entries.json", json.dumps(entries_doc).encode())
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), ranks=(2,), ranks_specified=True, log_dir=tmp_path / "logs")
+
+    assert DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env).run() == 0
+    assert int(sync_count.read_text(encoding="utf-8")) == 1
+
+    # Immediate re-run must resume 01_env (because 01_env.done was rebound to post-sync runtime identity).
+    assert DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env).run() == 0
+    assert int(sync_count.read_text(encoding="utf-8")) == 1
+    summary = (cfg.log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "01_env                               0 (resumed)" in summary
+    assert summary.count("0 (resumed)") == 4
+
+
+@pytest.mark.parametrize(("kill_sig", "expected_rc"), [(signal.SIGKILL, 137), (signal.SIGABRT, 134)])
+def test_signal_killed_stage_records_posix_code_and_continues_session(
+    tmp_path: Path, kill_sig: signal.Signals, expected_rc: int
+) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    stub_body = f"""\
+import os, signal, sys
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "--write-reference" in argv:
+    os.kill(os.getpid(), signal.{kill_sig.name})
+if "distributed_rank_failure_check.py" in joined:
+    print("result: PASS (no hang)")
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), ranks=(2,), ranks_specified=True, log_dir=tmp_path / "logs")
+
+    rc = DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env).run()
+    assert rc == 1
+    summary = (cfg.log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert f"03_ref_gloo_tiny_n2                  {expected_rc} " in summary
+    assert "04_gloo_tiny_n2                      SKIPPED (ref failed)" in summary
+    assert "09_rank_failure_gloo_n2              0 " in summary
+
+
+def test_ref_failure_skips_dependent_released_and_gloo_comparison_stages(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    stub_body = """\
+import json, pathlib, sys, uuid, zipfile
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "torch.cuda.device_count()" in joined and "tree_state_method=" not in joined: print("2"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "--write-reference" in argv:
+    ref_path = pathlib.Path(argv[argv.index("--write-reference") + 1])
+    if "released" in ref_path.name or "ref_gloo_" in ref_path.name:
+        sys.exit(1)
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_doc = {"spec": {"schema_version": 5}, "environment": {"archive_id": uuid.uuid4().hex}}
+    entries_doc = {
+        "tiny_random:s": {"tensor_member": "tensors/0000.bin", "tensor_dtype": "float32", "tensor_shape": [4]}
+    }
+    with zipfile.ZipFile(ref_path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("tensors/0000.bin", b"\\x00" * 16)
+        zf.writestr("spec.json", json.dumps(spec_doc).encode())
+        zf.writestr("entries.json", json.dumps(entries_doc).encode())
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+    cfg = DRIVER.SessionConfig(
+        backend="nccl", sizes=("5M",), ranks=(2,), ranks_specified=True, log_dir=tmp_path / "logs"
+    )
+
+    rc = DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env).run()
+    assert rc == 1
+    summary = (cfg.log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "03_ref_nccl_tiny_n2                  0 " in summary
+    assert "04_nccl_tiny_n2                      0 " in summary
+    assert "05_ref_nccl_released_n2              1 " in summary
+    assert "06_nccl_released_n2                  SKIPPED (ref failed)" in summary
+    assert "07_ref_gloo_tiny_n2                  1 " in summary
+    assert "08_gloo_tiny_n2                      SKIPPED (ref failed)" in summary
+    assert "09_rank_failure_gloo_n2              0 " in summary
+    assert "10_rank_failure_nccl_n2              0 " in summary
+
+
+def test_pick_free_port_failure_records_no_port_and_continues(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    _write_stub_uv(bin_dir, _standard_stub_uv_body())
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), ranks=(2, 4), ranks_specified=True, log_dir=tmp_path / "logs")
+
+    real_pick = DRIVER.pick_free_port
+    calls = {"n": 0}
+
+    def _flaky_port() -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("ephemeral port exhausted")
+        return real_pick()
+
+    with mock.patch.object(DRIVER, "pick_free_port", side_effect=_flaky_port):
+        rc = DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env).run()
+    assert rc == 1
+    summary = (cfg.log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "04_gloo_tiny_n2                      1 (no port)" in summary
+    assert "04_gloo_tiny_n4                      0 " in summary
+    assert "09_rank_failure_gloo_n2              0 " in summary
+    assert "09_rank_failure_gloo_n4              0 " in summary
+
+
+def test_second_signal_during_teardown_preserves_first_signal_and_completes_cleanup(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    tag = f"tt_second_sig_{os.getpid()}"
+    stage_ready = tmp_path / "stage.ready"
+    teardown_ready = tmp_path / "teardown.ready"
+    child_pidfile = tmp_path / "child.pid"
+
+    stub_body = f"""\
+import os, pathlib, signal, sys, time
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "--write-reference" in argv:
+    pathlib.Path({str(child_pidfile)!r}).write_text(str(os.getpid()))
+    def _on_term(_s, _f):
+        pathlib.Path({str(teardown_ready)!r}).write_text("in_teardown")
+    signal.signal(signal.SIGTERM, _on_term)
+    pathlib.Path({str(stage_ready)!r}).write_text("ready")
+    time.sleep(30)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "_TT_TEST_LEFTOVER_TAG": tag})
+    log_dir = tmp_path / "logs"
+
+    def _preexec() -> None:
+        os.setsid()
+        for managed in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(managed, signal.SIG_DFL)
+
+    proc = subprocess.Popen(
+        [
+            "/bin/bash",
+            str(repo / "scripts" / "multi_gpu_check.sh"),
+            "--backend",
+            "gloo",
+            "--ranks",
+            "2",
+            "--log-dir",
+            str(log_dir),
+        ],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        preexec_fn=_preexec,
+    )
+    try:
+        _wait_for_path(stage_ready, proc, timeout=20.0)
+        # First signal: SIGINT.
+        os.killpg(proc.pid, signal.SIGINT)
+        # Wait until the stage process receives SIGTERM from the orchestrator's teardown.
+        _wait_for_path(teardown_ready, proc, timeout=15.0)
+        # Send both a second SIGINT and a different signal (SIGTERM) during active teardown.
+        os.killpg(proc.pid, signal.SIGINT)
+        os.killpg(proc.pid, signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30.0)
+        assert proc.returncode == 130, out
+        child_pid = int(child_pidfile.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+
+    summary = (log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "INTERRUPTED by SIGINT (exit 130)" in summary
+    assert "130 (interrupted:SIGINT)" in summary
+
+
+def test_closed_stdout_mid_session_completes_cleanly(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    tag = f"tt_closed_stdout_{os.getpid()}"
+    stub_body = """\
+import json, pathlib, sys, uuid, zipfile
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync":
+    sys.stdout.write("short line\\n")
+    sys.stdout.write(("Y" * 512 + "\\n") * 250)
+    sys.stdout.flush()
+    sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "--write-reference" in argv:
+    sys.stdout.write("ref short line\\n")
+    sys.stdout.write(("R" * 512 + "\\n") * 250)
+    sys.stdout.flush()
+    ref_path = pathlib.Path(argv[argv.index("--write-reference") + 1])
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_doc = {"spec": {"schema_version": 5}, "environment": {"archive_id": uuid.uuid4().hex}}
+    entries_doc = {
+        "tiny_random:s": {"tensor_member": "tensors/0000.bin", "tensor_dtype": "float32", "tensor_shape": [4]}
+    }
+    with zipfile.ZipFile(ref_path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("tensors/0000.bin", b"\\x00" * 16)
+        zf.writestr("spec.json", json.dumps(spec_doc).encode())
+        zf.writestr("entries.json", json.dumps(entries_doc).encode())
+    sys.exit(0)
+if "torchrun" in argv:
+    sys.stdout.write(("T" * 512 + "\\n") * 250)
+    sys.stdout.flush()
+    sys.exit(0)
+print("done")
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "_TT_TEST_LEFTOVER_TAG": tag})
+    log_dir = tmp_path / "logs"
+
+    proc = subprocess.Popen(
+        [
+            "/bin/bash",
+            str(repo / "scripts" / "multi_gpu_check.sh"),
+            "--backend",
+            "gloo",
+            "--ranks",
+            "2",
+            "--log-dir",
+            str(log_dir),
+        ],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        assert proc.stdout is not None
+        first_line = proc.stdout.readline()
+        assert first_line, "driver exited before emitting first stdout line"
+        proc.stdout.close()
+        _, err = proc.communicate(timeout=30.0)
+        assert proc.returncode == 0, err
+        assert err == b"", f"unexpected stderr after closing stdout mid-session: {err!r}"
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+
+    summary = (log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "01_env                               0 " in summary
+    assert "03_ref_gloo_tiny_n2                  0 " in summary
+    assert "04_gloo_tiny_n2                      0 " in summary
+    assert "09_rank_failure_gloo_n2              0 " in summary
+    assert len((log_dir / "04_gloo_tiny_n2.log").read_bytes()) > 100_000
+
+    # Also verify a short-output resumed session survives a closed stdout pipe with empty stderr.
+    proc2 = subprocess.Popen(
+        [
+            "/bin/bash",
+            str(repo / "scripts" / "multi_gpu_check.sh"),
+            "--backend",
+            "gloo",
+            "--ranks",
+            "2",
+            "--log-dir",
+            str(log_dir),
+        ],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        assert proc2.stdout is not None
+        assert proc2.stdout.readline()
+        proc2.stdout.close()
+        _, err2 = proc2.communicate(timeout=30.0)
+        assert proc2.returncode == 0, err2
+        assert err2 == b"", f"unexpected stderr on resumed closed stdout: {err2!r}"
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc2)
+        _cleanup_tagged_processes(tag)
