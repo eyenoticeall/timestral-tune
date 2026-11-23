@@ -5,7 +5,7 @@
 > **License:** Apache 2.0 (software) | Weights governed by Mistral's Modified MIT License, which carries a revenue cap (see §8)
 > **Target Python Version:** 3.10+ with PyTorch 2.4+, matching upstream; the Apple GPU needs PyTorch 2.8+. The optional Lacuna integration needs Python 3.11+.
 > **Devices (v0.1):** CUDA, CPU, and Apple GPU (MPS, fp32 only, PyTorch 2.8+). See §5.4.
-> **Spec revision:** 5, dated 2026-11-21, describing library release v0.1. The original draft is kept at `archive/timestral_tune_handoff_document.v0.md`.
+> **Spec revision:** 5, dated 2026-11-21, describing library release v0.1. The original draft, `archive/timestral_tune_handoff_document.v0.md`, was removed from the tree on 2026-11-24 as superseded by this document; it remains in git history.
 > **File name:** this document was `timestral_tune_handoff_document.md` at the repository root until 2026-11-21; older commit messages use that name.
 > **Working in this repo:** start with `AGENTS.md`; current state is in `docs/STATUS.md`.
 
