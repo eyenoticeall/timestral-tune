@@ -520,13 +520,15 @@ class TimestralTrainer:
             return
         config = self.config
         effective_batch = dist_ctx.world_size * config.batch_size
-        logger.info(
-            "multi-process training enabled: world_size=%d backend=%s per_rank_batch_size=%d effective_batch_size=%d",
-            dist_ctx.world_size,
-            dist_ctx.backend,
-            config.batch_size,
-            effective_batch,
+        message = (
+            "multi-process training enabled: world_size=%d backend=%s per_rank_batch_size=%d effective_batch_size=%d"
         )
+        args: list[Any] = [dist_ctx.world_size, dist_ctx.backend, config.batch_size, effective_batch]
+        if self.replay_config is not None:
+            replay_per_rank = self.replay_config.resolved_batch_size(config.batch_size)
+            message += " per_rank_replay_batch_size=%d effective_replay_batch_size=%d"
+            args += [replay_per_rank, dist_ctx.world_size * replay_per_rank]
+        logger.info(message, *args)
         if config.learning_rate is None and effective_batch > 32:
             logger.warning(
                 "effective batch size is %d (%d ranks x %d per rank) with the default learning rate %g "

@@ -145,9 +145,13 @@ class ReplayConfig:
         distill_weight: Non-negative weight on frozen-base quantile distillation over replay
             windows. Defaults to `0.1`. At least one of `replay_fraction` or `distill_weight`
             must be positive.
-        batch_size: Replay windows per training step. `None` picks
-            `max(1, round(train_batch_size * replay_fraction))` when `replay_fraction > 0`, or
-            `max(1, train_batch_size // 4)` for distillation-only replay.
+        batch_size: Replay windows per training step, per process (per rank in multi-process mode).
+            `None` picks `max(1, round(train_batch_size * replay_fraction))` when
+            `replay_fraction > 0`, or `max(1, train_batch_size // 4)` for distillation-only replay.
+            In multi-process mode, this resolution uses each rank's `TrainingConfig.batch_size`, so
+            the global effective replay batch size is `world_size * resolved_batch_size(batch_size)`
+            (which may differ from `resolved_batch_size(world_size * batch_size)` when
+            `batch_size=None` due to rounding or the minimum of 1).
         sign_flip: Whether to apply random per-series sign flips (`p=0.5`) to replay batches.
             `None` inherits `TrainingConfig.sign_flip`. When distillation is enabled, both the
             tuned and frozen base models see the same orientation.
@@ -211,7 +215,7 @@ class ReplayConfig:
         object.__setattr__(self, "smooth_beta", float(self.smooth_beta))
 
     def resolved_batch_size(self, train_batch_size: int) -> int:
-        """Number of replay windows drawn per training step."""
+        """Number of replay windows drawn per training step (per rank in multi-process mode)."""
         if self.batch_size is not None:
             return self.batch_size
         if self.replay_fraction > 0.0:

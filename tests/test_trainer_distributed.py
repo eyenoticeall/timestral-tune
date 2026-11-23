@@ -29,7 +29,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from timestral_tune import LoraConfig, TimestralTrainer, TrainingConfig
+from timestral_tune import LoraConfig, ReplayConfig, TimestralTrainer, TrainingConfig
 from timestral_tune import export as export_module
 from timestral_tune.models import TuneTimestralModel
 from timestral_tune.trainer import RankFailureError
@@ -327,10 +327,31 @@ def _sc_rank0_only_startup_log_isolation(rank: int, world_size: int) -> dict[str
     finally:
         _release_trainer_logs(tlog, handler, prev)
     cache_off_bypass = [msg for lvl, msg in handler.records if lvl == logging.INFO and "frozen-feature cache" in msg]
+    no_replay_startup = [
+        msg for lvl, msg in handler.records if lvl == logging.INFO and "multi-process training enabled:" in msg
+    ]
+
+    # With replay_config set (including default batch_size=None), rank 0 logs per-rank and effective
+    # replay batch sizes; peers emit nothing. At batch_size=6 and replay_fraction=0.25, per-rank
+    # resolved_batch_size(6) == 2 -> effective_replay_batch_size == 4 (at world_size=2).
+    tlog, handler, prev = _capture_trainer_logs()
+    try:
+        TimestralTrainer(
+            _base_config(mode="head_only", batch_size=6, learning_rate=1e-3, cache_frozen_features=False),
+            ds,
+            replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.0, batch_size=None),
+            replay_dataset=ds,
+            model=_fresh_model(0),
+        )
+    finally:
+        _release_trainer_logs(tlog, handler, prev)
+    replay_startup_infos = [msg for lvl, msg in handler.records if lvl == logging.INFO]
     return {
         "big_warnings": big_warnings,
         "big_infos": big_infos,
         "cache_off_bypass": cache_off_bypass,
+        "no_replay_startup": no_replay_startup,
+        "replay_startup_infos": replay_startup_infos,
     }
 
 
@@ -383,9 +404,19 @@ def test_distributed_trainer_whitebox_internals() -> None:
     assert md[1]["raised"] is True and md[1]["exc_type"] is RankFailureError
     assert md[1]["failing_ranks"] == (0,) and md[1]["stage"] == "startup" and md[1]["followup"] == 2
 
-    # 4. Startup log isolation (rank 0 only) and cache_frozen_features=False silence.
+    # 4. Startup log isolation (rank 0 only), cache_frozen_features=False silence, and replay batch sizes.
     sl = unwrap_results(outcomes["startup_logs"])
     assert len(sl[0]["big_warnings"]) == 1 and "effective batch size" in sl[0]["big_warnings"][0]
     assert sum("frozen-feature cache" in m for m in sl[0]["big_infos"]) == 1
     assert sl[0]["cache_off_bypass"] == []
-    assert sl[1]["big_warnings"] == [] and sl[1]["big_infos"] == [] and sl[1]["cache_off_bypass"] == []
+    assert len(sl[0]["no_replay_startup"]) == 1 and "per_rank_replay_batch_size" not in sl[0]["no_replay_startup"][0]
+    assert len(sl[0]["replay_startup_infos"]) == 1
+    assert "per_rank_batch_size=6 effective_batch_size=12" in sl[0]["replay_startup_infos"][0]
+    assert "per_rank_replay_batch_size=2 effective_replay_batch_size=4" in sl[0]["replay_startup_infos"][0]
+    assert (
+        sl[1]["big_warnings"] == []
+        and sl[1]["big_infos"] == []
+        and sl[1]["cache_off_bypass"] == []
+        and sl[1]["no_replay_startup"] == []
+        and sl[1]["replay_startup_infos"] == []
+    )
