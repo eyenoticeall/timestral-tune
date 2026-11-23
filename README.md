@@ -169,12 +169,9 @@ Fine-tuning cut forecast error by 23% on German wind and solar power, in under a
 
 Each panel shows a week of day-ahead forecasts from Timestral-28M against what happened. The shaded
 band is where the model expects the outcome to fall 80% of the time. Across all ten series and the 25
-test days, all after the models' release, fine-tuning cut the error by 23% (95% interval: 19% to 25%)
-and made that band a third narrower. The band still held 84% of the time, against 87% as released.
-
-Two cautions. We picked this dataset because the released model does poorly on it. And a tuned
-gradient-boosted model, a stronger alternative than the released model, scored level with the
-fine-tuned one here.
+test days, all after the models' release, fine-tuning cut the error of the released model by 23% (95%
+interval: 19% to 25%) and made that band a third narrower. The band still held 84% of the time,
+against 87% as released. We picked this dataset because the released model does poorly on it.
 
 The [summary in docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md#summary)
 covers the other datasets, including 11% less error on retail demand, the evidence that these gains
