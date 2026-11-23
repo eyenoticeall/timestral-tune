@@ -67,7 +67,7 @@ scripts/
   check_upstream_drift.py
   probes/                Verification probes behind the [V] tags
   benchmarks/            Benchmark, sweep and significance runs behind docs/BENCHMARKS.md
-  make_banner.py, make_results_chart.py   Draw the README images in assets/
+  make_banner.py, make_forecast_figure.py  Draw the README images in assets/
   cuda_check.sh          Runs the device tests and the whole suite on a CUDA machine
 ```
 

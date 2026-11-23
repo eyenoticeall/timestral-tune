@@ -5,11 +5,21 @@
 Fine-tuning cut forecast error by about 11% on retail demand and 23% on German wind and solar power,
 in under a minute on a single GPU.
 
-![Forecast error of a classical statistical model, Timestral-28M as released, and Timestral-28M fine-tuned, on retail demand and German wind and solar power](../assets/results.png)
+![A week of day-ahead forecasts of German wind power from Timestral-28M, as released and fine-tuned, against what happened](../assets/forecast_example.png)
 
-We fine-tuned Timestral-28M on two real datasets and scored it on later data it had never seen. The
-bars show how far the forecasts were from what happened, so shorter is better. The dashed line marks
-the model exactly as Mistral AI released it.
+The figure shows a week of day-ahead forecasts for two of the ten German power series, from
+Timestral-28M as released and after fine-tuning, against what happened. The shaded band is where the
+model expects the outcome to fall 80% of the time. The two series were chosen by rule: ranked by how
+much fine-tuning improved them, they are the middle two. The figure is an illustration from one
+training run; the evidence is in the numbers.
+
+Forecast error of Timestral-28M on later data it had never seen (lower is better):
+
+| Dataset | Classical model | As released | Fine-tuned | Change |
+|---|---:|---:|---:|---:|
+| Retail demand | 0.218 | 0.219 | 0.195 | 11% less |
+| German wind and solar power | 0.112 | 0.129 | 0.099 | 23% less |
+| Stock volatility | 0.198 | 0.193 | 0.182 | 6% less |
 
 These gains are not noise:
 
@@ -21,14 +31,15 @@ These gains are not noise:
   on retail demand and 19% to 25% less on German power.
 - **Repeating the training changes little.** Three fine-tuning runs with different random seeds landed
   within 0.4% of each other on retail demand and within 1.2% on German power.
+- **The ranges got narrower and still held.** On German power the 80% range was 34% narrower after
+  fine-tuning (95% interval: 24% to 39%) and held 84% of the time, against 87% as released.
 
 What else we found:
 
 - **Every model size improved**, from 5M to 209M.
 - **Stock volatility improved by 6%.** On the hourly volatility of 51 US stocks, fine-tuning made the
   forecasts better on 50 of the 51 stocks and in 46 of 49 consecutive periods (95% interval: 5% to 7%
-  less error). The error was 0.193 as released and 0.182 fine-tuned, against 0.198 for a classical HAR
-  model.
+  less error).
 - **Two more test sets from after the release improved by 23% and 9%**: wave heights off Sri Lanka and
   air pollution in Indian cities. Each has only five test periods, so these are less certain over time.
 - **A small fine-tuned model can beat a larger one as released.** On retail demand the fine-tuned 5M
@@ -36,7 +47,7 @@ What else we found:
 - **Little was forgotten.** On three unrelated datasets, the error of the fully fine-tuned models moved
   by less than 3% either way.
 - **Against a tuned gradient-boosted model the result is mixed.** Gradient boosting is a stronger
-  baseline than the classical models in the chart. Fine-tuned Timestral-28M made 8% less error than it
+  baseline than the classical models in the table. Fine-tuned Timestral-28M made 8% less error than it
   on retail demand and 6% less on stock volatility, whose test periods mostly predate the models'
   release. On four test sets taken entirely from after the release (German wind and solar power, 18
   days of stock volatility, air pollution in Indian cities and wave heights off Sri Lanka) the two were
@@ -45,12 +56,17 @@ What else we found:
 
 The fine print:
 
-- The chart uses full fine-tuning at default settings. Error is the weighted quantile loss, which
-  scores the whole predicted range and not just a single best guess. The classical models are ridge
-  regressions: a seasonal one for retail demand, and one on recent values and the known inputs for
-  German power.
+- All results use full fine-tuning at default settings. Error is the weighted quantile loss, which
+  scores the whole predicted range and not just a single best guess. The classical models are a
+  seasonal ridge regression for retail demand, a ridge regression on recent values and the known
+  inputs for German power, and a HAR model for stock volatility.
 - The gradient-boosted model is scikit-learn's `HistGradientBoostingRegressor`. It predicts the same
   range of outcomes, trains on a CPU, and has its settings chosen on validation data.
+- The figure is drawn from one training run, repeated to save its forecasts
+  (`docs/benchmarks/forecast_example_de_power.json`); the table and the bullets are means of three
+  runs. Its ranges are the model's own, with no conformal calibration. The power data is from
+  `akderekaan/de-power-forecast-data` on the Hugging Face Hub (CC BY 4.0), which republishes ENTSO-E
+  data.
 - The German power test covers the 25 days after the models' release (28 October to 21 November 2026).
   We picked this dataset because the released model does poorly on it, so 23% is what fine-tuning can
   recover there and not a typical gain. Every method is given the grid operators' day-ahead forecast as

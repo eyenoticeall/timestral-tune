@@ -144,8 +144,8 @@ and stock volatility benchmarks finished in under a minute and used less than 5 
 
 Each run was 160 to 200 training steps at batch size 16 to 32, with a 256-step context, seven or eight
 covariates per series and `mixed_precision="bf16"`. Your numbers will scale with context length and
-batch size: the German power run in the chart below, with 400 steps and a 384-step context, took 40
-seconds on the 28M model.
+batch size: the German power run shown below, with 400 steps and a 384-step context, took 40 seconds
+on the 28M model.
 
 Why it stays small:
 
@@ -160,24 +160,25 @@ Why it stays small:
 
 ## Results
 
-Fine-tuning cut forecast error by about 11% on retail demand and 23% on German wind and solar power,
-in under a minute on a single GPU.
+Fine-tuning cut forecast error by 23% on German wind and solar power, in under a minute on a single GPU.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/eyenoticeall/timestral-tune/main/assets/results.png" width="100%"
-       alt="Forecast error of a classical statistical model, Timestral-28M as released, and Timestral-28M fine-tuned. Retail demand: 0.218, 0.219 and 0.195; fine-tuning gives 11% less error, better on 64 of 64 series. German wind and solar power: 0.112, 0.129 and 0.099; 23% less error, better on 10 of 10 series.">
+  <img src="https://raw.githubusercontent.com/eyenoticeall/timestral-tune/main/assets/forecast_example.png" width="100%"
+       alt="A week of day-ahead forecasts of German wind power from Timestral-28M, as released and fine-tuned, against what happened. For TenneT offshore wind the 80% range is 2,876 MW wide as released and 1,678 MW fine-tuned; for Amprion onshore wind, 2,090 MW and 1,246 MW.">
 </p>
 
-The chart shows Timestral-28M before and after fine-tuning. Shorter bars are better, and every series
-improved. The gain is measured against the model as released, and we picked German power because the
-released model does poorly on it, so read 23% as what fine-tuning can recover and not as a typical
-gain. A tuned gradient-boosted model is a stronger alternative than either grey bar: fine-tuned 28M
-was 8% ahead of it on retail demand, whose test period predates the models' release, and level with it
-on German power.
+Each panel shows a week of day-ahead forecasts from Timestral-28M against what happened. The shaded
+band is where the model expects the outcome to fall 80% of the time. Across all ten series and the 25
+test days, all after the models' release, fine-tuning cut the error by 23% (95% interval: 19% to 25%)
+and made that band a third narrower. The band still held 84% of the time, against 87% as released.
+
+Two cautions. We picked this dataset because the released model does poorly on it, so this is what
+fine-tuning can recover and not a typical gain. And a tuned gradient-boosted model, a stronger
+alternative than the released model, scored level with the fine-tuned one here.
 
 The [summary in docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md#summary)
-explains why these gains are not noise, what else we found and the fine print. The rest of that page
-has every number, for every model size and mode, with the command to reproduce it.
+covers the other datasets, including 11% less error on retail demand, the evidence that these gains
+are not noise, and the fine print.
 
 ## Calibrate intervals without training
 
