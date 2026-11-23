@@ -514,6 +514,41 @@ def test_gradient_reducer_construction_validation() -> None:
         GradientReducer(ctx, [p_meta])
 
 
+def test_gradient_reducer_uses_single_collective_with_presence_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`GradientReducer.reduce()` carries presence flags inside the single `all_reduce(SUM)` buffer."""
+    ctx = DistributedContext(rank=0, world_size=2, backend="gloo", device=torch.device("cpu"))
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
+
+    calls: list[tuple[int, Any]] = []
+
+    def _fake_all_reduce(tensor: torch.Tensor, op: Any = None) -> None:
+        calls.append((int(tensor.numel()), op))
+        # Simulate summing two identical ranks: multiply buffer in place by 2.
+        tensor.mul_(2.0)
+
+    monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce)
+
+    p_none = nn.Parameter(torch.ones(3, dtype=torch.float32))
+    p_zero = nn.Parameter(torch.ones(2, dtype=torch.float32))
+    p_vals = nn.Parameter(torch.ones(4, dtype=torch.float32))
+    reducer = GradientReducer(ctx, [p_none, p_zero, p_vals])
+    assert reducer.numel == 3 + 2 + 4
+
+    p_none.grad = None
+    p_zero.grad = torch.zeros(2, dtype=torch.float32)
+    p_vals.grad = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+    reducer.reduce()
+
+    assert calls == [(3 + 2 + 4 + 3, dist.ReduceOp.SUM)]
+    assert p_none.grad is None
+    assert p_zero.grad is not None and p_zero.grad.tolist() == [0.0, 0.0]
+    assert p_vals.grad is not None and p_vals.grad.tolist() == [2.0, 4.0, 6.0, 8.0]
+
+
 # --------------------------------------------------------------------------- multi-process scenarios (N=2 and N=4)
 
 
@@ -717,11 +752,11 @@ def _sc_gradient_reducer(rank: int, world_size: int) -> dict[str, Any]:
     p2.grad = None
     p3.grad = torch.tensor(float(rank + 2), dtype=torch.float64)
     reducer.reduce()
-    assert p0.grad is not None and p1.grad is not None and p2.grad is not None and p3.grad is not None
+    assert p0.grad is not None and p1.grad is not None and p2.grad is None and p3.grad is not None
     assert p3.grad.shape == ()
-    r1 = {"p0": p0.grad.tolist(), "p1": p1.grad.tolist(), "p2": p2.grad.tolist(), "p3": p3.grad.item()}
+    r1 = {"p0": p0.grad.tolist(), "p1": p1.grad.tolist(), "p2": None, "p3": p3.grad.item()}
 
-    # Round 2 (reusing the same flat buffer): flip None pattern so stale values would surface.
+    # Round 2 (reusing the same flat buffer): flip None pattern; p2 is an all-zero tensor on rank 0 and None on peers.
     p0.grad = None if rank == world_size - 1 else torch.full((3,), 0.5 * (rank + 1), dtype=torch.float64)
     p1.grad = torch.arange(4, dtype=torch.float64).reshape(2, 2) * (rank + 1)
     p2.grad = torch.full((4,), float(rank), dtype=torch.float64) if rank == 0 else None
@@ -729,7 +764,35 @@ def _sc_gradient_reducer(rank: int, world_size: int) -> dict[str, Any]:
     reducer.reduce()
     assert p0.grad is not None and p1.grad is not None and p2.grad is not None and p3.grad is not None
     r2 = {"p0": p0.grad.tolist(), "p1": p1.grad.tolist(), "p2": p2.grad.tolist(), "p3": p3.grad.item()}
-    return {"round1": r1, "round2": r2}
+
+    # Round 3: previously populated parameters that become all-None return to None; present zero scalar stays tensor.
+    p0.grad = None
+    p1.grad = torch.full((2, 2), 2.5, dtype=torch.float64) if rank == 1 else None
+    p2.grad = None
+    p3.grad = torch.tensor(0.0, dtype=torch.float64) if rank == 0 else None
+    reducer.reduce()
+    assert p0.grad is None and p1.grad is not None and p2.grad is None and p3.grad is not None
+    assert p3.grad.shape == ()
+    r3 = {"p0": None, "p1": p1.grad.tolist(), "p2": None, "p3": p3.grad.item()}
+
+    # AdamW weight-decay parity: all-None param skips decay; present all-zero param decays identically across ranks.
+    p_unused = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64))
+    p_zero = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64))
+    wd_reducer = GradientReducer(ctx, [p_unused, p_zero])
+    opt = torch.optim.AdamW([p_unused, p_zero], lr=0.1, weight_decay=0.5)
+    opt.zero_grad(set_to_none=True)
+    p_unused.grad = None
+    p_zero.grad = torch.zeros_like(p_zero) if rank == 0 else None
+    wd_reducer.reduce()
+    assert p_unused.grad is None and p_zero.grad is not None
+    opt.step()
+    return {
+        "round1": r1,
+        "round2": r2,
+        "round3": r3,
+        "wd_unused": p_unused.detach().tolist(),
+        "wd_zero": p_zero.detach().tolist(),
+    }
 
 
 def _sc_status_broadcast(rank: int, world_size: int) -> list[tuple[ControlStatus, float]]:
@@ -896,7 +959,7 @@ def test_distributed_primitives_multiprocess(world_size: int) -> None:
         assert res["non_contig_buf"] == ref_mod.non_contig_buf.tolist()
         assert res["non_contig_is_contig"] is False
 
-    # 11. Gradient reducer (two rounds against manual SUM, including None on one rank and all ranks).
+    # 11. Gradient reducer (three rounds against manual SUM, exact None vs present-zero, and AdamW weight decay).
     gr = unwrap_results(outcomes["grad_reducer"])
     exp_r1_p0 = [
         sum(r + 1.0 for r in range(world_size)),
@@ -905,26 +968,38 @@ def test_distributed_primitives_multiprocess(world_size: int) -> None:
     ]
     exp_r1_p1_val = sum(float(r + 3) for r in range(1, world_size))
     exp_r1_p1 = [[exp_r1_p1_val, exp_r1_p1_val], [exp_r1_p1_val, exp_r1_p1_val]]
-    exp_r1_p2 = [0.0, 0.0, 0.0, 0.0]
-
     exp_r1_p3 = sum(float(r + 2) for r in range(world_size))
 
     exp_r2_p0_val = sum(0.5 * (r + 1) for r in range(world_size - 1))
     exp_r2_p0 = [exp_r2_p0_val] * 3
     scale_r2 = sum(r + 1 for r in range(world_size))
     exp_r2_p1 = [[0.0, 1.0 * scale_r2], [2.0 * scale_r2, 3.0 * scale_r2]]
-    exp_r2_p2 = [0.0, 0.0, 0.0, 0.0]  # rank 0 contributed 0.0, others None
+    exp_r2_p2 = [0.0, 0.0, 0.0, 0.0]  # rank 0 contributed 0.0 tensor, others None
     exp_r2_p3 = -7.5
+
+    ref_unused = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64))
+    ref_zero = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64))
+    ref_opt = torch.optim.AdamW([ref_unused, ref_zero], lr=0.1, weight_decay=0.5)
+    ref_unused.grad = None
+    ref_zero.grad = torch.zeros_like(ref_zero)
+    ref_opt.step()
 
     for res in gr:
         assert res["round1"]["p0"] == exp_r1_p0
         assert res["round1"]["p1"] == exp_r1_p1
-        assert res["round1"]["p2"] == exp_r1_p2
+        assert res["round1"]["p2"] is None
         assert res["round1"]["p3"] == exp_r1_p3
         assert res["round2"]["p0"] == exp_r2_p0
         assert res["round2"]["p1"] == exp_r2_p1
         assert res["round2"]["p2"] == exp_r2_p2
         assert res["round2"]["p3"] == exp_r2_p3
+        assert res["round3"]["p0"] is None
+        assert res["round3"]["p1"] == [[2.5, 2.5], [2.5, 2.5]]
+        assert res["round3"]["p2"] is None
+        assert res["round3"]["p3"] == 0.0
+        assert res["wd_unused"] == [2.0, -4.0]
+        assert res["wd_zero"] == ref_zero.detach().tolist()
+        assert res["wd_zero"] != [2.0, -4.0]
 
     # 12. Status broadcast.
     sb_status = unwrap_results(outcomes["status_broadcast"])

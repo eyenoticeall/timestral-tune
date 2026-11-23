@@ -491,13 +491,18 @@ class GradientReducer:
     """Reusable flat-buffer gradient SUM-reducer over a fixed list of trainable parameters.
 
     Constructed once from the trainable parameter sequence, allocating a single flat buffer of the
-    shared dtype and device. All parameters must be non-empty in count, distinct, share one dtype
-    and one device, and reside on `ctx.device` (`ValueError` otherwise).
+    shared dtype and device containing all parameter gradient slots plus one trailing presence-flag
+    slot per parameter. All parameters must be non-empty in count, distinct, share one dtype and
+    one device, and reside on `ctx.device` (`ValueError` otherwise).
 
-    Calling `reduce()` packs each parameter's `.grad` into the flat buffer (writing zeros where
-    `.grad` is `None`), executes a single `ReduceOp.SUM` all-reduce with no division, and copies
-    the reduced slices back into every parameter's `.grad` (allocating `.grad` where it was
-    `None`).
+    Calling `reduce()` packs each parameter's `.grad` (zeros where `.grad` is `None`) together with
+    a `0.0`/`1.0` presence flag into the single flat buffer, executes one `ReduceOp.SUM` all-reduce
+    with no division, and writes back `.grad`:
+    - Parameters whose `.grad` is `None` on every rank stay `None` on every rank, so optimisers
+      such as `AdamW` skip them (including weight decay) just as in one-process mode.
+    - Parameters with a non-`None` `.grad` on at least one rank (even if all zeros, such as LoRA
+      `lora_A` at step 0) receive the reduced `.grad` tensor on every rank (allocating `.grad`
+      where it was locally `None`).
 
     Ranks: constructed independently on each rank over matching parameter lists; `reduce()` must
         be called by all ranks in lockstep.
@@ -530,7 +535,9 @@ class GradientReducer:
         self._ctx = ctx
         self._dtype = dtype
         self._device = device
-        self._buffer = torch.empty(total_numel, dtype=dtype, device=device)
+        self._grad_numel = total_numel
+        self._buffer = torch.empty(total_numel + len(params), dtype=dtype, device=device)
+        self._flags_slice = self._buffer.narrow(0, total_numel, len(params))
 
         entries: list[tuple[Tensor, Tensor]] = []
         offset = 0
@@ -542,24 +549,27 @@ class GradientReducer:
 
     @property
     def numel(self) -> int:
-        """Total number of scalar elements in the flat buffer."""
-        return int(self._buffer.numel())
+        """Total number of parameter scalar elements reduced (excluding presence flags)."""
+        return self._grad_numel
 
     def reduce(self) -> None:
-        """Pack gradients, SUM-reduce the flat buffer once without division, and write `.grad` back.
+        """Pack gradients and presence flags, SUM-reduce once without division, and write `.grad` back.
 
-        Parameters whose `.grad` is `None` contribute zeros and receive a newly allocated `.grad`
-        tensor containing the reduced sum.
+        Parameters whose `.grad` is `None` on every rank remain `None` on every rank. Parameters
+        with a non-`None` `.grad` on at least one rank (including all-zero tensors) receive the
+        summed `.grad` tensor on every rank, allocating `.grad` where it was locally `None`.
 
         Ranks: all ranks must call in lockstep on identically ordered, matching parameter lists.
         Collectives: 1 (`all_reduce(SUM)`).
         """
         self._ctx.check_active()
         with torch.no_grad():
+            local_flags: list[float] = []
             for param, buf_slice in self._entries:
                 grad = param.grad
                 if grad is None:
                     buf_slice.zero_()
+                    local_flags.append(0.0)
                 else:
                     if grad.shape != param.shape or grad.dtype != self._dtype or grad.device != self._device:
                         raise ValueError(
@@ -568,10 +578,16 @@ class GradientReducer:
                             f"dtype={grad.dtype} device={grad.device}"
                         )
                     buf_slice.copy_(grad.detach().reshape(-1))
+                    local_flags.append(1.0)
+            self._flags_slice.copy_(torch.tensor(local_flags, dtype=self._dtype))
 
             dist.all_reduce(self._buffer, op=dist.ReduceOp.SUM)
 
-            for param, buf_slice in self._entries:
+            present_counts = self._flags_slice.tolist()
+            for (param, buf_slice), present_count in zip(self._entries, present_counts, strict=True):
+                if present_count == 0.0:
+                    param.grad = None
+                    continue
                 if param.grad is None:
                     param.grad = torch.empty_like(param)
                 param.grad.copy_(buf_slice.view_as(param))
