@@ -66,6 +66,6 @@ Full list in spec §12. The ones that matter next:
 
 Branch policy is in `AGENTS.md` §6.
 
-## Multi-GPU training proposal
+## Multi-GPU training (Phase 5)
 
-A documentation-only design proposal for single-node multi-process training exists (`docs/SPEC.md` §5.6, §7.4, §9 T15, §10 Phase 5, D22–D35; `docs/phases/phase-5-multi-gpu.md`), backed by a standalone CPU/`gloo` prototype probe outside `src/` (`scripts/probes/distributed_parity.py`, `docs/VERIFICATION.md` §16). T15 is specified in `docs/SPEC.md` §9 and not implemented; the 14-of-14 acceptance-test count above refers to T1–T14. Nothing is implemented in `src/` or `tests/`; go/no-go and sequencing against gradient accumulation await a maintainer decision.
+The single-node multi-process training design (`docs/SPEC.md` §5.6, §7.4, §9 T15, §10 Phase 5, D22–D35; `docs/phases/phase-5-multi-gpu.md`), backed by a standalone CPU/`gloo` prototype probe outside `src/` (`scripts/probes/distributed_parity.py`, `docs/VERIFICATION.md` §16), was approved by the maintainer on 2026-11-23. Implementation is in progress; nothing is implemented yet in `src/` or `tests/`, and gradient accumulation remains an unticked, unscheduled option. T15 is specified in `docs/SPEC.md` §9 and not implemented; the 14-of-14 acceptance-test count above refers to T1–T14.

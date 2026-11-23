@@ -1,10 +1,10 @@
-# Phase 5 — Multi-Process / Multi-GPU Training (Proposed)
+# Phase 5 — Multi-Process / Multi-GPU Training
 
-**Status:** Proposed design only — awaiting maintainer go/no-go and sequencing decision (nothing in `src/` or `tests/` implements this yet).
+**Status:** Approved by the maintainer on 2026-11-23; implementation in progress, nothing implemented yet in `src/` or `tests/`.
 **Goal:** Data-parallel multi-process training across `N` ranks on a single node (CUDA/NCCL and CPU/`gloo`) with exact step-level equivalence to single-process training on the union batch.
-**Spec sections:** `docs/SPEC.md` §5.6, §9 (T15), §10 (Phase 5), §11 (D22–D35), §12; prototype evidence in `docs/VERIFICATION.md` §16.
+**Spec sections:** `docs/SPEC.md` §5.6, §7.4, §9 (T15), §10 (Phase 5), §11 (D22–D35), §12; prototype evidence in `docs/VERIFICATION.md` §16.
 
-The task checklist and proposed exit criteria are in `docs/SPEC.md` §10.
+The task checklist and exit criteria are in `docs/SPEC.md` §10.
 
 ---
 
@@ -43,58 +43,36 @@ An alternative raised while preparing this proposal is to defer multi-GPU and im
 - **Zero hardware risk:** fully testable on existing CPU, Apple GPU, and single-L4 setups with no NCCL unknowns or multi-GPU VM cost.
 - **Trade-off:** gradient accumulation does not cut wall-clock time on compute-bound large datasets; multi-GPU addresses throughput (subject to unmeasured NCCL scaling).
 
-**Decision for the maintainer:** go/no-go on Phase 5, and whether to land gradient accumulation (and `(sum, count)` loss helpers) before Stage 1, alongside it, or instead of it for now.
+**Status:** Phase 5 is approved (2026-11-23) and implementation is starting; gradient accumulation remains an unticked, unscheduled option (`docs/SPEC.md` §10).
 
 ---
 
-## 2. Staged implementation plan & trainer touch points
+## 2. Module and function map
 
-Design details and rationale are in `docs/SPEC.md` §5.6 and D22–D35. All touch points below name modules and functions rather than line numbers.
+All behavioural rules live in `docs/SPEC.md` §5.6, §7.4, and D22–D35; this section maps those rules to modules and functions.
 
-### Stage 1 — Core multi-process training (domain loss, four modes, no head cache)
+### Stage 1 — Core multi-process training
 
-- **`models/loader.py` (no changes)**
-  - `resolve_device()`, `load_model()`, and `load_forecaster()` remain pure and collective-free (D28, D29). Every rank calls `load_model()` as today without a rank-0 download barrier (Stage 1 includes checking `huggingface_hub==0.23` lock behaviour, §12).
+- **`models/loader.py`** — unchanged (`resolve_device`, `load_model`, `load_forecaster` stay pure and collective-free; Stage 1 checks `huggingface_hub==0.23` lock behaviour, §12).
+- **`trainer/__init__.py`** — export `RankFailureError` (`RuntimeError` subclass).
 - **`trainer/trainer.py`**
-  - `TimestralTrainer.__init__`:
-    - Detect caller-owned multi-process group (`dist.is_initialized()` with `world_size > 1`); keep single-process code path byte-for-byte unchanged otherwise (D25, D28).
-    - Run all rank-local setup and validation that can fail first, catching any exception locally (D28, D29, D32): backend-driven device resolution (`dist.get_backend()`: `nccl`→CUDA, `gloo`→CPU, `gloo`+CUDA refused in v1, `"auto"` never picks MPS, contradictions raise; for CUDA honour explicit index else `LOCAL_RANK` else `rank`, validate against `torch.cuda.device_count()`, and call `torch.cuda.set_device` for every CUDA device before `torch.cuda.is_bf16_supported()`), Stage 1 restrictions (`ValueError` for `compile_mode="reduce-overhead"` when `compile_model=True`; `NotImplementedError` for `replay_config is not None` following D13), `lora_config`/`replay_config`/`replay_dataset` checks, model loading or validation, dataset checks (`_check_dataset` and train/val layout equality), `_select_trainable()`, and `early_stopping_patience`/callback validation (moved ahead of the first collective).
-    - Run one small startup failure-status collective (`all_reduce(ReduceOp.SUM)` of per-rank failure flags): if any rank failed, failing rank(s) re-raise their own exception and peers raise an error naming the failing rank(s) without entering the broadcast (best-effort and unprototyped `[D]`; ranks unable to enter a collective and post-broadcast steps fall under D35) (D29).
-    - Only if all ranks succeed, broadcast **all model parameters and all buffers** from rank 0 (before `_setup_replay_teacher()` and `torch.compile`, which depend on the synced eager model) so caller-supplied `model=` weights/buffers and LoRA adapters start identical across ranks (D29).
-    - Log effective global batch `world_size * config.batch_size` and emit a warning when `config.learning_rate is None` and effective global batch `> 32` (D27).
-    - Compute `iters_per_epoch = math.ceil(len(train_dataset) / (world_size * config.batch_size))` loop iterations per epoch and the corresponding global `total_steps` budget (D26).
-  - `TimestralTrainer._raw_loader` and `_loader`:
-    - In multi-process mode, bypass `_get_head_cache` in Stage 1 and log that `head_only` is streaming (D32).
-    - Use a main-process epoch batch sampler derived from `(config.seed, epoch)` (or natural order when `shuffle=False`) giving `config.batch_size` indices per rank on full steps and splitting the final partial global batch evenly (sizes differ by at most 1; empty only when `< N` windows remain), yielding only non-empty index lists to `DataLoader(..., batch_sampler=...)` so `DHFDataCollator` is never called empty and `num_workers > 0` / `persistent_workers=True` work cleanly (D26).
-  - `TimestralTrainer.training_step` and internal distributed step helper:
-    - Public `training_step()` raises `RuntimeError` in an active multi-process group directing callers to `fit()` (D23, D31).
-    - Internal distributed step helper invoked by `fit()` implements the five-stage step (D22, D23, D24): local stage (empty ranks skip `DataLoader` fetch, sign flip, `batch.validate`, and forward; local exceptions caught into error flag) → 8-scalar `float64` `ReduceOp.SUM` statistics collective → globally decided local-error propagation, `FloatingPointError` (all ranks), or global skip (`W_D == 0`, preserving one-process skip semantics: no backward, no optimiser/scheduler step, `global_step` unchanged, `skipped_batches` incremented, identical per-epoch loop iterations across ranks) → local backward of `(W_d / W_D) * L_d` (backward failures fall under D35, not a gradient-buffer flag) → flat-buffer `ReduceOp.SUM` gradient collective (`None` grads filled with zeros, no division by `N`) → `clip_grad_norm_` → `optimizer.step()` → `scheduler.step()`.
-    - Preserve the collective-safety invariant: no rank-local branch may skip or add a collective (D23).
-  - `TimestralTrainer.fit`:
-    - Drive each epoch by global iteration index (`0..iters_per_epoch - 1`), fetching from the `DataLoader` only when the rank's shard is non-empty (D26).
-    - Seed epoch permutations identically across ranks; offset `_fit_flip_generator` and global `torch.manual_seed` (LoRA dropout) so rank 0 keeps today's seeds and distinct ranks get distinct streams (D33).
-    - Run `self.callbacks` (`ProgressLogger`, `EarlyStopping`, user callbacks), best-loss tracking, early stopping, and the restore decision on rank 0 only (non-zero ranks never compare validation losses); broadcast a status (`continue` / `stop` / `rank-0 callback failed`) after `on_fit_start`, `on_step_end`, and `on_evaluate` (D30).
-    - At the end of `fit()`, broadcast `(best_eval_loss, best_step, restored_best)` from rank 0 and, only if `restored_best` is True, broadcast restored `self._trainable`; construct equal `TrainingResult` across ranks (spec §5.6, D30).
-    - Sharded validation inside `fit()`: separate internal path and sharded loader (never `self._val_loader`); disjoint stride sharding (`r, r + N, …`), empty or zero-scored shards contribute zeros, one end-of-eval `float64` `ReduceOp.SUM` collective over `[loss_sum, scored_positions, batches, err]`, raising `"the dataset has no scored position to evaluate"` only after reduction from the global count on every rank (D31).
-  - `TimestralTrainer.evaluate` and `TimestralTrainer.export`:
-    - `evaluate()` remains rank-local and collective-free on the full dataset (unchanged).
-    - `export()` stays collective-free: performs identical argument validation on all ranks; rank 0 writes the export files (passing `world_size` and `effective_batch_size` for `tune_metadata.json`), while non-zero ranks skip Hub calls, weight merges, and disk writes, log that rank 0 writes the files, and return the same `Path` (D31).
-- **`export.py`**
-  - Accept optional multi-process metadata (`world_size`, `effective_batch_size`) in `export_checkpoint` for `tune_metadata.json` (proposed addition to spec §7.4).
-- **Acceptance tests (`tests/acceptance/test_distributed.py`)**
-  - Implement `test_t15_*` covering cases `(a)–(i)` in `docs/SPEC.md` §9 (including the non-zero-rank `export()` guard in case `(h)`).
+  - `TimestralTrainer.__init__` — process-group detection & snapshot, exact backend string check, pre-collective device resolution/binding, startup sequence `(a)–(e)` (rank-local setup/validation + single trainable dtype check, startup `int64` failure collective, integer consistency digest + collective, all-parameter/all-buffer broadcast, post-broadcast setup & pre-allocated flat gradient buffer, one-time logs), and global `total_steps`.
+  - `TimestralTrainer._raw_loader` / `_loader` — main-process contiguous epoch batch sampler (balanced trailing split, non-empty slices only) and `head_only` cache bypass.
+  - `TimestralTrainer.training_step` + internal distributed step helper — public `training_step()` raises `RuntimeError`; internal helper implements stages 1–5 (local skip on empty/`num_scored == 0`, 8-scalar `ReduceOp.SUM`, conditional length-`N` `int64` rank vector, count-weighted backward, reused flat-buffer `ReduceOp.SUM`).
+  - `TimestralTrainer.fit` — process-group liveness/`world_size` check, global-iteration loop with lazy per-epoch iterator creation, rank-offset RNG streams, `on_fit_start` inside `try/finally`, rank-0 callbacks/best-loss/restore with fixed-size `float64` `[code, value]` and conditional `[has_best, best_eval_loss, best_step, restored]` broadcasts.
+  - Internal sharded validation helper (separate from `self._val_loader`) — `eval()`/`no_grad()` restoring `training`, cached stride loader skipped on empty shards, per-rank `eval_batch_size`, `[loss_sum, scored_positions, batches, failed]` reduction.
+  - `TimestralTrainer.evaluate` — unchanged (rank-local, collective-free).
+  - `TimestralTrainer.export` — uses snapshotted `rank`/`world_size`, calls shared validation helper on all ranks; rank 0 writes files with `world_size`/`effective_batch_size`, non-zero ranks log, no-op, and return `Path`.
+- **`export.py`** — extract input validation into a shared helper called by `export_checkpoint` and non-zero-rank `export()`; write top-level `world_size` and `effective_batch_size` to `tune_metadata.json` only when `world_size > 1`.
+- **`tests/acceptance/test_distributed.py`** — `test_t15_*` covering cases `(a)–(i)` and harness rules in `docs/SPEC.md` §9.
 
-### Stage 2 — Replay, distillation, and head-cache decision
+### Stage 2 — Replay and distillation
 
-- **`trainer/trainer.py`**
-  - `_setup_replay_teacher`: run after rank-0 all-parameter/buffer broadcast (D29). How the frozen-base teacher output cache (`_replay_base_pos` / `_replay_base_neg`) is built across ranks is an open Stage 2 question.
-  - `_replay_loader` and `_compute_replay_terms`: `ReplayConfig.batch_size` is per rank (D27); shard `replay_dataset` per global step with the balanced epoch sampler (rank-offset `_replay_flip_generator`, D33), populate `[W_r, sum_r, M, sum_m]` in the stats collective, decide replay mixing globally from `W_R > 0`, and weight `L_replay` by `f * (W_r / W_R)` and `L_distill` by `distill_weight * (M / M_tot)` (D23, D24). Open Stage 2 decision (not settled; current leaning: a small pre-forward count collective used only when `replay_config` is set, leaving Stage 1 unaffected): scored counts are known from the CPU batches before any forward pass, so checking `W_D == 0` first preserves exact one-process skip semantics (`trainer/trainer.py`) without advancing `replay_iter`.
-  - `head_only` frozen-feature cache (open Stage 2 decision, not a commitment): decide whether a multi-process cache is worth having, given that per-epoch global permutations move windows between ranks across epochs (so a per-rank cache cannot serve later epochs without holding the whole dataset on every rank or exchanging caches across ranks).
-  - Extend `test_t15_*` to cover multi-process `ReplayConfig` (matching the four replay/distillation regimes in `scripts/probes/distributed_parity.py` §4) and any Stage 2 caching adopted.
+- **`trainer/trainer.py`** — `_setup_replay_teacher` (uncached paths only, logged once), `_replay_loader` (per-rank cycling loader with rank-offset shuffle seed and per-rank `ReplayConfig.batch_size`), internal distributed step (replay-only 1-element pre-forward domain count collective + `[W_r, sum_r, M, sum_m]` terms), and Stage 2 T15 coverage.
 
-### Optional shared refactor (if gradient accumulation precedes or joins Stage 1)
+### Optional (unscheduled): gradient accumulation
 
-- **`losses/pinball.py`** (`pinball_loss`) and **`replay/distill.py`** (`distillation_loss`): expose an internal `(loss_sum, active_count)` helper so gradient accumulation and multi-process count weighting share one denominator-free path without changing public signatures.
+- **`losses/pinball.py`** (`pinball_loss`) and **`replay/distill.py`** (`distillation_loss`) — internal `(loss_sum, active_count)` helper if gradient accumulation is scheduled later.
 
 ---
 
@@ -147,4 +125,5 @@ A single 1.5–2 hour session on `g2-standard-48` (which covers both `N = 2` and
 
 ## 5. Log of what was done
 
-- **2026-11-23 (proposal & prototype probe):** wrote the documentation-only single-node multi-process design proposal across `docs/SPEC.md` (§5.6, §7.4, §9 T15 cases `(a)–(i)`, §10 Phase 5, §11 D22–D35, §12), `docs/VERIFICATION.md` (§11 one-off `ReduceOp.AVG` check and §16), `docs/STATUS.md`, and these notes, backed by the standalone CPU/`gloo` prototype probe `scripts/probes/distributed_parity.py`. Final probe totals on macOS arm64 CPU/`gloo`: `326/326` passed (`0` failed) on `tiny_random` on both PyTorch `2.15.0` and `2.4.0` (verified against both `probe_ref` and independent one-process `TimestralTrainer` `shipped_trainer`, covering scalar global loss, exact `0.00e+00` cross-rank parity, LoRA step-0/1 invariants, empty-rank-0 delivery, global skip, non-finite propagation, and 10-active-step + 1-skip AdamW trajectories with `wd=0.01`, warmup + cosine, and clip `1.0` across `full_ft` and `lora_variate`); and `516/516` passed (`326` `tiny_random` + `190` enforced `Timestral-5M`), `0` failed, `68` ungraded `[INFO]` `Timestral-5M` body-backprop values on PyTorch `2.15.0` (`--sizes 5M`). Nothing in `src/` or `tests/` implements multi-process training; awaiting maintainer go/no-go and sequencing against gradient accumulation.
+- **2026-11-23 (proposal & prototype probe):** wrote the documentation-only single-node multi-process design proposal across `docs/SPEC.md` (§5.6, §7.4, §9 T15 cases `(a)–(i)`, §10 Phase 5, §11 D22–D35, §12), `docs/VERIFICATION.md` (§11 one-off `ReduceOp.AVG` check and §16), `docs/STATUS.md`, and these notes, backed by the standalone CPU/`gloo` prototype probe `scripts/probes/distributed_parity.py` (`326/326` passed on `tiny_random` on PyTorch `2.15.0` and `2.4.0`; `516/516` passed + `68` `[INFO]` on `--sizes 5M`).
+- **2026-11-23 (approved & pre-implementation design revision):** maintainer approved Phase 5 (implementation starting; gradient accumulation stays unscheduled). Updated `docs/SPEC.md`, `docs/VERIFICATION.md`, `docs/STATUS.md`, and these notes to lock down exact backend checks, pre-collective device binding, `__init__` startup failure/consistency collectives and rank/world-size/backend snapshot, binary failure flags + conditional `int64` length-`N` vectors, `Exception`-only / OOM-excluded propagation and `RankFailureError`, fixed-size `float64` control broadcasts, contiguous slices, local zero-scored skip order, `(base + r * 1_000_000_007) mod 2^63` rank seeds, reused flat gradient buffer, sharded validation `eval()`/`no_grad()` & shared `export()` validation, Stage 2 decisions (per-rank cycling replay loaders, replay-only pre-forward count collective, no multi-process head/teacher caches), and tightened T15 cases `(a)–(i)`; trimmed repeated numbers and cut §2 to a module/function map.

@@ -920,8 +920,9 @@ rank-offset augmentation/dropout streams; and rejection of `nn.DataParallel`, `a
 
 - Adding the independent one-process `TimestralTrainer` reference (`shipped_trainer`) exposed and fixed a
   `float64 → float32` state-dict truncation in the prototype's `_load_model` helper (casting to `dtype` now
-  precedes `load_state_dict`) and confirmed that `TimeSeriesDataset` enforces `np.float32`, so shipped
-  cached `head_only` runs in `float32` only (`float64` `head_only_cached` reported `n/a`).
+  precedes `load_state_dict`) and confirmed that `TimeSeriesDataset` stores `np.float32` inputs (a
+  `float64` model works with the shipped head cache in `fit()`, but `float64` input values cannot be fed
+  through `TimeSeriesDataset`, so `float64` `head_only_cached` is reported `n/a`).
 - Inspecting existing trainer and data code established that `DHFDataCollator` raises `ValueError` on an
   empty list (`data/collator.py:155-156`), motivating the global-iteration-driven loop and non-empty batch
   sampler; `torch.cuda.is_bf16_supported()` queries the current CUDA device (`trainer/trainer.py:292`),
@@ -959,3 +960,48 @@ decisions (replay skip ordering, teacher output caching across ranks, and whethe
 `head_only` cache is worth having); and unverified items (`docs/SPEC.md` §12): CUDA/NCCL, `bf16`,
 `torch.compile`, `torchrun` on Linux, released-weights T15 bounds, `huggingface_hub==0.23` lock behaviour,
 large-batch LR sweeps, unprototyped single-rank exception propagation, and NCCL rank-failure behaviour.
+
+---
+
+## 2026-11-23 — Multi-process design approved; pre-implementation spec revision
+
+**Done.** Recorded maintainer approval of Phase 5 (implementation starting; nothing implemented yet in
+`src/` or `tests/`, gradient accumulation unscheduled) and applied the pre-implementation design revision
+across `docs/SPEC.md`, `docs/VERIFICATION.md`, `docs/STATUS.md`, `docs/phases/phase-5-multi-gpu.md`, and
+one message string in `scripts/probes/distributed_parity.py`:
+
+- **Devices, backend, and startup (`§5.6`, D28, D29):** exact `get_backend()` check (`"gloo"` or `"nccl"`
+  only); device resolution/binding before any collective and outside failure propagation; snapshotting
+  `rank`, `world_size`, and `backend` (`fit()` checks liveness and `world_size`; `export()` uses snapshot);
+  five-step `__init__` sequence `(a)–(e)` adding a fixed-size integer consistency digest over model/config
+  (excluding `device` and `output_dir`)/datasets (`export.py:dataset_fingerprint`, lines `91–122`) and a
+  single trainable dtype check before the rank-0 broadcast.
+- **Failure propagation and rank-0 broadcasts (`§5.6`, D23, D30, D35):** replaced the float64 bitmask with
+  a `0/1` flag plus conditional `int64` length-`N` rank vector (used directly at startup); restricted
+  catching to `Exception` only excluding OOM in forward and backward; introduced `RankFailureError`
+  (`RuntimeError` subclass exported from `timestral_tune.trainer`); protected lazy iterator creation and
+  rank-0 post-validation, moved `on_fit_start` inside `try/finally` (`trainer/trainer.py:1004-1007`), and
+  switched all control broadcasts (including `on_fit_end`) to fixed-size `float64` `[code, value]` tensors
+  propagating rank-0 losses plus `[has_best, best_eval_loss, best_step, restored]` when `val_dataset`
+  exists, making all ten `TrainingResult` fields identical by construction (removing the NCCL history
+  caveat).
+- **Sampling, validation, export, Stage 2, and T15 (`§5.6`, `§7.4`, `§9`, `§10`, D22–D33):** specified
+  contiguous slices, local zero-scored skip before flip/validate/transfer/forward
+  (`trainer/trainer.py:1013-1020`), `(base + r * 1_000_000_007) mod 2^63` rank seeds (checked collision-free
+  against `trainer/trainer.py:344, 781, 967-972`), reused flat gradient buffer, sharded validation under
+  `eval()`/`no_grad()` restoring `training` (`models/adapter.py:112, 194`), shared `export()` validation
+  helper (`export.py:131-134, 267-312`) with conditional top-level `world_size`/`effective_batch_size`
+  keys, Stage 2 decisions (per-rank cycling replay loaders, replay-only pre-forward domain count
+  collective, no multi-process head/teacher caches), and tightened T15 cases `(a)–(i)` plus harness notes
+  (confirming `TuneTimestralModel` has only `transformer.rope.inv_freq` and citing
+  `tests/test_dataset.py:451` for worker skips). Trimmed repeated numbers in `docs/SPEC.md` and cut
+  `docs/phases/phase-5-multi-gpu.md` §2 to a module/function map.
+- **Wording fix:** corrected `scripts/probes/distributed_parity.py:655`, `docs/VERIFICATION.md` §16, and
+  this devlog so `float64` `head_only_cached` `n/a` is attributed to `TimeSeriesDataset` storing
+  `np.float32` inputs rather than claiming the head cache supports `float32` only.
+
+**Evidence.** Re-ran `uv run python scripts/probes/distributed_parity.py` after the message-string edit:
+`total: 326/326 passed, 0 failed`. Lint and `pytest -m "not network"` green.
+
+**Not done / open.** Phase 5 Stages 1–3 implementation and CUDA/NCCL hardware verification (`docs/SPEC.md`
+§10, §12).
