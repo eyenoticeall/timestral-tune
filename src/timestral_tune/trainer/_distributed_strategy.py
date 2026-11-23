@@ -18,6 +18,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..data.batch import TrainingBatch
+from ._types import EvalResult, TrainingResult, _FitBookkeeper, _LossTerms, _StepOutcome
 from .distributed import (
     ControlStatus,
     DistributedBatchSampler,
@@ -32,7 +33,7 @@ from .distributed import (
 )
 
 if TYPE_CHECKING:
-    from .trainer import EvalResult, TimestralTrainer, TrainingResult, _FitBookkeeper, _LossTerms, _StepOutcome
+    from .trainer import TimestralTrainer
 
 # Fixed layout of the 8-element float64 statistics all-reduce buffer (spec §5.6, D23).
 # Slots 2..5 are reserved as 0.0 in Stage 1 and populated by Stage 2 replay and distillation.
@@ -160,8 +161,6 @@ class _DistributedStrategy:
             - +1 conditional `propagate_failure` (`int64` length-`N`) only if any rank failed locally.
             - +1 `GradientReducer.reduce()` (`all_reduce(SUM)`) on active finite steps (`W_D > 0`).
         """
-        from .trainer import _StepOutcome
-
         trainer = self._trainer
         assert self._reducer is not None
         trainer.optimizer.zero_grad(set_to_none=True)
@@ -321,8 +320,6 @@ class _DistributedStrategy:
         Collectives: 1 `all_reduce_sum` (4 float64 scalars `[loss_sum, scored, batches, failed]`),
             plus 1 conditional `propagate_failure` (`int64` length-`N`) only if any rank failed.
         """
-        from .trainer import EvalResult
-
         trainer = self._trainer
         assert trainer.val_dataset is not None
         was_training = trainer.model.training
