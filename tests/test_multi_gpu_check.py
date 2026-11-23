@@ -304,13 +304,18 @@ def test_thin_wrapper_bash_32_syntax_and_help() -> None:
         ["--pg-timeout", "0"],
         ["--pg-timeout", "-1"],
         ["--pg-timeout", "nan"],
+        ["--pg-timeout", "5\n"],
         ["--step-timeout", "inf"],
+        ["--step-timeout", "5\n"],
         ["--stage-timeout", "-inf"],
+        ["--stage-timeout", "5\n"],
         ["--stage-timeout", "1" + "0" * 400],
         ["--ranks"],
         ["--ranks", ","],
         ["--ranks", "1"],
         ["--ranks", "abc"],
+        ["--ranks", "\u00b2"],
+        ["--ranks", "\u0662"],
         ["--sizes"],
         ["--sizes", ","],
         ["--sizes", "*"],
@@ -1734,3 +1739,192 @@ def test_relative_log_dir_keeps_stage_args_signatures_and_errors_relative(
     assert rc_corrupt == 1
     assert "rel_logs/refs/ref_gloo_tiny_n2.zip" in err_corrupt
     assert "secret_user_checkout_dir" not in err_corrupt
+
+
+# --------------------------------------------------------------------------- 12. CLI pipes, wrapper, early signals
+
+
+def test_cli_help_and_error_survive_closed_stdout_and_stderr_pipes() -> None:
+    p_help = subprocess.Popen(
+        [sys.executable, str(SCRIPT_PY), "--help"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert p_help.stdout is not None
+    p_help.stdout.close()
+    _, err_help = p_help.communicate(timeout=15)
+    assert p_help.returncode == 0
+    assert err_help == b"", err_help
+
+    p_err = subprocess.Popen(
+        [sys.executable, str(SCRIPT_PY), "--unknown-flag"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert p_err.stderr is not None
+    p_err.stderr.close()
+    out_err, _ = p_err.communicate(timeout=15)
+    assert p_err.returncode == 2
+    assert out_err == b"", out_err
+
+    # Unicode superscript digit in --ranks must exit 2 cleanly (never raise ValueError).
+    r_uni = subprocess.run(
+        [sys.executable, str(SCRIPT_PY), "--ranks", "\u00b2"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert r_uni.returncode == 2
+    assert "Traceback" not in r_uni.stderr
+
+
+def test_wrapper_uv_fallback_parses_python_flag_and_execs_directly(tmp_path: Path) -> None:
+    bash_bin = "/bin/bash" if os.path.isfile("/bin/bash") else shutil.which("bash")
+    assert bash_bin is not None
+
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "fallback_bin"
+    bin_dir.mkdir()
+    # Stub `python3` to exit 1 so the wrapper must take its `uv` fallback path.
+    fake_py3 = bin_dir / "python3"
+    fake_py3.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_py3.chmod(0o755)
+    for tool in ("dirname", "pwd", "ps"):
+        tp = shutil.which(tool)
+        if tp is not None:
+            os.symlink(tp, bin_dir / tool)
+
+    find_log = tmp_path / "uv_find.log"
+    pid_probe_ready = tmp_path / "py_pid.txt"
+    uv_stub_body = f"""\
+import json, os, pathlib, sys, uuid, zipfile
+
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv[:2] == ["python", "find"]:
+    with open({str(find_log)!r}, "a", encoding="utf-8") as ff:
+        ff.write(" ".join(argv) + "\\n")
+    req = argv[-1]
+    if req == "3.9":
+        sys.exit(1)
+    print({sys.executable!r})
+    sys.exit(0)
+if argv and argv[0] == "sync":
+    sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined:
+    print("stub-rt-fallback")
+    sys.exit(0)
+if "tree_state_method=" in joined:
+    print("tree_state_method=content_hash tree_state_sig=000000000000")
+    sys.exit(0)
+if "--write-reference" in argv:
+    # Record the orchestrator's parent PID (ppid of this stage is the orchestrator PID).
+    pathlib.Path({str(pid_probe_ready)!r}).write_text(str(os.getppid()), encoding="utf-8")
+    ref_path = pathlib.Path(argv[argv.index("--write-reference") + 1])
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_doc = {{"spec": {{"schema_version": 5}}, "environment": {{"archive_id": uuid.uuid4().hex}}}}
+    entries_doc = {{
+        "tiny_random:s": {{
+            "tensor_member": "tensors/0000.bin",
+            "tensor_dtype": "float32",
+            "tensor_shape": [4],
+        }}
+    }}
+    with zipfile.ZipFile(ref_path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("tensors/0000.bin", b"\\x00" * 16)
+        zf.writestr("spec.json", json.dumps(spec_doc).encode())
+        zf.writestr("entries.json", json.dumps(entries_doc).encode())
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, uv_stub_body)
+    env = _clean_tracked_env({"PATH": str(bin_dir)})
+
+    # 1. `--only --python` must NOT mis-parse `--ranks` as the `--python` version.
+    find_log.unlink(missing_ok=True)
+    r_only = subprocess.run(
+        [
+            bash_bin,
+            str(repo / "scripts" / "multi_gpu_check.sh"),
+            "--backend",
+            "gloo",
+            "--only",
+            "--python",
+            "--ranks",
+            "2",
+            "--log-dir",
+            str(tmp_path / "logs_only"),
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert r_only.returncode == 0, r_only.stderr
+    assert find_log.read_text(encoding="utf-8").splitlines() == ["python find --no-project --resolve-links >=3.10"]
+
+    # 2. Repeated `--python` must honour the LAST value, and `exec` must let Python own proc.pid directly.
+    find_log.unlink(missing_ok=True)
+    pid_probe_ready.unlink(missing_ok=True)
+    proc = subprocess.Popen(
+        [
+            bash_bin,
+            str(repo / "scripts" / "multi_gpu_check.sh"),
+            "--backend",
+            "gloo",
+            "--ranks",
+            "2",
+            "--python",
+            "3.9",
+            "--python",
+            "3.12",
+            "--log-dir",
+            str(tmp_path / "logs_rep"),
+        ],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=30)
+    finally:
+        _kill_process_group_quiet(proc)
+    assert proc.returncode == 0, err
+    assert find_log.read_text(encoding="utf-8").splitlines() == ["python find --no-project --resolve-links 3.12"]
+    assert int(pid_probe_ready.read_text(encoding="utf-8").strip()) == proc.pid
+
+
+def test_main_installs_signal_handlers_immediately_after_parse_args(tmp_path: Path) -> None:
+    log_dir = tmp_path / "early_sig_logs"
+    observed_handlers: dict[str, Any] = {}
+    prev_term = signal.getsignal(signal.SIGTERM)
+    prev_hup = signal.getsignal(signal.SIGHUP)
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+        def _chdir_spy(_path: Any) -> None:
+            observed_handlers["term"] = signal.getsignal(signal.SIGTERM)
+            observed_handlers["hup"] = signal.getsignal(signal.SIGHUP)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        with (
+            mock.patch.object(DRIVER, "REPO_ROOT", tmp_path),
+            mock.patch.object(os, "chdir", side_effect=_chdir_spy),
+        ):
+            rc = DRIVER.main(["--backend", "gloo", "--ranks", "2", "--log-dir", str(log_dir)])
+    finally:
+        signal.signal(signal.SIGTERM, prev_term)
+        signal.signal(signal.SIGHUP, prev_hup)
+
+    assert rc == 143
+    assert observed_handlers["term"] not in (signal.SIG_DFL, signal.SIG_IGN)
+    assert observed_handlers["hup"] == signal.SIG_IGN
+    summary = (log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "INTERRUPTED by SIGTERM (exit 143)" in summary
+    assert "01_env" not in summary

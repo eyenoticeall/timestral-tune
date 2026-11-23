@@ -65,7 +65,8 @@ import sys
 import time
 import uuid
 import zipfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -92,8 +93,8 @@ TRACKED_ENV_PREFIXES: tuple[str, ...] = (
 MANAGED_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 _STAGE_TOKEN_ENV_KEY = "_TIMESTRAL_STAGE_TOKEN"
 _DTYPE_NBYTES: dict[str, int] = {"float64": 8, "float32": 4, "bfloat16": 2, "float16": 2}
-_POS_NUMBER_RE = re.compile(r"^[0-9]+([.][0-9]+)?$")
-_HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_POS_NUMBER_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+_HEX_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 USAGE = """\
 Usage: bash scripts/multi_gpu_check.sh [options]
@@ -440,7 +441,7 @@ def split_tokens(raw: str) -> list[str]:
 
 def validate_positive_number(opt: str, val: str) -> float:
     """Validate that `val` is a finite positive decimal number and return its float value."""
-    if not _POS_NUMBER_RE.match(val):
+    if not _POS_NUMBER_RE.fullmatch(val):
         raise CliError(f"error: {opt} must be a finite positive number, got '{val}'")
     parsed = float(val)
     if not math.isfinite(parsed) or parsed <= 0.0:
@@ -541,7 +542,7 @@ def parse_args(argv: Sequence[str]) -> SessionConfig:
         if not rank_tokens:
             raise CliError(f"error: --ranks must contain at least one world size (integer >= 2), got '{ranks_raw}'")
         for tok in rank_tokens:
-            if not tok.isdigit() or int(tok) < 2:
+            if not (tok.isascii() and tok.isdigit()) or int(tok) < 2:
                 raise CliError(f"error: each entry in --ranks must be an integer >= 2, got '{tok}'")
             ranks.append(int(tok))
 
@@ -798,7 +799,7 @@ def compute_tree_state_sig(
         method = "content_hash"
         digest = _content_hash_tree_state(repo_root, log_dir_resolved, is_interrupted=is_interrupted)
 
-    if not _HEX_SHA256_RE.match(digest):
+    if not _HEX_SHA256_RE.fullmatch(digest):
         raise RuntimeError(f"invalid tree-state digest {digest!r} from method {method!r}")
     return method, digest
 
@@ -1175,6 +1176,7 @@ class SessionRunner:
     _stdout_open: bool = field(default=True, init=False)
     _ps_bin: str | None = field(default=None, init=False)
     _last_stage_status_note: str = field(default="", init=False)
+    _handlers_installed: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self.env = _prepare_session_env(self.env, shared_gpu=self.config.shared_gpu)
@@ -1235,6 +1237,20 @@ class SessionRunner:
                 signal.signal(sig_int, handler)
             except (OSError, ValueError):
                 pass
+
+    @contextmanager
+    def _managed_signals(self) -> Iterator[None]:
+        """Install managed signal handlers once across nested entrypoints and restore on exit."""
+        if self._handlers_installed:
+            yield
+            return
+        previous = self._install_signal_handlers()
+        self._handlers_installed = True
+        try:
+            yield
+        finally:
+            self._handlers_installed = False
+            self._restore_signal_handlers(previous)
 
     def _write_stdout_bytes(self, data: bytes) -> None:
         if not self._stdout_open:
@@ -1891,15 +1907,19 @@ class SessionRunner:
 
     def run(self) -> int:
         """Execute the full Stage 3 verification session and return the POSIX exit code."""
-        if self.uv_bin == "uv" and _which_in_env("uv", self.env) is None:
-            self._write_stderr_bytes(b"error: 'uv' not found on PATH; install uv before running this script\n")
-            return 2
+        with self._managed_signals():
+            if self.interrupted_sig_num is not None:
+                return self._finalize_interrupted()
 
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.refs_dir.mkdir(parents=True, exist_ok=True)
+            if self.uv_bin == "uv" and _which_in_env("uv", self.env) is None:
+                self._write_stderr_bytes(b"error: 'uv' not found on PATH; install uv before running this script\n")
+                return 2
 
-        previous_handlers = self._install_signal_handlers()
-        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self.refs_dir.mkdir(parents=True, exist_ok=True)
+            if self.interrupted_sig_num is not None:
+                return self._finalize_interrupted()
+
             try:
                 self.tree_method, self.tree_sig = compute_tree_state_sig(
                     self.repo_root,
@@ -2154,8 +2174,22 @@ class SessionRunner:
 
             self.write_summary()
             return self.any_failed
-        finally:
-            self._restore_signal_handlers(previous_handlers)
+
+
+def _write_stream_safe(stream: Any, text: str) -> None:
+    """Write CLI text to stdout/stderr without crashing or emitting finalizer errors on broken pipes."""
+    try:
+        stream.write(text)
+        stream.flush()
+    except OSError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, stream.fileno())
+            finally:
+                os.close(devnull)
+        except Exception:
+            pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2163,23 +2197,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = parse_args(sys.argv[1:] if argv is None else argv)
     except HelpRequested:
-        print(USAGE)
+        _write_stream_safe(sys.stdout, USAGE + "\n")
         return 0
     except CliError as exc:
-        print(str(exc), file=sys.stderr)
+        _write_stream_safe(sys.stderr, str(exc) + "\n")
         if exc.show_usage:
-            print(USAGE, file=sys.stderr)
+            _write_stream_safe(sys.stderr, USAGE + "\n")
         return 2
     except KeyboardInterrupt:
         return 130
 
-    os.chdir(REPO_ROOT)
     runner = SessionRunner(config=config, repo_root=REPO_ROOT)
-    try:
-        return runner.run()
-    except KeyboardInterrupt:
-        runner.interrupted_sig_num = int(signal.SIGINT)
-        return runner._finalize_interrupted()
+    with runner._managed_signals():
+        if runner.interrupted_sig_num is not None:
+            return runner._finalize_interrupted()
+        os.chdir(REPO_ROOT)
+        try:
+            return runner.run()
+        except KeyboardInterrupt:
+            runner.interrupted_sig_num = int(signal.SIGINT)
+            return runner._finalize_interrupted()
 
 
 if __name__ == "__main__":
