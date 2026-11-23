@@ -959,11 +959,15 @@ if "--write-reference" in argv:
     ws = int(argv[argv.index("--world-size") + 1])
     if ws == 2:
         if moment == "mid_stage":
+            # Verify POSIX SIG_IGN inheritance inside the child stage itself when ignored on entry.
+            if {ignored_on_entry!r}:
+                assert signal.getsignal(signal.{sig.name}) == signal.SIG_IGN
             # Write a partial .tmp file to verify interrupted stages clean up partial artifacts.
             ref_path.parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(f"{{ref_path}}.tmp").write_bytes(b"partial")
             ready.write_text("ready")
             _wait_go()
+            pathlib.Path(f"{{ref_path}}.tmp").unlink(missing_ok=True)
             _write_ref(ref_path)
             sys.exit(0)
         if moment == "timeout_teardown":
@@ -1067,3 +1071,34 @@ def test_signal_default_disposition_interrupts_cleanly(
         assert not (log_dir / "03_ref_gloo_tiny_n2.done").exists()
         assert not (log_dir / "refs" / "ref_gloo_tiny_n2.zip").exists()
         assert not (log_dir / "refs" / "ref_gloo_tiny_n2.zip.tmp").exists()
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP], ids=["INT", "TERM", "HUP"])
+@pytest.mark.parametrize("moment", ["startup", "mid_stage", "timeout_teardown", "between_stages"])
+def test_signal_ignored_on_entry_is_preserved(
+    tmp_path: Path,
+    sig: signal.Signals,
+    moment: str,
+) -> None:
+    rc, log_dir, later_stage, out = _run_signal_scenario(tmp_path, sig=sig, ignored_on_entry=True, moment=moment)
+    summary = (log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "INTERRUPTED" not in summary, summary
+    assert later_stage.exists(), f"subsequent stage did not run under ignored {sig.name}:\n{out}"
+
+    if moment == "timeout_teardown":
+        # Ignored signal must not turn a stage timeout into an interrupt; session continues to N=4 and exits 1.
+        assert rc == 1, f"expected 1 (stage timeout only), got {rc}\n{out}"
+        assert "03_ref_gloo_tiny_n2                  124 " in summary
+        assert "04_gloo_tiny_n2                      SKIPPED (ref failed)" in summary
+        assert "03_ref_gloo_tiny_n4                  0 " in summary
+        assert "04_gloo_tiny_n4                      0 " in summary
+        assert "09_rank_failure_gloo_n2              0 " in summary
+        assert "09_rank_failure_gloo_n4              0 " in summary
+    else:
+        assert rc == 0, f"expected 0 under ignored {sig.name}, got {rc}\n{out}"
+        assert "01_env                               0 " in summary
+        assert "03_ref_gloo_tiny_n2                  0 " in summary
+        assert "04_gloo_tiny_n2                      0 " in summary
+        assert "09_rank_failure_gloo_n2              0 " in summary
+        assert (log_dir / "03_ref_gloo_tiny_n2.done").is_file()
+        assert (log_dir / "refs" / "ref_gloo_tiny_n2.zip").is_file()

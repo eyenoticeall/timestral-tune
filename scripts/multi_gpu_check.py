@@ -20,6 +20,14 @@ Portability and process management:
 - Streams stage output directly to stdout and `<log-dir>/<stage>.log` via a non-blocking pipe
   (no shell `| tee` pipeline that orphaned descendants could hold open) and drains continuously
   through `SIGTERM` grace and `SIGKILL` teardown so shutting-down workers never block on a full pipe.
+- Signal handling: for each of `SIGINT`, `SIGTERM`, and `SIGHUP`, inspects the disposition inherited
+  on entry. Any signal set to `SIG_IGN` on entry (such as `SIGHUP` under `nohup` over SSH) remains
+  ignored for the entire session across start-up, mid-stage, timeout teardown, and stage boundaries;
+  child stages run in their own session (`start_new_session=True`), so terminal/group signals sent to
+  the orchestrator never reach them and they inherit `SIG_IGN` via standard POSIX `exec` semantics.
+  Any signal not ignored on entry interrupts cleanly at every moment: kills the active stage tree,
+  removes incomplete `.done` markers and partial artifacts, writes an interrupted `summary.txt`,
+  skips remaining stages, and exits `128 + signum`.
 - Runs each stage in its own session (`start_new_session=True`) tagged with an inherited per-stage
   environment token (`_TIMESTRAL_STAGE_TOKEN`), and re-collects confirmed-live non-zombie PIDs from
   `/proc` or `ps` immediately before every signal so reaped/reused PIDs are never signalled.
@@ -950,10 +958,19 @@ class SessionRunner:
             self.interrupted_sig_num = signum
 
     def _install_signal_handlers(self) -> dict[int, Any]:
-        """Install signal handlers for managed signals and return previous dispositions to restore."""
+        """Install handlers for managed signals not ignored on entry and return previous dispositions.
+
+        Preserves `SIG_IGN` inherited on entry (for example `SIGHUP` under `nohup` over SSH) for the
+        entire session. Child stages run in their own session (`start_new_session=True`) and inherit
+        `SIG_IGN` under POSIX `exec`, so neither terminal/group signals nor direct inheritance breaks
+        `nohup`.
+        """
         previous: dict[int, Any] = {}
         for sig in MANAGED_SIGNALS:
-            previous[int(sig)] = signal.getsignal(sig)
+            prev = signal.getsignal(sig)
+            if prev == signal.SIG_IGN:
+                continue
+            previous[int(sig)] = prev
             signal.signal(sig, self._on_signal)
         return previous
 
