@@ -70,6 +70,7 @@ scripts/
   benchmarks/            Benchmark, sweep and significance runs behind docs/BENCHMARKS.md
   make_banner.py, make_results_chart.py   Draw the README images in assets/
   cuda_check.sh          Runs the device tests and the whole suite on a CUDA machine
+  multi_gpu_check.sh     Staged Stage 3 multi-process/multi-GPU verification session runner
 ```
 
 No stub modules remain. Every module's docstring names the spec section it implements; start there when
@@ -127,10 +128,15 @@ a batch with upstream's own input assembly as ground truth).
   `run_scenarios` to amortise process startup across balanced scenarios, and a hard wall-clock deadline that
   terminates/kills stuck workers (`DistributedTimeoutError`) so collective hangs fail fast. Run them with:
   `TMPDIR=/tmp uv run pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py`
-  (`TMPDIR=/tmp` avoids macOS socket path-length failures with multi-process `DataLoader`s), or on the floor
-  with
+  or on the floor with
   `TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py`
   (the four `num_workers > 0` tests skip on macOS below PyTorch 2.8; see `docs/VERIFICATION.md` §10, §17).
+  **Why `TMPDIR=/tmp` on macOS:** PyTorch `DataLoader` workers share tensors through `torch_shm_manager`,
+  which binds an `AF_UNIX` socket under `TMPDIR`. If the socket path exceeds macOS's 103-byte `sun_path`
+  limit (a `TMPDIR` of roughly 70 bytes is enough, common in sandboxed or deeply nested environments), the
+  worker's feeder thread raises, drops the batch, and stays alive, leaving the main process waiting forever at
+  0% CPU with no error. This affects one-process `TimestralTrainer.fit()` with `num_workers > 0` the same way
+  as multi-process `fit()` (there is no library guard yet; spec §12). Setting `TMPDIR=/tmp` avoids it.
 - **Float32 multi-process parity tolerances & headroom knob.** All five parity tiers (`EVAL_TOL`, `STEP_TOL`,
   `STEP_PARAM_TOL`, `TRAJ_TOL`, `TRAJ_UPDATE_TOL`) live in `tests/distributed_harness.py`. The `float64`
   tiers check the distributed logic and are never scaled; `TIMESTRAL_TEST_F32_TOL_SCALE` (default `1.0`,
@@ -163,6 +169,49 @@ Probes are small scripts that measure facts the specification relies on. Run the
 
 Add a probe when the spec needs a new measured fact. Keep each probe single-purpose, print labelled
 lines, pin revisions through `_common.load`, and record the result in `docs/VERIFICATION.md`.
+
+### Multi-process / Stage 3 verification scripts
+
+Three tracked scripts support Stage 3 hardware measurement (they are measuring instruments, separate from T15,
+which runs on CPU/`gloo` through `tests/distributed_harness.py`):
+
+- **`scripts/probes/distributed_trainer_check.py`** — runs the real `TimestralTrainer` across ranks under
+  `torchrun` (`--backend gloo|nccl`, `--device-map per-rank|shared`), compares against a one-process reference
+  archive written beforehand on the same device (`--write-reference PATH`, then `torchrun ... --reference PATH`),
+  and prints ungraded numbers across 41 scenarios in groups `g1`–`g8` (`--list` prints all scenarios;
+  `--only` / `--skip` filters by scenario name; `--sizes 5M 28M` adds released checkpoints). Reference archives
+  default to `--reference-mode sketch` (SHA-256 hashes, exact norms, exact deltas for parameter sets up to
+  8,192 elements, and a CountSketch of dimension 8,192 for larger sets), with `--reference-mode exact`
+  available for full tensor snapshots.
+- **`scripts/probes/distributed_rank_failure_check.py`** — spawns `N` ranks (`--backend gloo|nccl`,
+  `--world-size N`, `--device-map per-rank|shared`, `--pg-timeout S`, `--wall-timeout S`), kills `--kill-rank`
+  (default `1`) mid-`fit()` via `os._exit(1)` at `--kill-step` (default `2`), and reports each rank's exit
+  status, exception type (if any), and elapsed seconds.
+- **`scripts/multi_gpu_check.sh`** — staged session runner that automates environment logging, optional
+  4-GPU `distributed_parity.py --device cuda`, reference generation, `torchrun` driver runs, and
+  rank-failure checks in numbered stages (`01_env` through `09_rank_failure_*`). Automatically exports
+  `TMPDIR=/tmp` whenever `TMPDIR` is unset or longer than 60 characters.
+
+```bash
+# CPU/gloo dry run (macOS or Linux; tiny model only)
+bash scripts/multi_gpu_check.sh --backend gloo --ranks 2 4 --pg-timeout 10
+
+# Single-GPU shared NCCL (testing convenience; sets NCCL_MULTI_RANK_GPU_ENABLE=1 and --device-map shared)
+bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12
+
+# Multi-GPU host (2 or 4 separate GPUs; --device-map per-rank, real LOCAL_RANK binding)
+bash scripts/multi_gpu_check.sh --python 3.12            # pass --ranks 2 on a 2-GPU host
+```
+
+**Logs, resume markers, and timeout caveats (`82a21ca`):** logs, `.done` markers, `summary.txt`, and
+reference archives (`refs/`) are written under `--log-dir`, which defaults to `multi_gpu_check_logs`
+(untracked; do not commit, or pass `--log-dir /tmp/<name>` and delete afterwards). Today at `82a21ca`, each
+passing stage writes `<stage>.done` and re-running with the same `--log-dir` skips stages whose `.done` file
+exists (`--force` re-runs them), **without checking whether CLI flags changed** or guarding against a stale
+reference archive after a failed `--write-reference` re-run; use a fresh `--log-dir` when changing flags.
+Likewise, the script's `--stage-timeout` wrapper does not reliably kill `torchrun`'s rank processes on a real
+hang because `torchrun` puts workers in separate sessions. Fixes for both are pending
+(`docs/VERIFICATION.md` §17.4). Full options: `bash scripts/multi_gpu_check.sh --help`.
 
 ## Style
 

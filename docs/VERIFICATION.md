@@ -15,12 +15,15 @@ When you add a `[V]` claim to the spec, add its probe or test and a row here in 
 | Python | 3.13 for the probes; 3.10, 3.12 and 3.13 for the test suite |
 | Checkpoints | Timestral-5M and Timestral-28M at the Hub revisions pinned in `docs/UPSTREAM.md` |
 
-CUDA results (§13) come from Linux x86_64 cloud VMs with one NVIDIA L4 (23 GB), Ubuntu 22.04, PyTorch
-2.15.0+cu132: Phase 1–4 runs used 4 CPU threads and Python 3.12.16 (`89ac249`), and the 2026-11-23 Phase 5
-run (§11, §13, §16, §17) used driver `580.178.04`, CUDA runtime `13.2`, NCCL `2.30.7`, and `uv`-selected
-Python `3.15.2` (outside the CI matrix of Python `3.10–3.13`). Linux CPU results in §11, §16, and §17 come
-from 8-vCPU Linux x86_64 cloud VMs (Ubuntu 22.04, including an AMD EPYC 7B12 VM for post-fix runs) with
-`uv`-managed Python `3.12.16` (`torch 2.15.0+cu132`) and `3.10.22` (`torch 2.14.1+cu130`).
+CUDA results (§13, §17.4) come from Linux x86_64 cloud VMs with one NVIDIA L4 (23 GB), PyTorch
+2.15.0+cu132: Phase 1–4 runs used Ubuntu 22.04, 4 CPU threads, and Python 3.12.16 (`89ac249`); the first
+2026-11-23 Phase 5 run (`71514a6`, §11, §13, §17.2) used driver `580.178.04`, CUDA runtime `13.2`, NCCL
+`2.30.7`, and `uv`-selected Python `3.15.2` (outside the CI matrix of Python `3.10–3.13`); and the
+2026-11-23 tracked Stage 3 session (`82a21ca`, §13, §17.4) used an 8-vCPU Linux x86_64 cloud VM with one
+NVIDIA L4 (`23034 MiB`, driver `595.112.07`), CUDA runtime `13.2`, NCCL `2.30.7`, and Python `3.12.16`.
+Linux CPU results in §11, §16, and §17 come from 8-vCPU Linux x86_64 cloud VMs (Ubuntu 22.04, including an
+AMD EPYC 7B12 VM for post-fix runs) with `uv`-managed Python `3.12.16` (`torch 2.15.0+cu132`) and
+`3.10.22` (`torch 2.14.1+cu130`).
 
 The 123M and 209M checkpoints were measured later and separately: on CUDA in §13 and §14, and on the
 Apple GPU in §15. Sections that do not name them used 5M and 28M only.
@@ -381,8 +384,8 @@ Re-measure before relying on them.
 | One-process bit-identity vs pre-implementation commit `57a781c` (2026-11-23; out-of-repo 12-scenario script covering all 4 modes, replay/distillation, cached/streamed `head_only`, sign flips, early stopping, and restore, run twice at `57a781c` for self-reproduction and once at branch tip) | Linux x86_64 CPU (8-vCPU VM at `3347f70`, and L4 VM CPU at `71514a6`): `57a781c` self-reproduction `BITWISE MATCH`, tip vs `57a781c` `BITWISE MATCH`. NVIDIA L4 CUDA (`71514a6`, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`): `57a781c` self-reproduction `BITWISE MATCH`, tip vs `57a781c` `BITWISE MATCH` |
 | One-process float32 intra-op thread sensitivity on T15(j) scenarios and pre-fix thread-count reproduction (2026-11-23, commit `3347f70`, 8-vCPU Linux x86_64 VM, out-of-repo script running one-process `fit()` only at 1, 2, and 4 threads with no multi-process code; plus acceptance file alone at default 4 threads vs `OMP_NUM_THREADS=1`) | One-process `param_update` rel L2 across threads `1/2/4` was identical on `torch 2.14.1+cu130` (Python `3.10.12`) and `torch 2.15.0+cu132` (Python `3.12.16`): worst `N=2 lora_variate distill_only` `1.14e-04` (`1v2`), `4.23e-05` (`1v4`), `7.65e-05` (`2v4`); next worst `N=4 lora_variate both` `4.71e-05` (`1v4`) and `N=4 lora_variate replay_only` `4.33e-05` (`2v4`); `head_only distill_only` `4.48e-08`–`2.73e-06`; `full_ft replay_only` `2.92e-06`–`6.93e-06`. Running `tests/acceptance/test_distributed.py` alone (subset of 6 tests) passed `6/6` at default 4 threads and failed the exact 2 float32 `param_update` checks at `OMP_NUM_THREADS=1` (`lora_variate_distill_only_wrap_float32` `1.07e-04` and `default_synth` `1.71e-04` vs `1e-4`), identically on both PyTorch versions |
 | Pre-fix 10×-tightened float32 margin scans (2026-11-23, commit `3347f70`, out-of-repo edit dividing every float32 tier by 10; lower bounds on what was thin because each test stops at its first failing assert) | macOS arm64: `9 failed, 24 passed, 4 deselected` (`param_update` up to `4.82e-05` in `T15(l)[4]`, `3.32e-05` in `T15(j)[4]`, `2.97e-05` in `T15(a)[4]`; `T15(b)[4]` step-0 `param` `1.67e-05`). Linux x86_64 (8-vCPU VM, threads `1/2/4`): `12 failed / 21 passed` (`t=1`), `9 failed / 24 passed` (`t=2`), `12 failed / 21 passed` (`t=4`), `4 deselected` — `param_update` up to `1.94e-04` (`t=2`, `T15(l)[4]` `default_synth` before switching to `lora_temporal`), `1.71e-04` (`t=1`), `7.78e-05` (`t=4`, `T15(a)[4]`); single-step `param` up to `3.38e-06` (`t=2`, replay whitebox `lora_variate:b_replay_zero_one_rank`) and `1.07e-05` (`t=1`, `T15(b)[4]` step 1 at old `lr=1e-2`); single-step `grad` `1.03e-06` (`t=4`, `T15(b)[4]` step 1 at old `lr=1e-2`) |
-| Single-rank NCCL collective-dtype and primitive smoke (2026-11-23, commit `71514a6`, one NVIDIA L4, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`, out-of-repo script) | `19/19 passed`: `all_reduce_sum` (`float64` n=8, `int64` n=4, `float32` n=1,048,576, `bfloat16` n=1,024), `broadcast` (`float32`, `float64`, `bfloat16`, `float16`, `int64`, `int32`, `bool`), `propagate_failure` (no error), `check_consistency`, `broadcast_status`, `broadcast_module_state` (`tiny` 47 f32, `5M` 75 f32, `5M` 75 bf16), and `GradientReducer` (`tiny` 47 tensors / `490,624` elements, reduce `1.50 ms`; `5M` 75 tensors / `5,208,960` elements, reduce `2.15 ms`) |
-| Multi-rank NCCL trainer trial on one shared GPU (2026-11-23, commit `71514a6`, one NVIDIA L4, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`, NCCL `2.30.7`, out-of-repo script run with `NCCL_MULTI_RANK_GPU_ENABLE=1` because NCCL refuses multiple ranks on one GPU by default; 23 6-step scenarios each at `N = 2` and `N = 4` vs one-process CUDA on the same GPU) | `N = 2` exit `[0, 0]`, `hung=[]`, wall `19 s`; `N = 4` exit `[0, 0, 0, 0]`, `hung=[]`, wall `35 s`; **`xrank_equal=True`** (bitwise cross-rank equality) across all 46 runs. **`float64`** (10 scenarios × 2: all 4 modes `none`, plus `head_only`/`lora_variate`/`full_ft` `replay_only` and `both`): `final_rel` `7.28e-17`–`1.43e-15`, `update_rel` `6.10e-16`–`2.99e-14`, `loss_rel` `1.33e-16`–`6.51e-16`. **`float32`** (`bf16=False`, same 10 scenarios × 2): `final_rel` `6.81e-08`–`9.86e-06`, `update_rel` `4.56e-07`–`1.80e-04` (peaks on `lora_variate`: `1.37e-04` at `N=2 none`, `1.80e-04` at `N=4 both`), `loss_rel` `7.76e-08`–`1.88e-05`. **`bf16`** (3 scenarios × 2: `lora_temporal none`, `full_ft none`, `full_ft both`; no parity tier set): `N = 2` `final_rel` `1.70e-04`–`8.14e-04`, `update_rel` `1.05e-02`–`1.89e-02`, `loss_rel` `1.96e-03`–`2.28e-03`; `N = 4` `final_rel` `1.77e-04`–`1.17e-03`, `update_rel` `1.03e-02`–`2.50e-02`, `loss_rel` `6.59e-04`–`2.85e-03` |
+| Single-rank NCCL collective-dtype and primitive smoke (2026-11-23, commit `71514a6`, one NVIDIA L4, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`, out-of-repo script; kept as history — multi-rank NCCL collectives on `TimestralTrainer` are now exercised by the tracked Stage 3 driver in §17.4) | `19/19 passed`: `all_reduce_sum` (`float64` n=8, `int64` n=4, `float32` n=1,048,576, `bfloat16` n=1,024), `broadcast` (`float32`, `float64`, `bfloat16`, `float16`, `int64`, `int32`, `bool`), `propagate_failure` (no error), `check_consistency`, `broadcast_status`, `broadcast_module_state` (`tiny` 47 f32, `5M` 75 f32, `5M` 75 bf16), and `GradientReducer` (`tiny` 47 tensors / `490,624` elements, reduce `1.50 ms`; `5M` 75 tensors / `5,208,960` elements, reduce `2.15 ms`) |
+| Multi-rank NCCL trainer trial on one shared GPU (2026-11-23, commit `71514a6`, one NVIDIA L4, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`, NCCL `2.30.7`, out-of-repo script run with `NCCL_MULTI_RANK_GPU_ENABLE=1` because NCCL refuses multiple ranks on one GPU by default; 23 6-step scenarios each at `N = 2` and `N = 4` vs one-process CUDA on the same GPU; **kept as history — reproduced and superseded by the tracked Stage 3 driver session in §17.4**) | `N = 2` exit `[0, 0]`, `hung=[]`, wall `19 s`; `N = 4` exit `[0, 0, 0, 0]`, `hung=[]`, wall `35 s`; **`xrank_equal=True`** (bitwise cross-rank equality) across all 46 runs. **`float64`** (10 scenarios × 2: all 4 modes `none`, plus `head_only`/`lora_variate`/`full_ft` `replay_only` and `both`): `final_rel` `7.28e-17`–`1.43e-15`, `update_rel` `6.10e-16`–`2.99e-14`, `loss_rel` `1.33e-16`–`6.51e-16`. **`float32`** (`bf16=False`, same 10 scenarios × 2): `final_rel` `6.81e-08`–`9.86e-06`, `update_rel` `4.56e-07`–`1.80e-04` (peaks on `lora_variate`: `1.37e-04` at `N=2 none`, `1.80e-04` at `N=4 both`), `loss_rel` `7.76e-08`–`1.88e-05`. **`bf16`** (3 scenarios × 2: `lora_temporal none`, `full_ft none`, `full_ft both`; no parity tier set): `N = 2` `final_rel` `1.70e-04`–`8.14e-04`, `update_rel` `1.05e-02`–`1.89e-02`, `loss_rel` `1.96e-03`–`2.28e-03`; `N = 4` `final_rel` `1.77e-04`–`1.17e-03`, `update_rel` `1.03e-02`–`2.50e-02`, `loss_rel` `6.59e-04`–`2.85e-03` |
 
 ## 12. Facts read from sources, not measured
 
@@ -408,22 +411,24 @@ float64-RMSNorm reference of §6.
 | `step_timing.py --device cuda --mode lora_variate --bf16 --compile reduce-overhead` (`b0980cb`) | 5M cov5 18 ms; 28M cov5 43 ms |
 | Real Hub export of `mistralai/Timestral-5M` (`lora_variate`, `bf16`, run at `3fe5bc9`) | Copies verbatim 1,687-byte `Modified MIT License` from Hub; reloads via upstream `load_model(..., strict=True)` on CUDA (`5,208,960` params) |
 
-Phase 5 branch re-run of `bash scripts/cuda_check.sh` on `2026-11-23` at commit `71514a6` (`40a580a` differs
-in comments only) on one NVIDIA L4 (`23034 MiB`, driver `580.178.04`, Linux x86_64, `torch 2.15.0+cu132`,
-CUDA runtime `13.2`, `nvidia-nccl-cu13==2.30.7`, `triton==3.9.0`; `uv sync --locked` selected `CPython 3.15.2`,
-which is outside the CI matrix of Python `3.10–3.13`):
+Phase 5 branch re-runs of `bash scripts/cuda_check.sh` on `2026-11-23` on one NVIDIA L4 (`23034 MiB`,
+Linux x86_64, `torch 2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`): first at `71514a6` (`40a580a`
+differs in comments only; driver `580.178.04`, `uv`-selected `CPython 3.15.2`, outside the CI matrix of
+Python `3.10–3.13`), and then at `82a21ca` on an 8-vCPU cloud VM (driver `595.112.07`, `Python 3.12.16`,
+closing the Python `3.12` gap on this branch):
 
-| Check (`71514a6`, one NVIDIA L4, Python `3.15.2`) | Result |
-|---|---|
-| T14 and all other device-parametrised tests | `266 passed, 3 skipped` (`188.12 s`; 3 Apple GPU tests skipped) |
-| Whole suite (`uv run pytest -q`, including T1–T14, network tests, and all 142 CPU/`gloo` multi-process items) | `735 passed, 4 skipped` (`603.65 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) |
-| `head_only` gradients on CUDA against the reference | At most `1.68e-6` (bound `1e-5`) |
-| `device_parity.py --device cuda` (`5M` / `28M`) | `5M` fwd `1.19e-7`–`1.49e-5` (`bf16` `1.49e-2`, `fp16` `1.96e-3`), grad `1.15e-2`; `28M` fwd `1.04e-7`–`2.20e-6` (`bf16` `5.74e-2`, `fp16` `5.92e-3`), grad `2.24e-3` |
-| `gradient_accuracy.py --device cuda` (`default` / `math` / `explicit`) | Tiny `1.6e-7`–`3.1e-7`; `5M` `1.7e-3`–`1.2e-2` / `3.6e-6`–`5.4e-5` / `6.0e-6`–`2.5e-5`; `28M` `1.4e-3`–`2.8e-3` / `4.8e-6`–`7.8e-5` / `3.5e-6`–`7.0e-5` |
-| `step_timing.py --device cuda` (`full_ft`, `fp32`, eager, batch 32, ctx 1,024, `cpu threads 8`) | `5M` uni `52 ms` / `0.27 GiB` (`3.7×` vs CPU `190 ms`), cov5 `55 ms` / `1.10 GiB` (`14.3×` vs `786 ms`); `28M` uni `68 ms` / `0.98 GiB` (`9.7×` vs `654 ms`), cov5 `209 ms` / `3.39 GiB` (`14.7×` vs `3,081 ms`) |
+| Check (one NVIDIA L4, `torch 2.15.0+cu132`) | `71514a6` (driver `580.178.04`, Python `3.15.2`) | `82a21ca` (driver `595.112.07`, Python `3.12.16`) |
+|---|---|---|
+| T14 and all other device-parametrised tests | `266 passed, 3 skipped` (`188.12 s`; 3 Apple GPU tests skipped) | `266 passed, 3 skipped` (`128.61 s`; 3 Apple GPU tests skipped) |
+| Whole suite (`uv run pytest -q`, incl. T1–T14, network tests, and all 142 CPU/`gloo` multi-process items) | `735 passed, 4 skipped` (`603.65 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) | `735 passed, 4 skipped` (`433.05 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) |
+| `head_only` gradients on CUDA against the reference | At most `1.68e-6` (bound `1e-5`) | At most `1.68e-06` (bound `1e-5`) |
+| `device_parity.py --device cuda` (`5M` / `28M`) | `5M` fwd `1.19e-7`–`1.49e-5` (`bf16` `1.49e-2`, `fp16` `1.96e-3`), grad `1.15e-2`; `28M` fwd `1.04e-7`–`2.20e-6` (`bf16` `5.74e-2`, `fp16` `5.92e-3`), grad `2.24e-3` | `5M` fwd `1.08e-07`–`3.19e-05` (`bf16` `1.49e-02`, `fp16` `1.96e-03`), grad `1.15e-02`; `28M` fwd `1.13e-07`–`2.53e-06` (`bf16` `5.74e-02`, `fp16` `5.92e-03`), grad `2.24e-03` |
+| `gradient_accuracy.py --device cuda` (`default` / `math` / `explicit`) | Tiny `1.6e-7`–`3.1e-7`; `5M` `1.7e-3`–`1.2e-2` / `3.6e-6`–`5.4e-5` / `6.0e-6`–`2.5e-5`; `28M` `1.4e-3`–`2.8e-3` / `4.8e-6`–`7.8e-5` / `3.5e-6`–`7.0e-5` | Tiny `1.6e-7`–`3.1e-7`; `5M` `1.7e-3`–`1.2e-2` / `3.6e-6`–`5.4e-5` / `6.0e-6`–`2.5e-5`; `28M` `1.4e-3`–`2.8e-3` / `4.8e-6`–`7.8e-5` / `3.5e-6`–`7.0e-5` |
+| `step_timing.py --device cuda` (`full_ft`, `fp32`, eager, batch 32, ctx 1,024, `cpu threads 8`) | `5M` uni `52 ms` / `0.27 GiB` (`3.7×` vs CPU `190 ms`), cov5 `55 ms` / `1.10 GiB` (`14.3×` vs `786 ms`); `28M` uni `68 ms` / `0.98 GiB` (`9.7×` vs `654 ms`), cov5 `209 ms` / `3.39 GiB` (`14.7×` vs `3,081 ms`) | `5M` uni `34 ms` / `0.27 GiB` (`5.1×` vs CPU `171 ms`), cov5 `51 ms` / `1.10 GiB` (`16.2×` vs `834 ms`); `28M` uni `49 ms` / `0.98 GiB` (`13.8×` vs `678 ms`), cov5 `194 ms` / `3.39 GiB` (`19.2×` vs `3,715 ms`) |
 
-One-off CUDA checks on the same L4 VM (one-process bit-identity vs `57a781c`, single-rank NCCL collective-dtype
-smoke, and 2-/4-rank shared-GPU NCCL trainer trial with `NCCL_MULTI_RANK_GPU_ENABLE=1`) are recorded in §11.
+The earlier `71514a6` one-off CUDA checks (one-process bit-identity vs `57a781c`, single-rank NCCL
+collective-dtype smoke, and 2-/4-rank shared-GPU trainer trial) are kept as history in §11; the tracked
+`82a21ca` Stage 3 driver and rank-failure session on the Python `3.12.16` L4 VM is recorded in §17.4.
 
 The first attempt at this run (at `163ae4a`, one commit earlier) failed
 `test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_overhead` because
@@ -795,16 +800,137 @@ count while macOS arm64 trajectories do not; on this synthetic workload the prob
 the larger `1.14e-04` one-process thread-count difference that motivated `TRAJ_UPDATE_TOL["float32"] = 1e-3`
 occurred on a T15(j) `lora_variate` distillation scenario (one-off measurement in §11).
 
+### 17.4 Stage 3 measuring driver & rank-failure sessions (`scripts/multi_gpu_check.sh`, commit `82a21ca`)
+
+Backs the `[V]` claims in spec §5.6, §7.6, §9, D28, D35, and §12 for the tracked Stage 3 scripts
+(`scripts/probes/distributed_trainer_check.py`, `scripts/probes/distributed_rank_failure_check.py`, and
+`scripts/multi_gpu_check.sh`). **All numbers in this subsection were produced by commit `82a21ca` of those
+scripts on `2026-11-23`.** An independent code review of the `82a21ca` scripts identified tooling defects
+summarised under *Known limitations of the tooling at `82a21ca`* below; the GPU session will be repeated
+after those review fixes land, and no Stage 3 roadmap box is ticked on the strength of this session.
+
+`scripts/probes/distributed_trainer_check.py` is an ungraded measuring driver (41 scenarios across groups
+`g1`–`g8`, 6 steps per scenario except 4 for `export_multirank_f32`; `B = 2`, `b = 2`, `seed = 0`), separate
+from acceptance test T15 (`tests/acceptance/test_distributed.py`, CPU/`gloo` only). Reproduces and supersedes
+the earlier `71514a6` one-off shared-GPU NCCL trial in §11.
+
+**Environments and commands (`82a21ca`, `2026-11-23`):**
+
+- **Single-L4 shared-GPU NCCL + Linux CPU/`gloo` session:** one NVIDIA L4 (`23034 MiB`, driver `595.112.07`)
+  on a Linux x86_64 cloud VM (8 vCPU), Python `3.12.16`, `torch 2.15.0+cu132`, CUDA runtime `13.2`, NCCL
+  `2.30.7`, `python_h=True`, `c_compiler=True`.
+  ```bash
+  bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12
+  ```
+  Sets `NCCL_MULTI_RANK_GPU_ENABLE=1` and `--device-map shared` (all ranks share `cuda:0`). `summary.txt`
+  recorded 16 stages: **15 exited `0`**, 1 skipped (`02_prototype_parity_cuda`: `SKIPPED (needs 4 GPUs)`),
+  zero hangs. Reference archives (`--reference-mode sketch`, `k = 8,192`): `tiny_random` `2.18 MiB` (40 CUDA
+  entries) / `1.86 MiB` (34 CPU entries); `5M`+`28M` combined `5.14 MiB` (80 CUDA entries).
+- **Reference-mode check (`exact` vs `sketch`, same L4 VM and commit `82a21ca`):** five scenarios
+  (`domain_full_ft_f64`, `domain_lora_temporal_f32`, `replay_full_ft_distill_only_f64`,
+  `bf16_lora_temporal`, `bf16_full_ft_replay`) on `tiny_random` and `5M` at `N = 2`
+  (`--backend nccl --device-map shared`, `NCCL_MULTI_RANK_GPU_ENABLE=1`), writing and running both
+  `--reference-mode exact` and `--reference-mode sketch`.
+- **macOS arm64 CPU/`gloo` session (reproduced locally on Apple M4, commit `82a21ca`):** Darwin arm64,
+  Python `3.12.13`, `torch 2.15.0`, `python_h=True`, `c_compiler=True`, `threads=1`.
+  ```bash
+  bash scripts/multi_gpu_check.sh --backend gloo --ranks 2 4 --pg-timeout 10 --log-dir /tmp/tt_docs_mgc
+  ```
+  8 stages listed (`350.0 s` wall): **7 exited `0`**, 1 skipped (`02_prototype_parity_cuda`: `SKIPPED (needs
+  4 GPUs)`), zero hangs (temporary log directory deleted afterwards).
+
+**What the `82a21ca` parity numbers measure (and how to read the table):** across all executed rows,
+`xr_eq`/`xr_max` compare every **parameter** (`model.named_parameters()`, omitting buffers), and
+`param_l2`/`upd_l2` compare **trainable parameters** (`trainer._trainable`) against the one-process reference
+on the same device. In `--reference-mode sketch` (`k = 8,192`), `float32`, `bf16`, and `float64` differences
+of `>= 1e-14` agree with `--reference-mode exact` to within ~1–2% (see the comparison table below), whereas
+`float64` values below `~1e-14` on large parameter sets (`head_only`/`full_ft` on `5M` and `28M`) sit at the
+sketch's own float64 bucket-accumulation noise floor (1.3×–7× inflation measured for true diffs of
+`1e-16`–`3e-15`; values `>= 1e-13` are unaffected) and are marked `(<= ~1e-14 floor)` below rather than
+treated as precise sub-`1e-14` measurements. On CUDA, the two `moved_student` `float32` rows
+(`replay_full_ft_distill_only_moved_f32`, `replay_full_ft_both_moved_f32`) are provisional because rank 0 and
+the reference loaded a CPU-computed `rope.inv_freq` buffer while peer ranks kept the CUDA-computed one
+(neither row was the worst `float32` row on `tiny`, `5M`, or `28M`).
+
+#### Driver parity summary (`distributed_trainer_check.py`, commit `82a21ca`, `--reference-mode sketch`)
+
+Every executed row across all runs below reported **`xr_eq = yes` and `xr_max = 0.00e+00`** over all model
+parameters (`246/246` NCCL rows on L4: `tiny_random`, `5M`, `28M` × `N = 2, 4`; `70/70` Linux CPU/`gloo` rows
+on L4; `70/70` macOS arm64 CPU/`gloo` rows). `val_restore_early_stop_*` returned
+`early=True restored=True best_step=2`, `export_multirank_f32` returned `export=ok(N/N)`, and
+`stochastic_lora_variate_f32` matched bitwise across ranks in every run.
+
+| Platform, backend, model, `N` | Executed / skipped | `float64` (14 rows): `param_l2` range (med); `upd_l2` min / med / max (worst scenario); `loss_rel` max; `val_rel` | `float32` (20 rows; CPU splits 18 non-id + 2 id-start): `param_l2` range (med); `upd_l2` min / med / max (worst scenario); `loss_rel` max; `val_rel` | `bf16` (6 rows, CUDA only; **no tier set**): `param_l2` range; `upd_l2` min / max (worst); `loss_rel` max |
+|---|---|---|---|---|
+| **L4 shared NCCL**, `tiny_random`, `N = 2` (`82a21ca`) | `41 / 0` | `param_l2` `<= 1.86e-15` (all `< 1e-14` floor); `upd_l2` `1.94e-15` / `4.70e-15` (floor) / **`4.62e-14`** (`replay_full_ft_distill_only_f64`, ~`2,160×` below T15 `1e-10`); `loss_rel` `<= 1.38e-15`; `val_rel` `2.23e-16` | `param_l2` `5.22e-08`–`3.43e-06` (med `1.83e-07`); `upd_l2` `1.88e-06` / `3.45e-06` / **`6.96e-05`** (`compile_default_lora_replay`; non-compile max `5.62e-06`; id-start `3.48e-06`/`5.56e-06`); `loss_rel` `<= 4.50e-06`; `val_rel` `3.94e-08`–`4.22e-08` | `param_l2` `3.96e-04`–`2.95e-03`; `upd_l2` `9.26e-03` (`bf16_head_only`) / **`5.75e-02`** (`bf16_lora_temporal`); `loss_rel` `<= 4.77e-03` (`bf16_lora_variate_replay`) |
+| **L4 shared NCCL**, `tiny_random`, `N = 4` (`82a21ca`) | `41 / 0` | `param_l2` `<= ~1e-14` floor except 2 rows up to `1.80e-13`; `upd_l2` `1.54e-15` / `4.50e-15` (floor) / **`7.81e-12`** (`replay_full_ft_distill_only_f64`, `12.8×` below T15 `1e-10`; 2nd `1.75e-12` `replay_full_ft_both_f64`; all other 12 `<= 9.78e-15`); `loss_rel` `<= 3.53e-14`; `val_rel` `0.00e+00` | `param_l2` `6.30e-08`–`4.81e-06` (med `5.19e-07`); `upd_l2` `9.78e-07` / `3.82e-06` / **`1.00e-04`** (`compile_default_lora_replay`; non-compile max `3.03e-05` `replay_lora_variate_distill_only_f32` and provisional `replay_full_ft_both_moved_f32`; id-start `3.34e-06`/`4.40e-06`); `loss_rel` `<= 9.49e-06`; `val_rel` `4.23e-08`–`4.67e-08` | `param_l2` `3.69e-04`–`2.39e-03`; `upd_l2` `4.18e-03` (`bf16_head_only`) / **`4.75e-02`** (`bf16_lora_temporal`); `loss_rel` `<= 2.14e-03` (`bf16_lora_variate_replay`) |
+| **L4 shared NCCL**, `5M`, `N = 2` (`82a21ca`, **no tier set**) | `41 / 0` | `param_l2` 13/14 `< 1e-14` floor, max `3.00e-14`; `upd_l2` `1.02e-14` / `5.00e-14` / **`5.94e-12`** (`domain_lora_temporal_f64`; `replay_full_ft_both_f64` `4.84e-12`, `replay_full_ft_distill_only_f64` `3.46e-12`); `loss_rel` `<= 3.57e-13`; `val_rel` `2.19e-16` | `param_l2` `2.38e-08`–**`5.58e-04`** (`domain_lora_temporal_f32`; `5.61e-04` exact; med `8.29e-06`); `upd_l2` `4.42e-06` / `4.13e-03` / **`1.04e-01`** (`domain_lora_temporal_f32`; 2nd `3.27e-02` `domain_full_ft_f32`; `head_only <= 1.78e-04`); `loss_rel` `<= 7.28e-04` (`domain_full_ft_f32`); `val_rel` `1.71e-08`–`1.56e-07` | `param_l2` `7.63e-05`–`1.09e-03`; `upd_l2` `1.02e-01` (`bf16_head_only`) / **`3.48e-01`** (`bf16_full_ft_replay`; `3.51e-01` exact); `loss_rel` `<=` **`1.27e-01`** (`bf16_full_ft_replay`) |
+| **L4 shared NCCL**, `5M`, `N = 4` (`82a21ca`, **no tier set**) | `41 / 0` | `param_l2` 11/14 `< 1e-14` floor, max `3.00e-14`; `upd_l2` `1.33e-14` / `1.44e-13` / **`8.73e-11`** (`replay_full_ft_both_f64`; 2nd `8.05e-11` `replay_full_ft_distill_only_f64`; next `4.33e-12` `domain_lora_temporal_f64`; all other 11 `<= 3.19e-13`); `loss_rel` `<= 2.31e-12`; `val_rel` `0.00e+00` | `param_l2` `6.72e-08`–**`2.34e-04`** (`domain_lora_temporal_f32`; med `6.29e-06`); `upd_l2` `1.28e-05` / `1.48e-03` / **`4.03e-02`** (`domain_lora_temporal_f32`; 2nd provisional `2.35e-02` `replay_full_ft_both_moved_f32`, non-moved 2nd `1.95e-02` `replay_full_ft_both_f32`); `loss_rel` `<= 1.38e-04` (`compile_default_lora_replay`); `val_rel` `1.09e-07`–`2.65e-07` | `param_l2` `9.51e-05`–`1.31e-03`; `upd_l2` `8.91e-02` (`bf16_head_only`) / **`2.77e-01`** (`bf16_full_ft_replay`); `loss_rel` `<= 3.90e-02` (`bf16_full_ft`) |
+| **L4 shared NCCL**, `28M`, `N = 2` (`82a21ca`, **no tier set**) | `41 / 0` | `param_l2` 12/14 `< 1e-14` floor, max `8.45e-14`; `upd_l2` `1.56e-14` / `7.95e-14` / **`1.55e-10`** (`replay_full_ft_both_f64`; 2nd **`1.21e-10`** `replay_full_ft_distill_only_f64`; all other 12 `<= 2.11e-13`); `loss_rel` `<= 2.80e-11`; `val_rel` `2.82e-16` | `param_l2` `5.37e-08`–**`3.38e-04`** (`domain_lora_temporal_f32`; med `6.09e-06`); `upd_l2` `6.44e-06` / `2.18e-03` / **`7.33e-02`** (`domain_lora_temporal_f32`; 2nd `2.25e-02` `replay_full_ft_distill_only_f32`); `loss_rel` `<= 4.43e-04` (`compile_default_lora_replay`); `val_rel` `4.85e-07`–`5.05e-07` | `param_l2` `7.94e-05`–`1.05e-03`; `upd_l2` `3.37e-02` (`bf16_head_only`) / **`2.30e-01`** (`bf16_lora_temporal`); `loss_rel` `<= 3.05e-02` (`bf16_full_ft_replay`) |
+| **L4 shared NCCL**, `28M`, `N = 4` (`82a21ca`, **no tier set**) | `41 / 0` | `param_l2` 12/14 `< 1e-14` floor, max `4.46e-14`; `upd_l2` `1.93e-14` / `1.12e-13` / **`7.68e-11`** (`replay_full_ft_distill_only_f64`; 2nd `3.89e-11` `replay_full_ft_both_f64`; all other 12 `<= 1.94e-13`); `loss_rel` `<= 4.96e-12`; `val_rel` `2.87e-16` | `param_l2` `6.57e-08`–**`3.01e-04`** (`domain_lora_temporal_f32`; med `7.32e-06`); `upd_l2` `7.83e-06` / `6.70e-03` / **`6.18e-02`** (`domain_lora_temporal_f32`; 2nd `3.33e-02` `replay_full_ft_both_f32`); `loss_rel` `<= 1.27e-04` (`compile_default_lora_replay`); `val_rel` `5.60e-08`–`9.12e-08` | `param_l2` `1.14e-04`–`1.26e-03`; `upd_l2` `1.10e-01` (`bf16_head_only`) / **`2.59e-01`** (`bf16_lora_temporal`); `loss_rel` `<= 3.06e-02` (`bf16_full_ft_replay`) |
+| **Linux L4 CPU/`gloo`**, `tiny_random`, `N = 2` (`82a21ca`, `threads=1`) | `35 / 6` (`bf16` skipped) | `param_l2` 12/14 `< 1e-14` floor, max `6.75e-14`; `upd_l2` `2.21e-15` / `5.55e-15` (floor) / **`3.00e-12`** (`replay_full_ft_distill_only_f64`, `33×` below `1e-10`; 2nd `2.01e-12` `replay_full_ft_both_f64`); `loss_rel` `<= 2.75e-14`; `val_rel` `1.54e-16` | Non-id (18): `param_l2` `6.42e-08`–`4.16e-06` (med `2.81e-07`), `upd_l2` `9.73e-07` / `3.30e-06` / **`8.44e-05`** (`compile_default_lora_replay`), `loss_rel` `<= 2.05e-05`, `val_rel` `6.38e-08`–`1.07e-07`. Id-start (2, §17.2): `upd_l2` `1.90e-03`–`1.95e-03` | — |
+| **Linux L4 CPU/`gloo`**, `tiny_random`, `N = 4` (`82a21ca`, `threads=1`) | `35 / 6` | `param_l2` 12/14 `< 1e-14` floor, max `1.14e-13`; `upd_l2` `1.37e-15` / `4.00e-15` (floor) / **`4.94e-12`** (`replay_full_ft_distill_only_f64`, `20×` below `1e-10`; 2nd `1.15e-12` `replay_full_ft_both_f64`); `loss_rel` `<= 3.22e-14`; `val_rel` `0.00e+00` | Non-id (18): `param_l2` `5.25e-08`–`7.79e-06` (med `3.31e-07`), `upd_l2` `7.93e-07` / `3.63e-06` / **`1.62e-04`** (`compile_default_lora_replay`), `loss_rel` `<= 1.18e-05`, `val_rel` `7.17e-08`–`1.06e-07`. Id-start (2): `upd_l2` `2.09e-03`–`2.14e-03` | — |
+| **macOS arm64 CPU/`gloo`**, `tiny_random`, `N = 2` (`82a21ca`, `threads=1`) | `35 / 6` | `param_l2` `<= 1.33e-15` (all `< 1e-14` floor); `upd_l2` `2.10e-15` / `4.80e-15` (floor) / **`1.49e-14`** (`domain_lora_variate_f64`, ~`6,710×` below `1e-10`); `loss_rel` `<= 8.63e-16`; `val_rel` `3.34e-16` | Non-id (18): `param_l2` `6.27e-08`–`7.78e-06` (med `2.66e-07`), `upd_l2` `1.58e-06` / `3.14e-06` / **`1.58e-04`** (`compile_default_lora_replay`; non-compile max `1.53e-05`), `loss_rel` `<= 1.34e-05`, `val_rel` `6.38e-08`–`1.23e-07`. Id-start (2): `upd_l2` `1.95e-03`–`2.18e-03` | — |
+| **macOS arm64 CPU/`gloo`**, `tiny_random`, `N = 4` (`82a21ca`, `threads=1`) | `35 / 6` | `param_l2` `<= 2.07e-15` (all `< 1e-14` floor); `upd_l2` `1.43e-15` / `5.20e-15` (floor) / **`1.38e-14`** (`replay_lora_variate_distill_only_f64`, ~`7,250×` below `1e-10`); `loss_rel` `<= 7.93e-16`; `val_rel` `3.03e-16` | Non-id (18): `param_l2` `5.10e-08`–`8.32e-06` (med `2.84e-07`), `upd_l2` `1.08e-06` / `3.97e-06` / **`1.73e-04`** (`compile_default_lora_replay`; non-compile max `1.19e-05`), `loss_rel` `<= 2.29e-05`, `val_rel` `5.03e-08`–`1.22e-07`. Id-start (2): `upd_l2` `1.89e-03`–`2.60e-03` | — |
+
+**Feature rows (`compile_mode="default"`, `num_workers=2`, `vram_mb`) at `82a21ca`:**
+- *`compile_mode="default"`:* across every distributed run (L4 NCCL `tiny`/`5M`/`28M`, Linux CPU/`gloo`, and macOS arm64 CPU/`gloo`, at both `N = 2` and `N = 4`), `compile_default_lora_variate` reported `graphs=2 recompiled=yes` and `compile_default_lora_replay` reported `graphs=5 recompiled=yes` (against `graphs=3 recompiled=yes` in `N = 2` cached one-process references and `graphs=2 recompiled=no` in `N = 4` cached references).
+- *`workers_uneven_f32` `tail_s` (time from last optimiser step to `fit()` returning):* Linux L4 NCCL `0.16 s` (`tiny` `N = 2`), `0.32 s` (`tiny` `N = 4`), `0.19 s` (`5M` `N = 2`), `0.32 s` (`5M` `N = 4`), `0.20 s` (`28M` `N = 2`), `0.32 s` (`28M` `N = 4`); Linux L4 CPU/`gloo` `0.06 s` (`N = 2`), `0.08 s` (`N = 4`); macOS arm64 CPU/`gloo` `20.02 s` (`N = 2`) and `20.04 s` (`N = 4`, vs `10.02 s` one-process reference). (`step_ms` and `wall_s` are intentionally not quoted as step latency or scaling metrics; see *Known limitations* below.)
+- *`vram_mb` (per-rank peak allocated MiB during `fit()`, not a sum across shared-GPU ranks):* `5M` NCCL rows used `30.5–135.6 MiB` on `f32` (`36.0–132.2 MiB` on `bf16`; `53.4–265.2 MiB` on `f64`, peaking on `replay_full_ft_distill_only_*` with live `_frozen_base`); `28M` NCCL rows used `123.4–671.5 MiB` on `f32` (`143.1–663.6 MiB` on `bf16`; `243.6–1,350.5 MiB` on `f64`).
+- *Interpretation note (not a demonstrated cause):* on `5M` and `28M` NCCL, `float32` `head_only` stays small (`param_l2` `2.38e-08`–`1.61e-06`, `upd_l2` `4.42e-06`–`1.78e-04`), while `lora_temporal`/`full_ft` `upd_l2` reaches `1.04e-01` (`5M`) / `7.33e-02` (`28M`) even though `float64` on the exact same scenarios stays at `8.87e-14`–`5.94e-12`; this is consistent with §13 / spec §12's CUDA default-SDPA `float32` gradient inaccuracy on released weights. By contrast, the cause of the large `bf16` differences (`upd_l2` up to `3.48e-01` / `3.51e-01` exact and `loss_rel` up to `1.27e-01` on `5M` `N = 2` `bf16_full_ft_replay`) has not been investigated (spec §12).
+
+#### Rank-failure timeout probe (`distributed_rank_failure_check.py`, commit `82a21ca`)
+
+Kills rank 1 via `os._exit(1)` at step 2 mid-`fit()` and observes surviving ranks (note: `gloo` rank failure was run on macOS arm64 only; `multi_gpu_check.sh` runs Stage 9 for the primary `--backend` only, so the Linux L4 session ran NCCL rank failure only):
+
+| Platform, backend, `N` (`82a21ca`) | Timeouts (`pg` / `wall`) | Killed rank 1 | Surviving rank(s) outcome | Elapsed (`exc_s` / `exit_s`) | Result |
+|---|---|---|---|---|---|
+| **macOS arm64 CPU/`gloo`**, `N = 2` | `10.0 s` / `60.0 s` | `exit:1` (`0.04 s`) | `exit:2`; raises Python `builtins.RuntimeError` (Gloo `recv` timeout `10000ms`); normal `except`/`finally` unwinds | `10.01 s` / `10.42 s` | `PASS (no hang)` (`parent_killed=none`) |
+| **macOS arm64 CPU/`gloo`**, `N = 4` | `10.0 s` / `60.0 s` | `exit:1` (`0.04 s`) | Ranks 0, 2, 3 all `exit:2`; raise Python `builtins.RuntimeError` (Gloo `recv`/`send` timeout `10000ms`) | `10.00–10.01 s` / `10.58 s` | `PASS (no hang)` (`parent_killed=none`) |
+| **L4 shared NCCL**, `N = 2` (`--device-map shared`) | `20.0 s` / `65.0 s` | `exit:1` (`0.18 s`) | Rank 0 killed by **`signal:SIGABRT`** (C++ watchdog: `Operation timed out after 20780 ms`, then `Waiting 15000ms for health check and flight recorder dump before aborting`, then `Fatal Python error: Aborted` in `_reduce_step_stats`); **no Python exception raised; `except`/`finally` blocks do not run** | `-` / `36.19 s` | `PASS (no hang)` (`parent_killed=none`) |
+| **L4 shared NCCL**, `N = 4` (`--device-map shared`) | `20.0 s` / `65.0 s` | `exit:1` (`0.19 s`) | Ranks 0, 2, 3 all killed by **`signal:SIGABRT`** (`Operation timed out after 20555 / 20535 / 20552 ms` + `15000 ms` wait); **no Python exception raised; `except`/`finally` blocks do not run** | `-` / `35.85 / 35.90 / 35.95 s` | `PASS (no hang)` (`parent_killed=none`) |
+
+#### Reference-mode comparison (`--reference-mode exact` vs `sketch`, `k = 8,192`, commit `82a21ca`, L4 shared NCCL `N = 2`)
+
+Ten entries across `tiny_random` and `5M`: `ref_exact.zip` was **`114,469,429` bytes (`109.17 MiB`)** versus
+`ref_sketch.zip` at **`674,359` bytes (`0.64 MiB`)** (~`170×` smaller). `loss_rel` agreed to `0.00%` on all
+10 entries; `param_l2` and `upd_l2` matched within `0.00%`–`1.60%` (`tiny` `lora_temporal` has `8,192`
+trainable elements `<= SKETCH_DIM` and stores `exact_delta`, so exact and sketch are identical there):
+
+| Model & scenario (`N = 2`, L4 shared NCCL, `82a21ca`) | `param_l2` (`exact` / `sketch`) | `upd_l2` (`exact` / `sketch`) | `loss_rel` (`exact` / `sketch`) | Max relative diff (`sketch` vs `exact`) |
+|---|---|---|---|---:|
+| `tiny_random` `domain_full_ft_f64` | `1.03e-15` / `1.02e-15` | `3.46e-14` / `3.46e-14` | `3.99e-16` / `3.99e-16` | `0.97%` (`param_l2`, sub-`1e-14` floor) |
+| `tiny_random` `domain_lora_temporal_f32` (`exact_delta`) | `2.66e-07` / `2.66e-07` | `5.58e-06` / `5.58e-06` | `2.36e-07` / `2.36e-07` | `0.00%` |
+| `tiny_random` `replay_full_ft_distill_only_f64` | `1.04e-15` / `1.04e-15` | `4.61e-14` / `4.62e-14` | `3.13e-16` / `3.13e-16` | `0.22%` (`upd_l2`) |
+| `tiny_random` `bf16_lora_temporal` (`exact_delta`) | `2.75e-03` / `2.75e-03` | `5.75e-02` / `5.75e-02` | `2.84e-03` / `2.84e-03` | `0.00%` |
+| `tiny_random` `bf16_full_ft_replay` | `8.46e-04` / `8.46e-04` | `3.72e-02` / `3.73e-02` | `1.44e-03` / `1.44e-03` | `0.27%` (`upd_l2`) |
+| `5M` `domain_full_ft_f64` | `1.25e-15` / `1.23e-15` | `2.46e-12` / `2.43e-12` | `2.65e-14` / `2.65e-14` | `1.60%` (`param_l2`, sub-`1e-14` floor; `1.22%` `upd_l2`) |
+| `5M` `domain_lora_temporal_f32` | `5.61e-04` / `5.58e-04` | `1.04e-01` / `1.04e-01` | `4.66e-06` / `4.66e-06` | `0.53%` (`param_l2`) |
+| `5M` `replay_full_ft_distill_only_f64` | `1.18e-15` / `1.17e-15` | `3.47e-12` / `3.46e-12` | `9.02e-14` / `9.02e-14` | `0.85%` (`param_l2`, sub-`1e-14` floor; `0.29%` `upd_l2`) |
+| `5M` `bf16_lora_temporal` | `1.09e-03` / `1.09e-03` | `2.04e-01` / `2.04e-01` | `3.20e-03` / `3.20e-03` | `0.00%` |
+| `5M` `bf16_full_ft_replay` | `1.12e-04` / `1.12e-04` | `3.51e-01` / `3.48e-01` | `1.27e-01` / `1.27e-01` | `0.85%` (`upd_l2`) |
+
+**Known limitations of the tooling at `82a21ca` (review fixes pending; GPU session will be repeated after fixes):**
+1. *Parameters only, no buffers:* `xr_eq` and `xr_max` inspect `model.named_parameters()` and omit `model.named_buffers()` (the model has one buffer, `transformer.rope.inv_freq`). `param_l2` and `upd_l2` inspect trainable parameters (`trainer._trainable`) only.
+2. *CountSketch float64 floor:* in `sketch` mode (`k = 8,192`), `float64` bucket accumulation has a noise floor below `~1e-14` on large parameter sets (`head_only`/`full_ft` on `5M` and `28M`: 1.3×–7× inflation measured on CPU for true diffs of `1e-16`–`3e-15`; values `>= 1e-13` are unaffected, and all worst-case `float64` distillation rows at `1e-12`–`1.55e-10` sit well above it). Sparse single-coordinate sub-ULP diffs can also be absorbed to `0.00e+00` in a bucket sum.
+3. *Timing columns (`step_ms`, `wall_s`):* `step_ms` on scenarios with periodic validation (`val_restore_early_stop_*`, `workers_uneven_f32`) includes validation passes and lazy validation worker spawning, and `wall_s` has no pre-`t0` barrier (absorbing pre-`fit()` setup/hashing skew across ranks). Neither is quoted here as training-step latency or scaling evidence. `tail_s` and `vram_mb` are as labelled (`vram_mb` is per-rank peak allocated MiB during `fit()`, not a sum across ranks sharing a GPU).
+4. *Provisional CUDA `moved_student` parity rows:* on CUDA, `replay_full_ft_distill_only_moved_f32` and `replay_full_ft_both_moved_f32` loaded a CPU-computed `rope.inv_freq` on rank 0 and in the reference while ranks `1..N-1` kept the CUDA-computed table; whether those differ in the last bit on that GPU is unknown, so their CUDA parity numbers are provisional (cross-rank parameter equality was exact).
+5. *Incomplete reference-mismatch guard:* `distributed_trainer_check.py`'s reference check hashes trainable parameters only (not frozen base weights in LoRA modes) and omits several hardcoded hyperparameters; in this `82a21ca` session both reference and distributed runs came from the same script invocation and checkpoints, so the comparison is sound, but the guard itself is incomplete.
+6. *Session script timeout and resume:* `scripts/multi_gpu_check.sh`'s stage timeout does not reliably kill `torchrun`'s rank processes on a real hang (they run in their own sessions via `start_new_session=True`), and its `.done` resume markers do not record CLI flags or guard against a stale reference archive after a failed `--write-reference` re-run. Fixes for all of the above are pending.
+
+**What this session does NOT cover:** ranks on separate GPUs; real `torch.cuda.set_device` / `LOCAL_RANK` per-rank binding; acceptance test T15 on NCCL (`tests/distributed_harness.py` still enforces CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`); `scripts/probes/distributed_parity.py --device cuda` on 4 separate GPUs (both tiny and `5M`/`28M`); cross-GPU NCCL reduction determinism; separate-GPU NCCL rank-failure behaviour; Linux CPU/`gloo` rank-failure checks; `bf16` and released-weights parity tier calibration; and 1/2/4-GPU throughput, VRAM, and scaling measurements.
+
 **Not verified anywhere (Stage 3, spec §10 & §12):** Stages 1–2 multi-process training is verified on
-CPU/`gloo` on macOS arm64 and Linux x86_64, and on one NVIDIA L4 the full suite (`scripts/cuda_check.sh`, §13)
-plus one-off single-rank NCCL smoke and 2-/4-rank shared-GPU NCCL trainer trials (`NCCL_MULTI_RANK_GPU_ENABLE=1`,
-§11) have run. Still unverified: T15 on NCCL (requires adding a backend and per-rank device switch to
-`tests/distributed_harness.py`, which currently restricts to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`), ranks on
-separate GPUs and real multi-GPU `torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests
-only), `torchrun` launch and `DataLoader` worker teardown timing under CUDA/NCCL, CUDA `compile_mode="default"`
-(including trailing-shape recompilation and replay) across ranks, `bf16` parity tiers (only 3 single-GPU trial
-scenarios measured in §11; no tier set), NCCL rank-failure behaviour, multi-GPU throughput/VRAM/scaling
-(including per-parameter pack/unpack, 3–4 collectives per step, flat gradient buffer live through validation,
-and per-rank `_frozen_base` VRAM in `full_ft` distillation), released-weights T15 bounds (with or without
-replay), live concurrent `huggingface_hub==0.23.0` downloads (source reading only, §12), and `F.linear`
-`requires_grad` dispatch on GPUs/CUDA.
+CPU/`gloo` on macOS arm64 and Linux x86_64 (§17.1), and on one NVIDIA L4 (Linux x86_64, Python `3.12.16`,
+`82a21ca`) `scripts/cuda_check.sh` passed (§13) and the tracked Stage 3 driver and rank-failure probe ran
+under `torchrun` with `N = 2` and `N = 4` NCCL ranks sharing that GPU (§17.4; to be re-run after tooling
+review fixes). Still unverified: T15 on NCCL (requires adding a backend and per-rank device switch to
+`tests/distributed_harness.py`, which currently restricts to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`), ranks
+on separate GPUs and real multi-GPU `torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests
+only), `scripts/probes/distributed_parity.py --device cuda` on 4 separate GPUs, cross-GPU NCCL reduction
+determinism, separate-GPU NCCL rank-failure behaviour, `bf16` parity tiers and the cause of the large
+released-checkpoint `bf16` differences in §17.4, multi-GPU throughput/VRAM/scaling (including per-parameter
+pack/unpack, 3–4 collectives per step, flat gradient buffer live through validation, and per-rank
+`_frozen_base` VRAM in `full_ft` distillation), released-weights T15 bounds (with or without replay, including
+cosine similarity), live concurrent `huggingface_hub==0.23.0` downloads (source reading only, §12), and
+`F.linear` `requires_grad` dispatch on GPUs/CUDA.

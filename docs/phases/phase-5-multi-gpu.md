@@ -1,8 +1,8 @@
 # Phase 5 — Multi-Process / Multi-GPU Training
 
-**Status:** Stages 1–2 implemented and verified on CPU/`gloo` on macOS arm64 and Linux x86_64, with first one-off CUDA/NCCL checks on one NVIDIA L4 (2026-11-23); Stage 3 (multi-GPU CUDA/NCCL hardware verification) is open; gradient accumulation remains unscheduled.
+**Status:** Stages 1–2 implemented and verified on CPU/`gloo` on macOS arm64 and Linux x86_64, and exercised on one NVIDIA L4 with `N = 2` and `N = 4` NCCL ranks sharing that GPU via the tracked Stage 3 driver and session script (2026-11-23, `82a21ca`); Stage 3 separate-GPU CUDA/NCCL hardware verification remains open; gradient accumulation remains unscheduled.
 **Goal:** Data-parallel multi-process training across `N` ranks on a single node (CUDA/NCCL and CPU/`gloo`) with exact step-level equivalence to single-process training on the union batch.
-**Spec sections:** `docs/SPEC.md` §5.6, §6, §7.4, §7.6, §9 (T15), §10 (Phase 5), §11 (D22–D37), §12; prototype and Stages 1–2 evidence in `docs/VERIFICATION.md` §16–§17.
+**Spec sections:** `docs/SPEC.md` §5.6, §6, §7.4, §7.6, §9 (T15), §10 (Phase 5), §11 (D22–D37), §12; prototype, Stages 1–2, and first shared-GPU NCCL driver evidence in `docs/VERIFICATION.md` §16–§17.
 
 The task checklist and exit criteria are in `docs/SPEC.md` §10.
 
@@ -43,7 +43,7 @@ An alternative raised while preparing this proposal is to defer multi-GPU and im
 - **Zero hardware risk:** fully testable on existing CPU, Apple GPU, and single-L4 setups with no NCCL unknowns or multi-GPU VM cost.
 - **Trade-off:** gradient accumulation does not cut wall-clock time on compute-bound large datasets; multi-GPU addresses throughput (subject to unmeasured NCCL scaling).
 
-**Status:** Stages 1–2 of Phase 5 are implemented and verified on CPU/`gloo` on macOS arm64 and Linux x86_64, with first one-off single-L4 CUDA/NCCL checks (2026-11-23); Stage 3 (multi-GPU CUDA/NCCL) and gradient accumulation remain open (`docs/SPEC.md` §10).
+**Status:** Stages 1–2 of Phase 5 are implemented and verified on CPU/`gloo` on macOS arm64 and Linux x86_64, and exercised on one NVIDIA L4 with `N = 2` and `N = 4` NCCL ranks sharing that GPU via the tracked Stage 3 driver and session script (2026-11-23, `82a21ca`); Stage 3 separate-GPU CUDA/NCCL verification and gradient accumulation remain open (`docs/SPEC.md` §10).
 
 ---
 
@@ -83,31 +83,66 @@ All behavioural rules live in `docs/SPEC.md` §5.6, §7.4, §7.6, and D22–D37;
 
 ## 3. Hardware verification session plan (Stage 3: CUDA / NCCL)
 
-**Already run on 2026-11-23 (`docs/VERIFICATION.md` §11, §13, §16, §17):** on Linux x86_64 CPU/`gloo`, the full non-network suite, headroom-scaled multi-process suite (`TIMESTRAL_TEST_F32_TOL_SCALE=0.2` at 1/2/4 threads and `0.1` at default threads), prototype probe (`326/326`), `F.linear` probe, and thread-noise probe all passed. On one NVIDIA L4 (`71514a6`, driver `580.178.04`, `uv`-selected Python `3.15.2`), `bash scripts/cuda_check.sh` passed (`735 passed, 4 skipped`), one-process bit-identity vs `57a781c` matched on CPU and CUDA, and two one-off NCCL scripts passed: a single-rank collective-dtype smoke (`19/19`) and a 2-/4-rank trainer trial sharing that single GPU (`NCCL_MULTI_RANK_GPU_ENABLE=1`, 23 scenarios per rank count, bitwise cross-rank equality across all 46 runs).
+**Already run on 2026-11-23 (`docs/VERIFICATION.md` §11, §13, §16, §17):**
 
-**How single-GPU multi-rank NCCL changes what needs a multi-GPU VM:** NCCL `2.30.7` refuses multiple ranks on one GPU by default (`"Multiple Ranks are using the same GPU/Partition. Set NCCL_MULTI_RANK_GPU_ENABLE=1 to enable this configuration"`), so setting `NCCL_MULTI_RANK_GPU_ENABLE=1` lets functional 2- and 4-rank NCCL trainer parity run on a cheaper 1-GPU VM as a testing convenience (not a production setup). A **multi-GPU VM (2× or 4× GPUs)** is still required for everything that depends on separate devices: real `torch.cuda.set_device` / `LOCAL_RANK` binding, cross-GPU NCCL communication and reduction determinism, `torchrun` multi-GPU launch, rank-failure timeout behaviour across GPUs, and 1/2/4-GPU throughput, VRAM, and scaling measurements.
+- **Linux x86_64 CPU/`gloo` (`3347f70` / `71514a6`):** full non-network suite, headroom-scaled multi-process suite, prototype probe, `F.linear` dispatch probe, and float32 thread-noise probe (§16, §17.1–§17.3).
+- **Earlier single-L4 checks (`71514a6`, `uv`-selected Python `3.15.2`):** `cuda_check.sh`, CPU/CUDA one-process bit-identity vs `57a781c`, one-off single-rank NCCL collective-dtype smoke, and one-off 2-/4-rank shared-GPU trial (§11, §13).
+- **First tracked Stage 3 session (`82a21ca`, 2026-11-23) on one NVIDIA L4 (Linux x86_64 cloud VM, 8 vCPU, Python `3.12.16`, PyTorch `2.15.0+cu132`, NCCL `2.30.7`):**
+  - `bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12`: 15 of 16 stages exited `0` (`02_prototype_parity_cuda` skipped as needing 4 GPUs), zero hangs, bitwise cross-rank parameter equality across every executed row on `tiny_random`, `5M`, and `28M` at `N = 2` and `N = 4` on shared-GPU NCCL (`NCCL_MULTI_RANK_GPU_ENABLE=1`), plus Linux CPU/`gloo` `tiny_random` and NCCL rank-failure `SIGABRT` checks (§17.4). Reproduces and supersedes the earlier one-off shared-GPU trial in §11; note that the `82a21ca` tooling has known review findings (§17.4) and the GPU session will be repeated after fixes land.
+  - `exact` vs `sketch` reference-mode comparison on `tiny_random` and `5M` at `N = 2` (§17.4).
+  - `bash scripts/cuda_check.sh` on Python `3.12.16` (device tests and whole suite pass, closing the Python `3.12` gap left by `71514a6`; §13).
+  - Matching CPU/`gloo` sessions on macOS arm64 (`--backend gloo --ranks 2 4 --pg-timeout 10`, §17.4).
 
-**Prerequisite before running T15 on NCCL:** `tests/distributed_harness.py` currently accepts CPU/`gloo` only (`_ALLOWED_CPU_BACKENDS = frozenset({"gloo", "cpu:gloo"})`). T15 cannot run on NCCL until the harness gets a backend and per-rank device switch.
+**How single-GPU multi-rank NCCL changes what needs a multi-GPU VM:** NCCL `2.30.7` refuses multiple ranks on one GPU by default (`"Multiple Ranks are using the same GPU/Partition. Set NCCL_MULTI_RANK_GPU_ENABLE=1 to enable this configuration"`). Setting `NCCL_MULTI_RANK_GPU_ENABLE=1` with `--device-map shared` lets functional 2- and 4-rank NCCL trainer parity, `compile_mode="default"`, `num_workers=2`, `export()`, and rank-failure checks run on a cheaper 1-GPU VM as a testing convenience (not a production setup). A **multi-GPU VM (2× or 4× GPUs)** is still required for everything that depends on separate devices: real `torch.cuda.set_device` / `LOCAL_RANK` binding, cross-GPU NCCL communication and reduction determinism, `02_prototype_parity_cuda` on 4 GPUs, separate-GPU rank-failure behaviour, T15 on NCCL, and 1/2/4-GPU throughput, VRAM, and scaling measurements.
 
-### What remains to run in Stage 3
+**Prerequisite before running T15 on NCCL:** `tests/distributed_harness.py` currently accepts CPU/`gloo` only (`_ALLOWED_CPU_BACKENDS = frozenset({"gloo", "cpu:gloo"})`). `scripts/probes/distributed_trainer_check.py` is a separate ungraded measuring instrument, not T15; T15 cannot run on NCCL until the harness gets a backend and per-rank device switch.
 
-1. **Preflight (on the multi-GPU VM, pinning a CI-matrix Python such as `3.12`):** run `bash scripts/cuda_check.sh` to confirm compiler/headers and baseline single-GPU suite health on Python `3.12` (the `71514a6` single-L4 run used `uv`-selected Python `3.15.2`, outside the CI matrix).
-2. **Prototype probe on NCCL (separate GPUs):**
-   - `uv run python scripts/probes/distributed_parity.py --device cuda` (`tiny_random`, `N = 2` and `N = 4`, NCCL).
-   - `uv run python scripts/probes/distributed_parity.py --device cuda --sizes 5M 28M` (released weights on NCCL; measure cross-rank diffs and body-backprop diffs vs union reference, including `[4]` replay/distillation).
-3. **Trainer acceptance & launcher checks (after adding the harness backend/device switch):**
-   - `torchrun --nproc_per_node=2` and `torchrun --nproc_per_node=4` running `T15` (`test_t15_*`, cases `(a)–(l)`) on separate-GPU CUDA/NCCL, verifying real `LOCAL_RANK` device binding.
-   - `mixed_precision="bf16"` parity calibration across all four modes (with and without `ReplayConfig`) to set `bf16` tiers (the one-off single-L4 trial measured 3 scenarios only; no tier is set), `compile_mode="default"` on CUDA across ranks (including epochs with shorter or empty trailing shards and replay/distillation, measuring graph recompilation and timeout interaction), and `num_workers > 0` on Linux CUDA under `torchrun`.
-   - Rank-failure smoke test: launch with a short explicit `timeout` (e.g. `15 s`), terminate rank 1 mid-step on separate GPUs, and verify surviving ranks abort cleanly at timeout rather than hanging indefinitely.
+### Running the tracked session script (`scripts/multi_gpu_check.sh`)
+
+```bash
+# 1. One shared GPU (testing convenience; sets NCCL_MULTI_RANK_GPU_ENABLE=1 and --device-map shared)
+bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12
+
+# 2. Multi-GPU host (4 GPUs; --device-map per-rank, real LOCAL_RANK binding; pass --ranks 2 on a 2-GPU host)
+bash scripts/multi_gpu_check.sh --python 3.12
+
+# 3. CPU/gloo dry run (macOS or Linux; tiny model only)
+bash scripts/multi_gpu_check.sh --backend gloo --ranks 2 4 --pg-timeout 10
+```
+
+**Stages executed by `scripts/multi_gpu_check.sh`:**
+
+| Stage | What it runs |
+|---|---|
+| `01_env` | Syncs the locked venv (`uv sync --locked --quiet`) and records OS/arch/Python, PyTorch/CUDA/NCCL versions, GPU list (via `nvidia-smi`), `python_h`/`c_compiler`, and `nccl_multi_rank_gpu_enable` |
+| `02_prototype_parity_cuda` | `scripts/probes/distributed_parity.py --device cuda` (tiny model, `N = 2` and `N = 4`); runs only for `--backend nccl --device-map per-rank` with `>= 4` visible GPUs (skipped otherwise) |
+| `03_ref_<backend>_tiny_n<N>` / `04_<backend>_tiny_n<N>` | Writes one-process reference archive (`--write-reference`, `--reference-mode sketch` by default) and runs the 41-scenario `distributed_trainer_check.py` matrix under `torchrun` on `tiny_random` for each `N` in `--ranks` |
+| `05_ref_<backend>_released_n<N>` / `06_<backend>_released_n<N>` | Same with `--no-tiny --sizes "${SIZES[@]}"` (defaults to `"5M 28M"` for `nccl`, empty for `gloo`; pass `--sizes ""` to skip) |
+| `07_ref_gloo_tiny_n<N>` / `08_gloo_tiny_n<N>` | CPU/`gloo` `tiny_random` reference and `torchrun` runs (`--cpu-threads 1` default; always run when `--backend nccl`) |
+| `09_rank_failure_<backend>_n<N>` | `scripts/probes/distributed_rank_failure_check.py` (kills rank 1 at step 2 mid-`fit()`; default `--pg-timeout 20`, `wall_timeout = max(60, pg_timeout * 2.5 + 15) = 65 s`) |
+
+**Resume markers, timeout caveats, and logs (`82a21ca`):** logs, `.done` markers, `summary.txt` (`stage`, `exit_code`, `log_file`), and reference archives (`refs/`) go to `--log-dir` (default `multi_gpu_check_logs`). Today at `82a21ca`, each passing stage touches `<log-dir>/<stage>.done` and re-running with the same `--log-dir` skips stages with a `.done` marker (`--force` re-runs them), **without checking whether CLI flags changed** or guarding against a stale reference archive after a failed `--write-reference` re-run; use a fresh `--log-dir` when changing flags. Likewise, the script's stage timeout does not reliably kill `torchrun`'s rank processes on a real hang because `torchrun` places workers in separate sessions. Fixes for both (along with the other `82a21ca` script review findings in `docs/VERIFICATION.md` §17.4) are pending before the separate-GPU session. The script exports `TMPDIR=/tmp` whenever `TMPDIR` is unset or longer than 60 characters to avoid the macOS `torch_shm_manager` socket-path deadlock (`docs/DEVELOPMENT.md`, spec §12).
+
+### What remains to run on separate GPUs in Stage 3
+
+1. **Full separate-GPU session on a 4-GPU (or 2-GPU) host:**
+   - Run `bash scripts/multi_gpu_check.sh --python 3.12` (exercising `--device-map per-rank`, real `LOCAL_RANK` binding, cross-GPU NCCL reduction determinism, `02_prototype_parity_cuda` on 4 GPUs, and separate-GPU `09_rank_failure_nccl`).
+   - Run `uv run python scripts/probes/distributed_parity.py --device cuda --sizes 5M 28M` separately (`02_prototype_parity_cuda` runs `tiny_random` only).
+   - Run `bash scripts/cuda_check.sh` once if the host differs from the verified L4 environment.
+2. **T15 on NCCL (after adding the harness backend/device switch):**
+   - Add a backend and per-rank device switch to `tests/distributed_harness.py` and run `T15` (`test_t15_*`, cases `(a)–(l)`) on 2-GPU and 4-GPU CUDA/NCCL.
+3. **`bf16` investigation and released-weights tier calibration:**
+   - Investigate the larger released-checkpoint `bf16` differences observed in §17.4 (`param_update` up to `3.48e-01` / `3.51e-01` exact; step-loss rel diff up to `1.27e-01` on `5M` `N = 2` `bf16_full_ft_replay`) and choose a `bf16` parity metric and tier.
+   - Collect multi-seed, multi-size (`5M`/`28M`/`123M`/`209M`), separate-GPU measurements—including cosine similarity (not yet reported by the probes)—to set released-weights T15 bounds.
 4. **Throughput, per-step cost breakdown, & scaling micro-benchmark:**
    - Measure 1-GPU vs 2-GPU vs 4-GPU step time, samples/s, peak VRAM (including whether keeping `GradientReducer`'s flat gradient buffer allocated across validation inside `fit()` and holding live `_frozen_base` on every rank in `full_ft` distillation raise peak VRAM materially), and per-step overhead breakdown: Python per-parameter pack/unpack loops in `GradientReducer`, the small collectives per active step (3 without replay; 4 with replay adding the 2-element pre-check `all_reduce`), and flat-buffer `all_reduce` wall-time share on `28M`, `123M`, and `209M` (`full_ft` and `lora_temporal`, `bf16`, eager and `compile_mode="default"`, at `ctx = 256` and `ctx = 1,024`–`4,096`).
 
 ### What to record (in `docs/VERIFICATION.md` §17)
 
-- Exact VM type, GPU count, CUDA/NCCL/PyTorch/Python versions, and commands.
-- Probe and T15 pass/fail counts and `[INFO]` ranges on NCCL for `tiny_random`, `5M`, and `28M` (plus multi-seed and cosine-similarity measurements—with and without replay—used to set released-weights T15 bounds).
-- Whether NCCL cross-rank gradients and final parameters remain bitwise `0.0` or exhibit non-zero reduction variance.
-- `bf16`, `compile_mode="default"` (including trailing-shape recompilation and replay), Linux `num_workers > 0` teardown latency, and rank-failure timeout exit results.
+- Exact VM GPU count, driver/CUDA/NCCL/PyTorch/Python versions, and commands (no private/machine-specific details).
+- Separate-GPU `multi_gpu_check.sh` summary and per-model ranges, `distributed_parity.py --device cuda --sizes 5M 28M` results, and T15 pass/fail counts on NCCL.
+- Whether cross-GPU NCCL gradients and final parameters remain bitwise `0.0` or exhibit non-zero reduction variance, and whether separate-GPU NCCL rank failure matches the single-GPU `SIGABRT` behaviour in §17.4.
+- Multi-seed and cosine-similarity measurements used to calibrate `bf16` and released-weights T15 bounds.
 - Measured 1 / 2 / 4 GPU step times, scaling efficiency, peak VRAM (training vs validation with flat buffer live, plus `full_ft` distillation with per-rank `_frozen_base`), and per-step pack/unpack + collective time shares.
 
 ### What findings would change the design
@@ -141,3 +176,4 @@ A single 1.5–2 hour session on `g2-standard-48` (which covers both `N = 2` and
 - **2026-11-23 (Stage 1 implemented & CPU/`gloo` verified):** implemented `trainer/_types.py`, `trainer/distributed.py`, `trainer/_distributed_strategy.py`, shared `_run_fit_loop` strategy dispatch in `trainer/trainer.py`, `RankFailureError` export, shared `_validate_export_inputs` and paired `world_size`/`effective_batch_size` on `export_checkpoint`, `tests/distributed_harness.py`, acceptance test T15 Stage 1 cases `(a)–(i)` (`tests/acceptance/test_distributed.py`), and unit/white-box distributed tests. Fixed review-found hang paths (`should_stop` clearing sync and protected startup digest in `290cd6c`; `strategy.cleanup()` after end-of-fit collectives in `d181c7a`), preserved `RankFailureError` on matching ranks during consistency checks (`09de038`), packed gradient presence flags into `GradientReducer` (`ac9ab04`), and added rank-seeded loader generators (`e3a4f6e`). Verified Stage 1 T15 on CPU/`gloo` on PyTorch `2.4.0` and `2.15.0`, plus `huggingface_hub==0.23.0` `WeakFileLock` source reading (`docs/VERIFICATION.md` §12).
 - **2026-11-23 (Stage 2 implemented & CPU/`gloo` verified at `3347f70`):** added `DistributedBatchCycle` with shared replay epoch seed (`+2_000_009`, D37) and main-process `num_workers=0` replay loader (D36), refactored `_DistributedStrategy._run_step` into six named stages with the replay-only 2-element `[w_d, failed]` pre-check collective (D23) and `[W_r, sum_r, M, sum_m]` count-weighted reduction, moved uncached `_setup_replay_teacher()` after rank-0 broadcast (one-time rank-0 bypass log; no head or teacher caches in multi-process mode, D32), added per-rank replay batch logging (D27), startup digest hashing over `replay_config`/`replay_dataset`, and peer fingerprint skip in `export()`. Extended T15 to cases `(a)–(l)` (including `test_t15_j_full_ft_distill_float32` and 2-rank CPU `test_t15_l_compile_default_replay_distill_smoke`), added `tests/test_trainer_distributed_replay.py` and `scripts/probes/linear_requires_grad_dispatch.py`, and verified the full network-free suite and four distributed test files on CPU/`gloo` on macOS arm64 across PyTorch `2.4.0` and `2.15.0`.
 - **2026-11-23 (Linux x86_64 validation, float32 tier recalibration, and single-L4 checks at `71514a6` / `40a580a`):** running the four multi-process files alone on Linux x86_64 at `3347f70` surfaced a `_worker_main` intra-op thread leak into the parent process plus Linux-only one-process float32 thread-count sensitivity (`e33cbf5` fixed the leak and added `_guard_torch_global_state` in `tests/conftest.py`; `0f80f4c` centralised the five parity tiers and `TIMESTRAL_TEST_F32_TOL_SCALE` headroom knob in `tests/distributed_harness.py`, aligned T15(b) to `lr=1e-3` and tightened its `float64` post-step `param_tol` to `1e-12`, switched T15(l)'s `default_synth` to `lora_temporal`, and set `TRAJ_UPDATE_TOL["float32"] = 1e-3`; `71514a6` added `scripts/probes/float32_trajectory_noise.py`; `40a580a` aligned comments with measured headroom). Verified Stages 1–2 on CPU/`gloo` across macOS arm64 and Linux x86_64 (including headroom runs), measured Linux `F.linear` dispatch (non-zero in `float64` as well as `float32`), and ran `cuda_check.sh`, CPU/CUDA one-process bit-identity vs `57a781c`, one-off single-rank NCCL smoke, and a one-off 2-/4-rank shared-GPU NCCL trainer trial (`NCCL_MULTI_RANK_GPU_ENABLE=1`) on one NVIDIA L4 (`docs/VERIFICATION.md` §11, §13, §16, §17). Stage 3 multi-GPU verification remains open.
+- **2026-11-23 (Stage 3 measuring scripts & first tracked single-L4 NCCL session at `82a21ca`):** added `scripts/probes/distributed_trainer_check.py` (`b25854e`, 41-scenario ungraded measuring driver under `torchrun` with `--reference-mode sketch|exact`), `scripts/probes/distributed_rank_failure_check.py` (`70c3561`), and `scripts/multi_gpu_check.sh` (`82a21ca`), and diagnosed the macOS `TMPDIR` `torch_shm_manager` `sun_path` silent `DataLoader` worker deadlock (affecting one-process and multi-process `fit()` alike; spec §12, `docs/DEVELOPMENT.md`). Ran the full shared-GPU session (`bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12`), the `exact` vs `sketch` comparison, and Python `3.12.16` `bash scripts/cuda_check.sh` on one NVIDIA L4 (Linux x86_64, 8 vCPU, driver `595.112.07`, `torch 2.15.0+cu132`, NCCL `2.30.7`), plus CPU/`gloo` sessions on macOS arm64 (`docs/VERIFICATION.md` §13, §17.4). Updated `docs/SPEC.md` (§5.6, §7.6, §9, §10, D28, D35, §12) for the observed per-backend rank-failure behaviour (`gloo` `RuntimeError` vs NCCL `SIGABRT` bypassing `except`/`finally`), `bf16` and released-weights `float32` observations, and driver API ergonomics observations. Stage 3 separate-GPU CUDA/NCCL verification remains open.

@@ -1321,3 +1321,115 @@ x86_64 cloud VM (Ubuntu 22.04) surfaced three platform differences not visible o
 - Maintainer decisions on `F.linear` `requires_grad` dispatch remedies and the ten pre-existing one-process
   observations in spec §12.
 - Optional gradient accumulation (unticked, unscheduled).
+
+---
+
+## 2026-11-23 — Stage 3 measuring scripts, first tracked single-L4 NCCL session, and script review findings
+
+**What was built (`b25854e`, `70c3561`, `82a21ca`).** Three tracked verification scripts were added ahead of
+the Stage 3 multi-GPU session (separate from acceptance test T15, which remains CPU/`gloo` only in
+`tests/distributed_harness.py`):
+
+1. `scripts/probes/distributed_trainer_check.py` (`b25854e`): a 41-scenario (`g1`–`g8`) ungraded measuring
+   driver that runs the real `TimestralTrainer` across ranks under `torchrun` (`gloo` or `nccl`;
+   `--device-map per-rank|shared`), compares against a one-process reference archive written beforehand on
+   the same device (`--reference-mode sketch` by default — SHA-256 hashes, exact norms, exact deltas for
+   parameter sets `<= 8,192` elements, and a `k = 8,192` CountSketch for larger sets — with
+   `--reference-mode exact` available), and reports cross-rank parameter equality, parity metrics, timing,
+   and peak VRAM without grading them.
+2. `scripts/probes/distributed_rank_failure_check.py` (`70c3561`): spawns `N` ranks on `gloo` or `nccl`,
+   terminates rank 1 via `os._exit(1)` mid-`fit()` at step 2, and records each rank's exit status, exception
+   (if any), and elapsed time against explicit process-group and wall timeouts.
+3. `scripts/multi_gpu_check.sh` (`82a21ca`): portable session runner automating environment capture,
+   optional 4-GPU `distributed_parity.py --device cuda`, reference generation, `torchrun` driver runs, and
+   rank-failure checks in numbered stages (`01_env`–`09_rank_failure_*`) with `.done` markers and macOS
+   `TMPDIR=/tmp` handling.
+
+**Development history (not `[V]` claims):**
+
+- The measuring driver was written across three engineers because two ran out of usage quota mid-task before
+  the full script suite landed at `82a21ca`.
+- **macOS `DataLoader` worker deadlock diagnosis:** while exercising `num_workers > 0` on macOS, the driver
+  engineer reproduced a silent hang with no project code: PyTorch `DataLoader` workers share tensors through
+  `torch_shm_manager`, which binds an `AF_UNIX` socket under `TMPDIR`. When the socket path exceeds macOS's
+  103-byte `sun_path` limit (a `TMPDIR` of ~70 bytes is enough), the worker's feeder thread raises, drops the
+  batch, and stays alive while the main process waits forever at 0% CPU with no error. This affects
+  one-process `TimestralTrainer.fit()` with `num_workers > 0` identically to multi-process `fit()`;
+  recorded in spec §12 (pre-existing one-process observation #11, with a candidate fail-fast remedy in
+  `_build_data_loader`) and `docs/DEVELOPMENT.md`.
+
+**First tracked hardware session (`82a21ca`, one rented NVIDIA L4, Linux x86_64, 8 vCPU, driver `595.112.07`,
+Python `3.12.16`, `torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`; full tables in `docs/VERIFICATION.md`
+§13 and §17.4):**
+
+- `bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12` ran 16 stages with `N = 2` and `N = 4` NCCL
+  ranks sharing the single GPU (`NCCL_MULTI_RANK_GPU_ENABLE=1`, `--device-map shared`): 15 stages exited `0`,
+  1 skipped (`02_prototype_parity_cuda`, requires 4 GPUs), zero hangs, and exact parameter-level cross-rank
+  equality (`xr_eq=yes, xr_max=0.00e+00`) in all 246 NCCL rows (`tiny_random`, `5M`, `28M` × `N = 2, 4`) and
+  all 70 Linux CPU/`gloo` rows (`tiny_random` × `N = 2, 4`). Reproduces and supersedes the earlier one-off
+  shared-GPU trial in `docs/VERIFICATION.md` §11.
+- `float64` stayed at round-off on almost every scenario, peaking on identical-start `full_ft` distillation
+  (`upd_l2` up to `7.81e-12` on `tiny` at `N = 4` — `12.8×` below T15's `1e-10`; up to `8.73e-11` on `5M` at
+  `N = 4` and `1.55e-10` on `28M` at `N = 2`, with no tier set for released weights).
+- `float32` stayed `<= 1.00e-04` (`upd_l2`) on `tiny_random` NCCL (`<= 1.62e-04` Linux `gloo`, `<= 1.73e-04`
+  macOS `gloo`, excluding identical-start `full_ft` distillation); on released `5M`/`28M`, `final_trainable`
+  agreed to `2.38e-08`–`5.58e-04` (`5.61e-04` exact) while `upd_l2` reached `1.04e-01` (`5M`
+  `domain_lora_temporal_f32`) / `7.33e-02` (`28M` `domain_lora_temporal_f32`) even though `float64` on those
+  scenarios stayed at `8.87e-14`–`5.94e-12` (consistent with spec §12's CUDA default-SDPA `float32` gradient
+  inaccuracy, recorded as an interpretation rather than a demonstrated cause).
+- `bf16` `upd_l2` ranged `4.18e-03`–`5.75e-02` on `tiny_random` and `3.37e-02`–`3.48e-01` (`3.51e-01` exact)
+  on released `5M`/`28M`, with step-loss rel diff up to `1.27e-01` (`5M`, `N = 2`, `bf16_full_ft_replay`);
+  cause uninvestigated, recorded as an open question in spec §12 with no tier set.
+- `compile_mode="default"` (`2` graphs without replay, `5` graphs with replay), `num_workers=2` (`tail_s`
+  `0.16–0.32 s` on Linux L4 NCCL vs `~20 s` on macOS `gloo`), `export()`, early stopping with restore, and
+  stochastic training all ran cleanly across ranks on CUDA.
+- **Per-backend rank-failure behaviour:** on macOS arm64 CPU/`gloo` (`pg_timeout=10 s`, reproduced locally),
+  surviving ranks raised Python `RuntimeError` at `10.00–10.01 s` and exited cleanly (`10.42–10.58 s`); on
+  shared-L4 NCCL (`pg_timeout=20 s`), surviving ranks were killed by `SIGABRT` at `35.85–36.19 s` (~20.5–20.8 s
+  watchdog timeout + 15 s health-check/flight-recorder wait) with **no Python exception raised**, so neither
+  `except` nor `finally` blocks ran. Neither backend hung.
+- **Reference-mode check:** `ref_exact.zip` (`109.17 MiB`) and `ref_sketch.zip` (`0.64 MiB`) matched within
+  `0.00%`–`1.60%` across 10 `tiny`/`5M` `N = 2` entries (`0.00%` in `loss_rel`).
+- **Python `3.12.16` `cuda_check.sh`:** passed at `82a21ca` (`266 passed, 3 skipped` device tests;
+  `735 passed, 4 skipped` whole suite; `docs/VERIFICATION.md` §13), closing the Python `3.12` branch gap left
+  by the earlier `71514a6` `CPython 3.15.2` run.
+- **Local macOS arm64 verification (`82a21ca`, Python `3.12.13`, PyTorch `2.15.0`):** `uv run ruff check . &&
+  uv run ruff format --check .` clean; `TMPDIR=/tmp uv run pytest -m "not network" -q -p no:cacheprovider`
+  passed (`511 passed, 15 skipped, 213 deselected`); `bash scripts/multi_gpu_check.sh --backend gloo --ranks 2
+  4 --pg-timeout 10` passed (`7` stages exit `0`, `1` skipped, `350.0 s`; `docs/VERIFICATION.md` §17.4).
+
+**Independent script review findings (re-run planned after fixes):**
+
+- An independent code review of the `82a21ca` scripts confirmed that parameter-level `xr_eq`/`xr_max` and the
+  parity columns (`param_l2`, `upd_l2`, `loss_rel`, `val_rel`) compare the right tensors with the right
+  denominators (with `sketch` matching `exact` to ~1% for `float32`/`bf16` and `float64 >= 1e-14`), while
+  identifying tooling limitations documented explicitly in `docs/VERIFICATION.md` §17.4: `xr_eq`/`xr_max` omit
+  buffers (`rope.inv_freq`), `param_l2`/`upd_l2` cover trainable parameters only, `sketch` has a `float64`
+  bucket-accumulation floor below `~1e-14` on `5M`/`28M`, `step_ms` includes validation/worker spawn on
+  validating scenarios and `wall_s` lacks a pre-`t0` barrier, the two CUDA `moved_student` rows mixed CPU and
+  CUDA `rope.inv_freq` across ranks (provisional parity), the reference mismatch guard omits frozen base
+  weights in LoRA modes and some hardcoded hyperparameters, and `multi_gpu_check.sh`'s stage timeout and
+  `.done` resume markers need hardening (separate-session `torchrun` orphans on hang; flag-blind resume and
+  stale-reference gating). The GPU session will be repeated after those script fixes land.
+
+**Documentation updated (`docs/SPEC.md` §5.6, §7.6, §9, §10, D28, D35, §12; `docs/VERIFICATION.md` §11, §13,
+§17.4; `docs/phases/phase-5-multi-gpu.md`; `docs/DEVELOPMENT.md`; `docs/STATUS.md`; `README.md`;
+`CHANGELOG.md`; `AGENTS.md` §1):** recorded the `82a21ca` session and qualifications, updated §5.6/§7.6/D35
+for per-backend peer-death behaviour (`gloo` `RuntimeError` vs NCCL `SIGABRT` bypassing `finally`), added the
+four API/runtime observations from the driver author and the macOS `TMPDIR` hazard to spec §12, and kept
+Phase 5 Stage 3 unticked.
+
+**Not done / open:**
+
+- Fix the `82a21ca` review findings in the three Stage 3 scripts and re-run the GPU session.
+- **Stage 3 (separate-GPU CUDA/NCCL hardware verification):** backend/device switch in
+  `tests/distributed_harness.py` to run T15 on NCCL, separate-GPU `multi_gpu_check.sh --device-map per-rank`
+  (real `LOCAL_RANK` binding, cross-GPU NCCL determinism, 4-GPU `distributed_parity.py --device cuda` on tiny
+  and `5M`/`28M`, separate-GPU NCCL rank-failure checks), `bf16` investigation and tier calibration,
+  released-weights T15 bounds (including cosine similarity), and 1/2/4-GPU throughput/VRAM/scaling
+  measurements (`docs/phases/phase-5-multi-gpu.md` §3, spec §10 & §12).
+- Live concurrent multi-process Hub download check at `huggingface_hub==0.23.0` (source reading only,
+  `docs/VERIFICATION.md` §12).
+- Maintainer decisions on `F.linear` `requires_grad` dispatch remedies, the eleven pre-existing one-process
+  observations (including the macOS `TMPDIR` guard), and the four Stage 3 driver API observations in spec §12.
+- Optional gradient accumulation (unticked, unscheduled).
