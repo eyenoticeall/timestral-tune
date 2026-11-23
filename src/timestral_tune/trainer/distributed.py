@@ -9,17 +9,17 @@ minimal, lockstep-friendly surface for the trainer:
   `DistributedContext.propagate_failure`, `DistributedContext.check_consistency`,
   `broadcast_module_state`, `GradientReducer`, `ControlStatus`, `broadcast_status`).
 - Failure classification (`RankFailureError`, `is_oom_error`).
-- Deterministic epoch sharding, validation sharding, and rank-offset seeding (`steps_per_epoch`,
-  `rank_slice_size`, `rank_step_indices`, `DistributedBatchSampler`, `validation_shard_indices`,
-  `rank_seed`).
+- Deterministic epoch sharding, cycling, validation sharding, and rank-offset seeding
+  (`steps_per_epoch`, `rank_slice_size`, `rank_step_indices`, `DistributedBatchSampler`,
+  `DistributedBatchCycle`, `validation_shard_indices`, `rank_seed`).
 
 Every communicating entry point (`DistributedContext` methods, `broadcast_module_state`,
 `broadcast_status`, and `GradientReducer.reduce`) documents which ranks must call it and how many
 collectives it executes so the integrator can keep all ranks strictly in lockstep. Everything in
 the sampling and seeding section (`steps_per_epoch`, `rank_slice_size`, `rank_step_indices`,
-`DistributedBatchSampler`, `validation_shard_indices`, `rank_seed`), along with `is_oom_error`,
-`RankFailureError`, `ControlStatus`, and read-only properties, is pure and rank-local (0
-collectives).
+`DistributedBatchSampler`, `DistributedBatchCycle`, `validation_shard_indices`, `rank_seed`),
+along with `is_oom_error`, `RankFailureError`, `ControlStatus`, and read-only properties, is pure
+and rank-local (0 collectives).
 
 - Spec: `docs/SPEC.md` §5.6, D22–D35
 """
@@ -34,7 +34,7 @@ import struct
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Literal, NoReturn
+from typing import Generic, Literal, NoReturn, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -43,6 +43,7 @@ from torch.utils.data import Sampler
 
 __all__ = [
     "ControlStatus",
+    "DistributedBatchCycle",
     "DistributedBatchSampler",
     "DistributedContext",
     "GradientReducer",
@@ -58,6 +59,7 @@ __all__ = [
 ]
 
 BackendName = Literal["gloo", "nccl"]
+_T = TypeVar("_T")
 
 _RANK_SEED_STRIDE = 1_000_000_007
 _SEED_MODULUS = 1 << 63
@@ -806,6 +808,70 @@ class DistributedBatchSampler(Sampler[list[int]]):
             start, end = _rank_slice_bounds(self._num_items, self._world_size, self._batch_size, self._rank, step)
             if end > start:
                 yield ordering[start:end]
+
+
+class DistributedBatchCycle(Generic[_T]):
+    """Cycles a `DistributedBatchSampler`-backed iterable across epochs, one global step at a time.
+
+    Each call to `next_batch()` consumes one global step across all ranks: at epoch boundaries it
+    calls `sampler.set_epoch(epoch)` and resets the underlying iterator; on steps where this rank's
+    slice is non-empty it lazily creates `iter(loader)` and returns `next(...)`; on steps where
+    this rank's slice is empty it returns `None` without touching `loader`.
+
+    Ranks: all ranks must call `next_batch()` in lockstep on the same global steps.
+    Collectives: 0.
+    """
+
+    def __init__(self, sampler: DistributedBatchSampler, loader: Iterable[_T]) -> None:
+        if not isinstance(sampler, DistributedBatchSampler):
+            raise TypeError(f"sampler must be a DistributedBatchSampler, got {type(sampler).__name__}")
+        if sampler.num_global_steps == 0:
+            raise ValueError("DistributedBatchCycle requires a non-empty sampler (num_global_steps > 0)")
+        self._sampler = sampler
+        self._loader = loader
+        self._epoch = 0
+        self._step_in_epoch = 0
+        self._global_step = 0
+        self._loader_iter: Iterator[_T] | None = None
+
+    @property
+    def epoch(self) -> int:
+        """0-based cycle epoch index for the next step to be fetched."""
+        return self._epoch
+
+    @property
+    def step_in_epoch(self) -> int:
+        """0-based global step index within the current cycle epoch."""
+        return self._step_in_epoch
+
+    @property
+    def global_step(self) -> int:
+        """Total number of global steps consumed across all wrapped epochs."""
+        return self._global_step
+
+    def next_batch(self) -> _T | None:
+        """Advance one global step and return this rank's batch, or `None` if its slice is empty."""
+        step = self._step_in_epoch
+        if step == 0:
+            self._sampler.set_epoch(self._epoch)
+            self._loader_iter = None
+
+        slice_size = self._sampler.slice_size(step)
+        batch: _T | None = None
+        if slice_size > 0:
+            if self._loader_iter is None:
+                self._loader_iter = iter(self._loader)
+            batch = next(self._loader_iter)
+
+        self._global_step += 1
+        next_step = step + 1
+        if next_step >= self._sampler.num_global_steps:
+            self._epoch += 1
+            self._step_in_epoch = 0
+            self._loader_iter = None
+        else:
+            self._step_in_epoch = next_step
+        return batch
 
 
 def validation_shard_indices(num_items: int, world_size: int, rank: int) -> list[int]:
