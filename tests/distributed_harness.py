@@ -58,8 +58,9 @@ __all__ = [
 _ALLOWED_CPU_BACKENDS = frozenset({"gloo", "cpu:gloo"})
 
 # Environment knob multiplying every float32 parity tolerance in the multi-process test suite
-# (float64 tiers are never scaled). Setting TIMESTRAL_TEST_F32_TOL_SCALE=0.1 proves >=10x headroom
-# over the worst observed discrepancy; 0.2 proves >=5x headroom. Must be a finite positive float.
+# (float64 tiers are never scaled). A run that passes at 0.1 has at least 10x headroom on that machine;
+# at 0.2, at least 5x. Values above 1 loosen the tiers, for exploring a new platform. Must be a finite
+# positive float.
 F32_TOL_SCALE_ENV = "TIMESTRAL_TEST_F32_TOL_SCALE"
 
 
@@ -79,23 +80,24 @@ def f32_tol_scale(env_var: str = F32_TOL_SCALE_ENV) -> float:
 
 F32_TOL_SCALE: float = f32_tol_scale()
 
-# Shared parity tolerance tiers for all multi-process tests (float64 guards the logic unchanged;
-# float32 tiers are calibrated with >=10x headroom on macOS arm64 and >=5x on Linux x86_64 across
-# 1/2/4 intra-op threads, see `scripts/probes/float32_trajectory_noise.py`):
+# Shared parity tolerance tiers for all multi-process tests. The float64 tiers check the logic and are
+# never scaled. The float32 tiers are calibrated against measured round-off, which depends on the
+# platform: on macOS arm64 one-process `fit()` is bit-identical across intra-op thread counts, while on
+# Linux x86_64 it is not (`scripts/probes/float32_trajectory_noise.py`). Headroom is checked by running
+# the four multi-process test files with `TIMESTRAL_TEST_F32_TOL_SCALE` below 1 (`docs/VERIFICATION.md`
+# §17): they pass at 0.1 on macOS arm64, and on Linux x86_64 at 0.2 with 1, 2 and 4 intra-op threads.
 #
-# - EVAL_TOL: sharded validation loss at identical weights (worst macOS: 9.74e-08; Linux: <1e-6).
-# - STEP_TOL: direct `_run_step` loss & gradients (worst macOS: 5.91e-07; Linux: <1e-6).
-# - STEP_PARAM_TOL: post-AdamW parameters after `_run_step`; split from STEP_TOL because AdamW
-#   divides by `sqrt(v) + eps` (`eps=1e-8`), amplifying ~1e-9 float32 GEMM/reduction gradient noise
-#   on small-gradient coordinates into O(1e-6) post-step parameter diffs (worst macOS: 1.68e-06;
-#   Linux: 3.38e-06).
-# - TRAJ_TOL: multi-step `fit()` step losses, eval losses, and `final_trainable` relative L2
-#   (worst macOS: 3.90e-06; Linux: <1e-5).
-# - TRAJ_UPDATE_TOL: multi-step `fit()` `param_update = final - init` relative L2. Widened to 1e-3
-#   in float32 only because `||param_update||` is ~20x smaller than `||final_trainable||` for LoRA
-#   and AdamW amplification of float32 kernel differences on `lora_variate` `q`/`k` coordinates near
-#   `eps=1e-8` reaches 7.11e-05 on macOS arm64 and 1.07e-04 on Linux x86_64 — where pure one-process
-#   `fit()` itself varies by 1.14e-04 across intra-op thread counts 1/2/4.
+# - EVAL_TOL: sharded validation loss at identical weights.
+# - STEP_TOL: loss and gradients of one direct `_run_step`.
+# - STEP_PARAM_TOL: parameters after that one step. Split from STEP_TOL because AdamW divides by
+#   `sqrt(v) + eps`, so gradient components at float32 round-off level become parameter differences
+#   orders of magnitude larger in relative terms (3.4e-06 was observed on Linux x86_64).
+# - TRAJ_TOL: step losses, validation losses and `final_trainable` relative L2 over a multi-step `fit()`.
+# - TRAJ_UPDATE_TOL: `param_update = final - init` relative L2 over a multi-step `fit()`. This is 1e-3 in
+#   float32, not 1e-4, because the update is much smaller than the parameters for LoRA and the same
+#   AdamW amplification applies at every step: with the tier at 1e-4, Linux x86_64 runs reached 1.9e-04
+#   against the one-process reference, and the one-process reference differed from itself by 1.1e-04
+#   between 1 and 2 intra-op threads on a T15(j) `lora_variate` distillation scenario.
 EVAL_TOL: Mapping[str, float] = MappingProxyType({"float64": 1e-12, "float32": 1e-5 * F32_TOL_SCALE})
 STEP_TOL: Mapping[str, float] = MappingProxyType({"float64": 1e-12, "float32": 1e-5 * F32_TOL_SCALE})
 STEP_PARAM_TOL: Mapping[str, float] = MappingProxyType({"float64": 1e-12, "float32": 1e-4 * F32_TOL_SCALE})

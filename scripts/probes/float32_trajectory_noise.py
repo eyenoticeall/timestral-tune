@@ -11,9 +11,10 @@ thread counts 1, 2, and 4, and reports pairwise `param_update = final - init` re
 differences (plus worst `final_params` and step-loss relative differences).
 
 Always exits 0 (measurement probe, not a grader) and restores the caller's intra-op thread count
-before exiting. On macOS arm64 thread count does not perturb float32 reductions, so every cell
-prints `0.00e+00`; on Linux x86_64 changing thread count shifts float32 GEMM/reduction rounding
-and reaches `O(1e-4)` on `lora_variate` `param_update`, motivating T15's `TRAJ_UPDATE_TOL` tier.
+before exiting. On macOS arm64 the thread count does not change float32 results, so every cell
+prints `0.00e+00`; on Linux x86_64 it does, and the size depends strongly on the scenario (measured
+values are in `docs/VERIFICATION.md` §17). This is the reason T15's float32 tiers are calibrated on
+both platforms (`tests/distributed_harness.py`).
 """
 
 from __future__ import annotations
