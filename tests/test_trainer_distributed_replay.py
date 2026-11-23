@@ -1,4 +1,22 @@
-"""Stage 2 multi-process replay and distillation tests.
+"""White-box and complementary Stage 2 multi-process replay and distillation tests.
+
+End-to-end acceptance clauses (trajectory parity across replay/distillation regimes, skipped-domain
+steps, unscored/partial replay, repeated `fit()`, flips, teachers/caches, startup consistency,
+failures, and replay export) live in `tests/acceptance/test_distributed.py` (T15(j)–(l)).
+
+This module keeps only checks that are white-box or complementary to T15:
+- White-box `_DistributedStrategy._run_step` parity on a warmed-up student with a non-patch-multiple
+  replay horizon (`REP_HORIZON = 6`, `PATCH = 4`, exercising distillation mask padding), at strict
+  `1e-12` (float64) and `1e-5` (float32).
+- Complementary trajectory parity combining replay with periodic validation + `restore_best=True`,
+  with `lora_temporal`, and with moved-student `full_ft` + distillation, all at strict `1e-10`
+  (float64) and `1e-4` (float32).
+- Direct white-box assertion that both flip generators and the replay cursor are untouched across a
+  globally zero-scored skipped step.
+- White-box replay loader generator seed check (`rank_seed(seed + 2_000_009, rank)`), `num_workers=0`
+  enforcement, global RNG preservation, and stochastic `SyntheticReplaySource` `lora_temporal` run.
+- Real multi-process `fit()` with `num_workers=1`, validation, and replay verifying training and
+  validation run in worker processes while replay runs in the main process, matching `num_workers=0`.
 
 - Spec: `docs/SPEC.md` §5.3, §5.6, §9 (T15), D22–D35
 """
@@ -8,13 +26,9 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
-import json
-import logging
 import os
 import sys
-import tempfile
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -23,14 +37,11 @@ import torch
 from torch import Tensor
 
 from timestral_tune import LoraConfig, ReplayConfig, TimestralTrainer, TrainingConfig
-from timestral_tune import export as export_module
 from timestral_tune.data import ColumnRoles, SeriesData, TimeSeriesDataset, TrainingBatch
-from timestral_tune.export import dataset_fingerprint
 from timestral_tune.models import TuneTimestralModel, inject_lora, lora_parameters
 from timestral_tune.replay import SyntheticReplaySource
-from timestral_tune.trainer import RankFailureError, compute_loss
-from timestral_tune.trainer import trainer as trainer_module
-from timestral_tune.trainer.distributed import DistributedContext, rank_seed
+from timestral_tune.trainer import compute_loss
+from timestral_tune.trainer.distributed import rank_seed
 
 from .distributed_harness import run_distributed, run_scenarios, unwrap_results
 from .helpers import as_double, float64_reference, l2_rel, make_tiny_forecaster
@@ -41,42 +52,14 @@ WORKERS_HANG_AT_EXIT = sys.platform == "darwin" and tuple(map(int, torch.__versi
 PATCH = 4
 CTX_STEPS = 4 * PATCH  # 16
 DOM_HORIZON = 2 * PATCH  # 8
-REP_HORIZON = 6  # deliberately different from DOM_HORIZON (non-multiple of PATCH)
+REP_HORIZON = 6  # deliberately not a multiple of PATCH (exercises distillation mask padding)
 COV_ROWS = 3
 
-
-# --------------------------------------------------------------------------- multi-process helpers
-
-
-class _RecordHandler(logging.Handler):
-    """In-worker log collector returning `(levelno, message)` tuples."""
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.DEBUG)
-        self.records: list[tuple[int, str]] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.records.append((record.levelno, record.getMessage()))
+STEP_TOL = {"float64": 1e-12, "float32": 1e-5}
+TRAJ_TOL = {"float64": 1e-10, "float32": 1e-4}
 
 
-def _capture_trainer_logs() -> tuple[logging.Logger, _RecordHandler, int]:
-    tlog = logging.getLogger("timestral_tune.trainer")
-    prev_level = tlog.level
-    handler = _RecordHandler()
-    tlog.setLevel(logging.DEBUG)
-    tlog.addHandler(handler)
-    return tlog, handler, prev_level
-
-
-def _release_trainer_logs(tlog: logging.Logger, handler: _RecordHandler, prev_level: int) -> None:
-    tlog.removeHandler(handler)
-    tlog.setLevel(prev_level)
-
-
-def _followup_sum(ctx: DistributedContext) -> int:
-    probe = torch.tensor([1], dtype=torch.int64)
-    ctx.all_reduce_sum(probe)
-    return int(probe.item())
+# --------------------------------------------------------------------------- helpers
 
 
 def _fresh_model(seed: int = 0, *, dtype: torch.dtype = torch.float32) -> TuneTimestralModel:
@@ -262,13 +245,13 @@ def _warmed_student_state(
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
-# --------------------------------------------------------------------------- Scenario 1: Step-level parity
+# --------------------------------------------------------------------------- Scenario 1: White-box step parity
 
 
 def _step_parity_regimes(
     world_size: int,
 ) -> list[tuple[str, float, float, tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]]:
-    """Probe section [4] regimes + empty-domain-with-active-replay + replay-only all-zero fallback."""
+    """Mixed unequal, single-rank zero replay, distill-only, all-zero fallback, and empty-domain active-replay."""
     if world_size == 2:
         uneq_d: tuple[tuple[int, ...], ...] = ((8, 6, 4), (2,))
         eq_d: tuple[tuple[int, ...], ...] = ((8, 6), (8, 6))
@@ -310,7 +293,7 @@ def _sc_step_level_parity(rank: int, world_size: int) -> dict[str, Any]:
                 for label, rf, dw, dom_spec, rep_spec in regimes:
                     key = f"{dtype_name}:{mode}:{label}"
                     base_model = _fresh_model(0, dtype=dtype)
-                    dom_u, dom_s = _make_sharded_batch_from_counts(
+                    _, dom_s = _make_sharded_batch_from_counts(
                         dom_spec,
                         covariates=True,
                         horizon=DOM_HORIZON,
@@ -318,7 +301,7 @@ def _sc_step_level_parity(rank: int, world_size: int) -> dict[str, Any]:
                         dtype=dtype,
                         model_config=base_model.config,
                     )
-                    rep_u, rep_s = _make_sharded_batch_from_counts(
+                    _, rep_s = _make_sharded_batch_from_counts(
                         rep_spec,
                         covariates=False,
                         horizon=REP_HORIZON,
@@ -340,7 +323,7 @@ def _sc_step_level_parity(rank: int, world_size: int) -> dict[str, Any]:
                         replay_fraction=rf,
                         distill_weight=dw,
                         batch_size=2,
-                        cache_base_outputs=True,  # must still be ignored in multi-process mode
+                        cache_base_outputs=True,
                         smooth_beta=1e-3,
                     )
                     trainer = TimestralTrainer(
@@ -370,39 +353,19 @@ def _sc_step_level_parity(rank: int, world_size: int) -> dict[str, Any]:
                     finally:
                         strategy.cleanup()
                         trainer.model.eval()
-                    # Confirm no caches were built.
                     assert trainer._replay_base_pos is None and trainer._replay_base_neg is None
                     assert trainer._train_head_cache is None and trainer._replay_head_cache is None
     return out
 
 
-# --------------------------------------------------------------------------- Scenario 2: Trajectory parity via fit()
+# --------------------------------------------------------------------------- Scenario 2: Complementary trajectories
 
 
-def _trajectory_cases(world_size: int) -> list[dict[str, Any]]:
-    # Domain has 2*N*B + 1 windows (with B=2) so a trailing partial step exercises unequal/empty domain slices.
+def _unique_trajectory_cases(world_size: int) -> list[dict[str, Any]]:
     dom_len = 2 * world_size * 2 + 1
-    non_mult_rep = world_size * 2 + (world_size // 2)  # 5 at N=2 (N*b=4); 10 at N=4 (N*b=8)
-    short_rep = max(1, world_size - 2) if world_size == 4 else 1  # 1 at N=2; 2 at N=4 (< N, empty trailing ranks)
+    non_mult_rep = world_size * 2 + (world_size // 2)  # 5 at N=2, 10 at N=4
+    short_rep = max(1, world_size - 2) if world_size == 4 else 1
     return [
-        {
-            "name": "replay_only_non_mult_full_ft",
-            "mode": "full_ft",
-            "dom_len": dom_len,
-            "rep_len": non_mult_rep,
-            "rf": 0.25,
-            "dw": 0.0,
-            "steps": 5,
-        },
-        {
-            "name": "distill_only_short_head_only",
-            "mode": "head_only",
-            "dom_len": dom_len,
-            "rep_len": short_rep,
-            "rf": 0.0,
-            "dw": 0.5,
-            "steps": 5,
-        },
         {
             "name": "both_non_mult_lora_temporal",
             "mode": "lora_temporal",
@@ -411,25 +374,6 @@ def _trajectory_cases(world_size: int) -> list[dict[str, Any]]:
             "rf": 0.25,
             "dw": 0.5,
             "steps": 5,
-        },
-        {
-            "name": "both_short_full_ft",
-            "mode": "full_ft",
-            "dom_len": dom_len,
-            "rep_len": short_rep,
-            "rf": 0.25,
-            "dw": 0.5,
-            "steps": 5,
-        },
-        {
-            "name": "both_short_full_ft_moved",
-            "mode": "full_ft",
-            "dom_len": dom_len,
-            "rep_len": short_rep,
-            "rf": 0.25,
-            "dw": 0.5,
-            "steps": 5,
-            "moved_student": True,
         },
         {
             "name": "both_non_mult_head_only_with_val",
@@ -441,10 +385,31 @@ def _trajectory_cases(world_size: int) -> list[dict[str, Any]]:
             "steps": 5,
             "with_val": True,
         },
+        {
+            # Starting from a moved student avoids the step-0 identical-weight regime where
+            # `_frozen_base` (`requires_grad=False`) and student (`requires_grad=True`) take
+            # different `F.linear` paths on permuted float32 inputs (measured in
+            # `scripts/probes/linear_requires_grad_dispatch.py`), holding strict 1e-4 / 1e-10.
+            "name": "both_short_full_ft_moved",
+            "mode": "full_ft",
+            "dom_len": dom_len,
+            "rep_len": short_rep,
+            "rf": 0.25,
+            "dw": 0.5,
+            "steps": 5,
+            "moved_student": True,
+        },
     ]
 
 
-def _run_trajectory_case(case: dict[str, Any], *, batch_size: int, replay_batch_size: int) -> dict[str, Any]:
+def _run_trajectory_case(
+    case: dict[str, Any],
+    *,
+    dtype_name: str,
+    batch_size: int,
+    replay_batch_size: int,
+) -> dict[str, Any]:
+    dtype = torch.float64 if dtype_name == "float64" else torch.float32
     dom_ds = _make_single_window_dataset(case["dom_len"], seed=40, covariates=True, horizon=DOM_HORIZON)
     rep_ds = _make_single_window_dataset(case["rep_len"], seed=41, covariates=False, horizon=REP_HORIZON)
     val_ds = (
@@ -472,101 +437,57 @@ def _run_trajectory_case(case: dict[str, Any], *, batch_size: int, replay_batch_
         cache_base_outputs=False,
         smooth_beta=1e-3,
     )
-    trainer = TimestralTrainer(
-        cfg,
-        dom_ds,
-        val_ds,
-        lora_config=lora_cfg,
-        replay_config=rcfg,
-        replay_dataset=rep_ds,
-        model=_fresh_model(3),
-    )
-    if case.get("moved_student"):
-        # Move student away from the step-0 frozen teacher so |student_q - teacher_q| >> smooth_beta.
-        moved_state = _warmed_student_state(mode, torch.float32, dom_ds, model_seed=3)
-        trainer.model.load_state_dict(moved_state)
-    res = trainer.fit()
-    return {
-        "result": res,
-        "params": _flat_tensors(trainer._trainable),
-    }
+    ctx_mgr = float64_reference() if dtype == torch.float64 else contextlib.nullcontext()
+    with ctx_mgr:
+        trainer = TimestralTrainer(
+            cfg,
+            dom_ds,
+            val_ds,
+            lora_config=lora_cfg,
+            replay_config=rcfg,
+            replay_dataset=rep_ds,
+            model=_fresh_model(3, dtype=dtype),
+        )
+        if case.get("moved_student"):
+            moved_state = _warmed_student_state(mode, dtype, dom_ds, model_seed=3)
+            trainer.model.load_state_dict(moved_state)
+        res = trainer.fit()
+        params = _flat_tensors(trainer._trainable)
+    return {"result": res, "params": params}
 
 
-def _sc_trajectory_parity(rank: int, world_size: int) -> dict[str, Any]:
+def _sc_unique_trajectory_parity(rank: int, world_size: int) -> dict[str, Any]:
     del rank
-    return {
-        case["name"]: _run_trajectory_case(case, batch_size=2, replay_batch_size=2)
-        for case in _trajectory_cases(world_size)
-    }
+    out: dict[str, Any] = {}
+    for dtype_name in ("float64", "float32"):
+        for case in _unique_trajectory_cases(world_size):
+            out[f"{dtype_name}:{case['name']}"] = _run_trajectory_case(
+                case, dtype_name=dtype_name, batch_size=2, replay_batch_size=2
+            )
+    return out
 
 
-# --------------------------------------------------------------------------- Scenario 3: Globally skipped domain step
+# --------------------------------------------------------------------------- Scenario 3: Skipped-step white-box check
 
 
-class _ZeroScoredMiddleDataset(TimeSeriesDataset):
-    """`TimeSeriesDataset` whose windows in `[zero_start, zero_end)` have all-NaN futures (zero scored)."""
+class _ZeroScoredDataset(TimeSeriesDataset):
+    """`TimeSeriesDataset` whose windows have all-NaN futures (zero scored)."""
 
-    def __init__(self, base: TimeSeriesDataset, zero_start: int, zero_end: int) -> None:
+    def __init__(self, base: TimeSeriesDataset) -> None:
         self.__dict__.update(base.__dict__)
-        self._zero_start = zero_start
-        self._zero_end = zero_end
 
     def __getitem__(self, index: int):
         win = super().__getitem__(index)
-        if self._zero_start <= index < self._zero_end:
-            return dataclasses.replace(win, target_future=np.full_like(win.target_future, np.nan))
-        return win
+        return dataclasses.replace(win, target_future=np.full_like(win.target_future, np.nan))
 
 
-def _sc_skipped_domain_step_preserves_replay(rank: int, world_size: int) -> dict[str, Any]:
+def _sc_skipped_step_preserves_generators_and_cursor(rank: int, world_size: int) -> dict[str, Any]:
     per_rank_b = 2
-    global_b = world_size * per_rank_b
-    base_dom = _make_single_window_dataset(3 * global_b, seed=55, covariates=True, horizon=DOM_HORIZON)
-    dom_with_skip = _ZeroScoredMiddleDataset(base_dom, global_b, 2 * global_b)
-    # Replay dataset with distinct windows so advancing an extra replay step would visibly change loss & weights.
-    rep_ds = _make_single_window_dataset(global_b * 3, seed=56, covariates=False, horizon=REP_HORIZON)
-
-    cfg = _base_config(
-        mode="full_ft",
-        batch_size=per_rank_b,
-        max_steps=4,
-        learning_rate=2e-3,
-        warmup_steps=1,
-        lr_schedule="cosine",
-        weight_decay=0.01,
-        gradient_clip_val=1.0,
-        seed=13,
+    dom_ds = _ZeroScoredDataset(
+        _make_single_window_dataset(world_size * per_rank_b, seed=55, covariates=True, horizon=DOM_HORIZON)
     )
-    rcfg = ReplayConfig(replay_fraction=0.3, distill_weight=0.4, batch_size=per_rank_b, cache_base_outputs=False)
-    trainer = TimestralTrainer(cfg, dom_with_skip, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(5))
-
-    # Spy on replay cursor advancement inside fit() by wrapping _make_fit_strategy.
-    real_make = trainer._make_fit_strategy
-    recorded_replay_steps: list[tuple[int, int]] = []  # (trainer.global_step before step, replay global_step)
-
-    def _wrapped_make():
-        strat = real_make()
-        real_prepare = strat.prepare_fit
-
-        def _wrapped_prepare() -> None:
-            real_prepare()
-            assert strat._replay_cycle is not None
-            real_next = strat._replay_cycle.next_batch
-
-            def _spied_next():
-                recorded_replay_steps.append((trainer.global_step, strat._replay_cycle.global_step))
-                return real_next()
-
-            strat._replay_cycle.next_batch = _spied_next  # type: ignore[method-assign]
-
-        strat.prepare_fit = _wrapped_prepare  # type: ignore[method-assign]
-        return strat
-
-    trainer._make_fit_strategy = _wrapped_make  # type: ignore[method-assign]
-    res = trainer.fit()
-
-    # Also verify stochastic skipped step leaves replay cursor and both flip generators untouched.
-    stoch_cfg = _base_config(
+    rep_ds = _make_single_window_dataset(world_size * per_rank_b * 2, seed=56, covariates=False, horizon=REP_HORIZON)
+    cfg = _base_config(
         mode="head_only",
         batch_size=per_rank_b,
         max_steps=2,
@@ -574,240 +495,37 @@ def _sc_skipped_domain_step_preserves_replay(rank: int, world_size: int) -> dict
         sign_flip=True,
         seed=29,
     )
-    stoch_rcfg = ReplayConfig(
+    rcfg = ReplayConfig(
         replay_fraction=0.25, distill_weight=0.2, batch_size=per_rank_b, sign_flip=True, cache_base_outputs=False
     )
-    stoch_trainer = TimestralTrainer(
-        stoch_cfg, dom_with_skip, replay_config=stoch_rcfg, replay_dataset=rep_ds, model=_fresh_model(5)
-    )
-    strat = stoch_trainer._make_fit_strategy()
+    trainer = TimestralTrainer(cfg, dom_ds, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(5))
+    strat = trainer._make_fit_strategy()
     strat.prepare_fit()
-    stoch_trainer.model.train()
+    trainer.model.train()
     try:
         assert strat._replay_cycle is not None
         assert strat._flip_generator is not None and strat._replay_flip_generator is not None
-        collator = dom_with_skip.collator(stoch_trainer.model.config)
-        zero_batch = collator([dom_with_skip[global_b + rank]])
+        collator = dom_ds.collator(trainer.model.config)
+        zero_batch = collator([dom_ds[rank]])
         dom_flip_before = strat._flip_generator.get_state().clone()
         rep_flip_before = strat._replay_flip_generator.get_state().clone()
         outcome = strat._run_step(lambda: zero_batch, strat._replay_cycle.next_batch)
-        stoch_skip_ok = (
-            outcome.skipped
-            and strat._replay_cycle.global_step == 0
-            and torch.equal(strat._flip_generator.get_state(), dom_flip_before)
-            and torch.equal(strat._replay_flip_generator.get_state(), rep_flip_before)
-        )
+        return {
+            "skipped": outcome.skipped,
+            "replay_step": strat._replay_cycle.global_step,
+            "dom_flip_unchanged": bool(torch.equal(strat._flip_generator.get_state(), dom_flip_before)),
+            "rep_flip_unchanged": bool(torch.equal(strat._replay_flip_generator.get_state(), rep_flip_before)),
+        }
     finally:
         strat.cleanup()
-        stoch_trainer.model.eval()
-
-    return {
-        "result": res,
-        "params": _flat_tensors(trainer._trainable),
-        "recorded_replay_steps": recorded_replay_steps,
-        "stoch_skip_ok": stoch_skip_ok,
-    }
+        trainer.model.eval()
 
 
-# --------------------------------------------------------------------------- Scenario 4: Replay failures & non-finite
+# --------------------------------------------------------------------------- Scenario 4: Loader seed & stochastic synth
 
 
-class _FailingOnRankDataset(TimeSeriesDataset):
-    """Raises `RuntimeError` when indexed on `fail_rank`."""
-
-    def __init__(self, base: TimeSeriesDataset, *, should_fail: bool) -> None:
-        self.__dict__.update(base.__dict__)
-        self._should_fail = should_fail
-
-    def __getitem__(self, index: int):
-        if self._should_fail:
-            raise RuntimeError("replay_fetch_boom")
-        return super().__getitem__(index)
-
-
-def _sc_replay_failures(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
-    assert ctx is not None
-    dom_ds = _make_single_window_dataset(world_size * 2, seed=60, covariates=True, horizon=DOM_HORIZON)
-    rep_ds = _make_single_window_dataset(world_size * 2, seed=61, covariates=False, horizon=REP_HORIZON)
-    cfg = _base_config(mode="full_ft", batch_size=2, max_steps=2)
-    rcfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False)
-    out: dict[str, Any] = {}
-
-    # 1. Rank 1 fails inside _prepare_replay_batch.
-    t1 = TimestralTrainer(cfg, dom_ds, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(6))
-    if rank == 1:
-
-        def _boom_prep(_item: Any, _gen: Any) -> Any:
-            raise KeyError("replay_prep_boom")
-
-        t1._prepare_replay_batch = _boom_prep  # type: ignore[method-assign]
-    try:
-        t1.fit()
-        out["prep_fail"] = {"raised": False}
-    except Exception as exc:
-        out["prep_fail"] = {
-            "raised": True,
-            "exc_type": type(exc),
-            "failing_ranks": getattr(exc, "failing_ranks", None),
-            "stage": getattr(exc, "stage", None),
-            "model_training": t1.model.training,
-            "followup": _followup_sum(ctx),
-        }
-
-    # 2. Rank 1 fails inside replay dataset __getitem__ (fetch_replay inside Stage 1).
-    # Keep identical dataset fingerprints at startup, then flip _should_fail on rank 1 before fit().
-    failing_rep_ds = _FailingOnRankDataset(rep_ds, should_fail=False)
-    t2 = TimestralTrainer(cfg, dom_ds, replay_config=rcfg, replay_dataset=failing_rep_ds, model=_fresh_model(6))
-    if rank == 1:
-        failing_rep_ds._should_fail = True
-    try:
-        t2.fit()
-        out["fetch_fail"] = {"raised": False}
-    except Exception as exc:
-        out["fetch_fail"] = {
-            "raised": True,
-            "exc_type": type(exc),
-            "failing_ranks": getattr(exc, "failing_ranks", None),
-            "stage": getattr(exc, "stage", None),
-            "model_training": t2.model.training,
-            "followup": _followup_sum(ctx),
-        }
-
-    # 3. Rank 1 fails inside Phase 0 domain fetch (with replay configured) -> propagates without advancing replay.
-    failing_dom_ds = _FailingOnRankDataset(dom_ds, should_fail=False)
-    t3 = TimestralTrainer(cfg, failing_dom_ds, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(6))
-    if rank == 1:
-        failing_dom_ds._should_fail = True
-    try:
-        t3.fit()
-        out["pre_fetch_fail"] = {"raised": False}
-    except Exception as exc:
-        out["pre_fetch_fail"] = {
-            "raised": True,
-            "exc_type": type(exc),
-            "failing_ranks": getattr(exc, "failing_ranks", None),
-            "stage": getattr(exc, "stage", None),
-            "model_training": t3.model.training,
-            "followup": _followup_sum(ctx),
-        }
-
-    # 4. Single-rank non-finite replay loss raises FloatingPointError on all ranks.
-    t4 = TimestralTrainer(cfg, dom_ds, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(6))
-    real_prep = t4._prepare_replay_batch
-    if rank == 1:
-
-        def _nan_replay(item: Any, gen: Any):
-            prepared = real_prep(item, gen)
-            bad_targets = prepared.batch.targets.clone()
-            bad_targets[0, 0] = float("nan")
-            return dataclasses.replace(prepared, batch=dataclasses.replace(prepared.batch, targets=bad_targets))
-
-        t4._prepare_replay_batch = _nan_replay  # type: ignore[method-assign]
-    try:
-        t4.fit()
-        out["non_finite_replay"] = {"raised": False}
-    except Exception as exc:
-        out["non_finite_replay"] = {
-            "raised": True,
-            "exc_type": type(exc),
-            "model_training": t4.model.training,
-            "followup": _followup_sum(ctx),
-        }
-
-    return out
-
-
-# --------------------------------------------------------------------------- Scenario 5: Caches, logs, broadcast, synth
-
-
-def _sc_caches_logs_startup_and_stochastic(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
-    assert ctx is not None
+def _sc_loader_seed_and_stochastic_synth(rank: int, world_size: int) -> dict[str, Any]:
     dom_ds = _make_single_window_dataset(world_size * 2 + 1, seed=70, covariates=True, horizon=DOM_HORIZON)
-    rep_ds = _make_single_window_dataset(world_size * 2 + 1, seed=71, covariates=False, horizon=REP_HORIZON)
-    out: dict[str, Any] = {}
-
-    # 1. Caches off + rank-0-only log notices across head_only, lora_variate, full_ft.
-    cache_checks: dict[str, Any] = {}
-    for mode in ("head_only", "lora_variate", "full_ft"):
-        lora_cfg = LoraConfig(axes=("variate",), dropout=0.0) if mode == "lora_variate" else None
-        # Perturb rank 1's initial model weights to verify teacher copies happen AFTER startup broadcast!
-        m = _fresh_model(7)
-        if rank != 0:
-            with torch.no_grad():
-                for p in m.parameters():
-                    p.add_(rank + 1.0)
-        tlog, handler, prev = _capture_trainer_logs()
-        try:
-            tr = TimestralTrainer(
-                _base_config(mode=mode, batch_size=2, max_steps=2, cache_frozen_features=True),
-                dom_ds,
-                lora_config=lora_cfg,
-                replay_config=ReplayConfig(
-                    replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=True
-                ),
-                replay_dataset=rep_ds,
-                model=m,
-            )
-            init_logs = list(handler.records)
-            handler.records.clear()
-
-            teacher_params: Tensor | None = None
-            if mode == "head_only":
-                assert tr._frozen_head is not None and tr._frozen_base is None
-                teacher_params = _flat_tensors(list(tr._frozen_head.parameters()))
-            elif mode == "full_ft":
-                assert tr._frozen_base is not None and tr._frozen_head is None
-                teacher_params = _flat_tensors(list(tr._frozen_base.parameters()))
-            else:
-                assert tr._frozen_head is None and tr._frozen_base is None
-
-            tr.fit()
-            fit_logs = list(handler.records)
-        finally:
-            _release_trainer_logs(tlog, handler, prev)
-
-        cache_checks[mode] = {
-            "caches_none": (
-                tr._train_head_cache is None
-                and tr._val_head_cache is None
-                and tr._replay_head_cache is None
-                and tr._replay_base_pos is None
-                and tr._replay_base_neg is None
-            ),
-            "teacher_params": teacher_params,
-            "final_params": _flat_tensors(tr._trainable),
-            "init_base_cache_logs": sum(1 for _, msg in init_logs if "cache_base_outputs=True" in msg),
-            "fit_base_cache_logs": sum(1 for _, msg in fit_logs if "cache_base_outputs=True" in msg),
-            "init_head_cache_logs": sum(1 for _, msg in init_logs if "cache_frozen_features=True" in msg),
-            "fit_head_cache_logs": sum(1 for _, msg in fit_logs if "cache_frozen_features=True" in msg),
-        }
-    out["cache_checks"] = cache_checks
-
-    # 2. No cache_base_outputs bypass notice when cache_base_outputs=False or distill_weight=0.
-    tlog, handler, prev = _capture_trainer_logs()
-    try:
-        TimestralTrainer(
-            _base_config(mode="full_ft", batch_size=2, max_steps=1),
-            dom_ds,
-            replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.5, cache_base_outputs=False),
-            replay_dataset=rep_ds,
-            model=_fresh_model(7),
-        )
-        TimestralTrainer(
-            _base_config(mode="full_ft", batch_size=2, max_steps=1),
-            dom_ds,
-            replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.0, cache_base_outputs=True),
-            replay_dataset=rep_ds,
-            model=_fresh_model(7),
-        )
-        silent_logs = list(handler.records)
-    finally:
-        _release_trainer_logs(tlog, handler, prev)
-    out["silent_base_cache_logs"] = sum(1 for _, msg in silent_logs if "cache_base_outputs=True" in msg)
-
-    # 3. Default SyntheticReplaySource (replay_dataset=None) + startup consistency + stochastic fit().
     t_synth = TimestralTrainer(
         _base_config(mode="lora_temporal", batch_size=2, max_steps=3, shuffle=True, sign_flip=True, seed=19),
         dom_ds,
@@ -816,168 +534,30 @@ def _sc_caches_logs_startup_and_stochastic(rank: int, world_size: int) -> dict[s
         model=_fresh_model(8),
     )
     assert isinstance(t_synth.replay_dataset, SyntheticReplaySource)
-    # Verify replay loader generator is rank-seeded and leaves global RNG untouched.
+
     strat_check = t_synth._make_fit_strategy()
     strat_check.prepare_fit()
     try:
         assert strat_check._replay_loader is not None and strat_check._replay_loader.generator is not None
-        assert strat_check._replay_loader.generator.initial_seed() == rank_seed(19 + 2_000_009, rank)
+        loader_seed_ok = strat_check._replay_loader.generator.initial_seed() == rank_seed(19 + 2_000_009, rank)
+        loader_workers_ok = (
+            strat_check._replay_loader.num_workers == 0 and strat_check._replay_loader.persistent_workers is False
+        )
         assert strat_check._replay_cycle is not None
         rng_before = torch.get_rng_state()
         _ = strat_check._replay_cycle.next_batch()
-        replay_rng_preserved = torch.equal(torch.get_rng_state(), rng_before)
+        replay_rng_preserved = bool(torch.equal(torch.get_rng_state(), rng_before))
     finally:
         strat_check.cleanup()
 
     synth_res = t_synth.fit()
-    out["synth"] = {
+    return {
+        "loader_seed_ok": loader_seed_ok,
+        "loader_workers_ok": loader_workers_ok,
+        "replay_rng_preserved": replay_rng_preserved,
         "steps": synth_res.steps,
         "train_history": synth_res.train_history,
         "params": _flat_tensors(t_synth._trainable),
-        "replay_rng_preserved": replay_rng_preserved,
-    }
-
-    # 4. Mismatched replay_dataset on rank 1 caught by startup_consistency.
-    bad_rep = _make_single_window_dataset(world_size * 2 + 1, seed=999, covariates=False, horizon=REP_HORIZON)
-    try:
-        TimestralTrainer(
-            _base_config(mode="head_only", batch_size=2, max_steps=1),
-            dom_ds,
-            replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2),
-            replay_dataset=bad_rep if rank == 1 else rep_ds,
-            model=_fresh_model(8),
-        )
-        out["replay_mismatch"] = {"raised": False}
-    except Exception as exc:
-        out["replay_mismatch"] = {
-            "raised": True,
-            "exc_type": type(exc),
-            "failing_ranks": getattr(exc, "failing_ranks", None),
-            "stage": getattr(exc, "stage", None),
-            "followup": _followup_sum(ctx),
-        }
-
-    return out
-
-
-# --------------------------------------------------------------------------- Scenario 6: Export with replay
-
-
-def _sc_export_with_replay(rank: int, world_size: int) -> dict[str, Any]:
-    dom_ds = _make_single_window_dataset(world_size * 2, seed=80, covariates=True, horizon=DOM_HORIZON)
-    rep_ds = _make_single_window_dataset(world_size * 2 + 1, seed=81, covariates=False, horizon=REP_HORIZON)
-
-    explicit_rcfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False)
-    synth_rcfg = ReplayConfig(replay_fraction=0.2, distill_weight=0.3, batch_size=2, cache_base_outputs=False)
-
-    t_explicit = TimestralTrainer(
-        _base_config(mode="head_only", batch_size=2, max_steps=1),
-        dom_ds,
-        replay_config=explicit_rcfg,
-        replay_dataset=rep_ds,
-        model=_fresh_model(9),
-    )
-    t_synth = TimestralTrainer(
-        _base_config(mode="lora_temporal", batch_size=2, max_steps=1),
-        dom_ds,
-        lora_config=LoraConfig(axes=("time",), dropout=0.0),
-        replay_config=synth_rcfg,
-        model=_fresh_model(9),
-    )
-    t_explicit.fit()
-    t_synth.fit()
-
-    out: dict[str, Any] = {}
-    with tempfile.TemporaryDirectory(prefix=f"tt_rep_exp_r{rank}_") as tmpdir:
-        base = Path(tmpdir)
-        orig_fp = trainer_module.dataset_fingerprint
-        orig_export_fn = trainer_module.export_checkpoint
-        orig_save = export_module.save_file
-
-        def _forbid(*_args: Any, **_kwargs: Any) -> Any:
-            raise AssertionError("non-zero rank export() must not hash datasets, build replay_source, or write")
-
-        if rank != 0:
-            trainer_module.dataset_fingerprint = _forbid
-            trainer_module.export_checkpoint = _forbid
-            export_module.save_file = _forbid
-        try:
-            explicit_dir = base / "explicit_ckpt"
-            synth_dir = base / "synth_ckpt"
-            out["explicit_returned"] = t_explicit.export(explicit_dir) == explicit_dir
-            out["synth_returned"] = t_synth.export(synth_dir) == synth_dir
-            out["explicit_exists"] = explicit_dir.exists()
-            out["synth_exists"] = synth_dir.exists()
-            if rank == 0:
-                out["explicit_metadata"] = json.loads((explicit_dir / "tune_metadata.json").read_text(encoding="utf-8"))
-                out["synth_metadata"] = json.loads((synth_dir / "tune_metadata.json").read_text(encoding="utf-8"))
-        finally:
-            trainer_module.dataset_fingerprint = orig_fp
-            trainer_module.export_checkpoint = orig_export_fn
-            export_module.save_file = orig_save
-    return out
-
-
-# --------------------------------------------------------------------------- Scenario 7: Repeated fit() with replay
-
-
-def _sc_repeated_fit_restarts_replay(rank: int, world_size: int) -> dict[str, Any]:
-    del rank
-    dom_len = 2 * world_size * 2 + 1
-    rep_len = world_size * 2 + (world_size // 2)  # 5 at N=2, 10 at N=4 (2 steps/epoch; 3 steps stops mid-epoch 1)
-    dom_ds = _make_single_window_dataset(dom_len, seed=90, covariates=True, horizon=DOM_HORIZON)
-    rep_ds = _make_single_window_dataset(rep_len, seed=91, covariates=False, horizon=REP_HORIZON)
-    cfg = _base_config(
-        mode="head_only",
-        batch_size=2,
-        max_steps=3,
-        learning_rate=2e-3,
-        warmup_steps=1,
-        lr_schedule="cosine",
-        weight_decay=0.01,
-        gradient_clip_val=1.0,
-        seed=17,
-    )
-    rcfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False)
-    trainer = TimestralTrainer(cfg, dom_ds, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(11))
-
-    real_make = trainer._make_fit_strategy
-    fit_cursors: list[list[tuple[int, int, int]]] = []
-
-    def _wrapped_make():
-        strat = real_make()
-        real_prepare = strat.prepare_fit
-        call_log: list[tuple[int, int, int]] = []
-        fit_cursors.append(call_log)
-
-        def _wrapped_prepare() -> None:
-            real_prepare()
-            assert strat._replay_cycle is not None
-            real_next = strat._replay_cycle.next_batch
-
-            def _spied_next():
-                cycle = strat._replay_cycle
-                assert cycle is not None
-                call_log.append((cycle.epoch, cycle.step_in_epoch, cycle.global_step))
-                return real_next()
-
-            strat._replay_cycle.next_batch = _spied_next  # type: ignore[method-assign]
-
-        strat.prepare_fit = _wrapped_prepare  # type: ignore[method-assign]
-        return strat
-
-    trainer._make_fit_strategy = _wrapped_make  # type: ignore[method-assign]
-
-    res1 = trainer.fit()
-    params1 = _flat_tensors(trainer._trainable)
-    res2 = trainer.fit()
-    params2 = _flat_tensors(trainer._trainable)
-    return {
-        "fit1_result": res1,
-        "fit2_result": res2,
-        "fit1_params": params1,
-        "fit2_params": params2,
-        "fit_cursors": fit_cursors,
     }
 
 
@@ -985,15 +565,12 @@ def _sc_repeated_fit_restarts_replay(rank: int, world_size: int) -> dict[str, An
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
+def test_distributed_replay_whitebox_scenarios(world_size: int) -> None:
     scenarios = {
         "step_parity": _sc_step_level_parity,
-        "trajectory_parity": _sc_trajectory_parity,
-        "skipped_domain": _sc_skipped_domain_step_preserves_replay,
-        "failures": _sc_replay_failures,
-        "caches_and_startup": _sc_caches_logs_startup_and_stochastic,
-        "export_with_replay": _sc_export_with_replay,
-        "repeated_fit": _sc_repeated_fit_restarts_replay,
+        "trajectory_unique": _sc_unique_trajectory_parity,
+        "skipped_step_whitebox": _sc_skipped_step_preserves_generators_and_cursor,
+        "loader_seed_and_synth": _sc_loader_seed_and_stochastic_synth,
     }
     outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=15.0, wall_timeout=120.0)
 
@@ -1003,7 +580,8 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
     rep_ds = _make_single_window_dataset(4, seed=11, covariates=False, horizon=REP_HORIZON)
     regimes = _step_parity_regimes(world_size)
 
-    for dtype_name, dtype, tol in (("float64", torch.float64, 1e-12), ("float32", torch.float32, 1e-5)):
+    for dtype_name, dtype in (("float64", torch.float64), ("float32", torch.float32)):
+        tol = STEP_TOL[dtype_name]
         ctx_mgr = float64_reference() if dtype == torch.float64 else contextlib.nullcontext()
         with ctx_mgr:
             for mode in ("head_only", "lora_variate", "full_ft"):
@@ -1020,7 +598,7 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
                         dtype=dtype,
                         model_config=base_model.config,
                     )
-                    rep_u, rep_s = _make_sharded_batch_from_counts(
+                    rep_u, _ = _make_sharded_batch_from_counts(
                         rep_spec,
                         covariates=False,
                         horizon=REP_HORIZON,
@@ -1061,14 +639,12 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
                     assert l2_rel(r0["params"], ref_params) <= tol, (
                         f"{key}: param rel L2 = {l2_rel(r0['params'], ref_params)}"
                     )
-                    # Cross-rank exact equality on gradients and updated parameters.
                     for r in range(1, world_size):
                         assert torch.equal(sp[r][key]["grads"], r0["grads"]), f"{key}: rank {r} grad mismatch"
                         assert torch.equal(sp[r][key]["params"], r0["params"]), f"{key}: rank {r} param mismatch"
                         assert sp[r][key]["loss"] == pytest.approx(r0["loss"], rel=0.0, abs=1e-15)
 
-                    # For e_empty_domain_active_replay (float32 full_ft), also prove the empty-domain rank's
-                    # replay slice actually contributed (dropping it yields strictly different loss/grads).
+                    # Prove the empty-domain rank's replay slice actually contributed.
                     if label == "e_empty_domain_active_replay" and dtype_name == "float32" and mode == "full_ft":
                         empty_rank = 0 if world_size == 2 else 3
                         non_empty_rep_spec = tuple(
@@ -1098,229 +674,58 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
                             "empty-domain rank's replay contribution was not distinguishable from dropping it"
                         )
 
-    # --- 2. Trajectory parity through fit() vs 1-process fit() at (N*B, N*b) ---
-    tp = unwrap_results(outcomes["trajectory_parity"])
-    for case in _trajectory_cases(world_size):
-        name = case["name"]
-        ref = _run_trajectory_case(case, batch_size=world_size * 2, replay_batch_size=world_size * 2)
-        r0 = tp[0][name]
-        assert r0["result"].steps == ref["result"].steps == case["steps"]
-        assert len(r0["result"].train_history) == len(ref["result"].train_history)
-        # Only `full_ft` with distillation starting at student == _frozen_base needs 5e-4 on fp32 loss:
-        # PyTorch CPU `grad` vs `no_grad` differs by ~3.6e-7 at batch_size>=2 vs 0 at batch_size=1, which
-        # `smooth_l1_loss(beta=1e-3)` amplifies by 1/beta into ~1.5e-4 step-1 grad / 3.38e-4 max loss diff
-        # in a pure 1-process union-vs-split comparison (drops to 2.18e-7 loss / 2.07e-7 param from a
-        # moved student and 3.08e-13 in float64). Every other case, including `both_short_full_ft_moved`,
-        # holds strict 1e-4 on both loss and parameters.
-        is_step0_full_ft_distill = (
-            case["mode"] == "full_ft" and case["dw"] > 0.0 and not case.get("moved_student", False)
-        )
-        loss_tol = 5e-4 if is_step0_full_ft_distill else 1e-4
-        for (s_got, l_got), (s_ref, l_ref) in zip(r0["result"].train_history, ref["result"].train_history, strict=True):
-            assert s_got == s_ref
-            assert abs(l_got - l_ref) <= loss_tol * max(1.0, abs(l_ref)), f"{name} step {s_got}: {l_got} vs {l_ref}"
-        assert l2_rel(r0["params"], ref["params"]) <= 1e-4, (
-            f"{name}: param rel L2 {l2_rel(r0['params'], ref['params'])}"
-        )
-        for r in range(1, world_size):
-            assert torch.equal(tp[r][name]["params"], r0["params"]), f"{name}: rank {r} param divergence"
-            assert tp[r][name]["result"] == r0["result"], f"{name}: rank {r} TrainingResult divergence"
+    # --- 2. Complementary trajectories (lora_temporal, periodic val+restore, moved-student full_ft) ---
+    tp = unwrap_results(outcomes["trajectory_unique"])
+    for dtype_name in ("float64", "float32"):
+        tol = TRAJ_TOL[dtype_name]
+        for case in _unique_trajectory_cases(world_size):
+            key = f"{dtype_name}:{case['name']}"
+            ref = _run_trajectory_case(
+                case, dtype_name=dtype_name, batch_size=world_size * 2, replay_batch_size=world_size * 2
+            )
+            r0 = tp[0][key]
+            assert r0["result"].steps == ref["result"].steps == case["steps"]
+            assert len(r0["result"].train_history) == len(ref["result"].train_history)
+            for (s_got, l_got), (s_ref, l_ref) in zip(
+                r0["result"].train_history, ref["result"].train_history, strict=True
+            ):
+                assert s_got == s_ref
+                assert abs(l_got - l_ref) <= tol * max(1.0, abs(l_ref)), f"{key} step {s_got}: {l_got} vs {l_ref}"
+            if case.get("with_val"):
+                assert len(r0["result"].eval_history) == len(ref["result"].eval_history) > 0
+                assert r0["result"].best_step == ref["result"].best_step
+                assert r0["result"].restored_best == ref["result"].restored_best
+                for (s_got, l_got), (s_ref, l_ref) in zip(
+                    r0["result"].eval_history, ref["result"].eval_history, strict=True
+                ):
+                    assert s_got == s_ref
+                    assert abs(l_got - l_ref) <= tol * max(1.0, abs(l_ref)), f"{key} eval {s_got}: {l_got} vs {l_ref}"
+            assert l2_rel(r0["params"], ref["params"]) <= tol, (
+                f"{key}: param rel L2 {l2_rel(r0['params'], ref['params'])}"
+            )
+            for r in range(1, world_size):
+                assert torch.equal(tp[r][key]["params"], r0["params"]), f"{key}: rank {r} param divergence"
+                assert tp[r][key]["result"] == r0["result"], f"{key}: rank {r} TrainingResult divergence"
 
-    # --- 3. Globally skipped domain step preserves replay position & matches 1-process fit() ---
-    sk = unwrap_results(outcomes["skipped_domain"])
-    global_b = world_size * 2
-    base_dom = _make_single_window_dataset(3 * global_b, seed=55, covariates=True, horizon=DOM_HORIZON)
-    dom_with_skip = _ZeroScoredMiddleDataset(base_dom, global_b, 2 * global_b)
-    rep_ds_skip = _make_single_window_dataset(global_b * 3, seed=56, covariates=False, horizon=REP_HORIZON)
-    ref_skip_trainer = TimestralTrainer(
-        _base_config(
-            mode="full_ft",
-            batch_size=global_b,
-            max_steps=4,
-            learning_rate=2e-3,
-            warmup_steps=1,
-            lr_schedule="cosine",
-            weight_decay=0.01,
-            gradient_clip_val=1.0,
-            seed=13,
-        ),
-        dom_with_skip,
-        replay_config=ReplayConfig(
-            replay_fraction=0.3, distill_weight=0.4, batch_size=global_b, cache_base_outputs=False
-        ),
-        replay_dataset=rep_ds_skip,
-        model=_fresh_model(5),
-    )
-    ref_skip_res = ref_skip_trainer.fit()
-    ref_skip_params = _flat_tensors(ref_skip_trainer._trainable)
-
-    r0_sk = sk[0]
-    assert r0_sk["result"].steps == 4
-    assert r0_sk["result"].skipped_batches == 2  # 2 epochs over 3 global batches (1 skipped per epoch)
-    # Every active step 0..3 consumed replay steps 0, 1, 2, 3 (never advanced on skipped middle batches!).
-    assert r0_sk["recorded_replay_steps"] == [(0, 0), (1, 1), (2, 2), (3, 3)]
-    # `skipped_domain` runs `full_ft` + distillation from student == _frozen_base; the same step-0
-    # 1/smooth_beta fp32 sensitivity gives 1.27e-4 param L2 in pure 1-process union-vs-split
-    # (2.14e-7 from a moved student, 9.64e-14 in float64), while loss stays inside 1e-4 (6.68e-5).
-    assert l2_rel(r0_sk["params"], ref_skip_params) <= 5e-4
-    for (s_got, l_got), (s_ref, l_ref) in zip(r0_sk["result"].train_history, ref_skip_res.train_history, strict=True):
-        assert s_got == s_ref and abs(l_got - l_ref) <= 1e-4 * max(1.0, abs(l_ref))
+    # --- 3. Skipped step leaves both flip generators and replay cursor untouched ---
+    sk = unwrap_results(outcomes["skipped_step_whitebox"])
     for r in range(world_size):
-        assert sk[r]["stoch_skip_ok"] is True
-        assert sk[r]["recorded_replay_steps"] == [(0, 0), (1, 1), (2, 2), (3, 3)]
-        assert torch.equal(sk[r]["params"], r0_sk["params"])
-        assert sk[r]["result"] == r0_sk["result"]
+        assert sk[r] == {
+            "skipped": True,
+            "replay_step": 0,
+            "dom_flip_unchanged": True,
+            "rep_flip_unchanged": True,
+        }
 
-    # --- 4. Replay failure propagation & non-finite replay loss ---
-    fl = unwrap_results(outcomes["failures"])
-    for key, rank1_exc in (
-        ("prep_fail", KeyError),
-        ("fetch_fail", RuntimeError),
-        ("pre_fetch_fail", RuntimeError),
-    ):
-        for r in range(world_size):
-            entry = fl[r][key]
-            assert entry["raised"] is True
-            assert entry["model_training"] is False
-            assert entry["followup"] == world_size
-            if r == 1:
-                assert entry["exc_type"] is rank1_exc
-            else:
-                assert entry["exc_type"] is RankFailureError
-                assert entry["failing_ranks"] == (1,)
-                assert entry["stage"] == "training_step"
+    # --- 4. Replay loader seed, num_workers=0, RNG isolation, and stochastic SyntheticReplaySource ---
+    ls = unwrap_results(outcomes["loader_seed_and_synth"])
     for r in range(world_size):
-        nf = fl[r]["non_finite_replay"]
-        assert nf["raised"] is True
-        assert nf["exc_type"] is FloatingPointError
-        assert nf["model_training"] is False
-        assert nf["followup"] == world_size
-
-    # --- 5. Caches off, rank-0 logs once, post-broadcast teachers, SyntheticReplaySource, consistency ---
-    cs = unwrap_results(outcomes["caches_and_startup"])
-    for mode in ("head_only", "lora_variate", "full_ft"):
-        r0_cc = cs[0]["cache_checks"][mode]
-        for r in range(world_size):
-            cc = cs[r]["cache_checks"][mode]
-            assert cc["caches_none"] is True
-            assert torch.equal(cc["final_params"], r0_cc["final_params"])
-            if mode in ("head_only", "full_ft"):
-                assert cc["teacher_params"] is not None and r0_cc["teacher_params"] is not None
-                assert torch.equal(cc["teacher_params"], r0_cc["teacher_params"])
-            if r == 0:
-                assert cc["init_base_cache_logs"] == (0 if mode == "head_only" else 1)
-                assert cc["fit_base_cache_logs"] == 0
-                assert cc["init_head_cache_logs"] == (1 if mode == "head_only" else 0)
-                assert cc["fit_head_cache_logs"] == 0
-            else:
-                assert cc["init_base_cache_logs"] == 0 and cc["fit_base_cache_logs"] == 0
-                assert cc["init_head_cache_logs"] == 0 and cc["fit_head_cache_logs"] == 0
-
-    for r in range(world_size):
-        assert cs[r]["silent_base_cache_logs"] == 0
-        assert cs[r]["synth"]["steps"] == 3
-        assert cs[r]["synth"]["replay_rng_preserved"] is True
-        assert torch.equal(cs[r]["synth"]["params"], cs[0]["synth"]["params"])
-        assert cs[r]["synth"]["train_history"] == cs[0]["synth"]["train_history"]
-
-        mm = cs[r]["replay_mismatch"]
-        assert mm["raised"] is True and mm["followup"] == world_size
-        if r == 1:
-            assert mm["exc_type"] is ValueError
-        else:
-            assert mm["exc_type"] is RankFailureError
-            assert mm["failing_ranks"] == (1,)
-            assert mm["stage"] == "startup_consistency"
-
-    # --- 6. export() with replay: non-zero ranks skip dataset hashing/replay_source/writes; rank 0 metadata ---
-    exp = unwrap_results(outcomes["export_with_replay"])
-    expected_rep_ds = _make_single_window_dataset(world_size * 2 + 1, seed=81, covariates=False, horizon=REP_HORIZON)
-    expected_explicit_rcfg = ReplayConfig(
-        replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False
-    )
-    expected_synth_rcfg = ReplayConfig(replay_fraction=0.2, distill_weight=0.3, batch_size=2, cache_base_outputs=False)
-
-    for r in range(world_size):
-        assert exp[r]["explicit_returned"] is True
-        assert exp[r]["synth_returned"] is True
-        if r == 0:
-            assert exp[r]["explicit_exists"] is True
-            assert exp[r]["synth_exists"] is True
-        else:
-            assert exp[r]["explicit_exists"] is False
-            assert exp[r]["synth_exists"] is False
-
-    em = exp[0]["explicit_metadata"]
-    assert em["replay_config"] == expected_explicit_rcfg.to_dict()
-    assert em["world_size"] == world_size
-    assert em["effective_batch_size"] == world_size * 2
-    assert em["replay_source"] == {
-        "type": "TimeSeriesDataset",
-        "num_series": len(expected_rep_ds.series),
-        "num_windows": len(expected_rep_ds),
-        "context_length": expected_rep_ds.context_length,
-        "forecast_horizon": expected_rep_ds.forecast_horizon,
-        "data_fingerprint": dataset_fingerprint(expected_rep_ds),
-    }
-
-    sm = exp[0]["synth_metadata"]
-    assert sm["replay_config"] == expected_synth_rcfg.to_dict()
-    assert sm["world_size"] == world_size
-    assert sm["effective_batch_size"] == world_size * 2
-    assert isinstance(sm["replay_source"], dict)
-    assert sm["replay_source"]["type"] == "SyntheticReplaySource"
-    assert isinstance(sm["replay_source"]["data_fingerprint"], str) and len(sm["replay_source"]["data_fingerprint"])
-    for key in ("num_series", "num_windows", "context_length", "forecast_horizon", "seed", "families", "missing_rate"):
-        assert key in sm["replay_source"]
-
-    # --- 7. Repeated fit() with replay restarts replay cursor from (epoch=0, step=0) like 1-process ---
-    rf_out = unwrap_results(outcomes["repeated_fit"])
-    dom_len = 2 * world_size * 2 + 1
-    rep_len = world_size * 2 + (world_size // 2)
-    ref_dom = _make_single_window_dataset(dom_len, seed=90, covariates=True, horizon=DOM_HORIZON)
-    ref_rep = _make_single_window_dataset(rep_len, seed=91, covariates=False, horizon=REP_HORIZON)
-    ref_rep_trainer = TimestralTrainer(
-        _base_config(
-            mode="head_only",
-            batch_size=world_size * 2,
-            max_steps=3,
-            learning_rate=2e-3,
-            warmup_steps=1,
-            lr_schedule="cosine",
-            weight_decay=0.01,
-            gradient_clip_val=1.0,
-            seed=17,
-        ),
-        ref_dom,
-        replay_config=ReplayConfig(
-            replay_fraction=0.25, distill_weight=0.5, batch_size=world_size * 2, cache_base_outputs=False
-        ),
-        replay_dataset=ref_rep,
-        model=_fresh_model(11),
-    )
-    ref_res1 = ref_rep_trainer.fit()
-    ref_p1 = _flat_tensors(ref_rep_trainer._trainable)
-    ref_res2 = ref_rep_trainer.fit()
-    ref_p2 = _flat_tensors(ref_rep_trainer._trainable)
-
-    expected_cursor = [(0, 0, 0), (0, 1, 1), (1, 0, 2)]
-    r0_rf = rf_out[0]
-    assert r0_rf["fit_cursors"] == [expected_cursor, expected_cursor]
-    assert r0_rf["fit1_result"].steps == ref_res1.steps == 3
-    assert r0_rf["fit2_result"].steps == ref_res2.steps == 3
-    assert not torch.equal(r0_rf["fit2_params"], r0_rf["fit1_params"])
-    for (s_got, l_got), (s_ref, l_ref) in zip(r0_rf["fit1_result"].train_history, ref_res1.train_history, strict=True):
-        assert s_got == s_ref and abs(l_got - l_ref) <= 1e-4 * max(1.0, abs(l_ref))
-    for (s_got, l_got), (s_ref, l_ref) in zip(r0_rf["fit2_result"].train_history, ref_res2.train_history, strict=True):
-        assert s_got == s_ref and abs(l_got - l_ref) <= 1e-4 * max(1.0, abs(l_ref))
-    assert l2_rel(r0_rf["fit1_params"], ref_p1) <= 1e-4
-    assert l2_rel(r0_rf["fit2_params"], ref_p2) <= 1e-4
-    for r in range(1, world_size):
-        assert rf_out[r]["fit_cursors"] == [expected_cursor, expected_cursor]
-        assert rf_out[r]["fit1_result"] == r0_rf["fit1_result"]
-        assert rf_out[r]["fit2_result"] == r0_rf["fit2_result"]
-        assert torch.equal(rf_out[r]["fit1_params"], r0_rf["fit1_params"])
-        assert torch.equal(rf_out[r]["fit2_params"], r0_rf["fit2_params"])
+        assert ls[r]["loader_seed_ok"] is True
+        assert ls[r]["loader_workers_ok"] is True
+        assert ls[r]["replay_rng_preserved"] is True
+        assert ls[r]["steps"] == 3
+        assert torch.equal(ls[r]["params"], ls[0]["params"])
+        assert ls[r]["train_history"] == ls[0]["train_history"]
 
 
 # --------------------------------------------------------------------------- Persistent DataLoader workers with replay

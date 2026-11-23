@@ -6,12 +6,14 @@ This module covers only white-box internals and invariants that §9 does not spe
 - `tests/distributed_harness.py:_worker_main` preserving the original scenario exception if
   `dist.destroy_process_group()` raises during `finally:` cleanup.
 - Non-zero rank `export()` monkeypatch forbid spies (`hf_hub_download`, `merged_state_dict`,
-  `extract_lora_state_dict`, `save_file`, `dataset_fingerprint`) for `head_only` and LoRA.
-- `_DistributedStrategy` private state cleanup (`_flip_generator`, `_reducer`, loaders, sampler,
-  `_val_loader_ready`, and untouched `trainer._val_loader`) on both normal runs and propagated step failures.
+  `extract_lora_state_dict`, `save_file`, `dataset_fingerprint`) for `head_only`, LoRA, and replay.
+- `_DistributedStrategy` private state cleanup (`_flip_generator`, `_replay_flip_generator`,
+  `_reducer`, loaders, samplers, `_replay_cycle`, `_val_loader_ready`, and untouched
+  `trainer._val_loader`) on both normal runs and propagated step failures, with and without replay.
 - Mixed trainable parameter dtypes rejected in startup step (a) and propagated to peers.
-- Rank-0-only startup log isolation (`WARNING`/`INFO` suppressed on non-zero ranks, and no cache
-  bypass notice when `cache_frozen_features=False`).
+- Rank-0-only startup log isolation (`WARNING`/`INFO` suppressed on non-zero ranks, no cache
+  bypass notice when `cache_frozen_features=False`, and per-rank/effective replay batch sizes
+  logged when `replay_config` is set).
 
 - Spec: `docs/SPEC.md` §5.6, §7.4, D22–D35
 """
@@ -144,11 +146,19 @@ def test_harness_preserves_scenario_error_when_destroy_process_group_raises(
 def _sc_non_zero_export_forbid_spies(rank: int, world_size: int) -> dict[str, Any]:
     del world_size
     ds = make_toy_dataset(TINY_CONFIG.patch_size, series=4, seed=11, covariates=True)
+    rep_ds = make_toy_dataset(TINY_CONFIG.patch_size, series=4, seed=12, covariates=False)
     head_trainer = TimestralTrainer(_base_config(mode="head_only"), ds, model=_fresh_model(0))
     lora_trainer = TimestralTrainer(
         _base_config(mode="lora_variate"),
         ds,
         lora_config=LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("q", "v")),
+        model=_fresh_model(0),
+    )
+    replay_trainer = TimestralTrainer(
+        _base_config(mode="head_only"),
+        ds,
+        replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2),
+        replay_dataset=rep_ds,
         model=_fresh_model(0),
     )
 
@@ -173,11 +183,14 @@ def _sc_non_zero_export_forbid_spies(rank: int, world_size: int) -> dict[str, An
         try:
             head_dir = base / "head_ckpt"
             lora_dir = base / "lora_ckpt"
+            replay_dir = base / "replay_ckpt"
             out["head_returned"] = head_trainer.export(head_dir) == head_dir
             out["lora_returned"] = lora_trainer.export(lora_dir) == lora_dir
+            out["replay_returned"] = replay_trainer.export(replay_dir) == replay_dir
             out["head_exists"] = head_dir.exists()
             out["lora_exists"] = lora_dir.exists()
             out["lora_adapter_exists"] = (lora_dir / "adapter.safetensors").is_file()
+            out["replay_exists"] = replay_dir.exists()
         finally:
             export_module.hf_hub_download = orig_download
             export_module.merged_state_dict = orig_merge
@@ -192,6 +205,7 @@ def _sc_strategy_cleanup_and_private_state(rank: int, world_size: int) -> dict[s
     assert ctx is not None
     ds = make_toy_dataset(TINY_CONFIG.patch_size, series=4, seed=13, covariates=True)
     train_ds, val_ds = ds.split_by_time(12 * TINY_CONFIG.patch_size)
+    rep_ds = make_toy_dataset(TINY_CONFIG.patch_size, series=4, seed=14, covariates=False)
 
     # 1. Normal strategy lifecycle populates private state and `cleanup()` releases the flip
     # generator, flat gradient buffer, loaders, sampler, and val-loader flag; internal sharded
@@ -265,6 +279,95 @@ def _sc_strategy_cleanup_and_private_state(rank: int, world_size: int) -> dict[s
         and captured_strategy._val_loader_ready is False
     )
 
+    # 3. Replay strategy lifecycle populates replay sampler, loader (num_workers=0), cycle, and
+    # replay flip generator, and `cleanup()` releases all of them on both normal and failing runs.
+    rcfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, sign_flip=True)
+    t_rep = TimestralTrainer(
+        _base_config(mode="head_only", sign_flip=True, max_steps=1, eval_every=1),
+        train_ds,
+        val_ds,
+        replay_config=rcfg,
+        replay_dataset=rep_ds,
+        model=_fresh_model(3),
+    )
+    rep_strategy = t_rep._make_fit_strategy()
+    rep_strategy.prepare_fit()
+    t_rep.model.train()
+    for _outcome in rep_strategy.iter_epoch_steps(0):
+        break
+    rep_strategy.evaluate_val()
+    replay_populated_before_cleanup = (
+        rep_strategy._flip_generator is not None
+        and rep_strategy._replay_flip_generator is not None
+        and rep_strategy._reducer is not None
+        and rep_strategy._train_loader is not None
+        and rep_strategy._sampler is not None
+        and rep_strategy._replay_sampler is not None
+        and rep_strategy._replay_loader is not None
+        and rep_strategy._replay_loader.num_workers == 0
+        and rep_strategy._replay_loader.persistent_workers is False
+        and rep_strategy._replay_cycle is not None
+        and rep_strategy._sharded_val_loader is not None
+        and rep_strategy._val_loader_ready is True
+    )
+    rep_strategy.cleanup()
+    replay_cleanup_cleared = (
+        rep_strategy._flip_generator is None
+        and rep_strategy._replay_flip_generator is None
+        and rep_strategy._reducer is None
+        and rep_strategy._train_loader is None
+        and rep_strategy._sampler is None
+        and rep_strategy._replay_sampler is None
+        and rep_strategy._replay_loader is None
+        and rep_strategy._replay_cycle is None
+        and rep_strategy._sharded_val_loader is None
+        and rep_strategy._val_loader_ready is False
+    )
+    t_rep.model.eval()
+
+    # 4. Propagated step failure during a replay run still releases all replay state and restores eval mode.
+    t_rep_fail = TimestralTrainer(
+        _base_config(mode="head_only", sign_flip=True, max_steps=1),
+        train_ds,
+        replay_config=rcfg,
+        replay_dataset=rep_ds,
+        model=_fresh_model(4),
+    )
+    captured_rep_strategy: Any = None
+    orig_make_rep_strategy = t_rep_fail._make_fit_strategy
+
+    def _capture_rep_strategy() -> Any:
+        nonlocal captured_rep_strategy
+        captured_rep_strategy = orig_make_rep_strategy()
+        return captured_rep_strategy
+
+    t_rep_fail._make_fit_strategy = _capture_rep_strategy  # type: ignore[method-assign]
+    if rank == 1:
+
+        def _boom_replay(_item: Any, _gen: Any) -> Any:
+            raise KeyError("whitebox_replay_boom")
+
+        t_rep_fail._prepare_replay_batch = _boom_replay  # type: ignore[method-assign]
+    rep_fail_exc_type: type[BaseException] | None = None
+    try:
+        t_rep_fail.fit()
+    except Exception as exc:
+        rep_fail_exc_type = type(exc)
+
+    replay_fail_cleanup_cleared = (
+        captured_rep_strategy is not None
+        and captured_rep_strategy._flip_generator is None
+        and captured_rep_strategy._replay_flip_generator is None
+        and captured_rep_strategy._reducer is None
+        and captured_rep_strategy._train_loader is None
+        and captured_rep_strategy._sampler is None
+        and captured_rep_strategy._replay_sampler is None
+        and captured_rep_strategy._replay_loader is None
+        and captured_rep_strategy._replay_cycle is None
+        and captured_rep_strategy._sharded_val_loader is None
+        and captured_rep_strategy._val_loader_ready is False
+    )
+
     return {
         "populated_before_cleanup": populated_before_cleanup,
         "val_loader_untouched": val_loader_untouched,
@@ -272,6 +375,11 @@ def _sc_strategy_cleanup_and_private_state(rank: int, world_size: int) -> dict[s
         "fail_exc_type": exc_type,
         "fail_model_eval": not t_fail.model.training,
         "fail_cleanup_cleared": fail_cleanup_cleared,
+        "replay_populated_before_cleanup": replay_populated_before_cleanup,
+        "replay_cleanup_cleared": replay_cleanup_cleared,
+        "replay_fail_exc_type": rep_fail_exc_type,
+        "replay_fail_model_eval": not t_rep_fail.model.training,
+        "replay_fail_cleanup_cleared": replay_fail_cleanup_cleared,
         "followup": _followup_sum(ctx),
     }
 
@@ -374,19 +482,23 @@ def test_distributed_trainer_whitebox_internals() -> None:
     assert exp[0] == {
         "head_returned": True,
         "lora_returned": True,
+        "replay_returned": True,
         "head_exists": True,
         "lora_exists": True,
         "lora_adapter_exists": True,
+        "replay_exists": True,
     }
     assert exp[1] == {
         "head_returned": True,
         "lora_returned": True,
+        "replay_returned": True,
         "head_exists": False,
         "lora_exists": False,
         "lora_adapter_exists": False,
+        "replay_exists": False,
     }
 
-    # 2. Private strategy cleanup and post-failure `cleanup()` + `model.eval()` teardown.
+    # 2. Private strategy cleanup and post-failure `cleanup()` + `model.eval()` teardown (with and without replay).
     sc = unwrap_results(outcomes["strategy_cleanup"])
     for r, entry in enumerate(sc):
         assert entry["populated_before_cleanup"] is True
@@ -394,8 +506,13 @@ def test_distributed_trainer_whitebox_internals() -> None:
         assert entry["cleanup_cleared"] is True
         assert entry["fail_model_eval"] is True
         assert entry["fail_cleanup_cleared"] is True
+        assert entry["replay_populated_before_cleanup"] is True
+        assert entry["replay_cleanup_cleared"] is True
+        assert entry["replay_fail_model_eval"] is True
+        assert entry["replay_fail_cleanup_cleared"] is True
         assert entry["followup"] == 2
         assert entry["fail_exc_type"] is (KeyError if r == 1 else RankFailureError)
+        assert entry["replay_fail_exc_type"] is (KeyError if r == 1 else RankFailureError)
 
     # 3. Single trainable parameter dtype invariant in startup step (a).
     md = unwrap_results(outcomes["mixed_dtype"])
