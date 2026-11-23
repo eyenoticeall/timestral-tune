@@ -82,6 +82,19 @@ class _RecordingDataset(TimeSeriesDataset):
         return super().__getitem__(index)
 
 
+class _ToggleFailDataset(TimeSeriesDataset):
+    """`TimeSeriesDataset` wrapper whose `__getitem__` can be armed on one rank after `__init__`."""
+
+    def __init__(self, base: TimeSeriesDataset) -> None:
+        self.__dict__.update(base.__dict__)
+        self.fail = False
+
+    def __getitem__(self, index: int):
+        if self.fail:
+            raise RuntimeError("domain_fetch_boom")
+        return super().__getitem__(index)
+
+
 def _make_uneven_dataset(
     scored_counts: Sequence[int],
     *,
@@ -3242,7 +3255,7 @@ def test_t15_j_replay_and_distillation_trajectory_parity(world_size: int, _t15_p
 
     # Non-vacuous check: verify replay and distillation each move final weights substantially vs no-replay.
     domain_ds = _make_uneven_dataset(_t15j_domain_counts(world_size), seed=1001, covariates=True)
-    base_no_replay_params: dict[str, Tensor] = {}
+    base_no_replay_params: dict[tuple[str, str], Tensor] = {}
     for mode in REPLAY_TEACHER_MODES:
         cfg = _base_config(
             mode=mode,
@@ -3258,7 +3271,12 @@ def test_t15_j_replay_and_distillation_trajectory_parity(world_size: int, _t15_p
         )
         t_plain = TimestralTrainer(cfg, domain_ds, lora_config=_lora_for(mode, dropout=0.0), model=_fresh_tiny_model(0))
         t_plain.fit()
-        base_no_replay_params[mode] = _flat_trainable(t_plain).clone()
+        base_no_replay_params[(mode, "float32")] = _flat_trainable(t_plain).clone()
+        if mode == "full_ft":
+            with float64_reference():
+                t_plain_f64 = TimestralTrainer(cfg, domain_ds, model=_fresh_tiny_model(0, dtype=torch.float64))
+                t_plain_f64.fit()
+                base_no_replay_params[(mode, "float64")] = _flat_trainable(t_plain_f64).clone()
 
     for label, mode, kind, layout, dt in _t15j_cases():
         tol = TRAJ_TOL[dt]
@@ -3279,8 +3297,8 @@ def test_t15_j_replay_and_distillation_trajectory_parity(world_size: int, _t15_p
         assert ref_res.steps == 6 and ref_res.epochs == 2 and ref_res.skipped_batches == 0
         ref_update = ref["final_trainable"] - ref["init_trainable"]
         assert float(ref_update.norm()) > 1e-4, f"{label}: reference update is trivial"
-        if dt == "float32" and layout == "wrap_unequal":
-            shift = l2_rel(ref["final_trainable"], base_no_replay_params[mode])
+        if layout == "wrap_unequal" and (mode, dt) in base_no_replay_params:
+            shift = l2_rel(ref["final_trainable"], base_no_replay_params[(mode, dt)])
             assert shift > 1e-4, f"{label}: replay/distill had negligible effect vs no-replay ({shift:.2e})"
 
         rank_outs = unwrap_results(outcomes[label])
@@ -4299,6 +4317,115 @@ def _sc_t15l_replay_stage_exception(rank: int, world_size: int, empty_domain_on_
     return out
 
 
+def _sc_t15l_pre_replay_domain_fetch_fail(rank: int, world_size: int, zero_scored_peers: bool) -> dict[str, Any]:
+    """Single-rank domain-fetch failure inside the pre-replay count check propagates before replay advances.
+
+    When `zero_scored_peers=True`, all healthy peers have zero-scored domain slices (`pre_w_d_tot == 0`
+    simultaneously with `pre_failed_tot == 1`), proving failure propagation takes precedence over skipping.
+    """
+    counts = [0, 0] * world_size if zero_scored_peers else [8, 4] * world_size
+    domain_ds = _ToggleFailDataset(_make_uneven_dataset(counts, seed=1223, covariates=True))
+    replay_ds = _make_uneven_dataset(
+        [8, 4] * world_size, seed=1224, covariates=False, recording=True, context_patches=3
+    )
+    assert isinstance(replay_ds, _RecordingDataset)
+    cfg = _base_config(mode="full_ft", batch_size=2, max_steps=1, learning_rate=1e-3, seed=129)
+    rcfg = ReplayConfig(replay_fraction=0.3, distill_weight=0.5, batch_size=2, sign_flip=False)
+    trainer = TimestralTrainer(
+        cfg, domain_ds, replay_config=rcfg, replay_dataset=replay_ds, model=_fresh_tiny_model(33)
+    )
+    replay_ds.accessed_indices.clear()
+    before = _flat_params(trainer.model).clone()
+    if rank == 1:
+        domain_ds.fail = True
+
+    out = _record_propagated_exception(trainer.fit, world_size)
+    out["replay_accessed"] = list(replay_ds.accessed_indices)
+    out["unchanged"] = torch.equal(_flat_params(trainer.model), before)
+    out["eval_mode"] = not trainer.model.training
+    return out
+
+
+def _sc_t15l_replay_loader_rng_isolation(rank: int, world_size: int) -> dict[str, Any]:
+    """Multi-process replay `DataLoader` uses its own generator and never advances global PyTorch RNG."""
+    del rank
+    domain_ds = _make_copied_dataset(4 * world_size, seed=1225)
+    # len = 2*N = 1 global replay step: step 0 creates epoch-0 replay iterator, step 1 wraps to epoch-1 iterator.
+    replay_ds = _make_uneven_dataset([8, 6] * world_size, seed=1226, covariates=False, context_patches=3)
+    cfg = _base_config(
+        mode="lora_variate",
+        batch_size=2,
+        max_steps=2,
+        learning_rate=1e-2,
+        shuffle=False,
+        sign_flip=False,
+        seed=131,
+    )
+    rcfg = ReplayConfig(replay_fraction=0.3, distill_weight=0.0, batch_size=2, sign_flip=False)
+    trainer = TimestralTrainer(
+        cfg,
+        domain_ds,
+        lora_config=_lora_for("lora_variate", dropout=0.5),
+        replay_config=rcfg,
+        replay_dataset=replay_ds,
+        model=_fresh_tiny_model(seed=35),
+    )
+    _activate_lora_b(trainer.model)
+    handles, masks, dropped_counts, _ = _attach_lora_dropout_recorder(trainer.model)
+
+    rng_after_prepare: list[Tensor] = []
+    pre_fwd_states: list[Tensor] = []
+    post_fwd_states: list[Tensor] = []
+
+    orig_make_strategy = trainer._make_fit_strategy
+
+    def _wrapped_make_strategy() -> Any:
+        strategy = orig_make_strategy()
+        orig_prepare = strategy.prepare_fit
+
+        def _wrapped_prepare() -> None:
+            orig_prepare()
+            rng_after_prepare.append(torch.get_rng_state().clone())
+
+        strategy.prepare_fit = _wrapped_prepare
+        return strategy
+
+    trainer._make_fit_strategy = _wrapped_make_strategy  # type: ignore[method-assign]
+    handles.append(
+        trainer.model.transformer.register_forward_pre_hook(
+            lambda _m, _inp: pre_fwd_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+        )
+    )
+    handles.append(
+        trainer.model.transformer.register_forward_hook(
+            lambda _m, _inp, _out: (
+                post_fwd_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+            )
+        )
+    )
+    try:
+        res = trainer.fit()
+    finally:
+        for h in handles:
+            h.remove()
+
+    init_isolated = (
+        bool(rng_after_prepare) and bool(pre_fwd_states) and bool(torch.equal(rng_after_prepare[0], pre_fwd_states[0]))
+    )
+    between_fwds_isolated = len(pre_fwd_states) == len(post_fwd_states) == 4 and all(
+        bool(torch.equal(post_fwd_states[i], pre_fwd_states[i + 1])) for i in range(3)
+    )
+    return {
+        "result": res,
+        "fwd_count": len(pre_fwd_states),
+        "init_isolated": init_isolated,
+        "between_fwds_isolated": between_fwds_isolated,
+        "dropped_counts": dropped_counts,
+        "masks": masks,
+        "params": _flat_params(trainer.model),
+    }
+
+
 def _sc_t15l_replay_export(rank: int, world_size: int, base_dir: str) -> dict[str, Any]:
     domain_ds = _make_uneven_dataset([8, 4, 6, 2] * world_size, seed=1222, covariates=True)
     cfg = _base_config(
@@ -4351,6 +4478,7 @@ def _scenarios_t15l(world_size: int, base_dir: str) -> dict[str, Any]:
     scenarios: dict[str, Any] = {
         "replay_flips": _sc_t15l_replay_sign_flip,
         "replay_flips_distill": _sc_t15l_replay_flip_distill_aligned,
+        "replay_loader_rng": _sc_t15l_replay_loader_rng_isolation,
         "default_synth": _sc_t15l_default_synth,
         "mismatch_replay_cfg": _sc_t15l_mismatch_replay_cfg,
         "mismatch_replay_presence": _sc_t15l_mismatch_replay_presence,
@@ -4360,6 +4488,8 @@ def _scenarios_t15l(world_size: int, base_dir: str) -> dict[str, Any]:
         "nf_distill": _sc_t15l_non_finite_distill,
         "fail_replay_stage": (_sc_t15l_replay_stage_exception, (False,)),
         "fail_replay_empty_domain": (_sc_t15l_replay_stage_exception, (True,)),
+        "fail_pre_domain_scored": (_sc_t15l_pre_replay_domain_fetch_fail, (False,)),
+        "fail_pre_domain_zero_peers": (_sc_t15l_pre_replay_domain_fetch_fail, (True,)),
         "replay_export": (_sc_t15l_replay_export, (base_dir,)),
     }
     for mode in REPLAY_TEACHER_MODES:
@@ -4371,12 +4501,14 @@ def _scenarios_t15l(world_size: int, base_dir: str) -> dict[str, Any]:
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_t15_l_replay_flips_teachers_startup_failures_and_export(world_size: int, _t15_pool: Any) -> None:
     """T15(l). Replay sign flips use rank-offset streams (rank 0 matches 1-process at the same
-    per-rank batch size; peers differ; student and teacher share orientation); caches are skipped
+    per-rank batch size; peers differ; student and teacher share orientation); the replay
+    `DataLoader` uses its own generator without advancing global PyTorch RNG; caches are skipped
     and the notice is logged once on rank 0; uncached teachers are identical across ranks from
     rank 0's broadcast and stay frozen; default `SyntheticReplaySource` is accepted and matches
     1-process; mismatched replay config/data raises at startup; non-finite replay/distillation
-    raises `FloatingPointError` on all ranks; single-rank replay exceptions propagate cleanly;
-    and `export()` writes replay and multi-process metadata on rank 0 only.
+    raises `FloatingPointError` on all ranks; single-rank replay-stage and pre-replay domain-fetch
+    exceptions (including failure-over-skip precedence when healthy peers are zero-scored)
+    propagate cleanly; and `export()` writes replay and multi-process metadata on rank 0 only.
     """
     ref_flips = _run_t15l_replay_sign_flip(world_size, per_rank_batch=2, per_rank_replay_batch=2, max_steps=8)
     assert len(ref_flips["replay_flips"]) == 16
@@ -4508,6 +4640,33 @@ def test_t15_l_replay_flips_teachers_startup_failures_and_export(world_size: int
     for _r, out in enumerate(fail_empty_outs):
         assert out["unchanged"] and out["eval_mode"]
 
+    # 6b. Single-rank domain-fetch failure inside the pre-replay check propagates before replay advances,
+    #     including when healthy peers have zero-scored slices (failure takes precedence over skip).
+    for pre_key in ("fail_pre_domain_scored", "fail_pre_domain_zero_peers"):
+        pre_outs = unwrap_results(outcomes[pre_key])
+        _assert_propagated(pre_outs, world_size, {1: RuntimeError}, pre_key)
+        for r, out in enumerate(pre_outs):
+            assert out["replay_accessed"] == [], f"{pre_key} r{r}: replay was accessed despite pre-check domain failure"
+            assert out["unchanged"] and out["eval_mode"], f"{pre_key} r{r}: state mutated or train mode left on"
+
+    # 6c. Replay DataLoader uses its own generator and never advances global PyTorch RNG (initial & epoch wrap).
+    rng_outs = unwrap_results(outcomes["replay_loader_rng"])
+    seen_rng_masks: set[tuple[bytes, ...]] = set()
+    for r, out in enumerate(rng_outs):
+        assert out["fwd_count"] == 4
+        assert out["init_isolated"] is True, (
+            f"replay_loader_rng r{r}: initial replay DataLoader iterator advanced global PyTorch RNG"
+        )
+        assert out["between_fwds_isolated"] is True, (
+            f"replay_loader_rng r{r}: replay epoch wrap DataLoader iterator advanced global PyTorch RNG"
+        )
+        assert len(out["masks"]) > 0 and all(c > 0 for c in out["dropped_counts"])
+        mask_key = tuple(out["masks"])
+        assert mask_key not in seen_rng_masks, f"replay_loader_rng r{r}: dropout masks collided with another rank"
+        seen_rng_masks.add(mask_key)
+        assert out["result"] == rng_outs[0]["result"]
+        assert torch.equal(out["params"], rng_outs[0]["params"])
+
     # 7. export() after a replay run: rank 0 writes replay + multi-process metadata; peers write nothing.
     exp_outs = unwrap_results(outcomes["replay_export"])
     for r, out in enumerate(exp_outs):
@@ -4574,10 +4733,10 @@ _TEST_TO_GROUP: dict[str, str] = {
 def _t15_pool(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
 ) -> Callable[[str, int], dict[str, list[RankResult]]]:
-    """Amortise spawn overhead by running all collected T15(a)-(i) scenarios in one process group per `world_size`.
+    """Amortise spawn overhead by running all collected T15(a)-(l) scenarios in one process group per `world_size`.
 
     Inspects `request.session.items` so filtered runs (e.g. `pytest -k test_t15_g`) still spawn only
-    the selected clause(s), while full-file runs execute all T15(a)-(i) clauses (including the
+    the selected clause(s), while full-file runs execute all T15(a)-(l) clauses (including the
     pooled hang regressions) in two spawns (`world_size=2` and `world_size=4`).
     """
     needed_by_ws: dict[int, list[str]] = {}
