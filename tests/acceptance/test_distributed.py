@@ -29,6 +29,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch.utils.data import DataLoader
 
 import timestral_tune.trainer as trainer_pkg
 from timestral_tune import LoraConfig, ReplayConfig, TimestralTrainer, TrainingConfig
@@ -39,6 +40,7 @@ from timestral_tune.models.adapter import merged_state_dict
 from timestral_tune.trainer import Callback, EvalResult, TrainingResult
 from timestral_tune.trainer.distributed import (
     RankFailureError,
+    rank_seed,
     steps_per_epoch,
     validation_shard_indices,
 )
@@ -389,18 +391,31 @@ def _run_t15a_one(world_size: int, mode: str, dtype_name: str, *, per_rank_batch
         seed=7,
     )
     ctx_mgr = float64_reference() if dtype == torch.float64 else torch.enable_grad()
+    pre_clip_norms: list[float] = []
     with ctx_mgr:
         model = _fresh_tiny_model(seed=0, dtype=dtype)
         trainer = TimestralTrainer(cfg, ds, lora_config=_lora_for(mode, dropout=0.0), model=model)
         init_trainable = _flat_trainable(trainer).clone()
+        orig_apply = trainer._apply_optimizer_step
+
+        def _spy_apply() -> None:
+            grads = [p.grad.detach() for p in trainer._trainable if p.grad is not None]
+            if grads:
+                norm = float(torch.linalg.vector_norm(torch.stack([g.norm() for g in grads])).item())
+                pre_clip_norms.append(norm)
+            orig_apply()
+
+        trainer._apply_optimizer_step = _spy_apply  # type: ignore[method-assign]
         res = trainer.fit()
         final_trainable = _flat_trainable(trainer).clone()
         final_all = _flat_params(trainer.model).clone()
+    clipped_steps = sum(1 for n in pre_clip_norms if cfg.gradient_clip_val is not None and n > cfg.gradient_clip_val)
     return {
         "result": res,
         "init_trainable": init_trainable,
         "final_trainable": final_trainable,
         "final_all": final_all,
+        "clipped_steps": clipped_steps,
     }
 
 
@@ -521,6 +536,8 @@ def test_t15_a_multi_epoch_trajectory_parity(world_size: int) -> None:
             assert ref_res.steps == 9 and ref_res.epochs == 3 and ref_res.skipped_batches == 0
             ref_update = ref["final_trainable"] - ref["init_trainable"]
             assert float(ref_update.norm()) > 1e-4, "reference update must be non-trivial"
+            if mode in ("head_only", "full_ft"):
+                assert ref["clipped_steps"] >= 1, f"{mode}/{dt}: trajectory never triggered gradient clipping"
 
             rank_outs = unwrap_results(outcomes[f"{mode}_{dt}"])
             r0 = rank_outs[0]
@@ -1154,12 +1171,69 @@ def _sc_t15e_early_stop_restore(rank: int, world_size: int) -> dict[str, Any]:
     return _run_t15e_early_stop_restore(world_size, per_rank_batch=2)
 
 
+def _sc_t15e_broadcast_loss_adoption(rank: int, world_size: int) -> dict[str, Any]:
+    """Perturb rank 0's reduced step/eval loss sums so non-zero ranks visibly adopt rank 0's broadcast values."""
+    train_ds = _make_uneven_dataset([8, 4, 6, 2] * world_size, seed=507, covariates=True)
+    val_ds = _make_uneven_dataset([8, 2, 7, 3, 5], seed=508, covariates=True)
+    cfg = _base_config(
+        mode="head_only",
+        batch_size=2,
+        eval_batch_size=2,
+        max_steps=2,
+        eval_every=1,
+        learning_rate=1e-2,
+        lr_schedule="constant",
+        restore_best=False,
+        seed=45,
+    )
+    trainer = TimestralTrainer(cfg, train_ds, val_ds, model=_fresh_tiny_model(seed=8))
+
+    orig_all_reduce = dist.all_reduce
+    perturbed_steps = 0
+    perturbed_evals = 0
+    unperturbed_step_losses: list[float] = []
+    unperturbed_eval_losses: list[float] = []
+
+    def _rank0_perturbed_all_reduce(tensor: Tensor, *args: Any, **kwargs: Any) -> Any:
+        nonlocal perturbed_steps, perturbed_evals
+        work = orig_all_reduce(tensor, *args, **kwargs)
+        if tensor.dtype == torch.float64 and tensor.numel() == 8 and tensor[0].item() > 0.0:
+            w_d = tensor[0].item()
+            unperturbed_step_losses.append(tensor[1].item() / w_d)
+            # Perturb sum_d only (slot 1); w_d (slot 0) and gradients remain exact.
+            tensor[1].add_(100.0 * w_d)
+            perturbed_steps += 1
+        elif tensor.dtype == torch.float64 and tensor.numel() == 4 and tensor[1].item() > 0.0:
+            scored = tensor[1].item()
+            unperturbed_eval_losses.append(tensor[0].item() / scored)
+            tensor[0].add_(200.0 * scored)
+            perturbed_evals += 1
+        return work
+
+    if rank == 0:
+        dist.all_reduce = _rank0_perturbed_all_reduce  # type: ignore[assignment]
+    try:
+        res = trainer.fit()
+    finally:
+        dist.all_reduce = orig_all_reduce  # type: ignore[assignment]
+
+    return {
+        "result": res,
+        "perturbed_steps": perturbed_steps,
+        "perturbed_evals": perturbed_evals,
+        "unperturbed_step_losses": unperturbed_step_losses,
+        "unperturbed_eval_losses": unperturbed_eval_losses,
+        "all_params": _flat_params(trainer.model),
+    }
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_t15_e_stop_restore_and_training_result(world_size: int) -> None:
     """T15(e). Stop from `on_fit_start`, `on_step_end`, and `EarlyStopping` halts all ranks together;
     callbacks run on rank 0 only; `restore_best=True` restores best weights on every rank matching
-    one-process `fit()`; all ten `TrainingResult` fields are equal on every rank.
+    one-process `fit()`; all ten `TrainingResult` fields are equal on every rank, with non-zero ranks
+    visibly adopting rank 0's broadcast step and evaluation losses.
     """
     ref_es = _run_t15e_early_stop_restore(world_size, per_rank_batch=2 * world_size)
     ref_res: TrainingResult = ref_es["result"]
@@ -1172,6 +1246,7 @@ def test_t15_e_stop_restore_and_training_result(world_size: int) -> None:
             "stop_start": _sc_t15e_stop_on_start,
             "stop_step": _sc_t15e_stop_on_step_end,
             "early_stop": _sc_t15e_early_stop_restore,
+            "broadcast_loss": _sc_t15e_broadcast_loss_adoption,
         },
         world_size=world_size,
         pg_timeout=PG_TIMEOUT,
@@ -1225,6 +1300,22 @@ def test_t15_e_stop_restore_and_training_result(world_size: int) -> None:
         assert l2_rel(out["params"], ref_es["params"]) <= TRAJ_TOL["float32"]
         if r > 0:
             assert out["cb"] == {"started": 0, "ended": 0, "steps": [], "lrs": [], "eval_steps": [], "eval_scored": []}
+
+    # 4. Non-zero ranks adopt rank 0's broadcast step & eval loss values (catches M3a and M3b).
+    bl_outs = unwrap_results(outcomes["broadcast_loss"])
+    r0_bl = bl_outs[0]
+    assert r0_bl["perturbed_steps"] == 2 and r0_bl["perturbed_evals"] == 2
+    for (_step, recorded), raw in zip(r0_bl["result"].train_history, r0_bl["unperturbed_step_losses"], strict=True):
+        assert recorded == pytest.approx(raw + 100.0, rel=1e-9)
+    for (_step, recorded), raw in zip(r0_bl["result"].eval_history, r0_bl["unperturbed_eval_losses"], strict=True):
+        assert recorded == pytest.approx(raw + 200.0, rel=1e-9)
+    for r, out in enumerate(bl_outs):
+        assert out["result"] == r0_bl["result"], (
+            f"broadcast_loss r{r}: rank did not adopt rank 0's broadcast step/eval losses"
+        )
+        assert torch.equal(out["all_params"], r0_bl["all_params"])
+        if r > 0:
+            assert out["perturbed_steps"] == 0 and out["perturbed_evals"] == 0
 
 
 def _run_t15e_set_clear_stop(world_size: int, *, mode: str, per_rank_batch: int) -> dict[str, Any]:
@@ -1400,18 +1491,164 @@ def _sc_t15f_sign_flip(rank: int, world_size: int) -> dict[str, Any]:
     return _run_t15f_sign_flip(world_size, per_rank_batch=2, max_steps=None)
 
 
+def _run_t15f_lora_dropout(world_size: int, *, per_rank_batch: int, copies: int) -> dict[str, Any]:
+    """Run `lora_variate` with active dropout and record packed zero-masks from `LoRASliceLinear.dropout`."""
+    base_ds = _make_uneven_dataset([8, 6], seed=604, covariates=True)
+    series_copies = [
+        SeriesData(
+            f"d{c}_{s.series_id}",
+            s.timestamps.copy(),
+            s.targets.copy(),
+            s.past.copy(),
+            s.known.copy(),
+            s.categorical_past.copy(),
+            s.categorical_known.copy(),
+        )
+        for c in range(copies)
+        for s in base_ds.series
+    ]
+    ds = TimeSeriesDataset(
+        series_copies,
+        context_length=base_ds.context_length,
+        forecast_horizon=base_ds.forecast_horizon,
+        stride=base_ds.forecast_horizon,
+        min_context=base_ds.context_length,
+        roles=base_ds.roles,
+    )
+    cfg = _base_config(
+        mode="lora_variate",
+        batch_size=per_rank_batch,
+        epochs=1,
+        max_steps=2,
+        learning_rate=1e-2,
+        shuffle=False,
+        sign_flip=False,
+        seed=63,
+    )
+    trainer = TimestralTrainer(
+        cfg, ds, lora_config=_lora_for("lora_variate", dropout=0.5), model=_fresh_tiny_model(seed=10)
+    )
+    _activate_lora_b(trainer.model)
+
+    masks: list[bytes] = []
+    dropped_counts: list[int] = []
+    seen_initial_seeds: list[int] = []
+    handles = []
+    for mod in trainer.model.modules():
+        if isinstance(mod, torch.nn.Dropout):
+
+            def _record_drop(_m: torch.nn.Module, inp: tuple[Tensor, ...], out: Tensor) -> None:
+                if not seen_initial_seeds:
+                    seen_initial_seeds.append(int(torch.initial_seed()))
+                dropped = (out.detach() == 0) & (inp[0].detach() != 0)
+                dropped_counts.append(int(dropped.sum().item()))
+                masks.append(np.packbits(dropped.cpu().numpy().reshape(-1).astype(np.uint8)).tobytes())
+
+            handles.append(mod.register_forward_hook(_record_drop))
+    assert handles, "expected at least one LoRA nn.Dropout module"
+    try:
+        res = trainer.fit()
+    finally:
+        for h in handles:
+            h.remove()
+    return {
+        "result": res,
+        "initial_seed": seen_initial_seeds[0],
+        "masks": masks,
+        "dropped_counts": dropped_counts,
+        "params": _flat_params(trainer.model),
+    }
+
+
+def _sc_t15f_lora_dropout(rank: int, world_size: int) -> dict[str, Any]:
+    del rank
+    # 2 identical windows per rank across 2 steps so any mask difference comes solely from rank-offset RNG.
+    return _run_t15f_lora_dropout(world_size, per_rank_batch=2, copies=world_size * 2)
+
+
+def _run_t15f_short_dataset(
+    world_size: int, *, with_val: bool, per_rank_batch: int, num_workers: int = 0, shuffle: bool = False
+) -> dict[str, Any]:
+    """Train on a dataset shorter than `world_size` (`len = world_size - 1`) and count `DataLoader.__iter__`."""
+    train_counts = [8, 2, 6][: world_size - 1]
+    val_counts = [7, 3, 5][: world_size - 1]
+    train_ds = _make_uneven_dataset(train_counts, seed=605, covariates=True, recording=(num_workers == 0))
+    val_ds = (
+        _make_uneven_dataset(val_counts, seed=606, covariates=True, recording=(num_workers == 0)) if with_val else None
+    )
+    cfg = _base_config(
+        mode="head_only",
+        batch_size=per_rank_batch,
+        eval_batch_size=2,
+        epochs=2,
+        max_steps=None,
+        eval_every=1 if with_val else None,
+        learning_rate=1e-2,
+        lr_schedule="constant",
+        shuffle=shuffle,
+        sign_flip=False,
+        restore_best=False,
+        num_workers=num_workers,
+        seed=65,
+    )
+    trainer = TimestralTrainer(cfg, train_ds, val_ds, model=_fresh_tiny_model(seed=11))
+    if isinstance(train_ds, _RecordingDataset):
+        train_ds.accessed_indices.clear()
+    if isinstance(val_ds, _RecordingDataset):
+        val_ds.accessed_indices.clear()
+
+    iter_calls = 0
+    orig_iter = DataLoader.__iter__
+
+    def _spied_iter(self_loader: DataLoader[Any]) -> Any:
+        nonlocal iter_calls
+        iter_calls += 1
+        return orig_iter(self_loader)
+
+    DataLoader.__iter__ = _spied_iter  # type: ignore[method-assign]
+    try:
+        res = trainer.fit()
+    finally:
+        DataLoader.__iter__ = orig_iter  # type: ignore[method-assign]
+
+    return {
+        "result": res,
+        "iter_calls": iter_calls,
+        "train_accessed": list(train_ds.accessed_indices) if isinstance(train_ds, _RecordingDataset) else None,
+        "val_accessed": list(val_ds.accessed_indices) if isinstance(val_ds, _RecordingDataset) else None,
+        "params": _flat_trainable(trainer),
+        "all_params": _flat_params(trainer.model),
+    }
+
+
+def _sc_t15f_short_dataset(rank: int, world_size: int, with_val: bool) -> dict[str, Any]:
+    del rank
+    return _run_t15f_short_dataset(world_size, with_val=with_val, per_rank_batch=2, num_workers=0, shuffle=False)
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_t15_f_sampling_and_sign_flips(world_size: int) -> None:
     """T15(f). Shuffled multi-epoch `fit()` uses distinct per-epoch permutations, equal step counts,
-    exact once-per-epoch union coverage, and balanced trailing splits; `sign_flip=True` succeeds with
-    an empty trailing rank, matching one-process on rank 0 while peers draw distinct streams.
+    exact once-per-epoch union coverage, and balanced trailing splits; `sign_flip=True` and LoRA
+    dropout use rank-0's one-process RNG stream while peers draw pairwise distinct streams; datasets
+    shorter than `world_size` (with and without `val_dataset`) never create a `DataLoader` iterator
+    on idle ranks and match one-process `fit()`.
     """
     ref_flip = _run_t15f_sign_flip(world_size, per_rank_batch=2, max_steps=8)
     assert len(ref_flip["flips"]) == 16
 
+    ref_short_noval = _run_t15f_short_dataset(world_size, with_val=False, per_rank_batch=2 * world_size)
+    ref_short_val = _run_t15f_short_dataset(world_size, with_val=True, per_rank_batch=2 * world_size)
+
     outcomes = run_scenarios(
-        {"shuffled": _sc_t15f_shuffled_epochs, "sign_flip": _sc_t15f_sign_flip},
+        {
+            "shuffled": _sc_t15f_shuffled_epochs,
+            "sign_flip": _sc_t15f_sign_flip,
+            "lora_dropout": _sc_t15f_lora_dropout,
+            "short_no_val": (_sc_t15f_short_dataset, (False,)),
+            "short_with_val": (_sc_t15f_short_dataset, (True,)),
+        },
         world_size=world_size,
         pg_timeout=PG_TIMEOUT,
         wall_timeout=WALL_TIMEOUT,
@@ -1468,61 +1705,130 @@ def test_t15_f_sampling_and_sign_flips(world_size: int) -> None:
         assert stream not in seen_streams, f"rank {r} flip stream collided with another rank"
         seen_streams.add(stream)
 
+    # 3. Rank-offset global seed (LoRA dropout stream): rank 0 keeps config.seed while all ranks draw distinct masks.
+    drop_outs = unwrap_results(outcomes["lora_dropout"])
+    seen_drop_streams: set[tuple[bytes, ...]] = set()
+    for r, out in enumerate(drop_outs):
+        assert len(out["masks"]) > 0 and all(c > 0 for c in out["dropped_counts"]), (
+            f"lora_dropout r{r}: dropout did not activate"
+        )
+        key = tuple(out["masks"])
+        assert key not in seen_drop_streams, f"lora_dropout r{r}: shared dropout mask stream with another rank"
+        seen_drop_streams.add(key)
+        assert out["initial_seed"] == rank_seed(63, r), (
+            f"lora_dropout r{r}: initial_seed {out['initial_seed']} != {rank_seed(63, r)}"
+        )
+        assert out["result"] == drop_outs[0]["result"]
+        assert torch.equal(out["params"], drop_outs[0]["params"])
+
+    # 4. Dataset shorter than world_size (`len = N - 1`), with and without val_dataset: idle rank never creates a
+    # DataLoader iterator and results match one-process fit().
+    for key, ref_short, has_val in (
+        ("short_no_val", ref_short_noval, False),
+        ("short_with_val", ref_short_val, True),
+    ):
+        s_outs = unwrap_results(outcomes[key])
+        r0_s = s_outs[0]
+        assert ref_short["result"].steps == 2 and ref_short["result"].epochs == 2
+        for r, out in enumerate(s_outs):
+            assert out["result"] == r0_s["result"], f"{key} r{r}: TrainingResult differs from rank 0"
+            assert out["result"].steps == 2 and out["result"].epochs == 2
+            assert torch.equal(out["all_params"], r0_s["all_params"])
+            assert l2_rel(out["params"], ref_short["params"]) <= TRAJ_TOL["float32"]
+            for (s, loss), (rs, rloss) in zip(
+                out["result"].train_history, ref_short["result"].train_history, strict=True
+            ):
+                assert s == rs and _scalar_rel(loss, rloss) <= TRAJ_TOL["float32"]
+            if has_val:
+                for (s, loss), (rs, rloss) in zip(
+                    out["result"].eval_history, ref_short["result"].eval_history, strict=True
+                ):
+                    assert s == rs and _scalar_rel(loss, rloss) <= TRAJ_TOL["float32"]
+            if r == world_size - 1:
+                assert out["iter_calls"] == 0, f"{key} r{r}: idle rank created a DataLoader iterator"
+                assert out["train_accessed"] == []
+                if has_val:
+                    assert out["val_accessed"] == []
+            else:
+                assert out["iter_calls"] >= 2, f"{key} r{r}: active rank did not iterate its DataLoader"
+
 
 def _sc_t15f_workers(rank: int, world_size: int, num_workers: int) -> dict[str, Any]:
     del rank
     n_items = world_size * 2 + 1  # trailing R = 1 < N (empty ranks)
     ds = _make_uneven_dataset([8 - (i % 6) for i in range(n_items)], seed=603, covariates=True)
+    # Validation set larger than N on uneven shards + short validation set (< N) tested in the short case below.
+    val_ds = _make_uneven_dataset([8, 2, 7, 1, 6][: world_size + 1], seed=607, covariates=True)
     cfg = _base_config(
         mode="head_only",
         batch_size=2,
+        eval_batch_size=2,
         epochs=2,
         max_steps=None,
+        eval_every=1,
         learning_rate=1e-2,
         shuffle=True,
         sign_flip=False,
+        restore_best=False,
         num_workers=num_workers,
         seed=67,
     )
-    trainer = TimestralTrainer(cfg, ds, model=_fresh_tiny_model(seed=11))
+    trainer = TimestralTrainer(cfg, ds, val_ds, model=_fresh_tiny_model(seed=11))
     res = trainer.fit()
-    return {"result": res, "params": _flat_params(trainer.model)}
+    trailing = {"result": res, "params": _flat_params(trainer.model)}
+
+    # Also test len(train_dataset) < N and len(val_dataset) < N with num_workers (idle rank never creates an iterator).
+    short = _run_t15f_short_dataset(world_size, with_val=True, per_rank_batch=2, num_workers=num_workers, shuffle=True)
+    return {"trailing": trailing, "short": short}
+
+
+def _worker_t15f_workers_paired(rank: int, world_size: int) -> dict[str, Any]:
+    """Run `num_workers=0` reference first, then `num_workers=2` in one spawned process group."""
+    w0 = _sc_t15f_workers(rank, world_size, 0)
+    dist.barrier()
+    w2 = _sc_t15f_workers(rank, world_size, 2)
+    return {"w0": w0, "w2": w2}
 
 
 @pytest.mark.acceptance
 @pytest.mark.skipif(WORKERS_HANG_AT_EXIT, reason="PyTorch < 2.8 on macOS: DataLoader worker hangs at exit")
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_f_dataloader_workers(world_size: int) -> None:
-    """T15(f). Multi-process `fit()` with `num_workers=2` and an empty trailing rank matches `num_workers=0`.
+def test_t15_f_dataloader_workers() -> None:
+    """T15(f). Multi-process `fit()` at `world_size=4` with `num_workers=2` matches `num_workers=0`
+    across (1) uneven trailing training shards + `val_dataset`, and (2) `len(train_dataset) < N`
+    with `len(val_dataset) < N` where idle ranks never create a `DataLoader` iterator.
 
-    The `num_workers=2` case runs in its own spawned process group with a generous process-group
-    timeout (30s) rather than sharing `run_scenarios`: on macOS, each active `DataLoader` worker
-    waits `MP_STATUS_CHECK_INTERVAL` (~5s) during shutdown, so ranks with different numbers of
-    active workers finish cleanup seconds apart and would trip a tight inter-scenario barrier.
+    Runs at `world_size=4` (which exercises active non-zero peers, uneven trailing shards, empty
+    trailing ranks, and idle ranks in one spawn) with a generous process-group timeout (30s) because
+    on macOS each active `DataLoader` worker waits `MP_STATUS_CHECK_INTERVAL` (~5s) on shutdown.
     """
-    w0 = unwrap_results(
+    world_size = 4
+    outs = unwrap_results(
         run_distributed(
-            _sc_t15f_workers,
+            _worker_t15f_workers_paired,
             world_size=world_size,
-            args=(0,),
-            pg_timeout=PG_TIMEOUT,
-            wall_timeout=WALL_TIMEOUT,
-        )
-    )
-    w2 = unwrap_results(
-        run_distributed(
-            _sc_t15f_workers,
-            world_size=world_size,
-            args=(2,),
             pg_timeout=30.0,
             wall_timeout=90.0,
         )
     )
     expected_steps = 2 * steps_per_epoch(world_size * 2 + 1, world_size, 2)
-    for r in range(world_size):
-        assert w2[r]["result"].steps == expected_steps
-        assert w2[r]["result"] == w0[0]["result"]
-        assert torch.equal(w2[r]["params"], w0[0]["params"])
+    r0_w0_trail = outs[0]["w0"]["trailing"]
+    r0_w0_short = outs[0]["w0"]["short"]
+    for r, out in enumerate(outs):
+        w2_trail = out["w2"]["trailing"]
+        assert w2_trail["result"].steps == expected_steps
+        assert len(w2_trail["result"].eval_history) == expected_steps
+        assert w2_trail["result"] == r0_w0_trail["result"]
+        assert torch.equal(w2_trail["params"], r0_w0_trail["params"])
+
+        w2_short = out["w2"]["short"]
+        assert w2_short["result"].steps == 2 and w2_short["result"].epochs == 2
+        assert len(w2_short["result"].eval_history) == 2
+        assert w2_short["result"] == r0_w0_short["result"]
+        assert torch.equal(w2_short["all_params"], r0_w0_short["all_params"])
+        if r == world_size - 1:
+            assert w2_short["iter_calls"] == 0, f"workers short r{r}: idle rank created a DataLoader iterator"
+        else:
+            assert w2_short["iter_calls"] >= 2
 
 
 # --------------------------------------------------------------------------- T15 (g): validation & post-fit evaluate()
@@ -1660,11 +1966,58 @@ def _sc_t15g_val_all_zero_scored(rank: int, world_size: int) -> dict[str, Any]:
     return {"exc_type": exc_type, "exc_msg": exc_msg, "followup": _followup_collective_sum(world_size)}
 
 
+def _sc_t15g_training_mode_restored_after_val(rank: int, world_size: int) -> dict[str, Any]:
+    """Verify `model.training` is restored to `True` (and LoRA dropout stays active) after internal validation."""
+    del rank
+    train_ds = _make_uneven_dataset([8, 4] * world_size, seed=705, covariates=True)
+    val_ds = _make_uneven_dataset([8, 6] * world_size, seed=706, covariates=True)
+    cfg = _base_config(
+        mode="lora_variate",
+        batch_size=2,
+        eval_batch_size=2,
+        max_steps=2,
+        eval_every=1,
+        learning_rate=1e-2,
+        shuffle=False,
+        sign_flip=False,
+        restore_best=False,
+        seed=75,
+    )
+    trainer = TimestralTrainer(
+        cfg,
+        train_ds,
+        val_ds,
+        lora_config=_lora_for("lora_variate", dropout=0.5),
+        model=_fresh_tiny_model(seed=12),
+    )
+    _activate_lora_b(trainer.model)
+
+    first_dropout = next(m for m in trainer.model.modules() if isinstance(m, torch.nn.Dropout))
+    trace: list[tuple[bool, bool, int]] = []
+
+    def _record(_mod: torch.nn.Module, inp: tuple[Tensor, ...], out: Tensor) -> None:
+        dropped = int(((out.detach() == 0) & (inp[0].detach() != 0)).sum().item())
+        trace.append((trainer.model.training, first_dropout.training, dropped))
+
+    handle = first_dropout.register_forward_hook(_record)
+    try:
+        res = trainer.fit()
+    finally:
+        handle.remove()
+    return {
+        "result": res,
+        "trace": trace,
+        "post_fit_training": trainer.model.training,
+        "params": _flat_params(trainer.model),
+    }
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_t15_g_validation_and_post_fit_evaluate(world_size: int) -> None:
     """T15(g). Internal sharded validation matches one-process `evaluate()` in `float64` (`1e-12`)
-    and `float32` (`1e-5`) including under LoRA dropout, handles `len(val) < N` and per-rank
+    and `float32` (`1e-5`) including under LoRA dropout, restores `model.training` after validation
+    so subsequent training steps keep LoRA dropout active, handles `len(val) < N` and per-rank
     zero-scored shards, raises `ValueError` on every rank when globally unscored, and leaves rank-0
     post-`fit()` `evaluate()` collective-free on the full validation set.
     """
@@ -1684,6 +2037,7 @@ def test_t15_g_validation_and_post_fit_evaluate(world_size: int) -> None:
             "val_small": _sc_t15g_val_smaller_than_world,
             "val_one_zero": _sc_t15g_val_one_rank_zero_scored,
             "val_all_zero": _sc_t15g_val_all_zero_scored,
+            "val_restore_train": _sc_t15g_training_mode_restored_after_val,
         },
         world_size=world_size,
         pg_timeout=PG_TIMEOUT,
@@ -1729,6 +2083,22 @@ def test_t15_g_validation_and_post_fit_evaluate(world_size: int) -> None:
         assert out["exc_type"] is ValueError, f"val_all_zero r{r}: expected ValueError, got {out['exc_type']}"
         assert "no scored position" in out["exc_msg"]
         assert out["followup"] == world_size
+
+    # Training mode and LoRA dropout must be restored after step-1 internal validation for step-2 training (catches M4).
+    rt_outs = unwrap_results(outcomes["val_restore_train"])
+    for r, out in enumerate(rt_outs):
+        assert out["result"] == rt_outs[0]["result"]
+        assert torch.equal(out["params"], rt_outs[0]["params"])
+        assert out["post_fit_training"] is False
+        trace = out["trace"]
+        assert len(trace) == 4, f"val_restore_train r{r}: expected 4 forwards (train, val, train, val), got {trace}"
+        # Step 1 train, step 1 val, step 2 train (post-val), step 2 val.
+        assert trace[0][0] is True and trace[0][1] is True and trace[0][2] > 0
+        assert trace[1] == (False, False, 0)
+        assert trace[2][0] is True and trace[2][1] is True and trace[2][2] > 0, (
+            f"val_restore_train r{r}: model left in eval mode after internal validation: {trace[2]}"
+        )
+        assert trace[3] == (False, False, 0)
 
 
 # --------------------------------------------------------------------------- T15 (h): guards & export
@@ -2196,13 +2566,32 @@ def _sc_t15i_fit_fail_val_shard(rank: int, world_size: int) -> dict[str, Any]:
     return _record_propagated_exception(trainer.fit, world_size)
 
 
+def _sc_t15i_fit_fail_over_non_finite(rank: int, world_size: int) -> dict[str, Any]:
+    """Failure check must take precedence over non-finite check when both occur in the same step (catches M5)."""
+    ds = _make_uneven_dataset([8, 4] * world_size, seed=910, covariates=True)
+    trainer = TimestralTrainer(
+        _base_config(mode="full_ft", batch_size=2, max_steps=1), ds, model=_fresh_tiny_model(seed=18)
+    )
+    handle = None
+    if rank == 0:
+        handle = trainer.model.head.register_forward_hook(lambda _mod, _inp, out: out * float("nan"))
+    elif rank == 1:
+        trainer.train_dataset.series[2].targets[0, -1] = np.inf
+    try:
+        return _record_propagated_exception(trainer.fit, world_size)
+    finally:
+        if handle is not None:
+            handle.remove()
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_t15_i_single_rank_failure_propagation(world_size: int) -> None:
-    """T15(i). Single-rank and two-rank failures in `__init__`, `fit()` local stage, rank-0
-    callbacks (`on_fit_start`, `on_step_end`, `on_evaluate`, `on_fit_end`), and sharded validation
-    propagate to all ranks (`RankFailureError` naming failing ranks and stage on peers) and leave
-    the process group clean for follow-up collectives.
+    """T15(i). Single-rank and two-rank failures in `__init__`, `fit()` local stage (including when
+    another rank simultaneously reports a non-finite loss), rank-0 callbacks (`on_fit_start`,
+    `on_step_end`, `on_evaluate`, `on_fit_end`), and sharded validation propagate to all ranks
+    (`RankFailureError` naming failing ranks and stage on peers) and leave the process group clean
+    for follow-up collectives.
     """
     two_ranks = (0, 1) if world_size == 2 else (1, 3)
     scenarios: dict[str, Any] = {
@@ -2212,6 +2601,7 @@ def test_t15_i_single_rank_failure_propagation(world_size: int) -> None:
         "fit_r1": (_sc_t15i_fit_fail_rank, ((1,),)),
         "fit_r0": (_sc_t15i_fit_fail_rank, ((0,),)),
         "fit_two": (_sc_t15i_fit_fail_rank, (two_ranks,)),
+        "fit_fail_over_nf": _sc_t15i_fit_fail_over_non_finite,
         "fit_cb_start": (_sc_t15i_fit_fail_callback, ("on_fit_start",)),
         "fit_cb_step": (_sc_t15i_fit_fail_callback, ("on_step_end",)),
         "fit_cb_eval": (_sc_t15i_fit_fail_callback, ("on_evaluate",)),
@@ -2235,6 +2625,9 @@ def test_t15_i_single_rank_failure_propagation(world_size: int) -> None:
         world_size,
         {two_ranks[0]: ValueError, two_ranks[1]: ValueError},
         "fit_two",
+    )
+    _assert_propagated(
+        unwrap_results(outcomes["fit_fail_over_nf"]), world_size, {1: ValueError}, "fit_fail_over_non_finite"
     )
     _assert_propagated(unwrap_results(outcomes["fit_cb_start"]), world_size, {0: KeyError}, "fit_cb_start")
     _assert_propagated(unwrap_results(outcomes["fit_cb_step"]), world_size, {0: KeyError}, "fit_cb_step")
