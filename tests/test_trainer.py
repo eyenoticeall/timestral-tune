@@ -1422,7 +1422,7 @@ def test_run_fit_loop_drives_custom_non_primary_strategy(tiny_forecaster):
         "step_end:3",
         "evaluate_val",
         "on_evaluate:3",
-        "cleanup",
         "finalize_best:3",
         "on_fit_end",
+        "cleanup",
     ]

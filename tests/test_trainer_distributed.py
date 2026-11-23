@@ -453,6 +453,39 @@ def _sc_guards_logs_and_export(rank: int, world_size: int) -> dict[str, Any]:
         else:
             out["export_meta"] = None
 
+    # 5b. Non-zero-rank LoRA export validates without merging/extracting adapters or writing files.
+    lora_trainer = TimestralTrainer(
+        _base_config(mode="lora_variate", batch_size=2),
+        ds,
+        lora_config=LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("q", "v")),
+        model=_fresh_model(0),
+    )
+    with tempfile.TemporaryDirectory(prefix=f"tt_lora_exp_r{rank}_") as tmpdir:
+        lora_target = Path(tmpdir) / "lora_ckpt"
+        orig_download = export_module.hf_hub_download
+        orig_merge = export_module.merged_state_dict
+        orig_extract = export_module.extract_lora_state_dict
+        orig_save = export_module.save_file
+
+        def _forbid_lora(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("non-zero rank LoRA export() must not call Hub, merge/extract, or save files")
+
+        if rank != 0:
+            export_module.hf_hub_download = _forbid_lora
+            export_module.merged_state_dict = _forbid_lora
+            export_module.extract_lora_state_dict = _forbid_lora
+            export_module.save_file = _forbid_lora
+        try:
+            lora_returned = lora_trainer.export(lora_target)
+        finally:
+            export_module.hf_hub_download = orig_download
+            export_module.merged_state_dict = orig_merge
+            export_module.extract_lora_state_dict = orig_extract
+            export_module.save_file = orig_save
+        out["lora_export_returned_matches"] = lora_returned == lora_target
+        out["lora_export_adapter_exists"] = (lora_target / "adapter.safetensors").is_file()
+        out["lora_export_dir_exists"] = lora_target.exists()
+
     out["followup"] = _followup_sum(ctx)
     return out
 
@@ -558,12 +591,14 @@ def test_trainer_distributed_startup_guards_and_export(world_size: int) -> None:
         assert entry["export_nan_metrics"] is ValueError
         assert entry["export_missing_license"] is FileNotFoundError
         assert entry["export_returned_matches"] is True
+        assert entry["lora_export_returned_matches"] is True
         assert entry["followup"] == world_size
         if r == 0:
             assert len(entry["big_warnings"]) == 1 and "effective batch size" in entry["big_warnings"][0]
             assert sum("frozen-feature cache" in m for m in entry["big_infos"]) == 1
             assert entry["training_step_err"][0] is RuntimeError
             assert entry["export_dir_exists"] is True
+            assert entry["lora_export_dir_exists"] is True and entry["lora_export_adapter_exists"] is True
             assert entry["export_meta"] == {
                 "world_size": world_size,
                 "effective_batch_size": world_size * 32,
@@ -574,6 +609,7 @@ def test_trainer_distributed_startup_guards_and_export(world_size: int) -> None:
             assert entry["big_warnings"] == []
             assert entry["big_infos"] == []
             assert entry["export_dir_exists"] is False
+            assert entry["lora_export_dir_exists"] is False and entry["lora_export_adapter_exists"] is False
             assert len(entry["export_infos"]) == 1 and "rank 0" in entry["export_infos"][0]
 
 
@@ -593,6 +629,18 @@ def _worker_stale_group_fit_and_post_destroy_export(rank: int, world_size: int) 
         fit_err_type = type(exc)
     state_untouched = trainer.should_stop is True and trainer.scheduler is prev_scheduler and trainer.global_step == 0
 
+    # Stale group (world size changed): fit() also raises RuntimeError without mutating state.
+    size_changed_err_type = None
+    with tempfile.TemporaryDirectory(prefix=f"tt_ws1_r{rank}_") as ws1_dir:
+        store = Path(ws1_dir) / "store"
+        dist.init_process_group("gloo", init_method=f"file://{store}", rank=0, world_size=1)
+        try:
+            trainer.fit()
+        except Exception as exc:
+            size_changed_err_type = type(exc)
+        finally:
+            dist.destroy_process_group()
+
     # export() still works after destroy_process_group() using construction-time snapshot.
     with tempfile.TemporaryDirectory(prefix=f"tt_post_destroy_r{rank}_") as tmpdir:
         target = Path(tmpdir) / "exported"
@@ -602,6 +650,7 @@ def _worker_stale_group_fit_and_post_destroy_export(rank: int, world_size: int) 
 
     return {
         "fit_err_type": fit_err_type,
+        "size_changed_err_type": size_changed_err_type,
         "state_untouched": state_untouched,
         "returned_matches": returned == target,
         "exists": exists,
@@ -618,6 +667,7 @@ def test_trainer_stale_group_fit_and_export_after_destroy() -> None:
     )
     assert results[0] == {
         "fit_err_type": RuntimeError,
+        "size_changed_err_type": RuntimeError,
         "state_untouched": True,
         "returned_matches": True,
         "exists": True,
@@ -626,6 +676,7 @@ def test_trainer_stale_group_fit_and_export_after_destroy() -> None:
     }
     assert results[1] == {
         "fit_err_type": RuntimeError,
+        "size_changed_err_type": RuntimeError,
         "state_untouched": True,
         "returned_matches": True,
         "exists": False,
@@ -1206,32 +1257,10 @@ def _sc_sampling_flips_and_workers(rank: int, world_size: int) -> dict[str, Any]
         ref_flipped.append(flip_batch_signs(raw_batch, one_proc_gen).targets.clone())
     flip_matches = all(torch.equal(got, ref) for got, ref in zip(captured_targets, ref_flipped, strict=True))
 
-    # 3. num_workers=2 run (when supported on this platform/PyTorch version).
-    workers_params = None
-    workers_res = None
-    if not WORKERS_HANG_AT_EXIT:
-        t_wk = TimestralTrainer(
-            _base_config(
-                mode="head_only",
-                batch_size=per_rank_bs,
-                epochs=2,
-                shuffle=True,
-                sign_flip=True,
-                num_workers=2,
-                seed=79,
-            ),
-            ds,
-            model=_fresh_model(73),
-        )
-        workers_res = _result_as_dict(t_wk.fit())
-        workers_params = _flat_trainable(t_wk).clone()
-
     return {
         "shuf_result": _result_as_dict(res_shuf),
         "shuf_params": _flat_trainable(t_shuf).clone(),
         "flip_matches_single_process_seed": flip_matches,
-        "workers_result": workers_res,
-        "workers_params": workers_params,
     }
 
 
@@ -1462,16 +1491,13 @@ def test_trainer_distributed_lifecycle_validation_and_failures(world_size: int) 
         else:
             assert s2["events"] == []
 
-    # 3. Shuffle, sign_flip stream parity on rank 0 (peers differ), and num_workers=2.
+    # 3. Shuffle and sign_flip stream parity on rank 0 (peers differ).
     sf = unwrap_results(outcomes["sampling_flips"])
     assert sf[0]["flip_matches_single_process_seed"] is True
     for r in range(1, world_size):
         assert sf[r]["flip_matches_single_process_seed"] is False
         assert sf[r]["shuf_result"] == sf[0]["shuf_result"]
         assert torch.equal(sf[r]["shuf_params"], sf[0]["shuf_params"])
-        if not WORKERS_HANG_AT_EXIT:
-            assert sf[r]["workers_result"] == sf[0]["workers_result"]
-            assert torch.equal(sf[r]["workers_params"], sf[0]["workers_params"])
 
     # 4. Internal sharded validation parity, tiny val_dataset < N, unscored val error, rank-0 evaluate().
     val_out = unwrap_results(outcomes["validation"])
@@ -1543,3 +1569,43 @@ def test_trainer_distributed_lifecycle_validation_and_failures(world_size: int) 
             else:
                 assert cf["exc_type"] is RankFailureError
                 assert cf["failing_ranks"] == (0,) and cf["stage"] == hook
+
+
+def _worker_num_workers_fit(rank: int, world_size: int) -> dict[str, Any]:
+    per_rank_bs = 2
+    # Trailing partial step has 1 window (< N) so rank 0 fetches 2 batches/epoch and peers fetch 1 batch/epoch,
+    # exercising persistent_workers=True across uneven batch counts and verifying cleanup runs after on_fit_end.
+    ds = _make_unequal_dataset(world_size * per_rank_bs + 1, seed=71, covariates=True)
+    trainer = TimestralTrainer(
+        _base_config(
+            mode="head_only",
+            batch_size=per_rank_bs,
+            epochs=2,
+            shuffle=True,
+            sign_flip=True,
+            num_workers=2,
+            seed=79,
+        ),
+        ds,
+        model=_fresh_model(73),
+    )
+    res = trainer.fit()
+    return {"result": _result_as_dict(res), "params": _flat_trainable(trainer).clone()}
+
+
+@pytest.mark.skipif(WORKERS_HANG_AT_EXIT, reason="PyTorch below 2.8 on macOS: a DataLoader worker hangs the exit")
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_trainer_distributed_num_workers(world_size: int) -> None:
+    """Multi-process `fit()` with `num_workers=2` and `persistent_workers=True` across uneven trailing shards.
+
+    Runs in its own group (not followed by a tight post-scenario barrier) because on macOS
+    PyTorch's DataLoader worker shutdown waits `MP_STATUS_CHECK_INTERVAL` (5s) per active worker.
+    Because `_run_fit_loop` runs `strategy.cleanup()` after `finalize_best()` and `on_fit_end()`,
+    `fit()` itself stays safe under a 5s process-group timeout.
+    """
+    results = unwrap_results(
+        run_distributed(_worker_num_workers_fit, world_size=world_size, pg_timeout=5.0, wall_timeout=45.0)
+    )
+    for r in range(1, world_size):
+        assert results[r]["result"] == results[0]["result"]
+        assert torch.equal(results[r]["params"], results[0]["params"])

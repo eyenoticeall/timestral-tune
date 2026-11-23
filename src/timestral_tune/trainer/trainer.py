@@ -1646,45 +1646,49 @@ class TimestralTrainer:
             strategy.on_evaluate(self.global_step, result, bookkeeper)
 
         try:
-            strategy.prepare_fit()
-            strategy.on_fit_start()
-            self.model.train()
-            while self.global_step < final_step and not self.should_stop:
-                bookkeeper.epochs += 1
-                steps_before_epoch = self.global_step
-                skipped_before_epoch = bookkeeper.skipped_batches
-                for outcome in strategy.iter_epoch_steps(bookkeeper.epochs - 1):
-                    if outcome.skipped:
-                        bookkeeper.skipped_batches += 1
-                        continue
-                    self.global_step += 1
-                    loss = strategy.on_step_end(self.global_step, outcome.loss, outcome.learning_rate)
-                    bookkeeper.record_step(self.global_step, loss)
-                    due = config.eval_every is not None and (self.global_step - start_step) % config.eval_every == 0
-                    if self.val_dataset is not None and due:
+            try:
+                strategy.prepare_fit()
+                strategy.on_fit_start()
+                self.model.train()
+                while self.global_step < final_step and not self.should_stop:
+                    bookkeeper.epochs += 1
+                    steps_before_epoch = self.global_step
+                    skipped_before_epoch = bookkeeper.skipped_batches
+                    for outcome in strategy.iter_epoch_steps(bookkeeper.epochs - 1):
+                        if outcome.skipped:
+                            bookkeeper.skipped_batches += 1
+                            continue
+                        self.global_step += 1
+                        loss = strategy.on_step_end(self.global_step, outcome.loss, outcome.learning_rate)
+                        bookkeeper.record_step(self.global_step, loss)
+                        due = config.eval_every is not None and (self.global_step - start_step) % config.eval_every == 0
+                        if self.val_dataset is not None and due:
+                            evaluate_now()
+                        if self.global_step >= final_step or self.should_stop:
+                            break
+                    if self.global_step == steps_before_epoch:
+                        epoch_skipped = bookkeeper.skipped_batches - skipped_before_epoch
+                        raise RuntimeError(
+                            f"an epoch produced no optimiser step: all {epoch_skipped} batches had no scored position"
+                        )
+                    if self.val_dataset is not None and config.eval_every is None and not self.should_stop:
                         evaluate_now()
-                    if self.global_step >= final_step or self.should_stop:
-                        break
-                if self.global_step == steps_before_epoch:
-                    epoch_skipped = bookkeeper.skipped_batches - skipped_before_epoch
-                    raise RuntimeError(
-                        f"an epoch produced no optimiser step: all {epoch_skipped} batches had no scored position"
-                    )
-                if self.val_dataset is not None and config.eval_every is None and not self.should_stop:
+                if self.val_dataset is not None and bookkeeper.last_evaluated_step != self.global_step:
                     evaluate_now()
-            if self.val_dataset is not None and bookkeeper.last_evaluated_step != self.global_step:
-                evaluate_now()
+            finally:
+                self.model.eval()
+                self._fit_flip_generator = None
+                self._replay_flip_generator = None
+
+            restored = strategy.finalize_best(bookkeeper, self.global_step)
+            if bookkeeper.skipped_batches and strategy.is_primary:
+                logger.warning("skipped %d training batches that had no scored position", bookkeeper.skipped_batches)
+
+            result = bookkeeper.build_result(self.global_step, restored_best=restored)
+            strategy.on_fit_end(result)
+            return result
         finally:
             strategy.cleanup()
-            self.model.eval()
-
-        restored = strategy.finalize_best(bookkeeper, self.global_step)
-        if bookkeeper.skipped_batches and strategy.is_primary:
-            logger.warning("skipped %d training batches that had no scored position", bookkeeper.skipped_batches)
-
-        result = bookkeeper.build_result(self.global_step, restored_best=restored)
-        strategy.on_fit_end(result)
-        return result
 
     def fit(self) -> TrainingResult:
         """Train for the configured number of steps and return a summary.
