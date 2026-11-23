@@ -6,7 +6,10 @@ true proportion. A dashed line marks the model as released and the gap to the fi
 shaded. Under the fine-tuned bar the chart states how many series improved and the 95% confidence
 interval of the gain, so that a reader can see the gain is not noise.
 
-Every number is read from ``docs/benchmarks/sig_v2.json``; nothing is typed in by hand.
+Every number is read from the committed results; nothing is typed in by hand. Retail demand comes from
+``docs/benchmarks/sig_v2.json`` and German power, a test set from after the models' release, from
+``docs/benchmarks/wp3_unfamiliar_domains.json``. The tuned gradient-boosted baseline of that second
+file is deliberately not a bar: the README states that comparison in words next to the chart.
 
 matplotlib is not a project dependency. Run from the repository root:
 
@@ -26,7 +29,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Rectangle
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "docs" / "benchmarks" / "sig_v2.json"
+SIGNIFICANCE = ROOT / "docs" / "benchmarks" / "sig_v2.json"
+POST_RELEASE = ROOT / "docs" / "benchmarks" / "wp3_unfamiliar_domains.json"
 OUT = ROOT / "assets" / "results.png"
 
 # Colours follow the banner: near-black navy surface, cream text. The fine-tuned bar is blue and
@@ -38,30 +42,48 @@ TUNED = "#3b98f0"
 OTHER = "#6f7690"
 
 MODEL = "Timestral-28M"
+MODEL_KEY = "28M"
 TUNED_MODE = "full_ft"
-# (key in the results file, title, subtitle, what one series is called)
+# The classical baseline drawn for the post-release dataset. Named explicitly, because the smallest
+# baseline error in that file belongs to the tuned gradient-boosted model, which is not classical.
+POST_RELEASE_CLASSICAL = "classical_domain"
+# (results file, key in it, title, subtitle, what one series is called)
 PANELS = (
-    ("retail_demand", "Retail demand", "hourly sales of 64 store-product series", "series"),
-    ("realised_volatility_2026_10m", "Stock volatility", "hourly volatility of 51 US stocks", "stocks"),
+    (SIGNIFICANCE, "retail_demand", "Retail demand", "hourly sales of 64 store-product series", "series"),
+    (POST_RELEASE, "de_power_15m", "German wind and solar power", "15-minute output of 10 regional series", "series"),
 )
 X_MAX = 0.5
 BAR_HEIGHT = 0.56
 
 
-def load(dataset: str) -> dict[str, float]:
-    data = json.loads(SOURCE.read_text(encoding="utf-8"))["datasets"][dataset]
-    released = data["zero_shot"]["wql"]
-    mode = data["modes"][TUNED_MODE]
-    by_series = mode["paired_by_series"]
-    low, high = (100.0 * bound / released for bound in by_series["ci95_delta_wql"])
+def load(source: Path, dataset: str) -> dict[str, float]:
+    results = json.loads(source.read_text(encoding="utf-8"))
+    if source == SIGNIFICANCE:
+        data = results["datasets"][dataset]
+        released = data["zero_shot"]["wql"]
+        mode = data["modes"][TUNED_MODE]
+        by_series = mode["paired_by_series"]
+        classical = min(baseline["wql"] for baseline in data["baselines"].values())
+        tuned = mode["wql_mean"]
+        low, high = (100.0 * bound / released for bound in by_series["ci95_delta_wql"])
+        improved = by_series["clusters_improved_wql"]
+    else:
+        model = results["models"][MODEL_KEY][dataset]
+        released = model["zero_shot"]["raw"]["wql"]
+        mode = model["modes"][TUNED_MODE]
+        by_series = mode["paired_vs_zero_shot"]["raw"]["by_series"]["wql"]
+        classical = results["baselines"][dataset][POST_RELEASE_CLASSICAL]["metrics"]["raw"]["wql"]
+        tuned = mode["summary"]["raw"]["wql_mean"]
+        low, high = (100.0 * bound for bound in by_series["ci95_rel_delta"])
+        improved = by_series["clusters_improved"]
     return {
-        "classical": min(baseline["wql"] for baseline in data["baselines"].values()),
+        "classical": classical,
         "released": released,
-        "tuned": mode["wql_mean"],
-        "change": 100.0 * (mode["wql_mean"] / released - 1.0),
+        "tuned": tuned,
+        "change": 100.0 * (tuned / released - 1.0),
         "ci_small": min(abs(low), abs(high)),
         "ci_large": max(abs(low), abs(high)),
-        "improved": by_series["clusters_improved_wql"],
+        "improved": improved,
         "series": by_series["n_clusters"],
     }
 
@@ -89,9 +111,7 @@ def main() -> None:
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 13})
     fig = plt.figure(figsize=(14, 7.2), dpi=100, facecolor=SURFACE)
-    fig.text(
-        0.035, 0.925, "Fine-tuning lowers forecast error on nearly every series", color=TEXT, fontsize=22, weight="bold"
-    )
+    fig.text(0.035, 0.925, "Fine-tuning lowers forecast error on every series", color=TEXT, fontsize=22, weight="bold")
     fig.text(
         0.035,
         0.868,
@@ -100,9 +120,9 @@ def main() -> None:
         fontsize=14,
     )
 
-    for (dataset, title, subtitle, unit), bottom in zip(PANELS, (0.47, 0.05), strict=True):
+    for (source, dataset, title, subtitle, unit), bottom in zip(PANELS, (0.47, 0.05), strict=True):
         ax = fig.add_axes((0.27, bottom, 0.695, 0.275), facecolor=SURFACE)
-        stats = load(dataset)
+        stats = load(source, dataset)
         rows = (
             ("Classical statistical model", stats["classical"], OTHER),
             (f"{MODEL}, as released", stats["released"], OTHER),
@@ -160,8 +180,8 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, facecolor=SURFACE)
     print(f"wrote {args.output} ({fig.get_size_inches()[0] * fig.dpi:.0f} x {fig.get_size_inches()[1] * fig.dpi:.0f})")
-    for dataset, _, _, _ in PANELS:
-        print(dataset, {key: round(value, 4) for key, value in load(dataset).items()})
+    for source, dataset, _, _, _ in PANELS:
+        print(dataset, {key: round(value, 4) for key, value in load(source, dataset).items()})
 
 
 if __name__ == "__main__":

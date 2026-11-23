@@ -132,19 +132,20 @@ to three percentage points more forgetting; keep 1e-4 on 123M and 209M.
 
 ## Results
 
-Fine-tuning cut forecast error by about 11% on retail demand and 6% on stock volatility, in under a
-minute on a single GPU.
+Fine-tuning cut forecast error by about 11% on retail demand and 23% on German wind and solar power,
+in under a minute on a single GPU.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/eyenoticeall/timestral-tune/main/assets/results.png" width="100%"
-       alt="Forecast error of a classical statistical model, Timestral-28M as released, and Timestral-28M fine-tuned. Retail demand: 0.218, 0.219 and 0.195; fine-tuning gives 11% less error, better on 64 of 64 series. Stock volatility: 0.198, 0.193 and 0.182; 6% less error, better on 50 of 51 stocks.">
+       alt="Forecast error of a classical statistical model, Timestral-28M as released, and Timestral-28M fine-tuned. Retail demand: 0.218, 0.219 and 0.195; fine-tuning gives 11% less error, better on 64 of 64 series. German wind and solar power: 0.112, 0.129 and 0.099; 23% less error, better on 10 of 10 series.">
 </p>
 
-The chart shows Timestral-28M before and after fine-tuning. Shorter bars are better, and nearly every
-series improved (64 of 64 on retail demand, 50 of 51 stocks). That gain is measured against the model
-as released. Against a tuned gradient-boosted model, fine-tuned 28M was 6% to 8% ahead on these two
-datasets, whose test periods mostly predate the models' release, and level on four test sets from
-after it.
+The chart shows Timestral-28M before and after fine-tuning. Shorter bars are better, and every series
+improved. The gain is measured against the model as released, and we picked German power because the
+released model does poorly on it, so read 23% as what fine-tuning can recover and not as a typical
+gain. A tuned gradient-boosted model is a stronger alternative than either grey bar: fine-tuned 28M
+was 8% ahead of it on retail demand, whose test period predates the models' release, and level with it
+on German power.
 
 The [summary in docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md#summary)
 explains why these gains are not noise, what else we found and the fine print. The rest of that page

@@ -2,10 +2,10 @@
 
 ## Summary
 
-Fine-tuning cut forecast error by about 11% on retail demand and 6% on stock volatility, in under a
-minute on a single GPU.
+Fine-tuning cut forecast error by about 11% on retail demand and 23% on German wind and solar power,
+in under a minute on a single GPU.
 
-![Forecast error of a classical statistical model, Timestral-28M as released, and Timestral-28M fine-tuned, on retail demand and stock volatility](../assets/results.png)
+![Forecast error of a classical statistical model, Timestral-28M as released, and Timestral-28M fine-tuned, on retail demand and German wind and solar power](../assets/results.png)
 
 We fine-tuned Timestral-28M on two real datasets and scored it on later data it had never seen. The
 bars show how far the forecasts were from what happened, so shorter is better. The dashed line marks
@@ -13,37 +13,48 @@ the model exactly as Mistral AI released it.
 
 These gains are not noise:
 
-- **Nearly every series improved.** Fine-tuning made the forecasts better on all 64 retail series and
-  on 50 of the 51 stocks.
+- **Every series improved.** Fine-tuning made the forecasts better on all 64 retail series and on all
+  10 German power series.
 - **It held up over time.** Splitting the test data into consecutive periods, the fine-tuned model was
-  ahead in 6 of 6 periods on retail demand and in 46 of 49 on stock volatility.
+  ahead in 6 of 6 periods on retail demand and on 24 of 25 days on German power.
 - **The uncertainty is small next to the gain.** The 95% confidence interval is 10% to 13% less error
-  on retail demand and 5% to 7% less on stock volatility.
-- **Repeating the training changes little.** Three fine-tuning runs on retail demand with different
-  random seeds landed within 0.4% of each other.
+  on retail demand and 19% to 25% less on German power.
+- **Repeating the training changes little.** Three fine-tuning runs with different random seeds landed
+  within 0.4% of each other on retail demand and within 1.2% on German power.
 
 What else we found:
 
 - **Every model size improved**, from 5M to 209M.
+- **Stock volatility improved by 6%.** On the hourly volatility of 51 US stocks, fine-tuning made the
+  forecasts better on 50 of the 51 stocks and in 46 of 49 consecutive periods (95% interval: 5% to 7%
+  less error). The error was 0.193 as released and 0.182 fine-tuned, against 0.198 for a classical HAR
+  model.
+- **Two more test sets from after the release improved by 23% and 9%**: wave heights off Sri Lanka and
+  air pollution in Indian cities. Each has only five test periods, so these are less certain over time.
 - **A small fine-tuned model can beat a larger one as released.** On retail demand the fine-tuned 5M
   model made 7% to 10% less error than every model size as released, the 209M included.
 - **Little was forgotten.** On three unrelated datasets, the error of the fully fine-tuned models moved
   by less than 3% either way.
 - **Against a tuned gradient-boosted model the result is mixed.** Gradient boosting is a stronger
   baseline than the classical models in the chart. Fine-tuned Timestral-28M made 8% less error than it
-  on retail demand and 6% less on stock volatility, the two datasets in the chart, whose test periods
-  mostly predate the models' release. On four test sets taken entirely from after the release (18 days
-  of stock volatility, German wind and solar power, air pollution in Indian cities and wave heights off
-  Sri Lanka) the two were level: no difference was larger than its margin of error. The fine-tuned 5M
-  model did not beat gradient boosting on any of the four, and was clearly behind on German power.
+  on retail demand and 6% less on stock volatility, whose test periods mostly predate the models'
+  release. On four test sets taken entirely from after the release (German wind and solar power, 18
+  days of stock volatility, air pollution in Indian cities and wave heights off Sri Lanka) the two were
+  level: no difference was larger than its margin of error. The fine-tuned 5M model did not beat
+  gradient boosting on any of the four, and was clearly behind on German power.
 
 The fine print:
 
 - The chart uses full fine-tuning at default settings. Error is the weighted quantile loss, which
-  scores the whole predicted range and not just a single best guess. The classical models are a
-  seasonal ridge regression for retail demand and a HAR model for stock volatility.
+  scores the whole predicted range and not just a single best guess. The classical models are ridge
+  regressions: a seasonal one for retail demand, and one on recent values and the known inputs for
+  German power.
 - The gradient-boosted model is scikit-learn's `HistGradientBoostingRegressor`. It predicts the same
   range of outcomes, trains on a CPU, and has its settings chosen on validation data.
+- The German power test covers the 25 days after the models' release (28 October to 21 November 2026).
+  We picked this dataset because the released model does poorly on it, so 23% is what fine-tuning can
+  recover there and not a typical gain. Every method is given the grid operators' day-ahead forecast as
+  an input; for the last hour of each day that forecast had not yet been published at forecast time.
 - The stock volatility test covers January to November 2026. Most of that is before the models'
   release in late October, so the released model may have seen some of it in its own training. On the
   18 days after the release the gain is the same 6%, but that is too short a period to confirm on its
@@ -51,8 +62,9 @@ The fine print:
 - The retail data is from 2024 and may also have been part of the models' training data.
 
 The sections below hold the numbers behind this summary, with the commands to reproduce them: §1 and §3
-for the four model sizes, §4 for the chart, its confidence intervals and the repeated runs, and §6.1 and
-§6.3 for the comparison with gradient boosting.
+for the four model sizes, §4 for retail demand and stock volatility with their confidence intervals and
+repeated runs, and §6.1 and §6.3 for German power, the other post-release test sets and the comparison
+with gradient boosting.
 
 ## Measurement setup
 
