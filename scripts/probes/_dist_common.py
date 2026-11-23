@@ -7,13 +7,17 @@ PyTorch/NumPy, `_common`, and public `timestral_tune` APIs (never `tests/`).
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
+import math
 import os
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,6 +39,43 @@ REP_HORIZON = PATCH + PATCH // 2  # 48 (non-multiple of PATCH; exercises distill
 # workers alive while DataLoader waits forever.
 _SHM_SUFFIX_LEN = len("/torch-shm-dir-XXXXXX/manager.sock")
 _UNIX_PATH_MAX = 103 if sys.platform == "darwin" else 107
+
+
+def require_positive_finite(parser: argparse.ArgumentParser, opt: str, value: float) -> None:
+    """Reject non-finite (`nan`, `inf`, `-inf`) or non-positive float CLI option values."""
+    if not math.isfinite(value) or value <= 0.0:
+        parser.error(f"{opt} must be a finite positive number, got {value}")
+
+
+def files_sha256(paths: Sequence[Path]) -> str:
+    """Return a deterministic SHA-256 hex digest over the contents of `paths` (in given order)."""
+    h = hashlib.sha256()
+    for p in paths:
+        resolved = p.resolve()
+        h.update(resolved.name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(resolved.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def git_head_commit(cwd: Path | None = None) -> str | None:
+    """Return the current git `HEAD` commit hash, or `None` if unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=None if cwd is None else str(cwd),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    val = out.stdout.strip()
+    return val or None
 
 
 def pick_free_port() -> int:
