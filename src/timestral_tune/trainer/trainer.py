@@ -229,13 +229,15 @@ class _SingleProcessStrategy:
         config = trainer.config
         torch.manual_seed(config.seed)
         self._flip_generator = torch.Generator().manual_seed(config.seed + 1_000_003) if config.sign_flip else None
-        trainer._fit_flip_generator = self._flip_generator
         self._replay_flip_generator = (
             torch.Generator().manual_seed(config.seed + 3_000_007) if trainer._replay_sign_flip else None
         )
-        trainer._replay_flip_generator = self._replay_flip_generator
-        self._loader = trainer._loader(trainer.train_dataset, training=True)
-        self._replay_iter = _cycle_loader(trainer._replay_loader()) if trainer.replay_config is not None else None
+        self._loader = trainer._loader(trainer.train_dataset, training=True, flip_generator=self._flip_generator)
+        self._replay_iter = (
+            _cycle_loader(trainer._replay_loader(flip_generator=self._replay_flip_generator))
+            if trainer.replay_config is not None
+            else None
+        )
 
     def on_fit_start(self) -> None:
         for callback in self._trainer.callbacks:
@@ -289,13 +291,9 @@ class _SingleProcessStrategy:
         for callback in self._trainer.callbacks:
             callback.on_fit_end(self._trainer, result)
 
-    def after_train_loop(self) -> None:
-        self._trainer._fit_flip_generator = None
-        self._trainer._replay_flip_generator = None
+    def cleanup(self) -> None:
         self._flip_generator = None
         self._replay_flip_generator = None
-
-    def cleanup(self) -> None:
         self._loader = None
         self._replay_iter = None
 
@@ -510,8 +508,6 @@ class TimestralTrainer:
         self._train_head_cache: _CachedHeadDataset | None = None
         self._val_head_cache: _CachedHeadDataset | None = None
         self._replay_head_cache: _CachedHeadDataset | None = None
-        self._fit_flip_generator: torch.Generator | None = None
-        self._replay_flip_generator: torch.Generator | None = None
         self._val_loader: DataLoader | None = None
 
     def _log_distributed_startup(self, dist_ctx: DistributedContext) -> None:
@@ -1039,7 +1035,13 @@ class TimestralTrainer:
             frame_scale=fscale_all,
         )
 
-    def _loader(self, dataset: TimeSeriesDataset, *, training: bool) -> DataLoader:
+    def _loader(
+        self,
+        dataset: TimeSeriesDataset,
+        *,
+        training: bool,
+        flip_generator: torch.Generator | None = None,
+    ) -> DataLoader:
         slot: Literal["train", "val", "replay"] | None = (
             "train" if dataset is self.train_dataset else ("val" if dataset is self.val_dataset else None)
         )
@@ -1049,7 +1051,7 @@ class TimestralTrainer:
         config = self.config
         generator = torch.Generator().manual_seed(config.seed) if training else None
         batch_size = config.batch_size if training else (config.eval_batch_size or config.batch_size)
-        flip_gen = self._fit_flip_generator if training else None
+        flip_gen = flip_generator if training else None
         collate_fn = (
             (lambda idx: cache.collate_sign_flipped(idx, flip_gen))
             if (flip_gen is not None and cache.negated is not None)
@@ -1065,7 +1067,7 @@ class TimestralTrainer:
             generator=generator,
         )
 
-    def _replay_loader(self) -> DataLoader:
+    def _replay_loader(self, *, flip_generator: torch.Generator | None = None) -> DataLoader:
         assert self.replay_config is not None and self.replay_dataset is not None
         dataset = self.replay_dataset
         config = self.config
@@ -1074,10 +1076,9 @@ class TimestralTrainer:
 
         cache = self._get_head_cache(dataset, slot="replay")
         if cache is not None:
-            flip_gen = self._replay_flip_generator
             collate_fn = (
-                (lambda idx: cache.collate_sign_flipped(idx, flip_gen))
-                if (flip_gen is not None and cache.negated is not None)
+                (lambda idx: cache.collate_sign_flipped(idx, flip_generator))
+                if (flip_generator is not None and cache.negated is not None)
                 else cache.collate
             )
             return DataLoader(
@@ -1456,11 +1457,10 @@ class TimestralTrainer:
                 if self.val_dataset is not None and bookkeeper.last_evaluated_step != self.global_step:
                     evaluate_now()
             finally:
-                # Switch to eval and clear loop-scoped flip generators before `finalize_best()` /
-                # `on_fit_end()`, while keeping `strategy.cleanup()` in the outer `finally:` so
-                # potentially asymmetric DataLoader worker teardown never stalls end-of-fit collectives.
+                # Switch to eval before `finalize_best()` / `on_fit_end()`, while keeping
+                # `strategy.cleanup()` in the outer `finally:` so potentially asymmetric
+                # DataLoader worker teardown never stalls end-of-fit collectives.
                 self.model.eval()
-                strategy.after_train_loop()
 
             restored = strategy.finalize_best(bookkeeper, self.global_step)
             if bookkeeper.skipped_batches and strategy.is_primary:

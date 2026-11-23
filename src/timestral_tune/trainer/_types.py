@@ -199,7 +199,7 @@ class _FitStrategy(Protocol):
         ...
 
     def prepare_fit(self) -> None:
-        """Seed RNGs, attach per-fit flip generators, and construct training/replay loaders."""
+        """Seed RNGs and construct training/replay loaders."""
         ...
 
     def on_fit_start(self) -> None:
@@ -230,10 +230,6 @@ class _FitStrategy(Protocol):
         """Run `on_fit_end` callbacks (rank 0 only in multi-process mode)."""
         ...
 
-    def after_train_loop(self) -> None:
-        """Clear loop-scoped state (flip generators) once the loop exits, before `finalize_best` / `on_fit_end`."""
-        ...
-
     def cleanup(self) -> None:
-        """Release loaders, samplers, and buffers after end-of-fit collectives finish."""
+        """Release flip generators, loaders, samplers, and buffers after end-of-fit collectives finish."""
         ...

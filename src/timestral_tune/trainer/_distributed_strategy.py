@@ -54,7 +54,6 @@ class _DistributedStrategy:
         self._trainer = trainer
         self._ctx = ctx
         self._flip_generator: torch.Generator | None = None
-        self._replay_flip_generator: torch.Generator | None = None
         self._sampler: DistributedBatchSampler | None = None
         self._train_loader: DataLoader | None = None
         self._sharded_val_loader: DataLoader | None = None
@@ -81,13 +80,6 @@ class _DistributedStrategy:
         self._flip_generator = (
             torch.Generator().manual_seed(rank_seed(config.seed + 1_000_003, rank)) if config.sign_flip else None
         )
-        trainer._fit_flip_generator = self._flip_generator
-        self._replay_flip_generator = (
-            torch.Generator().manual_seed(rank_seed(config.seed + 3_000_007, rank))
-            if trainer._replay_sign_flip
-            else None
-        )
-        trainer._replay_flip_generator = self._replay_flip_generator
 
         self._sampler = DistributedBatchSampler(
             len(trainer.train_dataset),
@@ -442,15 +434,9 @@ class _DistributedStrategy:
 
         self._broadcast_rank0_hook("on_fit_end", _run)
 
-    def after_train_loop(self) -> None:
-        """Detach per-fit flip generators once the training loop ends, before `finalize_best` / `on_fit_end`."""
-        self._trainer._fit_flip_generator = None
-        self._trainer._replay_flip_generator = None
-        self._flip_generator = None
-        self._replay_flip_generator = None
-
     def cleanup(self) -> None:
-        """Release the flat gradient buffer, loaders, and sampler after all end-of-fit collectives (0 collectives)."""
+        """Release the flip generator, gradient buffer, loaders, and sampler after fit (0 collectives)."""
+        self._flip_generator = None
         self._sampler = None
         self._train_loader = None
         self._sharded_val_loader = None

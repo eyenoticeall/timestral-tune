@@ -421,11 +421,11 @@ def test_unscored_batches_are_skipped_and_counted(tiny_forecaster, monkeypatch):
     scored = collate([dataset[0], dataset[1]])
     unscored = dataclasses.replace(scored, loss_weight=torch.zeros_like(scored.loss_weight))
     trainer = TimestralTrainer(config_for(max_steps=4), dataset, model=model)
-    monkeypatch.setattr(trainer, "_loader", lambda dataset, training: [scored, unscored, scored])
+    monkeypatch.setattr(trainer, "_loader", lambda dataset, training, flip_generator=None: [scored, unscored, scored])
     result = trainer.fit()
     assert result.steps == 4 and result.skipped_batches == 2 and result.epochs == 2
 
-    monkeypatch.setattr(trainer, "_loader", lambda dataset, training: [unscored, unscored])
+    monkeypatch.setattr(trainer, "_loader", lambda dataset, training, flip_generator=None: [unscored, unscored])
     with pytest.raises(RuntimeError, match="no optimiser step"):
         trainer.fit()
     with pytest.raises(ValueError, match="no scored position"):
@@ -1064,7 +1064,7 @@ def test_sign_flip_augmentation_coherence_determinism_and_head_cache_bypass(tiny
                 handle.remove()
         if cached:
             # Evaluating the training set AFTER fit() MUST use unflipped positive orientation
-            # (catches dropping `if training else None` on `_fit_flip_generator`).
+            # (catches leaking a sign-flip generator into evaluation).
             ev_cached_1 = trainer.evaluate(train).loss
             ev_cached_2 = trainer.evaluate(train).loss
             ref_eval = (
@@ -1400,9 +1400,6 @@ def test_run_fit_loop_drives_custom_non_primary_strategy(tiny_forecaster):
         def on_fit_end(self, result) -> None:
             events.append("on_fit_end")
 
-        def after_train_loop(self) -> None:
-            events.append("after_train_loop")
-
         def cleanup(self) -> None:
             events.append("cleanup")
 
@@ -1424,7 +1421,6 @@ def test_run_fit_loop_drives_custom_non_primary_strategy(tiny_forecaster):
         "step_end:3",
         "evaluate_val",
         "on_evaluate:3",
-        "after_train_loop",
         "finalize_best:3",
         "on_fit_end",
         "cleanup",
