@@ -261,13 +261,15 @@ def _validate_export_inputs(
     license_path: str | Path | None = None,
     replay_source: Mapping[str, Any] | None = None,
     data_fingerprint: str | None = None,
+    world_size: int | None = None,
+    effective_batch_size: int | None = None,
 ) -> _ValidatedExport:
     """Validate `export_checkpoint` inputs without Hub calls, weight merges, or disk writes.
 
     Checks, in the same order as `export_checkpoint`: fitted `ConformalCalibrator`, LoRA config
     match and presence when the model has adapters, strict (`allow_nan=False`) JSON serialisability
-    of adapter config, calibrator, `replay_source`, `data_fingerprint`, and `metrics`, and existence
-    of an explicit `license_path`.
+    of adapter config, calibrator, `replay_source`, `data_fingerprint`, and `metrics`, existence
+    of an explicit `license_path`, and optional multi-process metadata arguments.
     """
     if isinstance(calibrator, ConformalCalibrator) and not calibrator.is_fitted:
         raise ValueError("cannot export an unfitted ConformalCalibrator; call fit() first")
@@ -301,6 +303,13 @@ def _validate_export_inputs(
         if not src.is_file():
             raise FileNotFoundError(f"license_path {str(src)!r} does not exist")
 
+    if world_size is not None and (isinstance(world_size, bool) or not isinstance(world_size, int) or world_size < 1):
+        raise ValueError(f"world_size must be a positive integer or None, got {world_size!r}")
+    if effective_batch_size is not None and (
+        isinstance(effective_batch_size, bool) or not isinstance(effective_batch_size, int) or effective_batch_size < 1
+    ):
+        raise ValueError(f"effective_batch_size must be a positive integer or None, got {effective_batch_size!r}")
+
     return _ValidatedExport(
         model_has_lora=model_has_lora,
         effective_lora=effective_lora,
@@ -327,6 +336,8 @@ def export_checkpoint(
     data_fingerprint: str | None = None,
     license_path: str | Path | None = None,
     model_provided_directly: bool = False,
+    world_size: int | None = None,
+    effective_batch_size: int | None = None,
 ) -> Path:
     """Export `model` to `output_dir` in the upstream-loadable layout of spec §7.4.
 
@@ -334,7 +345,9 @@ def export_checkpoint(
     unmerged adapter matrices are written to `adapter.safetensors`. All metadata, JSON payloads,
     and licence files are validated and serialised before writing anything to disk, so errors
     never leave a partial export without `LICENSE` or `NOTICE`. Stale conditional files from a
-    previous export in `output_dir` are removed when not part of this export.
+    previous export in `output_dir` are removed when not part of this export. When `world_size` is
+    greater than 1, top-level `world_size` and `effective_batch_size` keys are added to
+    `tune_metadata.json`; one-process exports omit them.
     """
     validated = _validate_export_inputs(
         model,
@@ -344,6 +357,8 @@ def export_checkpoint(
         license_path=license_path,
         replay_source=replay_source,
         data_fingerprint=data_fingerprint,
+        world_size=world_size,
+        effective_batch_size=effective_batch_size,
     )
     model_has_lora = validated.model_has_lora
     effective_lora = validated.effective_lora
@@ -377,6 +392,13 @@ def export_checkpoint(
         "library_version": _library_version(),
         "vendored_upstream_commit": _vendored_upstream_commit(),
     }
+    if world_size is not None and world_size > 1:
+        metadata["world_size"] = world_size
+        metadata["effective_batch_size"] = (
+            effective_batch_size
+            if effective_batch_size is not None
+            else (None if training_config is None else world_size * training_config.batch_size)
+        )
     metadata_json = _dumps_json(metadata)
     license_bytes, is_verbatim = _resolve_license_bytes(resolved_base, resolved_revision, license_path)
     notice_text = _notice_text(
