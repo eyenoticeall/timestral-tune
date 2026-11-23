@@ -16,11 +16,13 @@ spec §9:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import shutil
 import sys
-from collections.abc import Sequence
+import tempfile
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -46,8 +48,8 @@ from timestral_tune.trainer.distributed import (
 )
 from timestral_tune.trainer.step import compute_loss
 
-from ..distributed_harness import run_distributed, run_scenarios, unwrap_results
-from ..helpers import as_double, float64_reference, l2_rel, make_tiny_forecaster
+from ..distributed_harness import RankResult, run_distributed, run_scenarios, unwrap_results
+from ..helpers import TINY_CONFIG, as_double, float64_reference, l2_rel, make_tiny_forecaster
 
 # PyTorch < 2.8 on macOS hangs at process exit after DataLoader workers run (tests/test_dataset.py:451).
 WORKERS_HANG_AT_EXIT = sys.platform == "darwin" and tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
@@ -449,12 +451,14 @@ def _run_t15a_repeated_det(world_size: int, *, per_rank_batch: int) -> dict[str,
     res1 = trainer.fit()
     lrs1 = list(cb.lrs)
     step1 = trainer.global_step
+    fit_start1 = trainer.fit_start_step
     params1_train = _flat_trainable(trainer).clone()
     params1_all = _flat_params(trainer.model).clone()
 
     res2 = trainer.fit()
     lrs2 = cb.lrs[len(lrs1) :]
     step2 = trainer.global_step
+    fit_start2 = trainer.fit_start_step
     params2_train = _flat_trainable(trainer).clone()
     params2_all = _flat_params(trainer.model).clone()
     return {
@@ -464,6 +468,8 @@ def _run_t15a_repeated_det(world_size: int, *, per_rank_batch: int) -> dict[str,
         "lrs2": lrs2,
         "step1": step1,
         "step2": step2,
+        "fit_start1": fit_start1,
+        "fit_start2": fit_start2,
         "params1_train": params1_train,
         "params2_train": params2_train,
         "params1_all": params1_all,
@@ -514,19 +520,24 @@ def _sc_t15a_repeated_shuf(rank: int, world_size: int) -> dict[str, Any]:
     }
 
 
-@pytest.mark.acceptance
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_a_multi_epoch_trajectory_parity(world_size: int) -> None:
-    """T15(a). Multi-epoch `fit()` parity across all four modes, float32 and float64, with unequal
-    scored counts, trailing empty rank(s), warmup+cosine LR, weight decay, and gradient clipping,
-    plus calling `fit()` twice on the same trainer (fresh schedule, identical batch order, parity).
-    """
+def _scenarios_t15a(world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size, base_dir
     scenarios: dict[str, Any] = {
         f"{mode}_{dt}": (_sc_t15a_trajectory, (mode, dt)) for dt in ("float64", "float32") for mode in ALL_MODES
     }
     scenarios["repeated_det"] = _sc_t15a_repeated_det
     scenarios["repeated_shuf"] = _sc_t15a_repeated_shuf
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=PG_TIMEOUT, wall_timeout=WALL_TIMEOUT)
+    return scenarios
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_t15_a_multi_epoch_trajectory_parity(world_size: int, _t15_pool: Any) -> None:
+    """T15(a). Multi-epoch `fit()` parity across all four modes, float32 and float64, with unequal
+    scored counts, trailing empty rank(s), warmup+cosine LR, weight decay, and gradient clipping,
+    plus calling `fit()` twice on the same trainer (fresh schedule, identical batch order, parity).
+    """
+    outcomes = _t15_pool("a", world_size)
 
     for dt in ("float64", "float32"):
         tol = TRAJ_TOL[dt]
@@ -575,6 +586,7 @@ def test_t15_a_multi_epoch_trajectory_parity(world_size: int) -> None:
     for _r, out in enumerate(rep_outs):
         assert out["res1"] == r0_rep["res1"] and out["res2"] == r0_rep["res2"]
         assert out["step1"] == 6 and out["step2"] == 12
+        assert out["fit_start1"] == 0 and out["fit_start2"] == 6
         assert out["res2"].train_history[0][0] == 7
         assert torch.equal(out["params1_all"], r0_rep["params1_all"])
         assert torch.equal(out["params2_all"], r0_rep["params2_all"])
@@ -841,9 +853,19 @@ def _sc_t15b_all_none_grad_param(rank: int, world_size: int) -> dict[str, Any]:
     }
 
 
+def _scenarios_t15b(world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size, base_dir
+    step_cases = [(f"{mode}_{dt}", mode, dt) for dt in ("float64", "float32") for mode in ALL_MODES]
+    scenarios: dict[str, Any] = {label: (_sc_t15b_direct_steps, (mode, dt)) for label, mode, dt in step_cases}
+    scenarios["all_none_grad"] = _sc_t15b_all_none_grad_param
+    scenarios["non_finite_direct"] = _sc_t15b_non_finite_direct
+    scenarios["non_finite_fit"] = _sc_t15b_non_finite_fit
+    return scenarios
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_b_step_gradients_loss_and_non_finite(world_size: int) -> None:
+def test_t15_b_step_gradients_loss_and_non_finite(world_size: int, _t15_pool: Any) -> None:
     """T15(b). Direct internal distributed step (`_run_step`) on constructed batches (unequal,
     zero-scored, and empty `None` shards; `as_double` inputs for `float64` tier) across all four
     modes including LoRA step 1 (both A and B gradients non-zero), all-`None` gradient preservation
@@ -851,12 +873,7 @@ def test_t15_b_step_gradients_loss_and_non_finite(world_size: int) -> None:
     `FloatingPointError` propagation.
     """
     step_cases = [(f"{mode}_{dt}", mode, dt) for dt in ("float64", "float32") for mode in ALL_MODES]
-    scenarios: dict[str, Any] = {label: (_sc_t15b_direct_steps, (mode, dt)) for label, mode, dt in step_cases}
-    scenarios["all_none_grad"] = _sc_t15b_all_none_grad_param
-    scenarios["non_finite_direct"] = _sc_t15b_non_finite_direct
-    scenarios["non_finite_fit"] = _sc_t15b_non_finite_fit
-
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=PG_TIMEOUT, wall_timeout=WALL_TIMEOUT)
+    outcomes = _t15_pool("b", world_size)
 
     for label, mode, dt in step_cases:
         tol = STEP_TOL[dt]
@@ -973,21 +990,21 @@ def _sc_t15c_empty_epoch(rank: int, world_size: int) -> dict[str, Any]:
     }
 
 
+def _scenarios_t15c(world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size, base_dir
+    return {"mid_skip": _sc_t15c_mid_epoch_skip, "empty_epoch": _sc_t15c_empty_epoch}
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_c_global_zero_scored_step_and_empty_epoch(world_size: int) -> None:
+def test_t15_c_global_zero_scored_step_and_empty_epoch(world_size: int, _t15_pool: Any) -> None:
     """T15(c). Globally zero-scored batch (`W_D == 0`) skips backward/optimiser/scheduler and
     increments `skipped_batches` on every rank; an all-unscored epoch raises `RuntimeError` on every rank.
     """
     ref = _run_t15c_skip(world_size, per_rank_batch=2 * world_size)
     assert ref["result"].steps == 4 and ref["result"].skipped_batches == 2 and ref["result"].epochs == 2
 
-    outcomes = run_scenarios(
-        {"mid_skip": _sc_t15c_mid_epoch_skip, "empty_epoch": _sc_t15c_empty_epoch},
-        world_size=world_size,
-        pg_timeout=PG_TIMEOUT,
-        wall_timeout=WALL_TIMEOUT,
-    )
+    outcomes = _t15_pool("c", world_size)
 
     skip_outs = unwrap_results(outcomes["mid_skip"])
     r0 = skip_outs[0]
@@ -1067,21 +1084,48 @@ def _sc_t15d_mismatch_config(rank: int, world_size: int) -> dict[str, Any]:
     )
 
 
-@pytest.mark.acceptance
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_d_initial_broadcast_and_consistency(world_size: int, tmp_path: Path) -> None:
-    """T15(d). `__init__` broadcasts all parameters (frozen and trainable) and buffers from rank 0
-    across all modes, allows rank-specific `output_dir`, and rejects mismatched datasets or configs
-    (`ValueError` on mismatched rank(s), `RankFailureError` naming them on matching peers).
-    """
-    scenarios: dict[str, Any] = {
-        f"bcast_{mode}": (_sc_t15d_initial_broadcast, (mode, str(tmp_path))) for mode in ALL_MODES
-    }
+def _sc_t15d_mismatch_model_shape(rank: int, world_size: int) -> dict[str, Any]:
+    ds = _make_uneven_dataset([8, 4, 6, 2], seed=406, covariates=True)
+    model = _fresh_tiny_model(seed=5)
+    if rank == 1:
+        model = TuneTimestralModel(dataclasses.replace(TINY_CONFIG, d_model=16))
+    cfg = _base_config(mode="head_only", batch_size=2, max_steps=1, seed=31)
+    return _record_propagated_exception(
+        lambda: TimestralTrainer(cfg, ds, model=model),
+        world_size,
+    )
+
+
+def _sc_t15d_mismatch_val_presence(rank: int, world_size: int) -> dict[str, Any]:
+    train_ds = _make_uneven_dataset([8, 4, 6, 2], seed=407, covariates=True)
+    val_ds = _make_uneven_dataset([8, 4], seed=408, covariates=True) if rank == 0 else None
+    cfg = _base_config(mode="head_only", batch_size=2, max_steps=1, seed=31)
+    return _record_propagated_exception(
+        lambda: TimestralTrainer(cfg, train_ds, val_ds, model=_fresh_tiny_model(seed=5)),
+        world_size,
+    )
+
+
+def _scenarios_t15d(world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size
+    scenarios: dict[str, Any] = {f"bcast_{mode}": (_sc_t15d_initial_broadcast, (mode, base_dir)) for mode in ALL_MODES}
     scenarios["mismatch_ds_len"] = _sc_t15d_mismatch_dataset_length
     scenarios["mismatch_ds_content"] = _sc_t15d_mismatch_dataset_content
     scenarios["mismatch_cfg"] = _sc_t15d_mismatch_config
+    scenarios["mismatch_model_shape"] = _sc_t15d_mismatch_model_shape
+    scenarios["mismatch_val_presence"] = _sc_t15d_mismatch_val_presence
+    return scenarios
 
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=PG_TIMEOUT, wall_timeout=WALL_TIMEOUT)
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_t15_d_initial_broadcast_and_consistency(world_size: int, _t15_pool: Any) -> None:
+    """T15(d). `__init__` broadcasts all parameters (frozen and trainable) and buffers from rank 0
+    across all modes, allows rank-specific `output_dir`, and rejects mismatched datasets, configs,
+    model shapes, or `val_dataset` presence (`ValueError` on mismatched rank(s), `RankFailureError`
+    naming them on matching peers).
+    """
+    outcomes = _t15_pool("d", world_size)
 
     for mode in ALL_MODES:
         outs = unwrap_results(outcomes[f"bcast_{mode}"])
@@ -1097,6 +1141,7 @@ def test_t15_d_initial_broadcast_and_consistency(world_size: int, tmp_path: Path
 
     # Decided consistency semantics: mismatched rank(s) raise ValueError; matching peers raise RankFailureError.
     cfg_bad = {1: ValueError} if world_size == 2 else {1: ValueError, 3: ValueError}
+    val_bad = {r: ValueError for r in range(1, world_size)}
     _assert_propagated(
         unwrap_results(outcomes["mismatch_ds_content"]), world_size, {1: ValueError}, "mismatch_ds_content"
     )
@@ -1104,6 +1149,10 @@ def test_t15_d_initial_broadcast_and_consistency(world_size: int, tmp_path: Path
         unwrap_results(outcomes["mismatch_ds_len"]), world_size, {world_size - 1: ValueError}, "mismatch_ds_len"
     )
     _assert_propagated(unwrap_results(outcomes["mismatch_cfg"]), world_size, cfg_bad, "mismatch_cfg")
+    _assert_propagated(
+        unwrap_results(outcomes["mismatch_model_shape"]), world_size, {1: ValueError}, "mismatch_model_shape"
+    )
+    _assert_propagated(unwrap_results(outcomes["mismatch_val_presence"]), world_size, val_bad, "mismatch_val_presence")
 
 
 # --------------------------------------------------------------------------- T15 (e): stop, restore, and TrainingResult
@@ -1227,9 +1276,19 @@ def _sc_t15e_broadcast_loss_adoption(rank: int, world_size: int) -> dict[str, An
     }
 
 
+def _scenarios_t15e(world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size, base_dir
+    return {
+        "stop_start": _sc_t15e_stop_on_start,
+        "stop_step": _sc_t15e_stop_on_step_end,
+        "early_stop": _sc_t15e_early_stop_restore,
+        "broadcast_loss": _sc_t15e_broadcast_loss_adoption,
+    }
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_e_stop_restore_and_training_result(world_size: int) -> None:
+def test_t15_e_stop_restore_and_training_result(world_size: int, _t15_pool: Any) -> None:
     """T15(e). Stop from `on_fit_start`, `on_step_end`, and `EarlyStopping` halts all ranks together;
     callbacks run on rank 0 only; `restore_best=True` restores best weights on every rank matching
     one-process `fit()`; all ten `TrainingResult` fields are equal on every rank, with non-zero ranks
@@ -1241,17 +1300,7 @@ def test_t15_e_stop_restore_and_training_result(world_size: int) -> None:
     assert ref_res.best_step is not None and ref_res.best_step < ref_res.steps
     assert ref_res.steps == ref_res.best_step + 2
 
-    outcomes = run_scenarios(
-        {
-            "stop_start": _sc_t15e_stop_on_start,
-            "stop_step": _sc_t15e_stop_on_step_end,
-            "early_stop": _sc_t15e_early_stop_restore,
-            "broadcast_loss": _sc_t15e_broadcast_loss_adoption,
-        },
-        world_size=world_size,
-        pg_timeout=PG_TIMEOUT,
-        wall_timeout=WALL_TIMEOUT,
-    )
+    outcomes = _t15_pool("e", world_size)
 
     # 1. Stop in on_fit_start.
     start_outs = unwrap_results(outcomes["stop_start"])
@@ -1626,9 +1675,20 @@ def _sc_t15f_short_dataset(rank: int, world_size: int, with_val: bool) -> dict[s
     return _run_t15f_short_dataset(world_size, with_val=with_val, per_rank_batch=2, num_workers=0, shuffle=False)
 
 
+def _scenarios_t15f(world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size, base_dir
+    return {
+        "shuffled": _sc_t15f_shuffled_epochs,
+        "sign_flip": _sc_t15f_sign_flip,
+        "lora_dropout": _sc_t15f_lora_dropout,
+        "short_no_val": (_sc_t15f_short_dataset, (False,)),
+        "short_with_val": (_sc_t15f_short_dataset, (True,)),
+    }
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_f_sampling_and_sign_flips(world_size: int) -> None:
+def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
     """T15(f). Shuffled multi-epoch `fit()` uses distinct per-epoch permutations, equal step counts,
     exact once-per-epoch union coverage, and balanced trailing splits; `sign_flip=True` and LoRA
     dropout use rank-0's one-process RNG stream while peers draw pairwise distinct streams; datasets
@@ -1641,18 +1701,7 @@ def test_t15_f_sampling_and_sign_flips(world_size: int) -> None:
     ref_short_noval = _run_t15f_short_dataset(world_size, with_val=False, per_rank_batch=2 * world_size)
     ref_short_val = _run_t15f_short_dataset(world_size, with_val=True, per_rank_batch=2 * world_size)
 
-    outcomes = run_scenarios(
-        {
-            "shuffled": _sc_t15f_shuffled_epochs,
-            "sign_flip": _sc_t15f_sign_flip,
-            "lora_dropout": _sc_t15f_lora_dropout,
-            "short_no_val": (_sc_t15f_short_dataset, (False,)),
-            "short_with_val": (_sc_t15f_short_dataset, (True,)),
-        },
-        world_size=world_size,
-        pg_timeout=PG_TIMEOUT,
-        wall_timeout=WALL_TIMEOUT,
-    )
+    outcomes = _t15_pool("f", world_size)
 
     # 1. Shuffled multi-epoch sampling checks.
     shuf_outs = unwrap_results(outcomes["shuffled"])
@@ -1755,17 +1804,17 @@ def test_t15_f_sampling_and_sign_flips(world_size: int) -> None:
 
 def _sc_t15f_workers(rank: int, world_size: int, num_workers: int) -> dict[str, Any]:
     del rank
-    n_items = world_size * 2 + 1  # trailing R = 1 < N (empty ranks)
+    n_items = world_size * 2 + 1  # trailing R = 1 < N (empty ranks on trailing step)
     ds = _make_uneven_dataset([8 - (i % 6) for i in range(n_items)], seed=603, covariates=True)
-    # Validation set larger than N on uneven shards + short validation set (< N) tested in the short case below.
-    val_ds = _make_uneven_dataset([8, 2, 7, 1, 6][: world_size + 1], seed=607, covariates=True)
+    # Validation set strictly smaller than world_size (ranks 0..N-2 run persistent val workers; rank N-1 is empty).
+    val_ds = _make_uneven_dataset([8, 2, 7][: world_size - 1], seed=607, covariates=True)
     cfg = _base_config(
         mode="head_only",
         batch_size=2,
         eval_batch_size=2,
         epochs=2,
         max_steps=None,
-        eval_every=1,
+        eval_every=2,
         learning_rate=1e-2,
         shuffle=True,
         sign_flip=False,
@@ -1777,8 +1826,8 @@ def _sc_t15f_workers(rank: int, world_size: int, num_workers: int) -> dict[str, 
     res = trainer.fit()
     trailing = {"result": res, "params": _flat_params(trainer.model)}
 
-    # Also test len(train_dataset) < N and len(val_dataset) < N with num_workers (idle rank never creates an iterator).
-    short = _run_t15f_short_dataset(world_size, with_val=True, per_rank_batch=2, num_workers=num_workers, shuffle=True)
+    # Also test len(train_dataset) < N with num_workers (idle rank N-1 never creates a DataLoader iterator).
+    short = _run_t15f_short_dataset(world_size, with_val=False, per_rank_batch=2, num_workers=num_workers, shuffle=True)
     return {"trailing": trailing, "short": short}
 
 
@@ -1794,12 +1843,14 @@ def _worker_t15f_workers_paired(rank: int, world_size: int) -> dict[str, Any]:
 @pytest.mark.skipif(WORKERS_HANG_AT_EXIT, reason="PyTorch < 2.8 on macOS: DataLoader worker hangs at exit")
 def test_t15_f_dataloader_workers() -> None:
     """T15(f). Multi-process `fit()` at `world_size=4` with `num_workers=2` matches `num_workers=0`
-    across (1) uneven trailing training shards + `val_dataset`, and (2) `len(train_dataset) < N`
-    with `len(val_dataset) < N` where idle ranks never create a `DataLoader` iterator.
+    across (1) uneven trailing training shards + a validation set smaller than `world_size`
+    (persistent workers reused across multiple evaluations, empty val shard on rank 3), and
+    (2) `len(train_dataset) < N` where idle rank 3 never creates a `DataLoader` iterator.
 
-    Runs at `world_size=4` (which exercises active non-zero peers, uneven trailing shards, empty
-    trailing ranks, and idle ranks in one spawn) with a generous process-group timeout (30s) because
-    on macOS each active `DataLoader` worker waits `MP_STATUS_CHECK_INTERVAL` (~5s) on shutdown.
+    Runs at `world_size=4` (covering active non-zero peers, uneven trailing shards, empty trailing
+    ranks, empty val shards, and idle ranks in one spawn) with a generous process-group timeout
+    (30s) because on macOS each active `DataLoader(num_workers=2, persistent_workers=True)` waits
+    `2 * MP_STATUS_CHECK_INTERVAL` (~10s) during worker shutdown.
     """
     world_size = 4
     outs = unwrap_results(
@@ -1816,13 +1867,12 @@ def test_t15_f_dataloader_workers() -> None:
     for r, out in enumerate(outs):
         w2_trail = out["w2"]["trailing"]
         assert w2_trail["result"].steps == expected_steps
-        assert len(w2_trail["result"].eval_history) == expected_steps
+        assert len(w2_trail["result"].eval_history) == 2
         assert w2_trail["result"] == r0_w0_trail["result"]
         assert torch.equal(w2_trail["params"], r0_w0_trail["params"])
 
         w2_short = out["w2"]["short"]
         assert w2_short["result"].steps == 2 and w2_short["result"].epochs == 2
-        assert len(w2_short["result"].eval_history) == 2
         assert w2_short["result"] == r0_w0_short["result"]
         assert torch.equal(w2_short["all_params"], r0_w0_short["all_params"])
         if r == world_size - 1:
@@ -2012,9 +2062,22 @@ def _sc_t15g_training_mode_restored_after_val(rank: int, world_size: int) -> dic
     }
 
 
+def _scenarios_t15g(world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size, base_dir
+    return {
+        "val_f64": (_sc_t15g_sharded_val_and_rank0_eval, ("float64", "full_ft", 0.0)),
+        "val_f32": (_sc_t15g_sharded_val_and_rank0_eval, ("float32", "full_ft", 0.0)),
+        "val_lora_drop": (_sc_t15g_sharded_val_and_rank0_eval, ("float32", "lora_variate", 0.5)),
+        "val_small": _sc_t15g_val_smaller_than_world,
+        "val_one_zero": _sc_t15g_val_one_rank_zero_scored,
+        "val_all_zero": _sc_t15g_val_all_zero_scored,
+        "val_restore_train": _sc_t15g_training_mode_restored_after_val,
+    }
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_g_validation_and_post_fit_evaluate(world_size: int) -> None:
+def test_t15_g_validation_and_post_fit_evaluate(world_size: int, _t15_pool: Any) -> None:
     """T15(g). Internal sharded validation matches one-process `evaluate()` in `float64` (`1e-12`)
     and `float32` (`1e-5`) including under LoRA dropout, restores `model.training` after validation
     so subsequent training steps keep LoRA dropout active, handles `len(val) < N` and per-rank
@@ -2029,20 +2092,7 @@ def test_t15_g_validation_and_post_fit_evaluate(world_size: int) -> None:
     one_zero_counts = [0 if i % world_size == 1 else (8 - (i % 5)) for i in range(2 * world_size)]
     ref_one_zero = _run_t15g_eval_ref(one_zero_counts, dtype_name="float32", mode="full_ft")
 
-    outcomes = run_scenarios(
-        {
-            "val_f64": (_sc_t15g_sharded_val_and_rank0_eval, ("float64", "full_ft", 0.0)),
-            "val_f32": (_sc_t15g_sharded_val_and_rank0_eval, ("float32", "full_ft", 0.0)),
-            "val_lora_drop": (_sc_t15g_sharded_val_and_rank0_eval, ("float32", "lora_variate", 0.5)),
-            "val_small": _sc_t15g_val_smaller_than_world,
-            "val_one_zero": _sc_t15g_val_one_rank_zero_scored,
-            "val_all_zero": _sc_t15g_val_all_zero_scored,
-            "val_restore_train": _sc_t15g_training_mode_restored_after_val,
-        },
-        world_size=world_size,
-        pg_timeout=PG_TIMEOUT,
-        wall_timeout=WALL_TIMEOUT,
-    )
+    outcomes = _t15_pool("g", world_size)
 
     for key, ref_ev, tol in (
         ("val_f64", ref_f64, EVAL_TOL["float64"]),
@@ -2130,6 +2180,7 @@ def _sc_t15h_guards_and_export(rank: int, world_size: int, base_dir: str) -> dic
     for label, kwargs in (
         ("bad_type", {"replay_config": object()}),
         ("ds_without_cfg", {"replay_dataset": ds}),
+        ("bad_ds_type", {"replay_config": ReplayConfig(), "replay_dataset": "bad"}),
         ("ds_is_val", {"replay_config": ReplayConfig(), "replay_dataset": val_ds}),
         ("valid_cfg", {"replay_config": ReplayConfig()}),
     ):
@@ -2286,9 +2337,14 @@ def _sc_t15h_guards_and_export(rank: int, world_size: int, base_dir: str) -> dic
     }
 
 
+def _scenarios_t15h(world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size
+    return {"guards": (_sc_t15h_guards_and_export, (base_dir,))}
+
+
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_h_guards_and_export(world_size: int, tmp_path: Path) -> None:
+def test_t15_h_guards_and_export(world_size: int, tmp_path: Path, _t15_pool: Any) -> None:
     """T15(h). Stage 1 guards (`reduce-overhead`, `ReplayConfig`, device mismatch, default-LR warning,
     `head_only` cache bypass, `training_step()` `RuntimeError`) and collective-free `export()` with
     rank-0 metadata keys and non-zero-rank validation/no-write semantics.
@@ -2300,12 +2356,7 @@ def test_t15_h_guards_and_export(world_size: int, tmp_path: Path) -> None:
     one_meta = json.loads((one_out / "tune_metadata.json").read_text(encoding="utf-8"))
     assert "world_size" not in one_meta and "effective_batch_size" not in one_meta
 
-    outcomes = run_scenarios(
-        {"guards": (_sc_t15h_guards_and_export, (str(tmp_path),))},
-        world_size=world_size,
-        pg_timeout=PG_TIMEOUT,
-        wall_timeout=WALL_TIMEOUT,
-    )
+    outcomes = _t15_pool("h", world_size)
     outs = unwrap_results(outcomes["guards"])
 
     # Rank 0 logs warnings & cache bypass once.
@@ -2320,6 +2371,7 @@ def test_t15_h_guards_and_export(world_size: int, tmp_path: Path) -> None:
         assert out["replay_errs"] == {
             "bad_type": TypeError,
             "ds_without_cfg": ValueError,
+            "bad_ds_type": TypeError,
             "ds_is_val": ValueError,
             "valid_cfg": NotImplementedError,
         }
@@ -2374,11 +2426,30 @@ def _worker_t15h_post_destroy_snapshot(rank: int, world_size: int, base_dir: str
         fit_err = type(exc)
     state_untouched = trainer.should_stop is True and trainer.scheduler is prev_scheduler and trainer.global_step == 0
 
+    # Stale group when world_size changes: fit() also raises RuntimeError without mutating state.
+    size_changed_err: type[BaseException] | None = None
+    with tempfile.TemporaryDirectory(prefix=f"t15_ws1_r{rank}_") as ws1_dir:
+        store = Path(ws1_dir) / "store"
+        dist.init_process_group("gloo", init_method=f"file://{store}", rank=0, world_size=1)
+        try:
+            trainer.fit()
+        except Exception as exc:
+            size_changed_err = type(exc)
+        finally:
+            dist.destroy_process_group()
+    state_still_untouched = (
+        state_untouched
+        and trainer.should_stop is True
+        and trainer.scheduler is prev_scheduler
+        and trainer.global_step == 0
+    )
+
     export_dir = Path(base_dir) / f"after_destroy_r{rank}"
     returned = trainer.export(export_dir)
     return {
         "fit_err": fit_err,
-        "state_untouched": state_untouched,
+        "size_changed_err": size_changed_err,
+        "state_untouched": state_still_untouched,
         "returned": str(returned),
         "export_dir": str(export_dir),
         "exists": export_dir.exists(),
@@ -2388,8 +2459,9 @@ def _worker_t15h_post_destroy_snapshot(rank: int, world_size: int, base_dir: str
 @pytest.mark.acceptance
 def test_t15_h_unsupported_backend_and_post_destroy_snapshot(tmp_path: Path) -> None:
     """T15(h) & §5.6 snapshot semantics. Device-qualified `"cpu:gloo"` raises `ValueError` at
-    construction; after `destroy_process_group()`, `fit()` raises `RuntimeError` without mutating
-    trainer state while `export()` still uses the construction snapshot cleanly.
+    construction; after `destroy_process_group()` (or when `world_size` changes), `fit()` raises
+    `RuntimeError` without mutating trainer state while `export()` still uses the construction
+    snapshot cleanly.
     """
     bad_backend_outs = unwrap_results(
         run_distributed(
@@ -2413,6 +2485,9 @@ def test_t15_h_unsupported_backend_and_post_destroy_snapshot(tmp_path: Path) -> 
     )
     for r, out in enumerate(snap_outs):
         assert out["fit_err"] is RuntimeError, f"r{r}: fit() after destroy expected RuntimeError, got {out['fit_err']}"
+        assert out["size_changed_err"] is RuntimeError, (
+            f"r{r}: fit() after world_size change expected RuntimeError, got {out['size_changed_err']}"
+        )
         assert out["state_untouched"] is True, f"r{r}: stale-group fit() mutated trainer state before failing"
         assert out["returned"] == out["export_dir"]
     assert snap_outs[0]["exists"] is True
@@ -2584,17 +2659,10 @@ def _sc_t15i_fit_fail_over_non_finite(rank: int, world_size: int) -> dict[str, A
             handle.remove()
 
 
-@pytest.mark.acceptance
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_i_single_rank_failure_propagation(world_size: int) -> None:
-    """T15(i). Single-rank and two-rank failures in `__init__`, `fit()` local stage (including when
-    another rank simultaneously reports a non-finite loss), rank-0 callbacks (`on_fit_start`,
-    `on_step_end`, `on_evaluate`, `on_fit_end`), and sharded validation propagate to all ranks
-    (`RankFailureError` naming failing ranks and stage on peers) and leave the process group clean
-    for follow-up collectives.
-    """
+def _scenarios_t15i(world_size: int, base_dir: str) -> dict[str, Any]:
+    del base_dir
     two_ranks = (0, 1) if world_size == 2 else (1, 3)
-    scenarios: dict[str, Any] = {
+    return {
         "init_r0": _sc_t15i_init_fail_rank0,
         "init_r1": _sc_t15i_init_fail_nonzero,
         "init_two": _sc_t15i_init_fail_two_ranks,
@@ -2608,7 +2676,19 @@ def test_t15_i_single_rank_failure_propagation(world_size: int) -> None:
         "fit_cb_end": (_sc_t15i_fit_fail_callback, ("on_fit_end",)),
         "fit_val": _sc_t15i_fit_fail_val_shard,
     }
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=PG_TIMEOUT, wall_timeout=WALL_TIMEOUT)
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_t15_i_single_rank_failure_propagation(world_size: int, _t15_pool: Any) -> None:
+    """T15(i). Single-rank and two-rank failures in `__init__`, `fit()` local stage (including when
+    another rank simultaneously reports a non-finite loss), rank-0 callbacks (`on_fit_start`,
+    `on_step_end`, `on_evaluate`, `on_fit_end`), and sharded validation propagate to all ranks
+    (`RankFailureError` naming failing ranks and stage on peers) and leave the process group clean
+    for follow-up collectives.
+    """
+    two_ranks = (0, 1) if world_size == 2 else (1, 3)
+    outcomes = _t15_pool("i", world_size)
 
     _assert_propagated(unwrap_results(outcomes["init_r0"]), world_size, {0: TypeError}, "init_r0")
     _assert_propagated(unwrap_results(outcomes["init_r1"]), world_size, {1: ValueError}, "init_r1")
@@ -2639,6 +2719,81 @@ def test_t15_i_single_rank_failure_propagation(world_size: int) -> None:
     assert getattr(trainer_pkg, "RankFailureError", None) is RankFailureError, (
         "RankFailureError must be exported from timestral_tune.trainer (spec §5.6)"
     )
+    assert "RankFailureError" in trainer_pkg.__all__
+    assert issubclass(RankFailureError, RuntimeError)
+
+
+# --------------------------------------------------------------------------- collection-aware scenario pool
+
+_SCENARIO_GROUPS: dict[str, Callable[[int, str], dict[str, Any]]] = {
+    "a": _scenarios_t15a,
+    "b": _scenarios_t15b,
+    "c": _scenarios_t15c,
+    "d": _scenarios_t15d,
+    "e": _scenarios_t15e,
+    "f": _scenarios_t15f,
+    "g": _scenarios_t15g,
+    "h": _scenarios_t15h,
+    "i": _scenarios_t15i,
+}
+
+_TEST_TO_GROUP: dict[str, str] = {
+    "test_t15_a_multi_epoch_trajectory_parity": "a",
+    "test_t15_b_step_gradients_loss_and_non_finite": "b",
+    "test_t15_c_global_zero_scored_step_and_empty_epoch": "c",
+    "test_t15_d_initial_broadcast_and_consistency": "d",
+    "test_t15_e_stop_restore_and_training_result": "e",
+    "test_t15_f_sampling_and_sign_flips": "f",
+    "test_t15_g_validation_and_post_fit_evaluate": "g",
+    "test_t15_h_guards_and_export": "h",
+    "test_t15_i_single_rank_failure_propagation": "i",
+}
+
+
+@pytest.fixture(scope="module")
+def _t15_pool(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> Callable[[str, int], dict[str, list[RankResult]]]:
+    """Amortise spawn overhead by running all collected T15(a)-(i) scenarios in one process group per `world_size`.
+
+    Inspects `request.session.items` so filtered runs (e.g. `pytest -k test_t15_g`) still spawn only
+    the selected clause(s), while full-file runs execute all nine balanced clauses in two spawns
+    (`world_size=2` and `world_size=4`) instead of eighteen.
+    """
+    needed_by_ws: dict[int, list[str]] = {}
+    for item in request.session.items:
+        orig_name = getattr(item, "originalname", None)
+        group = _TEST_TO_GROUP.get(orig_name or "")
+        if group is None:
+            continue
+        callspec = getattr(item, "callspec", None)
+        ws = callspec.params.get("world_size") if callspec is not None else None
+        if isinstance(ws, int):
+            groups = needed_by_ws.setdefault(ws, [])
+            if group not in groups:
+                groups.append(group)
+
+    cache: dict[int, dict[str, dict[str, list[RankResult]]]] = {}
+
+    def _get(group: str, world_size: int) -> dict[str, list[RankResult]]:
+        if world_size not in cache:
+            groups = needed_by_ws.get(world_size) or [group]
+            if group not in groups:
+                groups = [*groups, group]
+            combined: dict[str, Any] = {}
+            for g in groups:
+                g_dir = str(tmp_path_factory.mktemp(f"t15_{g}_ws{world_size}"))
+                for name, spec in _SCENARIO_GROUPS[g](world_size, g_dir).items():
+                    combined[f"{g}:{name}"] = spec
+            raw = run_scenarios(combined, world_size=world_size, pg_timeout=PG_TIMEOUT, wall_timeout=90.0)
+            grouped: dict[str, dict[str, list[RankResult]]] = {g: {} for g in groups}
+            for full_name, results in raw.items():
+                g, name = full_name.split(":", 1)
+                grouped[g][name] = results
+            cache[world_size] = grouped
+        return cache[world_size][group]
+
+    return _get
 
 
 def _worker_t15i_startup_digest_failure(rank: int, world_size: int) -> dict[str, Any]:
