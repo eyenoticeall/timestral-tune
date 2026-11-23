@@ -137,7 +137,7 @@ def _worker_main(
 ) -> None:
     """Top-level worker entry point for `spawn`."""
     torch.set_num_threads(1)
-    outcome: RankResult
+    outcome: RankResult | None = None
     try:
         dist.init_process_group(
             backend=backend,
@@ -153,9 +153,15 @@ def _worker_main(
             outcome = RankResult(rank=rank, error=_capture_error(exc))
         finally:
             if dist.is_initialized():
-                dist.destroy_process_group()
+                try:
+                    dist.destroy_process_group()
+                except BaseException as cleanup_exc:
+                    if outcome is None or outcome.ok:
+                        outcome = RankResult(rank=rank, error=_capture_error(cleanup_exc))
     except BaseException as exc:
-        outcome = RankResult(rank=rank, error=_capture_error(exc))
+        if outcome is None or outcome.ok:
+            outcome = RankResult(rank=rank, error=_capture_error(exc))
+    assert outcome is not None
     _write_result(Path(result_path), outcome)
 
 
