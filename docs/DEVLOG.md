@@ -1057,3 +1057,33 @@ The sentence now names the retail demand and stock volatility benchmarks, and th
 quoted as an example of how time scales with context length and steps.
 
 **Not done / open.** This change is not pushed.
+
+## 2026-11-24 — README results: forecast figure replaces the bar chart
+
+**Done.** For their own viewing the maintainer asked for forecasts against actuals; no forecast values
+had been saved, so `28M full_ft` seed 0 was re-run locally on `de_power_15m` (Apple M4 MPS `fp32`:
+released wQL `0.1290`, fine-tuned `0.1001`). They then asked for that kind of figure to replace the bar
+chart and for Results to focus on the German example. `README.md` now leads with
+`assets/forecast_example.png` and the headline "23% on German wind and solar power"; `assets/results.png`
+and `scripts/make_results_chart.py` are removed; the Summary in `docs/BENCHMARKS.md` carries a small
+table with the former bar values and the retail demand result.
+
+**Decisions.**
+
+- *What may be committed.* `AGENTS.md` rule 5 bars "trained outputs" under Mistral's weights licence.
+  Read with `.gitignore` ("trained checkpoints and run outputs"), that means checkpoints and adapters.
+  Forecast values are not weights or derivatives of them, and the repository already commits per-series
+  scores, so a 120 kB slice of forecasts (`docs/benchmarks/forecast_example_de_power.json`) was committed.
+  This is the author's reading; the maintainer has not ruled on it.
+- *No picking by eye.* The export script ranks the ten series by fine-tuned over released wQL on all 25
+  test days and exports the middle two (`TTG_wind_off`, `AMP_wind_on`); the week is the first seven test
+  days. Each panel prints range width and coverage over all 25 days, not the week shown.
+- *What the picture shows.* The visible difference is the 80% range, not the forecast line, so the title
+  is about the range. The fine-tuned raw range holds less often (`0.873 → 0.836` over three seeds; `79%`
+  on both series drawn) and the figure and README say so.
+- *Which numbers are quoted.* README and Summary text quote the three-seed L4 results; the figure is one
+  seed and is described as an illustration.
+- *Attribution.* The data credit (`akderekaan/de-power-forecast-data`, ENTSO-E, CC BY 4.0) is in the
+  figure footer, the JSON and the Summary's fine print.
+
+**Not done / open.** This change is not pushed.

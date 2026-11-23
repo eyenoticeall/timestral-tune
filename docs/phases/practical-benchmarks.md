@@ -102,7 +102,10 @@ zero leftover GPU VMs/disks; `README.md` and `assets/results.png` were left unto
 now states the tuned-GBT comparison for `28M` in one sentence; the fuller plain-language account,
 including `5M`, is the Summary at the top of `docs/BENCHMARKS.md` (`docs/DEVLOG.md`, 2026-11-24). The
 chart's second panel was then changed from stock volatility to `de_power_15m` (`28M full_ft` against the
-released model, `−23.0%`); the tuned GBT is not drawn, and the caption states that it is level.
+released model, `−23.0%`); the tuned GBT is not drawn, and the caption states that it is level. Later the
+same day the bar chart was replaced by a forecast-against-actuals figure for `de_power_15m`
+(`assets/forecast_example.png`, drawn from `docs/benchmarks/forecast_example_de_power.json`), and
+`assets/results.png` was removed.
 
 ### Methodological disclosures (including all three GBT search revisions)
 
