@@ -68,9 +68,9 @@ The fine print:
   `akderekaan/de-power-forecast-data` on the Hugging Face Hub (CC BY 4.0), which republishes ENTSO-E
   data.
 - The German power test covers the 25 days after the models' release (28 October to 21 November 2026).
-  We picked this dataset because the released model does poorly on it, so 23% is what fine-tuning can
-  recover there and not a typical gain. Every method is given the grid operators' day-ahead forecast as
-  an input; for the last hour of each day that forecast had not yet been published at forecast time.
+  We picked this dataset because the released model does poorly on it. Every method is given the grid
+  operators' day-ahead forecast as an input; for the last hour of each day that forecast had not yet
+  been published at forecast time.
 - The stock volatility test covers January to November 2026. Most of that is before the models'
   release in late October, so the released model may have seen some of it in its own training. On the
   18 days after the release the gain is the same 6%, but that is too short a period to confirm on its

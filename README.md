@@ -172,9 +172,9 @@ band is where the model expects the outcome to fall 80% of the time. Across all 
 test days, all after the models' release, fine-tuning cut the error by 23% (95% interval: 19% to 25%)
 and made that band a third narrower. The band still held 84% of the time, against 87% as released.
 
-Two cautions. We picked this dataset because the released model does poorly on it, so this is what
-fine-tuning can recover and not a typical gain. And a tuned gradient-boosted model, a stronger
-alternative than the released model, scored level with the fine-tuned one here.
+Two cautions. We picked this dataset because the released model does poorly on it. And a tuned
+gradient-boosted model, a stronger alternative than the released model, scored level with the
+fine-tuned one here.
 
 The [summary in docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md#summary)
 covers the other datasets, including 11% less error on retail demand, the evidence that these gains
