@@ -171,16 +171,27 @@ if backend == "nccl" and not torch.cuda.is_available():
 _ENV_STAGE_BOOTSTRAP = """\
 import subprocess, sys
 
+def _posix_rc(rc: int) -> int:
+    return 128 + (-rc) if rc < 0 else rc
+
 uv_bin, backend, tree_method, tree_sig_short, probe_code = sys.argv[1:6]
 uv_py_args = sys.argv[6:]
-r1 = subprocess.run([uv_bin, "sync", "--locked", "--quiet", *uv_py_args], check=False)
+try:
+    r1 = subprocess.run([uv_bin, "sync", "--locked", "--quiet", *uv_py_args], check=False)
+except OSError as exc:
+    print(f"error: failed to launch {uv_bin}: {exc}", file=sys.stderr)
+    sys.exit(127)
 if r1.returncode != 0:
-    sys.exit(r1.returncode)
-r2 = subprocess.run(
-    [uv_bin, "run", "--no-sync", *uv_py_args, "python", "-c", probe_code, backend, tree_method, tree_sig_short],
-    check=False,
-)
-sys.exit(r2.returncode)
+    sys.exit(_posix_rc(r1.returncode))
+try:
+    r2 = subprocess.run(
+        [uv_bin, "run", "--no-sync", *uv_py_args, "python", "-c", probe_code, backend, tree_method, tree_sig_short],
+        check=False,
+    )
+except OSError as exc:
+    print(f"error: failed to launch {uv_bin}: {exc}", file=sys.stderr)
+    sys.exit(127)
+sys.exit(_posix_rc(r2.returncode))
 """
 
 
@@ -732,23 +743,30 @@ def read_proc_table(ps_bin: str | None) -> tuple[dict[int, list[int]], dict[int,
 
 
 def find_token_pids(token_needle: str, *, self_pid: int, ps_bin: str | None) -> set[int]:
-    """Find live processes carrying our inherited stage environment token (catches reparented/new-session workers)."""
+    """Find live processes carrying our exact stage environment token (catches reparented/new-session workers)."""
     found: set[int] = set()
     if os.path.isdir("/proc"):
         needle_b = token_needle.encode("utf-8")
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
+        saw_proc_pid = False
+        try:
+            proc_entries = os.listdir("/proc")
+        except OSError:
+            proc_entries = []
+        for entry in proc_entries:
+            if not (entry.isascii() and entry.isdigit()):
                 continue
+            saw_proc_pid = True
             pid = int(entry)
             if pid == self_pid:
                 continue
             try:
                 env_bytes = Path(f"/proc/{pid}/environ").read_bytes()
-                if needle_b in env_bytes:
+                if needle_b in env_bytes.split(b"\0"):
                     found.add(pid)
             except OSError:
                 continue
-        return found
+        if saw_proc_pid:
+            return found
     if ps_bin is not None:
         try:
             out = subprocess.run(
@@ -760,13 +778,14 @@ def find_token_pids(token_needle: str, *, self_pid: int, ps_bin: str | None) -> 
             )
             if out.returncode == 0:
                 for line in out.stdout.splitlines():
-                    if token_needle not in line:
+                    parts = line.strip().split()
+                    if len(parts) < 2 or not (parts[0].isascii() and parts[0].isdigit()):
                         continue
-                    parts = line.strip().split(None, 1)
-                    if parts and parts[0].isdigit():
-                        pid = int(parts[0])
-                        if pid != self_pid:
-                            found.add(pid)
+                    if token_needle not in parts[1:]:
+                        continue
+                    pid = int(parts[0])
+                    if pid != self_pid:
+                        found.add(pid)
         except Exception:
             pass
     return found
@@ -781,8 +800,11 @@ def collect_live_targets(
     ps_bin: str | None,
 ) -> tuple[set[int], set[int]]:
     """Collect only currently confirmed-live stage PIDs and safe PGIDs (never reaped/reused PIDs)."""
-    children, pgids = read_proc_table(ps_bin)
+    # Scan token-carrying processes before reading the process table so any child forked between the
+    # two snapshots is still reachable via its parent in `children`, while processes that exited in
+    # between are filtered out by `pgids`.
     token_pids = find_token_pids(token_needle, self_pid=self_pid, ps_bin=ps_bin)
+    children, pgids = read_proc_table(ps_bin)
 
     seeds = [p for p in token_pids if p != self_pid and (not pgids or p in pgids)]
     # Only seed proc.pid while our un-reaped Popen handle confirms it has not exited yet so the
@@ -936,6 +958,7 @@ class SessionRunner:
     interrupted_exit_code: int = field(default=0, init=False)
     _stdout_open: bool = field(default=True, init=False)
     _ps_bin: str | None = field(default=None, init=False)
+    _last_stage_status_note: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
         self.env = _prepare_session_env(self.env, shared_gpu=self.config.shared_gpu)
@@ -1022,9 +1045,12 @@ class SessionRunner:
             interrupted_sig=self.interrupted_short_sig,
             interrupted_code=self.interrupted_exit_code,
         )
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        summary_file = self.log_dir / "summary.txt"
-        summary_file.write_text(text, encoding="utf-8")
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            summary_file = self.log_dir / "summary.txt"
+            summary_file.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            self._write_stderr_bytes(f"warning: failed to write summary.txt: {exc}\n".encode())
         self._write_stdout_bytes(text.encode("utf-8"))
         return text
 
@@ -1136,8 +1162,10 @@ class SessionRunner:
         """Run one stage process with timeout, live non-blocking pipe drain, and confirmed-live tree kill.
 
         Returns `(exit_code, interrupted_sig_num)`. On any exit path, a recorded session interrupt
-        takes precedence over timeout (`124`) or normal process return code.
+        takes precedence over timeout (`124`) or normal process return code. Any unexpected error
+        after spawn kills the stage tree before returning non-zero so descendants never survive.
         """
+        self._last_stage_status_note = ""
         self_pid = os.getpid()
         self_pgid = os.getpgrp()
         token_val = f"tt_{self_pid}_{uuid.uuid4().hex}"
@@ -1149,29 +1177,164 @@ class SessionRunner:
         os.set_blocking(r_fd, False)
         sel = selectors.DefaultSelector()
         sel.register(r_fd, selectors.EVENT_READ)
+        fd_registered = True
+        eof = False
+        proc: subprocess.Popen[Any] | None = None
+        log_f: Any = None
+        log_write_enabled = True
+
+        def _mark_eof() -> None:
+            nonlocal eof, fd_registered
+            eof = True
+            if fd_registered:
+                try:
+                    sel.unregister(r_fd)
+                except (KeyError, ValueError, OSError):
+                    pass
+                fd_registered = False
+
+        def _safe_write_log(data: bytes) -> None:
+            nonlocal log_write_enabled
+            if log_f is not None and log_write_enabled:
+                try:
+                    log_f.write(data)
+                    log_f.flush()
+                except OSError:
+                    log_write_enabled = False
+
+        def _drain_available(*, raise_on_log_error: bool = True) -> None:
+            nonlocal log_write_enabled
+            while not eof:
+                try:
+                    chunk = os.read(r_fd, 65536)
+                except BlockingIOError:
+                    return
+                except InterruptedError:
+                    continue
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        return
+                    _mark_eof()
+                    return
+                if not chunk:
+                    _mark_eof()
+                    return
+                if log_f is not None and log_write_enabled:
+                    if raise_on_log_error:
+                        log_f.write(chunk)
+                        log_f.flush()
+                    else:
+                        _safe_write_log(chunk)
+                self._write_stdout_bytes(chunk)
+
+        def _wait_and_drain(duration: float, *, raise_on_log_error: bool = True) -> None:
+            end = time.monotonic() + duration
+            while True:
+                _drain_available(raise_on_log_error=raise_on_log_error)
+                rem = end - time.monotonic()
+                if rem <= 0:
+                    return
+                if eof or not fd_registered:
+                    time.sleep(min(0.05, rem))
+                    return
+                try:
+                    events = sel.select(timeout=min(0.05, rem))
+                except InterruptedError:
+                    continue
+                if events:
+                    _drain_available(raise_on_log_error=raise_on_log_error)
+
+        def _kill_stage_tree(*, notify_timeout_teardown: bool = False, raise_on_log_error: bool = True) -> int:
+            assert proc is not None
+            ever_signalled: set[int] = set()
+            _drain_available(raise_on_log_error=raise_on_log_error)
+
+            live_pids, live_pgids = collect_live_targets(
+                proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
+            )
+            if live_pids or live_pgids:
+                ever_signalled |= live_pids
+                signal_live(live_pids, live_pgids, signal.SIGTERM)
+
+            if notify_timeout_teardown and self.on_timeout_teardown is not None:
+                self.on_timeout_teardown(stage_name)
+
+            grace_end = time.monotonic() + self.teardown_grace_s
+            while time.monotonic() < grace_end:
+                _wait_and_drain(0.05, raise_on_log_error=raise_on_log_error)
+                live_pids, live_pgids = collect_live_targets(
+                    proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
+                )
+                if not live_pids and proc.poll() is not None:
+                    _wait_and_drain(0.1, raise_on_log_error=raise_on_log_error)
+                    break
+                newly_seen = live_pids - ever_signalled
+                if newly_seen:
+                    ever_signalled |= newly_seen
+                    signal_live(newly_seen, set(), signal.SIGTERM)
+
+            live_pids, live_pgids = collect_live_targets(
+                proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
+            )
+            if live_pids or live_pgids:
+                ever_signalled |= live_pids
+                signal_live(live_pids, live_pgids, signal.SIGKILL)
+
+                reap_end = time.monotonic() + self.teardown_reap_s
+                while time.monotonic() < reap_end:
+                    _wait_and_drain(0.05, raise_on_log_error=raise_on_log_error)
+                    live_pids, live_pgids = collect_live_targets(
+                        proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
+                    )
+                    if not live_pids and proc.poll() is not None:
+                        break
+                    if live_pids or live_pgids:
+                        ever_signalled |= live_pids
+                        signal_live(live_pids, live_pgids, signal.SIGKILL)
+
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+            _wait_and_drain(0.1, raise_on_log_error=raise_on_log_error)
+            _drain_available(raise_on_log_error=raise_on_log_error)
+            return len(ever_signalled)
+
+        def _log_interrupted(killed_n: int, context: str = "") -> tuple[int, int]:
+            assert self.interrupted_sig_num is not None
+            sig_num = self.interrupted_sig_num
+            sig_label, _ = signal_names(sig_num)
+            suffix = f" ({context})" if context else ""
+            msg = (
+                f"ERROR: stage {stage_name} interrupted by {sig_label}{suffix} "
+                f"and killed (signalled {killed_n} pid(s))\n"
+            ).encode()
+            _safe_write_log(msg)
+            self._write_stderr_bytes(msg)
+            return 128 + sig_num, sig_num
 
         try:
-            with open(log_file, "wb") as log_f:
-                header = f"== stage: {stage_name} (tree_state={self.tree_method}:{self.tree_sig[:12]}) ==\n".encode()
-                log_f.write(header)
-                log_f.flush()
-                self._write_stdout_bytes(header)
+            log_f = open(log_file, "wb")
+            header = f"== stage: {stage_name} (tree_state={self.tree_method}:{self.tree_sig[:12]}) ==\n".encode()
+            log_f.write(header)
+            log_f.flush()
+            self._write_stdout_bytes(header)
 
-                if self.on_before_stage_spawn is not None:
-                    self.on_before_stage_spawn(stage_name)
+            if self.on_before_stage_spawn is not None:
+                self.on_before_stage_spawn(stage_name)
 
-                if self.interrupted_sig_num is not None:
-                    sig_num = self.interrupted_sig_num
-                    sig_label, _ = signal_names(sig_num)
-                    msg = (
-                        f"ERROR: stage {stage_name} interrupted by {sig_label} "
-                        "(during startup before launch) and killed (signalled 0 pid(s))\n"
-                    ).encode()
-                    log_f.write(msg)
-                    log_f.flush()
-                    self._write_stderr_bytes(msg)
-                    return 128 + sig_num, sig_num
+            if self.interrupted_sig_num is not None:
+                sig_num = self.interrupted_sig_num
+                sig_label, _ = signal_names(sig_num)
+                msg = (
+                    f"ERROR: stage {stage_name} interrupted by {sig_label} "
+                    "(during startup before launch) and killed (signalled 0 pid(s))\n"
+                ).encode()
+                _safe_write_log(msg)
+                self._write_stderr_bytes(msg)
+                return 128 + sig_num, sig_num
 
+            try:
                 proc = subprocess.Popen(
                     list(cmd),
                     cwd=str(self.repo_root),
@@ -1180,140 +1343,26 @@ class SessionRunner:
                     start_new_session=True,
                     env=child_env,
                 )
-                os.close(w_fd)
-                w_fd = -1
+            except OSError as exc:
+                msg = f"ERROR: failed to launch stage {stage_name}: {exc}\n".encode()
+                _safe_write_log(msg)
+                self._write_stderr_bytes(msg)
+                return 127, None
+            os.close(w_fd)
+            w_fd = -1
 
-                deadline = time.monotonic() + self.config.stage_timeout
-                timed_out = False
-                eof = False
+            deadline = time.monotonic() + self.config.stage_timeout
+            timed_out = False
 
-                def _drain_available() -> None:
-                    nonlocal eof
-                    while not eof:
-                        try:
-                            chunk = os.read(r_fd, 65536)
-                        except BlockingIOError:
-                            return
-                        except InterruptedError:
-                            continue
-                        except OSError as exc:
-                            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                                return
-                            eof = True
-                            return
-                        if not chunk:
-                            eof = True
-                            return
-                        log_f.write(chunk)
-                        log_f.flush()
-                        self._write_stdout_bytes(chunk)
-
-                def _wait_and_drain(duration: float) -> None:
-                    end = time.monotonic() + duration
-                    while True:
-                        _drain_available()
-                        rem = end - time.monotonic()
-                        if rem <= 0:
-                            return
-                        if eof:
-                            time.sleep(min(0.05, rem))
-                            return
-                        try:
-                            events = sel.select(timeout=min(0.05, rem))
-                        except InterruptedError:
-                            continue
-                        if events:
-                            _drain_available()
-
-                def _kill_stage_tree(*, notify_timeout_teardown: bool = False) -> int:
-                    ever_signalled: set[int] = set()
+            while True:
+                if self.interrupted_sig_num is not None:
+                    break
+                rc = proc.poll()
+                remaining = deadline - time.monotonic()
+                if rc is not None:
                     _drain_available()
-
-                    live_pids, live_pgids = collect_live_targets(
-                        proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-                    )
-                    if live_pids or live_pgids:
-                        ever_signalled |= live_pids
-                        signal_live(live_pids, live_pgids, signal.SIGTERM)
-
-                    if notify_timeout_teardown and self.on_timeout_teardown is not None:
-                        self.on_timeout_teardown(stage_name)
-
-                    grace_end = time.monotonic() + self.teardown_grace_s
-                    while time.monotonic() < grace_end:
-                        _wait_and_drain(0.05)
-                        live_pids, live_pgids = collect_live_targets(
-                            proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-                        )
-                        if not live_pids and proc.poll() is not None:
-                            _wait_and_drain(0.1)
-                            break
-                        newly_seen = live_pids - ever_signalled
-                        if newly_seen:
-                            ever_signalled |= newly_seen
-                            signal_live(newly_seen, set(), signal.SIGTERM)
-
-                    live_pids, live_pgids = collect_live_targets(
-                        proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-                    )
-                    if live_pids or live_pgids:
-                        ever_signalled |= live_pids
-                        signal_live(live_pids, live_pgids, signal.SIGKILL)
-
-                        reap_end = time.monotonic() + self.teardown_reap_s
-                        while time.monotonic() < reap_end:
-                            _wait_and_drain(0.05)
-                            live_pids, live_pgids = collect_live_targets(
-                                proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-                            )
-                            if not live_pids and proc.poll() is not None:
-                                break
-                            if live_pids or live_pgids:
-                                ever_signalled |= live_pids
-                                signal_live(live_pids, live_pgids, signal.SIGKILL)
-
-                    try:
-                        proc.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    _wait_and_drain(0.1)
-                    _drain_available()
-                    return len(ever_signalled)
-
-                def _log_interrupted(killed_n: int, context: str = "") -> tuple[int, int]:
-                    assert self.interrupted_sig_num is not None
-                    sig_num = self.interrupted_sig_num
-                    sig_label, _ = signal_names(sig_num)
-                    suffix = f" ({context})" if context else ""
-                    msg = (
-                        f"ERROR: stage {stage_name} interrupted by {sig_label}{suffix} "
-                        f"and killed (signalled {killed_n} pid(s))\n"
-                    ).encode()
-                    log_f.write(msg)
-                    log_f.flush()
-                    self._write_stderr_bytes(msg)
-                    return 128 + sig_num, sig_num
-
-                while True:
-                    if self.interrupted_sig_num is not None:
+                    if eof:
                         break
-                    rc = proc.poll()
-                    remaining = deadline - time.monotonic()
-                    if rc is not None:
-                        _drain_available()
-                        if eof:
-                            break
-                        if remaining <= 0:
-                            timed_out = True
-                            break
-                        try:
-                            events = sel.select(timeout=min(0.05, remaining))
-                        except InterruptedError:
-                            continue
-                        if events:
-                            _drain_available()
-                        continue
-
                     if remaining <= 0:
                         timed_out = True
                         break
@@ -1323,32 +1372,81 @@ class SessionRunner:
                         continue
                     if events:
                         _drain_available()
+                    continue
 
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                if eof or not fd_registered:
+                    time.sleep(min(0.05, remaining))
+                    continue
+                try:
+                    events = sel.select(timeout=min(0.05, remaining))
+                except InterruptedError:
+                    continue
+                if events:
+                    _drain_available()
+
+            if self.interrupted_sig_num is not None:
+                killed_n = _kill_stage_tree()
+                return _log_interrupted(killed_n)
+
+            if timed_out:
+                killed_n = _kill_stage_tree(notify_timeout_teardown=True)
+                msg = (
+                    f"ERROR: stage {stage_name} timed out after {self.config.stage_timeout:.0f}s "
+                    f"and was killed (signalled {killed_n} pid(s))\n"
+                ).encode()
+                _safe_write_log(msg)
+                self._write_stderr_bytes(msg)
                 if self.interrupted_sig_num is not None:
-                    killed_n = _kill_stage_tree()
-                    return _log_interrupted(killed_n)
+                    return _log_interrupted(killed_n, context="during timeout teardown")
+                return 124, None
 
-                if timed_out:
-                    killed_n = _kill_stage_tree(notify_timeout_teardown=True)
-                    msg = (
-                        f"ERROR: stage {stage_name} timed out after {self.config.stage_timeout:.0f}s "
-                        f"and was killed (signalled {killed_n} pid(s))\n"
-                    ).encode()
-                    log_f.write(msg)
-                    log_f.flush()
-                    self._write_stderr_bytes(msg)
-                    if self.interrupted_sig_num is not None:
-                        return _log_interrupted(killed_n, context="during timeout teardown")
-                    return 124, None
+            rc = proc.wait()
+            _drain_available()
+            if self.interrupted_sig_num is not None:
+                killed_n = _kill_stage_tree()
+                return _log_interrupted(killed_n, context="at stage exit")
 
-                rc = proc.wait()
-                _drain_available()
+            exit_code = 128 + (-rc) if rc < 0 else rc
+            # Sweep any surviving token-carrying descendants (for example backgrounded workers
+            # with closed/redirected stdio) so finished stages never leak processes or GPU memory.
+            survivor_pids, survivor_pgids = collect_live_targets(
+                proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
+            )
+            if survivor_pids or survivor_pgids:
+                killed_n = _kill_stage_tree()
                 if self.interrupted_sig_num is not None:
-                    killed_n = _kill_stage_tree()
-                    return _log_interrupted(killed_n, context="at stage exit")
-                exit_code = 128 + (-rc) if rc < 0 else rc
-                return exit_code, None
+                    return _log_interrupted(killed_n, context="during post-exit cleanup")
+                warn_msg = (
+                    f"WARNING: stage {stage_name} exited ({exit_code}) with surviving descendants; "
+                    f"killed stage tree (signalled {killed_n} pid(s))\n"
+                ).encode()
+                _safe_write_log(warn_msg)
+                self._write_stderr_bytes(warn_msg)
+            return exit_code, None
+        except BaseException as exc:
+            log_write_enabled = False
+            killed_n = 0
+            if proc is not None:
+                killed_n = _kill_stage_tree(raise_on_log_error=False)
+            if not isinstance(exc, Exception):
+                raise
+            err_msg = (
+                f"ERROR: stage {stage_name} aborted due to {type(exc).__name__}: {exc} (killed {killed_n} pid(s))\n"
+            ).encode()
+            self._write_stderr_bytes(err_msg)
+            if self.interrupted_sig_num is not None:
+                return _log_interrupted(killed_n, context=f"after {type(exc).__name__}")
+            self._last_stage_status_note = type(exc).__name__
+            return 1, None
         finally:
+            if log_f is not None:
+                try:
+                    log_f.close()
+                except OSError:
+                    pass
             sel.close()
             if w_fd >= 0:
                 try:
@@ -1420,7 +1518,8 @@ class SessionRunner:
             return StageOutcome(ok=True, returncode=0)
 
         self.any_failed = 1
-        self.record_stage(name, str(rc), shown_log)
+        status_str = f"{rc} ({self._last_stage_status_note})" if self._last_stage_status_note else str(rc)
+        self.record_stage(name, status_str, shown_log)
         return StageOutcome(ok=False, returncode=rc)
 
     def run_stage(self, name: str, required_artifact: Path | None, cmd: Sequence[str]) -> StageOutcome:

@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -1102,3 +1103,267 @@ def test_signal_ignored_on_entry_is_preserved(
         assert "09_rank_failure_gloo_n2              0 " in summary
         assert (log_dir / "03_ref_gloo_tiny_n2.done").is_file()
         assert (log_dir / "refs" / "ref_gloo_tiny_n2.zip").is_file()
+
+
+# --------------------------------------------------------------------------- 9. stage runner & process-tree hardening
+
+
+@pytest.mark.parametrize("fail_step", ["sync", "probe"])
+def test_env_stage_bootstrap_maps_signal_kill_to_posix_exit_code(tmp_path: Path, fail_step: str) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    stub_body = f"""\
+import os, signal, sys
+
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if "sys.executable" in joined and "torch.version.cuda" in joined:
+    print("stub-rt")
+    sys.exit(0)
+if argv and argv[0] == "sync":
+    if {fail_step!r} == "sync":
+        os.kill(os.getpid(), signal.SIGSEGV)
+    sys.exit(0)
+if "tree_state_method=" in joined:
+    if {fail_step!r} == "probe":
+        os.kill(os.getpid(), signal.SIGSEGV)
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    log_dir = tmp_path / f"logs_{fail_step}"
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+    r = subprocess.run(
+        [
+            "/bin/bash",
+            str(repo / "scripts" / "multi_gpu_check.sh"),
+            "--backend",
+            "gloo",
+            "--ranks",
+            "2",
+            "--log-dir",
+            str(log_dir),
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert r.returncode == 139, (r.returncode, r.stderr)
+    summary = (log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "01_env                               139 " in summary
+
+
+def test_stage_process_closed_stdio_does_not_busy_spin(tmp_path: Path) -> None:
+    cfg = DRIVER.SessionConfig(backend="gloo", log_dir=tmp_path / "logs", stage_timeout=5.0)
+    runner = DRIVER.SessionRunner(config=cfg, repo_root=tmp_path, env=_clean_tracked_env())
+    runner.log_dir.mkdir(parents=True, exist_ok=True)
+    runner.tree_method, runner.tree_sig = "content_hash", "0" * 64
+
+    cpu0 = time.process_time()
+    rc, int_sig = runner.run_stage_process(
+        "closed_stdio",
+        runner.log_dir / "closed_stdio.log",
+        [sys.executable, "-c", "import os, time; os.close(1); os.close(2); time.sleep(0.45)"],
+    )
+    cpu_dt = time.process_time() - cpu0
+    assert (rc, int_sig) == (0, None)
+    assert cpu_dt < 0.20, f"busy-spin detected on closed stdio: cpu_dt={cpu_dt:.3f}s"
+
+
+def test_post_exit_survivor_descendant_is_killed_and_logged(tmp_path: Path) -> None:
+    cfg = DRIVER.SessionConfig(backend="gloo", log_dir=tmp_path / "logs", stage_timeout=5.0)
+    runner = DRIVER.SessionRunner(
+        config=cfg, repo_root=tmp_path, env=_clean_tracked_env(), teardown_grace_s=0.4, teardown_reap_s=1.0
+    )
+    runner.log_dir.mkdir(parents=True, exist_ok=True)
+    runner.tree_method, runner.tree_sig = "content_hash", "0" * 64
+
+    pidfile = tmp_path / "survivor.pid"
+    stage_code = (
+        "import subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); "
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))"
+    )
+    log_file = runner.log_dir / "survivor_stage.log"
+    rc, int_sig = runner.run_stage_process("survivor_stage", log_file, [sys.executable, "-c", stage_code])
+    assert (rc, int_sig) == (0, None)
+
+    survivor_pid = int(pidfile.read_text(encoding="utf-8").strip())
+    alive = True
+    try:
+        os.kill(survivor_pid, 0)
+    except OSError:
+        alive = False
+    finally:
+        if alive:
+            try:
+                os.kill(survivor_pid, signal.SIGKILL)
+            except OSError:
+                pass
+    assert not alive, f"surviving descendant pid={survivor_pid} outlived finished stage"
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "surviving descendants" in log_text
+    assert "signalled 1 pid(s)" in log_text
+
+
+def test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order(tmp_path: Path) -> None:
+    ps_bin = DRIVER._resolve_ps_bin()
+    base_token = f"tt_exact_{os.getpid()}"
+    p_exact = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(15)"],
+        env=dict(os.environ, _TIMESTRAL_STAGE_TOKEN=base_token),
+    )
+    p_extended = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(15)"],
+        env=dict(os.environ, _TIMESTRAL_STAGE_TOKEN=f"{base_token}_suffix"),
+    )
+    try:
+        # Wait briefly for both children to exec with their updated environment.
+        time.sleep(0.1)
+        needle = f"_TIMESTRAL_STAGE_TOKEN={base_token}"
+        hits = DRIVER.find_token_pids(needle, self_pid=os.getpid(), ps_bin=ps_bin)
+        assert p_exact.pid in hits
+        assert p_extended.pid not in hits
+
+        # Simulate an empty /proc directory and ensure fallback to ps still finds the exact token.
+        real_isdir = os.path.isdir
+        real_listdir = os.listdir
+        with (
+            mock.patch.object(os.path, "isdir", side_effect=lambda p: True if str(p) == "/proc" else real_isdir(p)),
+            mock.patch.object(os, "listdir", side_effect=lambda p: [] if str(p) == "/proc" else real_listdir(p)),
+        ):
+            fallback_hits = DRIVER.find_token_pids(needle, self_pid=os.getpid(), ps_bin=ps_bin)
+            assert p_exact.pid in fallback_hits
+            assert p_extended.pid not in fallback_hits
+    finally:
+        for p in (p_exact, p_extended):
+            p.kill()
+            p.wait()
+
+    # Verify collect_live_targets scans tokens before reading the process table so a child forked in
+    # between is still discovered via its parent in `children`.
+    call_order: list[str] = []
+
+    def _fake_find_tokens(*_a: Any, **_kw: Any) -> set[int]:
+        call_order.append("token")
+        return {1001}
+
+    def _fake_proc_table(*_a: Any, **_kw: Any) -> tuple[dict[int, list[int]], dict[int, int]]:
+        call_order.append("table")
+        # Child 1002 was forked by 1001 between the token scan and the table read.
+        return {1001: [1002]}, {1001: 1001, 1002: 1001}
+
+    fake_proc = mock.MagicMock()
+    fake_proc.poll.return_value = 0
+    fake_proc.pid = 999
+    with (
+        mock.patch.object(DRIVER, "find_token_pids", side_effect=_fake_find_tokens),
+        mock.patch.object(DRIVER, "read_proc_table", side_effect=_fake_proc_table),
+    ):
+        live_pids, live_pgids = DRIVER.collect_live_targets(
+            fake_proc, "_TIMESTRAL_STAGE_TOKEN=t", self_pid=1, self_pgid=1, ps_bin=None
+        )
+    assert call_order == ["token", "table"]
+    assert live_pids == {1001, 1002}
+    assert live_pgids == {1001}
+
+
+def test_missing_stage_binary_records_127_and_writes_summary(tmp_path: Path) -> None:
+    cfg = DRIVER.SessionConfig(backend="gloo", log_dir=tmp_path / "logs", ranks=(2,), ranks_specified=True)
+    runner = DRIVER.SessionRunner(config=cfg, repo_root=tmp_path, env=_clean_tracked_env())
+    runner.log_dir.mkdir(parents=True, exist_ok=True)
+    runner.tree_method, runner.tree_sig = "content_hash", "0" * 64
+
+    outcome = runner.run_stage_with_sig("missing_bin_stage", "sig", None, ["/nonexistent_binary_for_stage_test"])
+    assert not outcome.ok
+    assert outcome.returncode == 127
+    assert runner.any_failed == 1
+    summary = runner.write_summary()
+    assert "missing_bin_stage                    127 " in summary
+    log_text = (runner.log_dir / "missing_bin_stage.log").read_text(encoding="utf-8")
+    assert "failed to launch stage missing_bin_stage" in log_text
+
+
+def test_unexpected_log_write_error_kills_stage_tree_and_writes_summary(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    pidfile = tmp_path / "enospc_stage.pid"
+    stub_body = f"""\
+import os, sys, time
+
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync":
+    sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined:
+    print("stub-rt")
+    sys.exit(0)
+if "tree_state_method=" in joined:
+    print("tree_state_method=content_hash tree_state_sig=000000000000")
+    sys.exit(0)
+if "--write-reference" in argv:
+    open({str(pidfile)!r}, "w").write(str(os.getpid()))
+    print("trigger log write failure", flush=True)
+    time.sleep(30)
+    sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_body)
+    cfg = DRIVER.SessionConfig(
+        backend="gloo", sizes=(), log_dir=tmp_path / "logs", ranks=(2,), ranks_specified=True, stage_timeout=10.0
+    )
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+    runner = DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env, teardown_grace_s=0.4, teardown_reap_s=1.0)
+
+    real_open = open
+
+    class _FailingWriteFile:
+        def __init__(self, f: Any) -> None:
+            self._f = f
+            self._writes = 0
+
+        def write(self, data: bytes) -> int:
+            self._writes += 1
+            if self._writes >= 2:
+                raise OSError(28, "No space left on device")
+            return self._f.write(data)
+
+        def flush(self) -> None:
+            self._f.flush()
+
+        def close(self) -> None:
+            self._f.close()
+
+    def _patched_open(path: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        f = real_open(path, mode, *args, **kwargs)
+        if str(path).endswith("03_ref_gloo_tiny_n2.log") and "w" in mode:
+            return _FailingWriteFile(f)
+        return f
+
+    with mock.patch("builtins.open", side_effect=_patched_open):
+        rc = runner.run()
+
+    assert rc == 1
+    assert pidfile.exists()
+    stage_pid = int(pidfile.read_text(encoding="utf-8").strip())
+    alive = True
+    try:
+        os.kill(stage_pid, 0)
+    except OSError:
+        alive = False
+    finally:
+        if alive:
+            try:
+                os.kill(stage_pid, signal.SIGKILL)
+            except OSError:
+                pass
+    assert not alive, f"stage pid={stage_pid} survived unexpected OSError in log writer"
+    summary = (cfg.log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "03_ref_gloo_tiny_n2                  1 (OSError)" in summary
+    assert "04_gloo_tiny_n2                      SKIPPED (ref failed)" in summary
+    assert "09_rank_failure_gloo_n2              0 " in summary
