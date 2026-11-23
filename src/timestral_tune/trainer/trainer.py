@@ -314,9 +314,10 @@ class TimestralTrainer:
     Multi-process training (spec §5.6) activates automatically when `torch.distributed` is
     initialised with `world_size > 1` on the `"gloo"` or `"nccl"` backend; the library never
     initialises or destroys process groups. All ranks must construct the trainer in lockstep with
-    matching config, datasets, and model layout. `config.batch_size` is per process (the global
-    effective batch size is `world_size * config.batch_size`), rank 0 broadcasts initial parameters
-    and buffers at construction, and callbacks run on rank 0 only.
+    matching config, datasets, and model layout. `config.batch_size` (and `replay_config.batch_size`
+    when replay is enabled) is per process (the global effective batch size is
+    `world_size * config.batch_size`), rank 0 broadcasts initial parameters and buffers at
+    construction, caches are skipped, and callbacks run on rank 0 only.
 
     Args:
         config: Training settings.
@@ -424,10 +425,6 @@ class TimestralTrainer:
             raise TypeError(f"replay_dataset must be a TimeSeriesDataset or None, got {type(replay_dataset).__name__}")
         if val_dataset is not None and replay_dataset is val_dataset:
             raise ValueError("replay_dataset must not be the same object as val_dataset")
-        if distributed and replay_config is not None:
-            raise NotImplementedError(
-                "multi-process training with replay_config is not implemented yet (planned for Stage 2)"
-            )
         self.replay_config = replay_config
 
         self._model_provided_directly = model is not None
@@ -544,6 +541,16 @@ class TimestralTrainer:
             logger.info(
                 "multi-process mode skips the head_only frozen-feature cache (cache_frozen_features=True "
                 "is ignored); running the uncached forward path"
+            )
+        if (
+            self.replay_config is not None
+            and self.replay_config.distill_weight > 0.0
+            and self.replay_config.cache_base_outputs
+            and config.mode != "head_only"
+        ):
+            logger.info(
+                "multi-process mode skips the frozen-base teacher output cache (cache_base_outputs=True "
+                "is ignored); running the live frozen-base forward path"
             )
 
     def _init_distributed(
@@ -838,20 +845,22 @@ class TimestralTrainer:
             self._frozen_head = frozen_head
             return
 
-        estimated = self._estimate_replay_base_cache_bytes(self.replay_dataset)
-        if self.replay_config.cache_base_outputs and estimated <= _MAX_HEAD_CACHE_BYTES:
-            self._replay_base_pos = self._precompute_replay_base_outputs(self.replay_dataset, negate=False)
-            if self._replay_sign_flip:
-                self._replay_base_neg = self._precompute_replay_base_outputs(self.replay_dataset, negate=True)
-            return
+        if self._dist is None:
+            estimated = self._estimate_replay_base_cache_bytes(self.replay_dataset)
+            if self.replay_config.cache_base_outputs and estimated <= _MAX_HEAD_CACHE_BYTES:
+                self._replay_base_pos = self._precompute_replay_base_outputs(self.replay_dataset, negate=False)
+                if self._replay_sign_flip:
+                    self._replay_base_neg = self._precompute_replay_base_outputs(self.replay_dataset, negate=True)
+                return
 
-        if self.replay_config.cache_base_outputs and estimated > _MAX_HEAD_CACHE_BYTES:
-            logger.info(
-                "skipping frozen-base teacher cache for %d replay windows (estimated %.1f MiB exceeds %.0f MiB cap)",
-                len(self.replay_dataset),
-                estimated / (1024 * 1024),
-                _MAX_HEAD_CACHE_BYTES / (1024 * 1024),
-            )
+            if self.replay_config.cache_base_outputs and estimated > _MAX_HEAD_CACHE_BYTES:
+                logger.info(
+                    "skipping frozen-base teacher cache for %d replay windows "
+                    "(estimated %.1f MiB exceeds %.0f MiB cap)",
+                    len(self.replay_dataset),
+                    estimated / (1024 * 1024),
+                    _MAX_HEAD_CACHE_BYTES / (1024 * 1024),
+                )
         if self.config.mode == "full_ft":
             frozen_base = copy.deepcopy(self.model).to(self.device).eval()
             for parameter in frozen_base.parameters():
@@ -1260,7 +1269,7 @@ class TimestralTrainer:
 
     def _prepare_replay_batch(
         self,
-        replay_item: _ReplayBatchItem | CachedHeadBatch,
+        replay_item: _ReplayBatchItem | TrainingBatch | CachedHeadBatch,
         flip_generator: torch.Generator | None,
     ) -> _PreparedReplayBatch:
         """Sign-flip, validate on CPU, resolve cached teacher quantiles, and transfer a replay batch."""
@@ -1270,23 +1279,29 @@ class TimestralTrainer:
                 batch=replay_item.to(self.device, non_blocking=non_blocking),
                 num_scored=replay_item.num_scored,
             )
-        assert isinstance(replay_item, _ReplayBatchItem)
         assert self.replay_dataset is not None
-        r_batch = replay_item.batch
-        real_series = replay_item.real_series
+        rows_per_series = sum(self.replay_dataset.series[0].layout)
+        if isinstance(replay_item, TrainingBatch):
+            r_batch = replay_item
+            real_series = r_batch.num_rows // rows_per_series
+            indices: Tensor | None = None
+        else:
+            assert isinstance(replay_item, _ReplayBatchItem)
+            r_batch = replay_item.batch
+            real_series = replay_item.real_series
+            indices = replay_item.indices
         flip_mask: Tensor | None = None
         if flip_generator is not None:
-            rows_per_series = sum(self.replay_dataset.series[0].layout)
             flip_mask = torch.rand((real_series,), generator=flip_generator) < 0.5
             r_batch = _apply_series_flip(r_batch, flip_mask, rows_per_series)
         r_batch.validate(self.model.config.patch_size)
         scored = r_batch.num_scored
         replay_dev = r_batch.to(self.device, non_blocking=non_blocking)
         teacher_dev: Tensor | None = None
-        if self._replay_base_pos is not None:
-            pos_q = self._replay_base_pos[replay_item.indices]
+        if indices is not None and self._replay_base_pos is not None:
+            pos_q = self._replay_base_pos[indices]
             if flip_mask is not None and self._replay_base_neg is not None:
-                neg_q = self._replay_base_neg[replay_item.indices]
+                neg_q = self._replay_base_neg[indices]
                 sel = flip_mask.view(-1, 1, 1, 1)
                 teacher_cpu = torch.where(sel, neg_q, pos_q).flatten(0, 1)
             else:

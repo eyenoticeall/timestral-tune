@@ -1,11 +1,11 @@
 """Multi-process execution strategy for `TimestralTrainer._run_fit_loop`.
 
-Implements the five-stage distributed training step, main-process epoch batch sampling,
-rank-offset stochastic streams, rank-0 callback / best-state ownership with fixed-size
-`float64` control broadcasts, and internal sharded validation of spec §5.6 (Stage 1: domain
-loss across all four modes, no caches, no replay).
+Implements the five-stage distributed training step (domain loss, optional sharded replay mixing,
+and frozen-base distillation), main-process epoch batch sampling and replay epoch cycling,
+rank-offset stochastic streams, rank-0 callback / best-state ownership with fixed-size `float64`
+control broadcasts, and internal sharded validation of spec §5.6 (all four modes, no caches).
 
-- Spec: `docs/SPEC.md` §5.6, §9 (T15), §11 (D22–D35)
+- Spec: `docs/SPEC.md` §5.3, §5.6, §9 (T15), §11 (D22–D35)
 """
 
 from __future__ import annotations
@@ -15,12 +15,14 @@ from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING
 
 import torch
+from torch import Tensor
 from torch.utils.data import DataLoader
 
 from ..data.batch import TrainingBatch
-from ._types import EvalResult, TrainingResult, _FitBookkeeper, _LossTerms, _StepOutcome
+from ._types import EvalResult, TrainingResult, _FitBookkeeper, _LossTerms, _PreparedReplayBatch, _StepOutcome
 from .distributed import (
     ControlStatus,
+    DistributedBatchCycle,
     DistributedBatchSampler,
     DistributedContext,
     GradientReducer,
@@ -35,7 +37,6 @@ if TYPE_CHECKING:
     from .trainer import TimestralTrainer
 
 # Fixed layout of the 8-element float64 statistics all-reduce buffer (spec §5.6, D23).
-# Slots 2..5 are reserved as 0.0 in Stage 1 and populated by Stage 2 replay and distillation.
 _STAT_W_D = 0
 _STAT_SUM_D = 1
 _STAT_W_R = 2
@@ -53,8 +54,12 @@ class _DistributedStrategy:
         self._trainer = trainer
         self._ctx = ctx
         self._flip_generator: torch.Generator | None = None
+        self._replay_flip_generator: torch.Generator | None = None
         self._sampler: DistributedBatchSampler | None = None
         self._train_loader: DataLoader | None = None
+        self._replay_sampler: DistributedBatchSampler | None = None
+        self._replay_loader: DataLoader | None = None
+        self._replay_cycle: DistributedBatchCycle[TrainingBatch] | None = None
         self._sharded_val_loader: DataLoader | None = None
         self._val_loader_ready = False
         self._reducer: GradientReducer | None = None
@@ -65,7 +70,7 @@ class _DistributedStrategy:
         return self._ctx.is_rank_zero
 
     def prepare_fit(self) -> None:
-        """Verify group liveness, seed rank-offset streams, and build the sampler, loader, and reducer.
+        """Verify group liveness, seed rank-offset streams, and build samplers, loaders, and reducer.
 
         Ranks: all ranks must call in lockstep.
         Collectives: 0.
@@ -95,6 +100,37 @@ class _DistributedStrategy:
             batch_sampler=self._sampler,
             generator=train_loader_generator,
         )
+
+        if trainer.replay_config is not None:
+            assert trainer.replay_dataset is not None
+            self._replay_flip_generator = (
+                torch.Generator().manual_seed(rank_seed(config.seed + 3_000_007, rank))
+                if trainer._replay_sign_flip
+                else None
+            )
+            replay_batch_size = trainer.replay_config.resolved_batch_size(config.batch_size)
+            self._replay_sampler = DistributedBatchSampler(
+                len(trainer.replay_dataset),
+                world_size=self._ctx.world_size,
+                rank=rank,
+                batch_size=replay_batch_size,
+                shuffle=config.shuffle,
+                seed=config.seed + 2_000_009,
+                epoch=0,
+            )
+            replay_loader_generator = torch.Generator().manual_seed(rank_seed(config.seed + 2_000_009, rank))
+            self._replay_loader = trainer._build_data_loader(
+                trainer.replay_dataset,
+                batch_sampler=self._replay_sampler,
+                generator=replay_loader_generator,
+            )
+            self._replay_cycle = DistributedBatchCycle(self._replay_sampler, self._replay_loader)
+        else:
+            self._replay_flip_generator = None
+            self._replay_sampler = None
+            self._replay_loader = None
+            self._replay_cycle = None
+
         self._sharded_val_loader = None
         self._val_loader_ready = False
         self._reducer = GradientReducer(self._ctx, trainer._trainable)
@@ -148,61 +184,158 @@ class _DistributedStrategy:
 
         self._broadcast_rank0_hook("on_fit_start", _run)
 
-    def _run_step(self, fetch_batch: Callable[[], TrainingBatch | None]) -> _StepOutcome:
+    def _run_step(
+        self,
+        fetch_batch: Callable[[], TrainingBatch | None],
+        fetch_replay: Callable[[], TrainingBatch | None] | None = None,
+    ) -> _StepOutcome:
         """Execute one five-stage distributed training step (spec §5.6, D22–D24).
+
+        When `trainer.replay_config` is set, a 2-scalar `float64` pre-check `[w_d, failed]`
+        runs first so a globally zero-scored domain step (`W_D == 0`) skips before any rank
+        advances its replay iterator. Without replay, no pre-check runs.
 
         Ranks: all ranks must call in lockstep.
         Collectives:
-            - 1 stats `all_reduce_sum` (8 float64 scalars).
-            - +1 conditional `propagate_failure` (`int64` length-`N`) only if any rank failed locally.
-            - +1 `GradientReducer.reduce()` (`all_reduce(SUM)`) on active finite steps (`W_D > 0`).
+            - Without replay:
+              - Normal step: 1 stats `all_reduce_sum` (8 float64) + 1 `GradientReducer.reduce()`.
+              - Skipped step (`W_D == 0`): 1 stats `all_reduce_sum` (8 float64).
+              - Local failure: 1 stats `all_reduce_sum` (8 float64) + 1 `propagate_failure` (N int64).
+            - With replay:
+              - Normal step: 1 pre-check `all_reduce_sum` (2 float64) + 1 stats `all_reduce_sum`
+                (8 float64) + 1 `GradientReducer.reduce()`.
+              - Skipped step (`W_D == 0`): 1 pre-check `all_reduce_sum` (2 float64) only.
+              - Local failure during domain fetch: 1 pre-check `all_reduce_sum` (2 float64) + 1
+                `propagate_failure` (N int64).
+              - Local failure during prep/replay/forward: 1 pre-check `all_reduce_sum` (2 float64)
+                + 1 stats `all_reduce_sum` (8 float64) + 1 `propagate_failure` (N int64).
         """
         trainer = self._trainer
         assert self._reducer is not None
         trainer.optimizer.zero_grad(set_to_none=True)
 
-        # Stage 1: protected local stage (lazy iterator creation, fetch, zero-scored skip, flip, validate, forward).
+        replay_cfg = trainer.replay_config
+        has_replay = replay_cfg is not None
+        raw_domain: TrainingBatch | None = None
+
+        # Pre-replay domain-count check: skip globally zero-scored steps before advancing replay.
+        if has_replay:
+            fetch_error: Exception | None = None
+            pre_w_d = 0
+            fetch_failed = 0.0
+            try:
+                raw_domain = fetch_batch()
+                pre_w_d = 0 if raw_domain is None else raw_domain.num_scored
+            except Exception as exc:
+                if is_oom_error(exc):
+                    raise
+                fetch_error = exc
+                raw_domain = None
+                pre_w_d = 0
+                fetch_failed = 1.0
+
+            pre_stats = torch.tensor(
+                [float(pre_w_d), fetch_failed],
+                dtype=torch.float64,
+                device=self._ctx.device,
+            )
+            self._ctx.all_reduce_sum(pre_stats)
+            pre_w_d_tot, pre_failed_tot = pre_stats.tolist()
+            if pre_failed_tot > 0.0:
+                self._ctx.raise_propagated_failure(fetch_error, stage="training_step")
+            if pre_w_d_tot == 0.0:
+                return _StepOutcome(skipped=True)
+
+        # Stage 1: protected local stage (domain fetch if no replay, domain & replay prep, forward).
         local_error: Exception | None = None
         terms: _LossTerms | None = None
-        loss_val: float | None = None
+        domain_val: float | None = None
+        replay_val: float | None = None
+        distill_val: float | None = None
         w_d = 0
         sum_d = 0.0
+        w_r = 0
+        sum_r = 0.0
+        m_count = 0
+        sum_m = 0.0
         non_finite = 0.0
         failed = 0.0
         try:
-            raw_batch = fetch_batch()
-            prepared = None if raw_batch is None else trainer._prepare_domain_batch(raw_batch, self._flip_generator)
-            if prepared is not None:
+            if not has_replay:
+                raw_domain = fetch_batch()
+            prepared_domain = (
+                None if raw_domain is None else trainer._prepare_domain_batch(raw_domain, self._flip_generator)
+            )
+            prepared_replay: _PreparedReplayBatch | None = None
+            if has_replay and fetch_replay is not None:
+                raw_replay = fetch_replay()
+                if raw_replay is not None:
+                    prepared_replay = trainer._prepare_replay_batch(raw_replay, self._replay_flip_generator)
+
+            if prepared_domain is not None or prepared_replay is not None:
                 terms = trainer._compute_loss_terms(
-                    prepared.batch,
-                    domain_count=prepared.num_scored,
+                    None if prepared_domain is None else prepared_domain.batch,
+                    domain_count=0 if prepared_domain is None else prepared_domain.num_scored,
                     validate=False,
+                    replay=prepared_replay,
                 )
-                assert terms.domain is not None
-                w_d = prepared.num_scored
-                loss_val = terms.domain.item()
-                if math.isfinite(loss_val):
-                    weighted_sum = loss_val * w_d
-                    if math.isfinite(weighted_sum):
-                        sum_d = weighted_sum
+
+                if terms.domain is not None:
+                    assert prepared_domain is not None
+                    w_d = prepared_domain.num_scored
+                    domain_val = terms.domain.item()
+                    if math.isfinite(domain_val):
+                        weighted_d = domain_val * w_d
+                        if math.isfinite(weighted_d):
+                            sum_d = weighted_d
+                        else:
+                            non_finite = 1.0
                     else:
                         non_finite = 1.0
-                else:
-                    non_finite = 1.0
+
+                if terms.replay is not None and terms.replay_count > 0:
+                    w_r = terms.replay_count
+                    replay_val = terms.replay.item()
+                    if math.isfinite(replay_val):
+                        weighted_r = replay_val * w_r
+                        if math.isfinite(weighted_r):
+                            sum_r = weighted_r
+                        else:
+                            non_finite = 1.0
+                    else:
+                        non_finite = 1.0
+
+                if terms.distill is not None and terms.distill_count > 0:
+                    m_count = terms.distill_count
+                    distill_val = terms.distill.item()
+                    if math.isfinite(distill_val):
+                        weighted_m = distill_val * m_count
+                        if math.isfinite(weighted_m):
+                            sum_m = weighted_m
+                        else:
+                            non_finite = 1.0
+                    else:
+                        non_finite = 1.0
         except Exception as exc:
             if is_oom_error(exc):
                 raise
             local_error = exc
             terms = None
-            loss_val = None
+            domain_val = None
+            replay_val = None
+            distill_val = None
             w_d = 0
             sum_d = 0.0
+            w_r = 0
+            sum_r = 0.0
+            m_count = 0
+            sum_m = 0.0
             non_finite = 0.0
             failed = 1.0
 
         # Stage 2: 8-scalar float64 SUM statistics collective.
         stats = torch.tensor(
-            [float(w_d), sum_d, 0.0, 0.0, 0.0, 0.0, non_finite, failed],
+            [float(w_d), sum_d, float(w_r), sum_r, float(m_count), sum_m, non_finite, failed],
             dtype=torch.float64,
             device=self._ctx.device,
         )
@@ -210,6 +343,10 @@ class _DistributedStrategy:
         reduced = stats.tolist()
         w_d_tot = reduced[_STAT_W_D]
         sum_d_tot = reduced[_STAT_SUM_D]
+        w_r_tot = reduced[_STAT_W_R]
+        sum_r_tot = reduced[_STAT_SUM_R]
+        m_tot = reduced[_STAT_M]
+        sum_m_tot = reduced[_STAT_SUM_M]
         non_finite_tot = reduced[_STAT_NON_FINITE]
         failed_tot = reduced[_STAT_FAILED]
 
@@ -218,7 +355,11 @@ class _DistributedStrategy:
             self._ctx.raise_propagated_failure(local_error, stage="training_step")
 
         if non_finite_tot > 0.0:
-            bad_value: object = loss_val if (loss_val is not None and not math.isfinite(loss_val)) else "non-finite"
+            bad_value: object = "non-finite"
+            for candidate in (domain_val, replay_val, distill_val):
+                if candidate is not None and not math.isfinite(candidate):
+                    bad_value = candidate
+                    break
             raise FloatingPointError(
                 f"the training loss became {bad_value} at step {trainer.global_step + 1}. "
                 "Lower the learning rate, or check the data for extreme values"
@@ -227,17 +368,37 @@ class _DistributedStrategy:
         if w_d_tot == 0.0:
             return _StepOutcome(skipped=True)
 
-        global_loss = sum_d_tot / w_d_tot
+        replay_fraction = 0.0 if replay_cfg is None else replay_cfg.replay_fraction
+        distill_weight = 0.0 if replay_cfg is None else replay_cfg.distill_weight
+        replay_active = replay_fraction > 0.0 and w_r_tot > 0.0
+        distill_active = distill_weight > 0.0 and m_tot > 0.0
+        dom_weight = (1.0 - replay_fraction) if replay_active else 1.0
+
+        global_loss = dom_weight * (sum_d_tot / w_d_tot)
+        if replay_active:
+            global_loss += replay_fraction * (sum_r_tot / w_r_tot)
+        if distill_active:
+            global_loss += distill_weight * (sum_m_tot / m_tot)
         if not math.isfinite(global_loss):
             raise FloatingPointError(
                 f"the training loss became {global_loss} at step {trainer.global_step + 1}. "
                 "Lower the learning rate, or check the data for extreme values"
             )
 
-        # Stage 4: count-weighted local backward (skipped on empty or zero-scored ranks).
-        if terms is not None and terms.domain is not None and w_d > 0:
-            weighted_loss = (w_d / w_d_tot) * terms.domain
-            weighted_loss.backward()
+        # Stage 4: count-weighted local backward over active local terms.
+        if terms is not None:
+            local_terms: list[Tensor] = []
+            if terms.domain is not None and w_d > 0:
+                local_terms.append((dom_weight * (w_d / w_d_tot)) * terms.domain)
+            if replay_active and terms.replay is not None and w_r > 0:
+                local_terms.append((replay_fraction * (w_r / w_r_tot)) * terms.replay)
+            if distill_active and terms.distill is not None and m_count > 0:
+                local_terms.append((distill_weight * (m_count / m_tot)) * terms.distill)
+            if local_terms:
+                weighted_loss = local_terms[0]
+                for extra in local_terms[1:]:
+                    weighted_loss = weighted_loss + extra
+                weighted_loss.backward()
 
         # Stage 5: single flat-buffer SUM gradient collective, clipping, optimiser and scheduler step.
         learning_rate = trainer.optimizer.param_groups[0]["lr"]
@@ -255,6 +416,7 @@ class _DistributedStrategy:
         self._sampler.set_epoch(epoch)
         total_epoch_steps = self._sampler.num_global_steps
         loader_iter: Iterator[TrainingBatch] | None = None
+        fetch_replay = None if self._replay_cycle is None else self._replay_cycle.next_batch
 
         for step_idx in range(total_epoch_steps):
             slice_size = self._sampler.slice_size(step_idx)
@@ -268,7 +430,7 @@ class _DistributedStrategy:
                     loader_iter = iter(self._train_loader)
                 return next(loader_iter)
 
-            yield self._run_step(_fetch)
+            yield self._run_step(_fetch, fetch_replay)
 
     def on_step_end(self, step: int, loss: float, learning_rate: float) -> float:
         """Run `on_step_end` callbacks on rank 0 and broadcast `[status, rank0_loss]`.
@@ -440,10 +602,14 @@ class _DistributedStrategy:
         self._broadcast_rank0_hook("on_fit_end", _run)
 
     def cleanup(self) -> None:
-        """Release the flip generator, gradient buffer, loaders, and sampler after fit (0 collectives)."""
+        """Release flip generators, gradient buffer, loaders, and samplers after fit (0 collectives)."""
         self._flip_generator = None
+        self._replay_flip_generator = None
         self._sampler = None
         self._train_loader = None
+        self._replay_sampler = None
+        self._replay_loader = None
+        self._replay_cycle = None
         self._sharded_val_loader = None
         self._val_loader_ready = False
         self._reducer = None
