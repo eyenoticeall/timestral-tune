@@ -1367,3 +1367,231 @@ sys.exit(0)
     assert "03_ref_gloo_tiny_n2                  1 (OSError)" in summary
     assert "04_gloo_tiny_n2                      SKIPPED (ref failed)" in summary
     assert "09_rank_failure_gloo_n2              0 " in summary
+
+
+# --------------------------------------------------------------------------- 10. helper capture & git interruptibility
+
+
+def test_interruptible_capture_drains_large_stdout_and_enforces_deadline_and_interrupt_on_grandchild(
+    tmp_path: Path,
+) -> None:
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs")
+    runner = DRIVER.SessionRunner(config=cfg, repo_root=tmp_path, env=_clean_tracked_env())
+
+    # Large stdout/stderr exceeding OS pipe buffer must drain cleanly without deadlocking.
+    res_big = runner._run_interruptible_capture(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('A' * 200000); sys.stdout.flush(); "
+            "sys.stderr.write('E' * 70000); sys.stderr.flush()",
+        ],
+        timeout=5.0,
+    )
+    assert res_big.returncode == 0 and not res_big.timed_out
+    assert len(res_big.stdout) == 200000
+    assert len(res_big.stderr) == 70000
+
+    # Grandchild holding stdout open past parent exit must still respect timeout and be killed.
+    pidfile_to = tmp_path / "gc_timeout.pid"
+    t0 = time.monotonic()
+    res_to = runner._run_interruptible_capture(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys; "
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); "
+            f"open({str(pidfile_to)!r}, 'w').write(str(p.pid))",
+        ],
+        timeout=0.35,
+    )
+    dt_to = time.monotonic() - t0
+    assert res_to.timed_out and res_to.returncode == 124
+    assert dt_to < 2.5, f"capture ignored deadline on grandchild holding stdout: {dt_to:.2f}s"
+    gc_pid_to = int(pidfile_to.read_text(encoding="utf-8").strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(gc_pid_to, 0)
+
+    # Grandchild holding stdout open must also abort promptly on session interrupt and be killed.
+    runner_int = DRIVER.SessionRunner(config=cfg, repo_root=tmp_path, env=_clean_tracked_env())
+    pidfile_int = tmp_path / "gc_int.pid"
+
+    def _trigger_int() -> None:
+        deadline = time.monotonic() + 5.0
+        while not pidfile_int.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        runner_int.interrupted_sig_num = int(signal.SIGTERM)
+
+    import threading
+
+    th = threading.Thread(target=_trigger_int, daemon=True)
+    th.start()
+    t1 = time.monotonic()
+    res_int = runner_int._run_interruptible_capture(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys; "
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); "
+            f"open({str(pidfile_int)!r}, 'w').write(str(p.pid))",
+        ],
+        timeout=10.0,
+    )
+    dt_int = time.monotonic() - t1
+    th.join(timeout=5.0)
+    assert res_int.interrupted and res_int.returncode == 143
+    assert dt_int < 2.5, f"capture ignored interrupt on grandchild holding stdout: {dt_int:.2f}s"
+    gc_pid_int = int(pidfile_int.read_text(encoding="utf-8").strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(gc_pid_int, 0)
+
+
+def test_tree_state_git_interrupt_aborts_without_content_hash_fallback(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=True)
+    fake_git_dir = tmp_path / "fake_git"
+    fake_git_dir.mkdir()
+    git_ready = tmp_path / "git.ready"
+    git_pidfile = tmp_path / "git.pid"
+    fake_git = fake_git_dir / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        f"import os, pathlib, time\n"
+        f"pathlib.Path({str(git_pidfile)!r}).write_text(str(os.getpid()))\n"
+        f"pathlib.Path({str(git_ready)!r}).write_text('ready')\n"
+        "time.sleep(20)\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    _write_stub_uv(bin_dir, _standard_stub_uv_body())
+
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs", ranks=(2,), ranks_specified=True)
+    env = _clean_tracked_env({"PATH": f"{fake_git_dir}:{bin_dir}:{os.environ.get('PATH', '')}"})
+    runner = DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env)
+
+    import threading
+
+    def _interrupt_git() -> None:
+        deadline = time.monotonic() + 10.0
+        while not git_ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        runner.interrupted_sig_num = int(signal.SIGTERM)
+
+    th = threading.Thread(target=_interrupt_git, daemon=True)
+    th.start()
+    t0 = time.monotonic()
+    with mock.patch.object(
+        DRIVER,
+        "_content_hash_tree_state",
+        side_effect=AssertionError("must not fall back to content_hash when interrupted"),
+    ):
+        rc = runner.run()
+    dt = time.monotonic() - t0
+    th.join(timeout=5.0)
+
+    assert rc == 143
+    assert dt < 3.0, f"git interrupt waited too long: {dt:.2f}s"
+    git_pid = int(git_pidfile.read_text(encoding="utf-8").strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(git_pid, 0)
+    summary = (cfg.log_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "INTERRUPTED by SIGTERM (exit 143)" in summary
+
+
+def test_empty_env_is_respected_by_git_and_ps_resolution(tmp_path: Path) -> None:
+    assert DRIVER._try_git_tree_state(REPO_ROOT, tmp_path / "logs", env={}) is None
+    assert DRIVER._which_in_env("ps", {}) is None
+    with mock.patch.object(os.path, "isfile", return_value=False):
+        assert DRIVER._resolve_ps_bin(env={}) is None
+
+
+def test_helper_failure_and_timeout_report_stderr_without_conflating_with_zero_gpus(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Default helper timeout must be generous enough for cold CUDA initialisation.
+    default_runner = DRIVER.SessionRunner(config=DRIVER.SessionConfig(backend="gloo", sizes=()), repo_root=tmp_path)
+    assert default_runner.helper_timeout_s >= 180.0
+
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+
+    # 1. GPU count probe fails with stderr -> explicit failure error, NOT "0 visible CUDA GPUs".
+    stub_gpu_fail = """\
+import sys
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "torch.cuda.device_count()" in joined:
+    print("CUDA_DRIVER_INIT_BOOM", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_gpu_fail)
+    cfg1 = DRIVER.SessionConfig(backend="nccl", sizes=(), log_dir=tmp_path / "logs_gpu_fail")
+    rc1 = DRIVER.SessionRunner(config=cfg1, repo_root=repo, env=env).run()
+    err1 = capsys.readouterr().err
+    assert rc1 == 2
+    assert "CUDA GPU count probe failed (exit 1)" in err1
+    assert "CUDA_DRIVER_INIT_BOOM" in err1
+    assert "0 visible CUDA GPUs" not in err1
+    assert (cfg1.log_dir / "summary.txt").is_file()
+
+    # 2. GPU count probe times out with stderr -> explicit timeout error, NOT "0 visible CUDA GPUs".
+    stub_gpu_timeout = """\
+import sys, time
+argv = sys.argv[1:]
+joined = " ".join(argv)
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "torch.cuda.device_count()" in joined:
+    print("SLOW_CUDA_INIT_MSG", file=sys.stderr, flush=True)
+    time.sleep(20)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_gpu_timeout)
+    cfg2 = DRIVER.SessionConfig(backend="nccl", sizes=(), log_dir=tmp_path / "logs_gpu_to")
+    rc2 = DRIVER.SessionRunner(config=cfg2, repo_root=repo, env=env, helper_timeout_s=0.3).run()
+    err2 = capsys.readouterr().err
+    assert rc2 == 2
+    assert "CUDA GPU count probe timed out" in err2
+    assert "SLOW_CUDA_INIT_MSG" in err2
+    assert "0 visible CUDA GPUs" not in err2
+    assert (cfg2.log_dir / "summary.txt").is_file()
+
+    # 3. Post-01_env runtime identity probe failure must error with stderr rather than reset to "uninitialized".
+    rt_calls = tmp_path / "rt_calls_helper_err.txt"
+    stub_rt_fail = f"""\
+import pathlib, sys
+argv = sys.argv[1:]
+joined = " ".join(argv)
+counter = pathlib.Path({str(rt_calls)!r})
+if argv and argv[0] == "sync": sys.exit(0)
+if "sys.executable" in joined and "torch.version.cuda" in joined:
+    n = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(n))
+    if n == 1:
+        # Pre-sync failure is allowed (fresh venv not synced yet).
+        sys.exit(1)
+    print("POST_SYNC_TORCH_IMPORT_ERROR", file=sys.stderr)
+    sys.exit(1)
+if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+sys.exit(0)
+"""
+    _write_stub_uv(bin_dir, stub_rt_fail)
+    cfg3 = DRIVER.SessionConfig(
+        backend="gloo", sizes=(), log_dir=tmp_path / "logs_rt_fail", ranks=(2,), ranks_specified=True
+    )
+    rc3 = DRIVER.SessionRunner(config=cfg3, repo_root=repo, env=env).run()
+    err3 = capsys.readouterr().err
+    assert rc3 == 2
+    assert "runtime environment probe failed (exit 1)" in err3
+    assert "POST_SYNC_TORCH_IMPORT_ERROR" in err3
+    assert (cfg3.log_dir / "summary.txt").is_file()

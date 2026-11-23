@@ -207,6 +207,181 @@ class HelpRequested(Exception):
     """Raised when `-h` or `--help` is passed (mapped to exit code 0)."""
 
 
+class HelperError(Exception):
+    """Raised when a required runtime or GPU helper probe fails or times out."""
+
+
+class _SessionInterrupted(Exception):
+    """Internal control-flow signal raised when a managed signal interrupts pre-stage work."""
+
+
+@dataclass(frozen=True)
+class _CaptureResult:
+    """Raw outcome of an interruptible, non-blocking helper subprocess capture."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+    interrupted: bool = False
+
+
+def _which_in_env(cmd: str, env: Mapping[str, str] | None) -> str | None:
+    """Look up `cmd` using `env['PATH']` without falling back to `os.environ` when `env` is empty."""
+    source_env = os.environ if env is None else env
+    path_env = source_env.get("PATH", "")
+    return shutil.which(cmd, path=path_env) if path_env else None
+
+
+def _format_stderr_snippet(stderr_bytes: bytes, *, max_chars: int = 400) -> str:
+    """Return a concise single-line stderr excerpt suitable for error diagnostics."""
+    text = stderr_bytes.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    compact = " | ".join(line.strip() for line in text.splitlines() if line.strip())
+    if len(compact) > max_chars:
+        compact = compact[: max_chars - 3] + "..."
+    return f" (stderr: {compact})"
+
+
+def _capture_subprocess_bytes(
+    cmd: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None,
+    timeout: float,
+    is_interrupted: Callable[[], bool] | None = None,
+) -> _CaptureResult:
+    """Run a helper command in its own session, draining stdout/stderr non-blockingly under deadline and interrupt."""
+    if is_interrupted is not None and is_interrupted():
+        return _CaptureResult(128, b"", b"", interrupted=True)
+    try:
+        proc = subprocess.Popen(
+            list(cmd),
+            cwd=str(cwd),
+            env=None if env is None else dict(env),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return _CaptureResult(127, b"", str(exc).encode("utf-8"))
+
+    assert proc.stdout is not None and proc.stderr is not None
+    out_fd = proc.stdout.fileno()
+    err_fd = proc.stderr.fileno()
+    os.set_blocking(out_fd, False)
+    os.set_blocking(err_fd, False)
+    sel = selectors.DefaultSelector()
+    sel.register(out_fd, selectors.EVENT_READ, data="out")
+    sel.register(err_fd, selectors.EVENT_READ, data="err")
+    open_fds: dict[int, str] = {out_fd: "out", err_fd: "err"}
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+
+    def _drain_fd(fd: int) -> None:
+        bucket = out_chunks if open_fds.get(fd) == "out" else err_chunks
+        while fd in open_fds:
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                return
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    return
+                chunk = b""
+            if not chunk:
+                try:
+                    sel.unregister(fd)
+                except (KeyError, ValueError, OSError):
+                    pass
+                open_fds.pop(fd, None)
+                return
+            bucket.append(chunk)
+
+    def _kill_group() -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        grace_end = time.monotonic() + 0.5
+        while time.monotonic() < grace_end:
+            for fd in list(open_fds):
+                _drain_fd(fd)
+            if proc.poll() is not None and not open_fds:
+                return
+            time.sleep(0.02)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        reap_end = time.monotonic() + 1.0
+        while time.monotonic() < reap_end:
+            for fd in list(open_fds):
+                _drain_fd(fd)
+            if proc.poll() is not None and not open_fds:
+                break
+            time.sleep(0.02)
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+        for fd in list(open_fds):
+            _drain_fd(fd)
+
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            interrupted = is_interrupted is not None and is_interrupted()
+            now = time.monotonic()
+            timed_out = now >= deadline
+            if interrupted or timed_out:
+                _kill_group()
+                return _CaptureResult(
+                    128 if interrupted else 124,
+                    b"".join(out_chunks),
+                    b"".join(err_chunks),
+                    timed_out=not interrupted,
+                    interrupted=interrupted,
+                )
+
+            rc = proc.poll()
+            if rc is not None:
+                for fd in list(open_fds):
+                    _drain_fd(fd)
+                if not open_fds:
+                    return _CaptureResult(rc, b"".join(out_chunks), b"".join(err_chunks))
+
+            rem = max(0.0, deadline - time.monotonic())
+            if open_fds:
+                try:
+                    events = sel.select(timeout=min(0.05, rem))
+                except InterruptedError:
+                    continue
+                for key, _ in events:
+                    _drain_fd(key.fd)
+            else:
+                time.sleep(min(0.02, rem))
+    finally:
+        sel.close()
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 @dataclass(frozen=True)
 class SessionConfig:
     """Validated configuration for one multi-GPU verification session."""
@@ -415,25 +590,32 @@ def _is_bytecode_cache(name: str) -> bool:
     return name == "__pycache__" or name.endswith((".pyc", ".pyo"))
 
 
-def _try_git_tree_state(repo_root: Path, log_dir_resolved: Path, *, env: Mapping[str, str] | None = None) -> str | None:
+def _try_git_tree_state(
+    repo_root: Path,
+    log_dir_resolved: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+    is_interrupted: Callable[[], bool] | None = None,
+    timeout: float = 180.0,
+) -> str | None:
     """Compute git-based tree digest when `git` is available and `repo_root` is a work-tree top-level."""
-    path_env = (env or os.environ).get("PATH")
-    git_bin = shutil.which("git", path=path_env)
+    if is_interrupted is not None and is_interrupted():
+        raise _SessionInterrupted()
+    git_bin = _which_in_env("git", env)
     if git_bin is None:
         return None
 
     def _run(args: Sequence[str]) -> tuple[int, bytes]:
-        try:
-            proc = subprocess.run(
-                [git_bin, *args],
-                cwd=str(repo_root),
-                env=None if env is None else dict(env),
-                check=False,
-                capture_output=True,
-            )
-        except OSError:
-            return 1, b""
-        return proc.returncode, proc.stdout
+        res = _capture_subprocess_bytes(
+            [git_bin, *args],
+            cwd=repo_root,
+            env=env,
+            timeout=timeout,
+            is_interrupted=is_interrupted,
+        )
+        if res.interrupted or (is_interrupted is not None and is_interrupted()):
+            raise _SessionInterrupted()
+        return res.returncode, res.stdout
 
     rc_wt, out_wt = _run(["rev-parse", "--is-inside-work-tree"])
     if rc_wt != 0 or out_wt.strip() != b"true":
@@ -492,14 +674,24 @@ def _try_git_tree_state(repo_root: Path, log_dir_resolved: Path, *, env: Mapping
     return h.hexdigest()
 
 
-def _content_hash_tree_state(repo_root: Path, log_dir_resolved: Path) -> str:
+def _content_hash_tree_state(
+    repo_root: Path,
+    log_dir_resolved: Path,
+    *,
+    is_interrupted: Callable[[], bool] | None = None,
+) -> str:
     """Deterministically hash `scripts/`, `src/`, `pyproject.toml`, and `uv.lock`."""
     h = hashlib.sha256()
     h.update(b"method=content_hash\0")
     hashed_files = 0
 
+    def _check_interrupt() -> None:
+        if is_interrupted is not None and is_interrupted():
+            raise _SessionInterrupted()
+
     def _hash_file(rel_posix: str, fp: Path) -> None:
         nonlocal hashed_files
+        _check_interrupt()
         h.update(b"file=")
         h.update(rel_posix.encode("utf-8", errors="surrogateescape"))
         h.update(b"\0")
@@ -507,6 +699,7 @@ def _content_hash_tree_state(repo_root: Path, log_dir_resolved: Path) -> str:
         h.update(f"{size}:".encode("ascii"))
         with open(fp, "rb") as f:
             while True:
+                _check_interrupt()
                 chunk = f.read(1024 * 1024)
                 if not chunk:
                     break
@@ -515,6 +708,7 @@ def _content_hash_tree_state(repo_root: Path, log_dir_resolved: Path) -> str:
         hashed_files += 1
 
     for root_name in ("scripts", "src"):
+        _check_interrupt()
         root_p = repo_root / root_name
         if not root_p.is_dir():
             h.update(b"missing_dir=")
@@ -522,6 +716,7 @@ def _content_hash_tree_state(repo_root: Path, log_dir_resolved: Path) -> str:
             h.update(b"\0")
             continue
         for dirpath, dirnames, filenames in os.walk(root_p, topdown=True, followlinks=False):
+            _check_interrupt()
             dp = Path(dirpath)
             dirnames[:] = sorted(
                 d for d in dirnames if not _is_bytecode_cache(d) and not _is_inside_dir(dp / d, log_dir_resolved)
@@ -534,6 +729,7 @@ def _content_hash_tree_state(repo_root: Path, log_dir_resolved: Path) -> str:
                     continue
                 rel_posix = fp.relative_to(repo_root).as_posix()
                 if fp.is_symlink():
+                    _check_interrupt()
                     h.update(b"symlink=")
                     h.update(rel_posix.encode("utf-8", errors="surrogateescape"))
                     h.update(b"\0")
@@ -544,6 +740,7 @@ def _content_hash_tree_state(repo_root: Path, log_dir_resolved: Path) -> str:
                     _hash_file(rel_posix, fp)
 
     for top_file in ("pyproject.toml", "uv.lock"):
+        _check_interrupt()
         fp = repo_root / top_file
         if fp.is_symlink():
             h.update(b"symlink=")
@@ -569,22 +766,33 @@ def compute_tree_state_sig(
     log_dir: Path,
     *,
     env: Mapping[str, str] | None = None,
+    is_interrupted: Callable[[], bool] | None = None,
+    git_timeout_s: float = 180.0,
 ) -> tuple[TreeStateMethod, str]:
     """Return `(method, sha256_hex)` describing the current repository tree state.
 
     Uses git when `git` is on `PATH` and `repo_root` is the top-level of a git work tree; otherwise
     falls back to deterministic content hashing of `scripts/`, `src/`, `pyproject.toml`, and `uv.lock`
     excluding `log_dir` and Python bytecode caches. Raises `RuntimeError` if no valid digest can be
-    produced so callers never proceed with an empty or constant signature.
+    produced so callers never proceed with an empty or constant signature, and raises
+    `_SessionInterrupted` without falling back if `is_interrupted()` triggers during git inspection.
     """
     log_dir_resolved = log_dir.resolve()
-    git_digest = _try_git_tree_state(repo_root, log_dir_resolved, env=env)
+    git_digest = _try_git_tree_state(
+        repo_root,
+        log_dir_resolved,
+        env=env,
+        is_interrupted=is_interrupted,
+        timeout=git_timeout_s,
+    )
+    if is_interrupted is not None and is_interrupted():
+        raise _SessionInterrupted()
     if git_digest is not None:
         method: TreeStateMethod = "git"
         digest = git_digest
     else:
         method = "content_hash"
-        digest = _content_hash_tree_state(repo_root, log_dir_resolved)
+        digest = _content_hash_tree_state(repo_root, log_dir_resolved, is_interrupted=is_interrupted)
 
     if not _HEX_SHA256_RE.match(digest):
         raise RuntimeError(f"invalid tree-state digest {digest!r} from method {method!r}")
@@ -687,8 +895,7 @@ def signal_names(sig_num: int) -> tuple[str, str]:
 
 
 def _resolve_ps_bin(env: Mapping[str, str] | None = None) -> str | None:
-    path_env = (env or os.environ).get("PATH")
-    found = shutil.which("ps", path=path_env)
+    found = _which_in_env("ps", env)
     if found is not None:
         return found
     return "/bin/ps" if os.path.isfile("/bin/ps") else None
@@ -942,6 +1149,7 @@ class SessionRunner:
     repo_root: Path = REPO_ROOT
     env: dict[str, str] = field(default_factory=lambda: dict(os.environ))
     uv_bin: str = "uv"
+    helper_timeout_s: float = 180.0
     teardown_grace_s: float = 3.0
     teardown_reap_s: float = 2.0
     on_before_stage_spawn: Callable[[str], None] | None = None
@@ -1063,53 +1271,32 @@ class SessionRunner:
         self.write_summary()
         return self.interrupted_exit_code
 
-    def _run_interruptible_capture(self, cmd: Sequence[str], *, timeout: float = 30.0) -> tuple[int, str]:
-        """Run a short helper command while polling for session interrupts so signals never wait on it."""
-        if self.interrupted_sig_num is not None:
-            return 128 + self.interrupted_sig_num, ""
-        try:
-            proc = subprocess.Popen(
-                list(cmd),
-                cwd=str(self.repo_root),
-                env=self.env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+    def _run_interruptible_capture(
+        self,
+        cmd: Sequence[str],
+        *,
+        timeout: float | None = None,
+    ) -> _CaptureResult:
+        """Run a helper command non-blockingly under deadline and session-interrupt checks."""
+        effective_timeout = self.helper_timeout_s if timeout is None else timeout
+        res = _capture_subprocess_bytes(
+            cmd,
+            cwd=self.repo_root,
+            env=self.env,
+            timeout=effective_timeout,
+            is_interrupted=lambda: self.interrupted_sig_num is not None,
+        )
+        if res.interrupted and self.interrupted_sig_num is not None:
+            return _CaptureResult(
+                128 + self.interrupted_sig_num,
+                res.stdout,
+                res.stderr,
+                timed_out=False,
+                interrupted=True,
             )
-        except OSError:
-            return 1, ""
-        deadline = time.monotonic() + timeout
-        while True:
-            rc = proc.poll()
-            if rc is not None:
-                out_b = proc.stdout.read() if proc.stdout is not None else b""
-                if proc.stdout is not None:
-                    proc.stdout.close()
-                return rc, out_b.decode("utf-8", errors="replace").strip()
-            if self.interrupted_sig_num is not None or time.monotonic() >= deadline:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except OSError:
-                    pass
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except OSError:
-                        pass
-                    try:
-                        proc.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        pass
-                if proc.stdout is not None:
-                    proc.stdout.close()
-                if self.interrupted_sig_num is not None:
-                    return 128 + self.interrupted_sig_num, ""
-                return 124, ""
-            time.sleep(0.02)
+        return res
 
-    def compute_runtime_env_sig(self) -> str:
+    def compute_runtime_env_sig(self, *, allow_uninitialized: bool = False) -> str:
         """Query the synced uv environment's interpreter, PyTorch, and CUDA identity."""
         cmd = [
             self.uv_bin,
@@ -1120,10 +1307,23 @@ class SessionRunner:
             "-c",
             _RUNTIME_ENV_SIG_SNIPPET,
         ]
-        rc, out = self._run_interruptible_capture(cmd)
-        if rc == 0 and out:
-            return out.splitlines()[-1].strip()
-        return "uninitialized"
+        res = self._run_interruptible_capture(cmd)
+        if res.interrupted or self.interrupted_sig_num is not None:
+            return "uninitialized"
+        stderr_detail = _format_stderr_snippet(res.stderr)
+        if res.timed_out:
+            raise HelperError(f"runtime environment probe timed out after {self.helper_timeout_s:.0f}s{stderr_detail}")
+        out = res.stdout.decode("utf-8", errors="replace").strip()
+        if res.returncode == 0:
+            if out:
+                return out.splitlines()[-1].strip()
+            if allow_uninitialized:
+                return "uninitialized"
+            raise HelperError(f"runtime environment probe returned empty output{stderr_detail}")
+        if allow_uninitialized:
+            return "uninitialized"
+        posix_rc = 128 + (-res.returncode) if res.returncode < 0 else res.returncode
+        raise HelperError(f"runtime environment probe failed (exit {posix_rc}){stderr_detail}")
 
     def query_gpu_count(self) -> int:
         """Query visible CUDA GPU count via PyTorch inside the synced project environment."""
@@ -1136,10 +1336,20 @@ class SessionRunner:
             "-c",
             _GPU_COUNT_SNIPPET,
         ]
-        rc, out = self._run_interruptible_capture(cmd)
-        if rc == 0 and out.isdigit():
-            return int(out)
-        return 0
+        res = self._run_interruptible_capture(cmd)
+        if res.interrupted or self.interrupted_sig_num is not None:
+            return 0
+        stderr_detail = _format_stderr_snippet(res.stderr)
+        if res.timed_out:
+            raise HelperError(f"CUDA GPU count probe timed out after {self.helper_timeout_s:.0f}s{stderr_detail}")
+        if res.returncode != 0:
+            posix_rc = 128 + (-res.returncode) if res.returncode < 0 else res.returncode
+            raise HelperError(f"CUDA GPU count probe failed (exit {posix_rc}){stderr_detail}")
+        out = res.stdout.decode("utf-8", errors="replace").strip()
+        last_line = out.splitlines()[-1].strip() if out else ""
+        if not (last_line.isascii() and last_line.isdigit()):
+            raise HelperError(f"CUDA GPU count probe returned invalid output {out!r}{stderr_detail}")
+        return int(last_line)
 
     def is_stage_resumed(self, name: str, expected_sig: str, required_artifact: Path | None) -> tuple[bool, str]:
         """Return `(resumed, artifact_sha)` when `<name>.done` matches `expected_sig` and artifact integrity."""
@@ -1642,7 +1852,7 @@ class SessionRunner:
 
     def run(self) -> int:
         """Execute the full Stage 3 verification session and return the POSIX exit code."""
-        if self.uv_bin == "uv" and shutil.which("uv", path=self.env.get("PATH")) is None:
+        if self.uv_bin == "uv" and _which_in_env("uv", self.env) is None:
             self._write_stderr_bytes(b"error: 'uv' not found on PATH; install uv before running this script\n")
             return 2
 
@@ -1652,7 +1862,15 @@ class SessionRunner:
         previous_handlers = self._install_signal_handlers()
         try:
             try:
-                self.tree_method, self.tree_sig = compute_tree_state_sig(self.repo_root, self.log_dir, env=self.env)
+                self.tree_method, self.tree_sig = compute_tree_state_sig(
+                    self.repo_root,
+                    self.log_dir,
+                    env=self.env,
+                    is_interrupted=lambda: self.interrupted_sig_num is not None,
+                    git_timeout_s=self.helper_timeout_s,
+                )
+            except _SessionInterrupted:
+                return self._finalize_interrupted()
             except Exception as exc:
                 self._write_stderr_bytes(f"error: failed to compute tree-state signature: {exc}\n".encode())
                 return 2
@@ -1660,7 +1878,13 @@ class SessionRunner:
             if self.interrupted_sig_num is not None:
                 return self._finalize_interrupted()
 
-            self.runtime_env_sig = self.compute_runtime_env_sig()
+            try:
+                self.runtime_env_sig = self.compute_runtime_env_sig(allow_uninitialized=True)
+            except HelperError as exc:
+                self._write_stderr_bytes(f"error: {exc}\n".encode())
+                self.any_failed = 1
+                self.write_summary()
+                return 2
             if self.interrupted_sig_num is not None:
                 return self._finalize_interrupted()
 
@@ -1691,7 +1915,13 @@ class SessionRunner:
 
             # Refresh resolved runtime identity after uv sync; if 01_env just synced a new venv,
             # rebind 01_env.done to the post-sync runtime identity so identical re-runs resume cleanly.
-            post_env_runtime_sig = self.compute_runtime_env_sig()
+            try:
+                post_env_runtime_sig = self.compute_runtime_env_sig(allow_uninitialized=False)
+            except HelperError as exc:
+                self._write_stderr_bytes(f"error: {exc}\n".encode())
+                self.any_failed = 1
+                self.write_summary()
+                return 2
             if self.interrupted_sig_num is not None:
                 return self._finalize_interrupted()
             if post_env_runtime_sig != self.runtime_env_sig:
@@ -1705,7 +1935,13 @@ class SessionRunner:
             # Query visible GPU count via PyTorch in the synced project environment.
             gpu_count = 0
             if self.config.backend == "nccl":
-                gpu_count = self.query_gpu_count()
+                try:
+                    gpu_count = self.query_gpu_count()
+                except HelperError as exc:
+                    self._write_stderr_bytes(f"error: {exc}\n".encode())
+                    self.any_failed = 1
+                    self.write_summary()
+                    return 2
                 if self.interrupted_sig_num is not None:
                     return self._finalize_interrupted()
                 if gpu_count < 1:
