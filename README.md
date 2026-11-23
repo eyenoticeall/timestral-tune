@@ -130,6 +130,34 @@ the default adapter (`r=8`, all four attention projections) come from sweeps acr
 For `full_ft` on 5M and 28M, `learning_rate=3e-4` gave lower error in our benchmarks, at the cost of two
 to three percentage points more forgetting; keep 1e-4 on 123M and 209M.
 
+## Memory and speed
+
+You do not need a large GPU. On a single NVIDIA L4, fine-tuning each model size on our retail demand
+and stock volatility benchmarks finished in under a minute and used less than 5 GiB of GPU memory:
+
+| Model | Peak GPU memory | Time to fine-tune |
+|---|---:|---:|
+| Timestral-5M | up to 0.5 GiB | under 20 s |
+| Timestral-28M | up to 1.5 GiB | under 30 s |
+| Timestral-123M | up to 3.1 GiB | under 45 s |
+| Timestral-209M | up to 4.9 GiB | under 60 s |
+
+Each run was 160 to 200 training steps at batch size 16 to 32, with a 256-step context, seven or eight
+covariates per series and `mixed_precision="bf16"`. Your numbers will scale with context length and
+batch size: the German power run in the chart below, with 400 steps and a 384-step context, took 40
+seconds on the 28M model.
+
+Why it stays small:
+
+- **LoRA trains under 2% of the weights.**
+- **`head_only` computes the frozen part of the model up front** and reuses it on every later pass.
+- **Covariates cost about 40% less memory** than in the official forward pass, because the training
+  layout drops tokens that carry no information.
+- **`bf16` and `compile_model=True` help on NVIDIA GPUs.** On the 28M model they took one full
+  fine-tuning step from 197 ms and 3.3 GiB to 60 ms and 1.8 GiB.
+- **Apple GPUs work too.** A full fine-tuning step of the 209M model at the longest supported context
+  (32,768 steps) fit in about 6 GiB on a 16 GB M4.
+
 ## Results
 
 Fine-tuning cut forecast error by about 11% on retail demand and 23% on German wind and solar power,
@@ -150,33 +178,6 @@ on German power.
 The [summary in docs/BENCHMARKS.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/BENCHMARKS.md#summary)
 explains why these gains are not noise, what else we found and the fine print. The rest of that page
 has every number, for every model size and mode, with the command to reproduce it.
-
-## Memory and speed
-
-You do not need a large GPU. On a single NVIDIA L4, every fine-tuning run behind the results above
-finished in under a minute and used less than 5 GiB of GPU memory:
-
-| Model | Peak GPU memory | Time to fine-tune |
-|---|---:|---:|
-| Timestral-5M | up to 0.5 GiB | under 20 s |
-| Timestral-28M | up to 1.5 GiB | under 30 s |
-| Timestral-123M | up to 3.1 GiB | under 45 s |
-| Timestral-209M | up to 4.9 GiB | under 60 s |
-
-Each run was 160 to 200 training steps at batch size 16 to 32, with a 256-step context, seven or eight
-covariates per series and `mixed_precision="bf16"`. Your numbers will scale with context length and
-batch size.
-
-Why it stays small:
-
-- **LoRA trains under 2% of the weights.**
-- **`head_only` computes the frozen part of the model up front** and reuses it on every later pass.
-- **Covariates cost about 40% less memory** than in the official forward pass, because the training
-  layout drops tokens that carry no information.
-- **`bf16` and `compile_model=True` help on NVIDIA GPUs.** On the 28M model they took one full
-  fine-tuning step from 197 ms and 3.3 GiB to 60 ms and 1.8 GiB.
-- **Apple GPUs work too.** A full fine-tuning step of the 209M model at the longest supported context
-  (32,768 steps) fit in about 6 GiB on a 16 GB M4.
 
 ## Calibrate intervals without training
 
