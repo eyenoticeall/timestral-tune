@@ -63,6 +63,6 @@ Full list in spec §12. The ones that matter next:
 ## Branch state
 
 - `main`: Phases 0–4 and v0.1.0 release (`v0.1.0` published on PyPI).
-- `practical-benchmarks` (unpushed, unmerged): practical-value benchmarks (WP1–WP4: decision metrics, scaling curves, three non-hourly post-release datasets vs tuned GBT, covariate ablation, serving latency; `README.md` untouched).
+- `practical-benchmarks`: squash-merged into `main` on 2026-11-24 (practical-value benchmarks WP1–WP4). The local branch is kept until `main` is pushed, then deleted.
 
 Branch policy is in `AGENTS.md` §6.

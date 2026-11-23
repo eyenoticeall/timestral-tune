@@ -973,3 +973,29 @@ L4 `bf16` training), removing all stale Revision-2 rows:
 **Not done / open.** Branch `practical-benchmarks` remains unpushed and unmerged awaiting maintainer
 review; `README.md`, `assets/results.png`, and version `0.1.0` remain untouched.
 
+
+## 2026-11-24 — Squash-merge `practical-benchmarks` into `main`; README states the GBT comparison
+
+**Done.**
+
+- Independent review of the final branch state before merging: recomputed the six-dataset table from
+  `docs/benchmarks/wp1_decision_metrics.json` and `wp3_unfamiliar_domains.json`, checked that every
+  paired interval contains its own estimate, confirmed the fine-tuned scores did not change across the
+  three baseline revisions, and re-ran the Revision-3 GBT search on all six datasets on a second machine
+  (Apple M4). Waves (`0.0798`) and German power (`0.0972`) reproduce exactly; the other four differ by
+  at most `0.4%`, which is the cross-machine spread recorded in `docs/BENCHMARKS.md` §6.3. No reading
+  depends on it.
+- Squash-merged the branch into `main` as one commit, so that the superseded copies of the result files
+  (about 13–15 MB each revision) stay out of history. The tree of the squash commit is identical to the
+  branch tip.
+- `README.md`, Results: added the comparison with the tuned gradient-boosted model, scoped to
+  `Timestral-28M` (8% and 6% less error on the two charted datasets, level on the four post-release test
+  sets) and noting that fine-tuned `5M` trails on those four. The chart is unchanged.
+
+**Decisions.** The README claim is limited to what the registered protocol supports: the two leads are on
+test periods that mostly predate the release, so the sentence says so next to the numbers. The other
+README proposals from the benchmark report (interval width, serving latency) were not applied.
+
+**Not done / open.** `main` is not pushed. The README on PyPI does not change until a release. The
+result files (`docs/benchmarks`, 14.7 MB) are included in the source package through the `docs` entry
+in `pyproject.toml`; excluding them is undecided.
