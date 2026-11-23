@@ -1276,6 +1276,11 @@ def _sc_t15e_broadcast_loss_adoption(rank: int, world_size: int) -> dict[str, An
     }
 
 
+def _sc_t15e_set_clear_stop(rank: int, world_size: int, mode: str) -> dict[str, Any]:
+    del rank
+    return _run_t15e_set_clear_stop(world_size, mode=mode, per_rank_batch=2)
+
+
 def _scenarios_t15e(world_size: int, base_dir: str) -> dict[str, Any]:
     del world_size, base_dir
     return {
@@ -1283,6 +1288,14 @@ def _scenarios_t15e(world_size: int, base_dir: str) -> dict[str, Any]:
         "stop_step": _sc_t15e_stop_on_step_end,
         "early_stop": _sc_t15e_early_stop_restore,
         "broadcast_loss": _sc_t15e_broadcast_loss_adoption,
+        # Reachable set->clear order 1: `on_fit_start` sets True, post-loop step-0 `on_evaluate` clears False
+        # (`_run_fit_loop` skips the while loop, then runs final `evaluate_now()` because `last_evaluated_step != 0`).
+        "stop_clear_start_to_eval": (_sc_t15e_set_clear_stop, ("fit_start_to_step0_eval",)),
+        # Reachable set->clear order 2: `on_step_end` sets True, same-step `on_evaluate` (`eval_every=1`) clears False
+        # before the loop's `if self.global_step >= final_step or self.should_stop: break` check.
+        # (Reverse orders -- `on_evaluate` -> next `on_step_end`, and `on_fit_start` -> first `on_step_end` -- are
+        # unreachable in `_run_fit_loop`, which immediately checks `self.should_stop` before entering the next step.)
+        "stop_clear_step_to_eval": (_sc_t15e_set_clear_stop, ("step_end_to_eval",)),
     }
 
 
@@ -1394,26 +1407,9 @@ def _run_t15e_set_clear_stop(world_size: int, *, mode: str, per_rank_batch: int)
     }
 
 
-def _worker_t15e_should_stop_cleared(rank: int, world_size: int) -> dict[str, Any]:
-    del rank
-    # Reachable set->clear order 1: `on_fit_start` sets True, post-loop step-0 `on_evaluate` clears False
-    # (`_run_fit_loop` skips the while loop, then runs final `evaluate_now()` because `last_evaluated_step != 0`).
-    start_to_eval = _run_t15e_set_clear_stop(world_size, mode="fit_start_to_step0_eval", per_rank_batch=2)
-    dist.barrier()
-    # Reachable set->clear order 2: `on_step_end` sets True, same-step `on_evaluate` (`eval_every=1`) clears False
-    # before the loop's `if self.global_step >= final_step or self.should_stop: break` check.
-    # (Reverse orders -- `on_evaluate` -> next `on_step_end`, and `on_fit_start` -> first `on_step_end` -- are
-    # unreachable in `_run_fit_loop`, which immediately checks `self.should_stop` before entering the next step.)
-    step_to_eval = _run_t15e_set_clear_stop(world_size, mode="step_end_to_eval", per_rank_batch=2)
-    return {
-        "fit_start_to_step0_eval": start_to_eval,
-        "step_end_to_eval": step_to_eval,
-    }
-
-
 @pytest.mark.acceptance
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_e_should_stop_cleared_after_set(world_size: int) -> None:
+def test_t15_e_should_stop_cleared_after_set(world_size: int, _t15_pool: Any) -> None:
     """T15(e) regression. Clearing `trainer.should_stop` after an earlier hook set it must sync
     `should_stop = False` on every non-zero rank so training continues to `max_steps` without
     deadlocking and matches one-process `fit()` with the same callback.
@@ -1428,19 +1424,13 @@ def test_t15_e_should_stop_cleared_after_set(world_size: int) -> None:
     assert ref_start["should_stop"] is False
     assert ref_start["cb_steps"] == [] and ref_start["cb_evals"] == [0]
 
-    outs = unwrap_results(
-        run_distributed(
-            _worker_t15e_should_stop_cleared,
-            world_size=world_size,
-            pg_timeout=3.0,
-            wall_timeout=15.0,
-        )
-    )
+    outcomes = _t15_pool("e", world_size)
+    step_outs = unwrap_results(outcomes["stop_clear_step_to_eval"])
+    start_outs = unwrap_results(outcomes["stop_clear_start_to_eval"])
 
-    r0_step = outs[0]["step_end_to_eval"]
+    r0_step = step_outs[0]
     assert r0_step["cb_steps"] == [1, 2, 3, 4] and r0_step["cb_evals"] == [1, 2, 3, 4]
-    for r, out in enumerate(outs):
-        se = out["step_end_to_eval"]
+    for r, se in enumerate(step_outs):
         assert se["result"] == r0_step["result"], f"step_end_to_eval r{r}: TrainingResult differs from rank 0"
         assert se["result"].steps == 4 and not se["result"].stopped_early
         assert se["should_stop"] is False, f"step_end_to_eval r{r}: should_stop left True on non-zero rank"
@@ -1453,8 +1443,8 @@ def test_t15_e_should_stop_cleared_after_set(world_size: int) -> None:
         if r > 0:
             assert se["cb_steps"] == [] and se["cb_evals"] == []
 
-        fs = out["fit_start_to_step0_eval"]
-        assert fs["result"] == outs[0]["fit_start_to_step0_eval"]["result"]
+    for r, fs in enumerate(start_outs):
+        assert fs["result"] == start_outs[0]["result"]
         assert fs["result"].steps == 0 and fs["result"].stopped_early
         assert fs["should_stop"] is False, f"fit_start_to_step0_eval r{r}: should_stop left True on non-zero rank"
         if r == 0:
@@ -1540,23 +1530,22 @@ def _sc_t15f_sign_flip(rank: int, world_size: int) -> dict[str, Any]:
     return _run_t15f_sign_flip(world_size, per_rank_batch=2, max_steps=None)
 
 
-def _run_t15f_lora_dropout(world_size: int, *, per_rank_batch: int, copies: int) -> dict[str, Any]:
-    """Run `lora_variate` with active dropout and record packed zero-masks from `LoRASliceLinear.dropout`."""
-    base_ds = _make_uneven_dataset([8, 6], seed=604, covariates=True)
+def _make_copied_dataset(num_windows: int, *, seed: int) -> TimeSeriesDataset:
+    """Build `num_windows` identical-shape 1-window series copies for deterministic dropout/RNG checks."""
+    base_ds = _make_uneven_dataset([8, 6], seed=seed, covariates=True)
     series_copies = [
         SeriesData(
-            f"d{c}_{s.series_id}",
-            s.timestamps.copy(),
-            s.targets.copy(),
-            s.past.copy(),
-            s.known.copy(),
-            s.categorical_past.copy(),
-            s.categorical_known.copy(),
+            f"d{idx}_{base_ds.series[idx % len(base_ds.series)].series_id}",
+            base_ds.series[idx % len(base_ds.series)].timestamps.copy(),
+            base_ds.series[idx % len(base_ds.series)].targets.copy(),
+            base_ds.series[idx % len(base_ds.series)].past.copy(),
+            base_ds.series[idx % len(base_ds.series)].known.copy(),
+            base_ds.series[idx % len(base_ds.series)].categorical_past.copy(),
+            base_ds.series[idx % len(base_ds.series)].categorical_known.copy(),
         )
-        for c in range(copies)
-        for s in base_ds.series
+        for idx in range(num_windows)
     ]
-    ds = TimeSeriesDataset(
+    return TimeSeriesDataset(
         series_copies,
         context_length=base_ds.context_length,
         forecast_horizon=base_ds.forecast_horizon,
@@ -1564,29 +1553,22 @@ def _run_t15f_lora_dropout(world_size: int, *, per_rank_batch: int, copies: int)
         min_context=base_ds.context_length,
         roles=base_ds.roles,
     )
-    cfg = _base_config(
-        mode="lora_variate",
-        batch_size=per_rank_batch,
-        epochs=1,
-        max_steps=2,
-        learning_rate=1e-2,
-        shuffle=False,
-        sign_flip=False,
-        seed=63,
-    )
-    trainer = TimestralTrainer(
-        cfg, ds, lora_config=_lora_for("lora_variate", dropout=0.5), model=_fresh_tiny_model(seed=10)
-    )
-    _activate_lora_b(trainer.model)
 
+
+def _attach_lora_dropout_recorder(
+    model: TuneTimestralModel,
+) -> tuple[list[Any], list[bytes], list[int], list[int]]:
+    """Attach training-only forward hooks to every `nn.Dropout` in `model`."""
     masks: list[bytes] = []
     dropped_counts: list[int] = []
     seen_initial_seeds: list[int] = []
-    handles = []
-    for mod in trainer.model.modules():
+    handles: list[Any] = []
+    for mod in model.modules():
         if isinstance(mod, torch.nn.Dropout):
 
-            def _record_drop(_m: torch.nn.Module, inp: tuple[Tensor, ...], out: Tensor) -> None:
+            def _record_drop(m: torch.nn.Module, inp: tuple[Tensor, ...], out: Tensor) -> None:
+                if not m.training:
+                    return
                 if not seen_initial_seeds:
                     seen_initial_seeds.append(int(torch.initial_seed()))
                 dropped = (out.detach() == 0) & (inp[0].detach() != 0)
@@ -1595,24 +1577,249 @@ def _run_t15f_lora_dropout(world_size: int, *, per_rank_batch: int, copies: int)
 
             handles.append(mod.register_forward_hook(_record_drop))
     assert handles, "expected at least one LoRA nn.Dropout module"
+    return handles, masks, dropped_counts, seen_initial_seeds
+
+
+def _run_t15f_lora_dropout(
+    world_size: int,
+    *,
+    per_rank_batch: int,
+    num_windows: int,
+    epochs: int = 1,
+    max_steps: int = 2,
+    seed: int = 63,
+    with_val: bool = False,
+    track_rng_isolation: bool = False,
+) -> dict[str, Any]:
+    """Run `lora_variate` with active dropout, recording training zero-masks and optional RNG isolation."""
+    ds = _make_copied_dataset(num_windows, seed=604)
+    val_ds = _make_uneven_dataset([8, 4, 6, 2][:world_size], seed=608, covariates=True) if with_val else None
+    cfg = _base_config(
+        mode="lora_variate",
+        batch_size=per_rank_batch,
+        eval_batch_size=2,
+        epochs=epochs,
+        max_steps=max_steps,
+        eval_every=1 if with_val else None,
+        learning_rate=1e-2,
+        shuffle=False,
+        sign_flip=False,
+        restore_best=False,
+        seed=seed,
+    )
+    trainer = TimestralTrainer(
+        cfg, ds, val_ds, lora_config=_lora_for("lora_variate", dropout=0.5), model=_fresh_tiny_model(seed=10)
+    )
+    _activate_lora_b(trainer.model)
+
+    handles, masks, dropped_counts, seen_initial_seeds = _attach_lora_dropout_recorder(trainer.model)
+    rng_after_prepare: list[Tensor] = []
+    train_pre_states: list[Tensor] = []
+    train_post_states: list[Tensor] = []
+    val_rng_preserved: list[bool] = []
+
+    if track_rng_isolation:
+        orig_make_strategy = trainer._make_fit_strategy
+
+        def _wrapped_make_strategy() -> Any:
+            strategy = orig_make_strategy()
+            orig_prepare = strategy.prepare_fit
+            orig_eval = strategy.evaluate_val
+
+            def _wrapped_prepare() -> None:
+                orig_prepare()
+                rng_after_prepare.append(torch.get_rng_state().clone())
+
+            def _wrapped_eval() -> EvalResult:
+                before = torch.get_rng_state().clone()
+                ev = orig_eval()
+                after = torch.get_rng_state().clone()
+                val_rng_preserved.append(bool(torch.equal(before, after)))
+                return ev
+
+            strategy.prepare_fit = _wrapped_prepare
+            strategy.evaluate_val = _wrapped_eval
+            return strategy
+
+        trainer._make_fit_strategy = _wrapped_make_strategy  # type: ignore[method-assign]
+        handles.append(
+            trainer.model.transformer.register_forward_pre_hook(
+                lambda _m, _inp: (
+                    train_pre_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+                )
+            )
+        )
+        handles.append(
+            trainer.model.transformer.register_forward_hook(
+                lambda _m, _inp, _out: (
+                    train_post_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+                )
+            )
+        )
+
     try:
         res = trainer.fit()
     finally:
         for h in handles:
             h.remove()
+
+    train_loader_rng_isolated = (
+        bool(rng_after_prepare)
+        and bool(train_pre_states)
+        and bool(torch.equal(rng_after_prepare[0], train_pre_states[0]))
+    )
+    between_steps_rng_isolated = len(train_pre_states) == len(train_post_states) and all(
+        bool(torch.equal(train_post_states[i], train_pre_states[i + 1])) for i in range(len(train_pre_states) - 1)
+    )
     return {
         "result": res,
         "initial_seed": seen_initial_seeds[0],
         "masks": masks,
         "dropped_counts": dropped_counts,
+        "train_fwd_count": len(train_pre_states),
+        "train_loader_rng_isolated": train_loader_rng_isolated,
+        "between_steps_rng_isolated": between_steps_rng_isolated,
+        "val_rng_preserved": val_rng_preserved,
         "params": _flat_params(trainer.model),
     }
 
 
 def _sc_t15f_lora_dropout(rank: int, world_size: int) -> dict[str, Any]:
     del rank
-    # 2 identical windows per rank across 2 steps so any mask difference comes solely from rank-offset RNG.
-    return _run_t15f_lora_dropout(world_size, per_rank_batch=2, copies=world_size * 2)
+    # 2 full global steps (4*N windows) + eval_every=1 with len(val)==N so every rank exercises
+    # lazy train loader creation, sharded validation iteration, and 2-step LoRA dropout.
+    return _run_t15f_lora_dropout(
+        world_size,
+        per_rank_batch=2,
+        num_windows=world_size * 4,
+        epochs=1,
+        max_steps=2,
+        seed=63,
+        with_val=True,
+        track_rng_isolation=True,
+    )
+
+
+def _sc_t15f_empty_step_rng(rank: int, world_size: int) -> dict[str, Any]:
+    del rank
+    # N*2 + 1 windows across 2 epochs (max_steps=3, eval_every=1):
+    # step 1 (epoch 0, step 0): all ranks active (2w) -> eval 1
+    # step 2 (epoch 0, step 1, trailing R=1): rank 0 active (1w), ranks 1..N-1 EMPTY -> eval 2
+    # step 3 (epoch 1, step 0): all ranks lazily build epoch-1 train loader and run active (2w) -> eval 3
+    return _run_t15f_lora_dropout(
+        world_size,
+        per_rank_batch=2,
+        num_windows=world_size * 2 + 1,
+        epochs=2,
+        max_steps=3,
+        seed=68,
+        with_val=True,
+        track_rng_isolation=True,
+    )
+
+
+def _sc_t15f_late_first_slice_rng(rank: int, world_size: int) -> dict[str, Any]:
+    """Verify lazy `iter(self._train_loader)` on a rank whose first non-empty slice comes late (step 1).
+
+    Swaps `slice_size(0)` and `slice_size(1)` on rank `N - 1` (from `(2, 0)` to `(0, 2)`) inside a
+    2-step epoch with an internal `evaluate_val()` between steps 0 and 1, checking that neither the
+    empty step 0, nor sharded validation, nor step-1 lazy iterator creation advances global RNG,
+    and that rank `N - 1`'s step-1 LoRA dropout masks equal an uninterrupted stream from
+    `rank_seed(69, N - 1)`.
+    """
+    ds = _make_copied_dataset(world_size * 2 + 1, seed=604)
+    val_ds = _make_uneven_dataset([8, 4, 6, 2][:world_size], seed=609, covariates=True)
+    cfg = _base_config(
+        mode="lora_variate",
+        batch_size=2,
+        eval_batch_size=2,
+        epochs=1,
+        max_steps=2,
+        learning_rate=1e-2,
+        shuffle=False,
+        sign_flip=False,
+        restore_best=False,
+        seed=69,
+    )
+    trainer = TimestralTrainer(
+        cfg, ds, val_ds, lora_config=_lora_for("lora_variate", dropout=0.5), model=_fresh_tiny_model(seed=10)
+    )
+    _activate_lora_b(trainer.model)
+    handles, masks, dropped_counts, _ = _attach_lora_dropout_recorder(trainer.model)
+
+    strategy = trainer._make_fit_strategy()
+    strategy.prepare_fit()
+    assert strategy._sampler is not None and strategy._train_loader is not None
+    rng_after_prepare = torch.get_rng_state().clone()
+
+    if rank == world_size - 1:
+        orig_slice_size = strategy._sampler.slice_size
+        assert orig_slice_size(0) == 2 and orig_slice_size(1) == 0
+        strategy._sampler.slice_size = lambda step_idx: orig_slice_size(1 - step_idx)  # type: ignore[method-assign]
+
+    train_loader = strategy._train_loader
+    train_iter_calls = 0
+    orig_iter = DataLoader.__iter__
+
+    def _spied_iter(self_loader: DataLoader[Any]) -> Any:
+        nonlocal train_iter_calls
+        if self_loader is train_loader:
+            train_iter_calls += 1
+        return orig_iter(self_loader)
+
+    train_pre_states: list[Tensor] = []
+    train_post_states: list[Tensor] = []
+    handles.append(
+        trainer.model.transformer.register_forward_pre_hook(
+            lambda _m, _inp: train_pre_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+        )
+    )
+    handles.append(
+        trainer.model.transformer.register_forward_hook(
+            lambda _m, _inp, _out: (
+                train_post_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+            )
+        )
+    )
+
+    DataLoader.__iter__ = _spied_iter  # type: ignore[method-assign]
+    trainer.model.train()
+    try:
+        step_gen = strategy.iter_epoch_steps(0)
+        outcome0 = next(step_gen)
+        iter_after_step0 = train_iter_calls
+        rng_after_step0 = torch.get_rng_state().clone()
+
+        rng_before_val = torch.get_rng_state().clone()
+        strategy.evaluate_val()
+        rng_after_val = torch.get_rng_state().clone()
+
+        outcome1 = next(step_gen)
+        iter_after_step1 = train_iter_calls
+    finally:
+        DataLoader.__iter__ = orig_iter  # type: ignore[method-assign]
+        for h in handles:
+            h.remove()
+        strategy.cleanup()
+        trainer.model.eval()
+
+    return {
+        "skipped": [outcome0.skipped, outcome1.skipped],
+        "iter_after_step0": iter_after_step0,
+        "iter_after_step1": iter_after_step1,
+        "step0_preserved_prepare_rng": bool(torch.equal(rng_after_step0, rng_after_prepare)),
+        "val_preserved_rng": bool(torch.equal(rng_before_val, rng_after_val)),
+        "first_train_fwd_preserved_prepare_rng": bool(train_pre_states)
+        and bool(torch.equal(train_pre_states[0], rng_after_prepare)),
+        "between_steps_preserved_rng": len(train_pre_states) == len(train_post_states)
+        and all(
+            bool(torch.equal(train_post_states[i], train_pre_states[i + 1])) for i in range(len(train_pre_states) - 1)
+        ),
+        "train_fwd_count": len(train_pre_states),
+        "masks": masks,
+        "dropped_counts": dropped_counts,
+        "params": _flat_params(trainer.model),
+    }
 
 
 def _run_t15f_short_dataset(
@@ -1681,6 +1888,8 @@ def _scenarios_t15f(world_size: int, base_dir: str) -> dict[str, Any]:
         "shuffled": _sc_t15f_shuffled_epochs,
         "sign_flip": _sc_t15f_sign_flip,
         "lora_dropout": _sc_t15f_lora_dropout,
+        "empty_step_rng": _sc_t15f_empty_step_rng,
+        "late_first_slice_rng": _sc_t15f_late_first_slice_rng,
         "short_no_val": (_sc_t15f_short_dataset, (False,)),
         "short_with_val": (_sc_t15f_short_dataset, (True,)),
     }
@@ -1691,9 +1900,11 @@ def _scenarios_t15f(world_size: int, base_dir: str) -> dict[str, Any]:
 def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
     """T15(f). Shuffled multi-epoch `fit()` uses distinct per-epoch permutations, equal step counts,
     exact once-per-epoch union coverage, and balanced trailing splits; `sign_flip=True` and LoRA
-    dropout use rank-0's one-process RNG stream while peers draw pairwise distinct streams; datasets
-    shorter than `world_size` (with and without `val_dataset`) never create a `DataLoader` iterator
-    on idle ranks and match one-process `fit()`.
+    dropout use rank-0's one-process RNG stream while peers draw pairwise distinct streams; lazy
+    train-loader iterator creation (including late first non-empty slices) and sharded validation
+    never advance the global PyTorch RNG so post-empty-step dropout matches uninterrupted
+    `rank_seed(seed, rank)`; datasets shorter than `world_size` (with and without `val_dataset`)
+    never create a `DataLoader` iterator on idle ranks and match one-process `fit()`.
     """
     ref_flip = _run_t15f_sign_flip(world_size, per_rank_batch=2, max_steps=8)
     assert len(ref_flip["flips"]) == 16
@@ -1754,12 +1965,33 @@ def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
         assert stream not in seen_streams, f"rank {r} flip stream collided with another rank"
         seen_streams.add(stream)
 
-    # 3. Rank-offset global seed (LoRA dropout stream): rank 0 keeps config.seed while all ranks draw distinct masks.
+    # 3. Rank-offset global seed, loader RNG isolation (train + sharded val), and LoRA dropout stream continuity.
     drop_outs = unwrap_results(outcomes["lora_dropout"])
     seen_drop_streams: set[tuple[bytes, ...]] = set()
     for r, out in enumerate(drop_outs):
         assert len(out["masks"]) > 0 and all(c > 0 for c in out["dropped_counts"]), (
             f"lora_dropout r{r}: dropout did not activate"
+        )
+        assert out["train_loader_rng_isolated"] is True, (
+            f"lora_dropout r{r}: lazy train DataLoader iterator advanced global PyTorch RNG"
+        )
+        assert out["val_rng_preserved"] == [True, True], (
+            f"lora_dropout r{r}: sharded validation loader advanced global PyTorch RNG: {out['val_rng_preserved']}"
+        )
+        assert out["between_steps_rng_isolated"] is True, (
+            f"lora_dropout r{r}: global PyTorch RNG changed between step-1 and step-2 forwards"
+        )
+        ref_drop = _run_t15f_lora_dropout(
+            world_size,
+            per_rank_batch=2,
+            num_windows=4,
+            epochs=1,
+            max_steps=2,
+            seed=rank_seed(63, r),
+            with_val=False,
+        )
+        assert out["masks"] == ref_drop["masks"], (
+            f"lora_dropout r{r}: LoRA dropout masks diverged from uninterrupted rank_seed(63, {r}) stream"
         )
         key = tuple(out["masks"])
         assert key not in seen_drop_streams, f"lora_dropout r{r}: shared dropout mask stream with another rank"
@@ -1769,6 +2001,82 @@ def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
         )
         assert out["result"] == drop_outs[0]["result"]
         assert torch.equal(out["params"], drop_outs[0]["params"])
+
+    # 3b. Empty trailing step + sharded validation + epoch-1 lazy loader preserve every rank's global RNG stream:
+    # rank 0 matches 1-process fit() from seed=68; peers match uninterrupted rank_seed(68, r) after the empty step.
+    empty_rng_outs = unwrap_results(outcomes["empty_step_rng"])
+    ref_empty_r0 = _run_t15f_lora_dropout(
+        world_size, per_rank_batch=2, num_windows=3, epochs=2, max_steps=3, seed=68, with_val=False
+    )
+    for r, out in enumerate(empty_rng_outs):
+        assert out["result"] == empty_rng_outs[0]["result"]
+        assert torch.equal(out["params"], empty_rng_outs[0]["params"])
+        assert out["train_loader_rng_isolated"] is True, (
+            f"empty_step_rng r{r}: epoch-0 lazy train loader advanced global PyTorch RNG"
+        )
+        assert out["val_rng_preserved"] == [True, True, True], (
+            f"empty_step_rng r{r}: sharded validation advanced global PyTorch RNG: {out['val_rng_preserved']}"
+        )
+        assert out["between_steps_rng_isolated"] is True, (
+            f"empty_step_rng r{r}: empty step / val / epoch-1 lazy loader advanced global PyTorch RNG"
+        )
+        if r == 0:
+            assert out["train_fwd_count"] == 3
+            assert out["masks"] == ref_empty_r0["masks"], (
+                "empty_step_rng r0: dropout stream diverged from one-process fit() at seed=68"
+            )
+        else:
+            assert out["train_fwd_count"] == 2, f"empty_step_rng r{r}: expected 2 active forwards across 3 global steps"
+            ref_peer = _run_t15f_lora_dropout(
+                world_size,
+                per_rank_batch=2,
+                num_windows=4,
+                epochs=1,
+                max_steps=2,
+                seed=rank_seed(68, r),
+                with_val=False,
+            )
+            assert out["masks"] == ref_peer["masks"], (
+                f"empty_step_rng r{r}: post-empty-step dropout stream diverged from uninterrupted rank_seed(68, {r})"
+            )
+
+    # 3c. Rank whose VERY FIRST non-empty slice comes late (step 1 after empty step 0 + sharded val):
+    # lazy iter(self._train_loader) on step 1 leaves global RNG untouched and matches uninterrupted rank_seed(69, r).
+    late_outs = unwrap_results(outcomes["late_first_slice_rng"])
+    ref_late_r0 = _run_t15f_lora_dropout(
+        world_size, per_rank_batch=2, num_windows=3, epochs=1, max_steps=2, seed=69, with_val=False
+    )
+    ref_late_last = _run_t15f_lora_dropout(
+        world_size,
+        per_rank_batch=2,
+        num_windows=2,
+        epochs=1,
+        max_steps=1,
+        seed=rank_seed(69, world_size - 1),
+        with_val=False,
+    )
+    for r, out in enumerate(late_outs):
+        assert out["skipped"] == [False, False]
+        assert out["val_preserved_rng"] is True, f"late_first_slice_rng r{r}: sharded val advanced global PyTorch RNG"
+        assert out["first_train_fwd_preserved_prepare_rng"] is True, (
+            f"late_first_slice_rng r{r}: lazy train loader advanced global PyTorch RNG"
+        )
+        assert out["between_steps_preserved_rng"] is True
+        assert torch.equal(out["params"], late_outs[0]["params"])
+        if r == 0:
+            assert out["iter_after_step0"] == 1 and out["iter_after_step1"] == 1
+            assert out["train_fwd_count"] == 2
+            assert out["masks"] == ref_late_r0["masks"]
+        elif r == world_size - 1:
+            assert out["iter_after_step0"] == 0 and out["iter_after_step1"] == 1, (
+                f"late_first_slice_rng r{r}: expected lazy iterator creation on step 1, got "
+                f"({out['iter_after_step0']}, {out['iter_after_step1']})"
+            )
+            assert out["step0_preserved_prepare_rng"] is True
+            assert out["train_fwd_count"] == 1
+            assert out["masks"] == ref_late_last["masks"], (
+                f"late_first_slice_rng r{r}: late-first-slice dropout stream diverged from rank_seed(69, {r})"
+            )
 
     # 4. Dataset shorter than world_size (`len = N - 1`), with and without val_dataset: idle rank never creates a
     # DataLoader iterator and results match one-process fit().
@@ -2659,6 +2967,18 @@ def _sc_t15i_fit_fail_over_non_finite(rank: int, world_size: int) -> dict[str, A
             handle.remove()
 
 
+def _sc_t15i_startup_digest_failure(rank: int, world_size: int) -> dict[str, Any]:
+    ds = _make_uneven_dataset([8, 4, 6, 2], seed=909, covariates=True)
+    # Non-JSON-serialisable `model_name_or_path` with explicit `model=` bypasses `load_model()` in
+    # step (a) and raises `TypeError` inside `_startup_consistency_digest()` on rank 1 only.
+    bad_path: Any = object() if rank == 1 else "tiny-local-test"
+    cfg = _base_config(model_name_or_path=bad_path, mode="head_only", batch_size=2, max_steps=1, seed=31)
+    return _record_propagated_exception(
+        lambda: TimestralTrainer(cfg, ds, model=_fresh_tiny_model(seed=17)),
+        world_size,
+    )
+
+
 def _scenarios_t15i(world_size: int, base_dir: str) -> dict[str, Any]:
     del base_dir
     two_ranks = (0, 1) if world_size == 2 else (1, 3)
@@ -2666,6 +2986,7 @@ def _scenarios_t15i(world_size: int, base_dir: str) -> dict[str, Any]:
         "init_r0": _sc_t15i_init_fail_rank0,
         "init_r1": _sc_t15i_init_fail_nonzero,
         "init_two": _sc_t15i_init_fail_two_ranks,
+        "init_digest_r1": _sc_t15i_startup_digest_failure,
         "fit_r1": (_sc_t15i_fit_fail_rank, ((1,),)),
         "fit_r0": (_sc_t15i_fit_fail_rank, ((0,),)),
         "fit_two": (_sc_t15i_fit_fail_rank, (two_ranks,)),
@@ -2723,6 +3044,17 @@ def test_t15_i_single_rank_failure_propagation(world_size: int, _t15_pool: Any) 
     assert issubclass(RankFailureError, RuntimeError)
 
 
+@pytest.mark.acceptance
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_t15_i_startup_digest_failure_propagation(world_size: int, _t15_pool: Any) -> None:
+    """T15(i) regression. A single-rank failure while computing the startup consistency digest
+    must propagate (`TypeError` on the failing rank, `RankFailureError` naming it on every peer)
+    and leave the process group clean for follow-up collectives instead of timing out peers.
+    """
+    outcomes = _t15_pool("i", world_size)
+    _assert_propagated(unwrap_results(outcomes["init_digest_r1"]), world_size, {1: TypeError}, "init_digest_r1")
+
+
 # --------------------------------------------------------------------------- collection-aware scenario pool
 
 _SCENARIO_GROUPS: dict[str, Callable[[int, str], dict[str, Any]]] = {
@@ -2743,10 +3075,12 @@ _TEST_TO_GROUP: dict[str, str] = {
     "test_t15_c_global_zero_scored_step_and_empty_epoch": "c",
     "test_t15_d_initial_broadcast_and_consistency": "d",
     "test_t15_e_stop_restore_and_training_result": "e",
+    "test_t15_e_should_stop_cleared_after_set": "e",
     "test_t15_f_sampling_and_sign_flips": "f",
     "test_t15_g_validation_and_post_fit_evaluate": "g",
     "test_t15_h_guards_and_export": "h",
     "test_t15_i_single_rank_failure_propagation": "i",
+    "test_t15_i_startup_digest_failure_propagation": "i",
 }
 
 
@@ -2757,8 +3091,8 @@ def _t15_pool(
     """Amortise spawn overhead by running all collected T15(a)-(i) scenarios in one process group per `world_size`.
 
     Inspects `request.session.items` so filtered runs (e.g. `pytest -k test_t15_g`) still spawn only
-    the selected clause(s), while full-file runs execute all nine balanced clauses in two spawns
-    (`world_size=2` and `world_size=4`) instead of eighteen.
+    the selected clause(s), while full-file runs execute all T15(a)-(i) clauses (including the
+    pooled hang regressions) in two spawns (`world_size=2` and `world_size=4`).
     """
     needed_by_ws: dict[int, list[str]] = {}
     for item in request.session.items:
@@ -2794,33 +3128,3 @@ def _t15_pool(
         return cache[world_size][group]
 
     return _get
-
-
-def _worker_t15i_startup_digest_failure(rank: int, world_size: int) -> dict[str, Any]:
-    ds = _make_uneven_dataset([8, 4, 6, 2], seed=909, covariates=True)
-    # Non-JSON-serialisable `model_name_or_path` with explicit `model=` bypasses `load_model()` in
-    # step (a) and raises `TypeError` inside `_startup_consistency_digest()` on rank 1 only.
-    bad_path: Any = object() if rank == 1 else "tiny-local-test"
-    cfg = _base_config(model_name_or_path=bad_path, mode="head_only", batch_size=2, max_steps=1, seed=31)
-    return _record_propagated_exception(
-        lambda: TimestralTrainer(cfg, ds, model=_fresh_tiny_model(seed=17)),
-        world_size,
-    )
-
-
-@pytest.mark.acceptance
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_i_startup_digest_failure_propagation(world_size: int) -> None:
-    """T15(i) regression. A single-rank failure while computing the startup consistency digest
-    must propagate (`TypeError` on the failing rank, `RankFailureError` naming it on every peer)
-    and leave the process group clean for follow-up collectives instead of timing out peers.
-    """
-    outs = unwrap_results(
-        run_distributed(
-            _worker_t15i_startup_digest_failure,
-            world_size=world_size,
-            pg_timeout=3.0,
-            wall_timeout=15.0,
-        )
-    )
-    _assert_propagated(outs, world_size, {1: TypeError}, "init_digest_r1")
