@@ -3,8 +3,8 @@
 Runs the real `TimestralTrainer` across ranks under `torchrun` on either `gloo` (CPU) or `nccl`
 (CUDA) and compares against a one-process reference saved on the same device type. Reports
 measured numbers without grading float32/bf16 tolerances; exits non-zero only on crashes, detected
-hangs, cross-rank mismatches of parameters or `TrainingResult` in a deterministic scenario,
-failed export checks, reference mismatches, or raised exceptions.
+hangs, cross-rank mismatches of model state (parameters + buffers) or `TrainingResult` in a
+deterministic scenario, failed export checks, reference mismatches, or raised exceptions.
 
 Two-step workflow (one-process reference first, then `torchrun`):
 
@@ -29,15 +29,44 @@ Two-step workflow (one-process reference first, then `torchrun`):
         scripts/probes/distributed_trainer_check.py \\
         --backend nccl --device-map per-rank --sizes 5M 28M --reference /tmp/ref_cuda_n4.zip
 
-Reference storage (`--reference-mode`, default `sketch`):
-- `sketch`: stores exact float64 `delta = final - init` whenever `numel <= 8192` (all tiny LoRA
-  scenarios are 100% exact) and a deterministic `k = 8192` float64 CountSketch of `delta`
-  (`64 KiB` per scenario, ~0.8% relative L2 standard error across 15+ orders of magnitude) when
-  `numel > 8192`, alongside exact SHA-256 digests (`init_sha256`, `final_sha256` -> exact `0.0`
-  on bitwise matches) and exact float64 `||final||_2` and `||delta||_2`. Keeps reference archives
-  under ~2 MiB for `tiny_random` and ~5 MiB for `5M`+`28M` with O(1) peak memory.
-- `exact`: streams full native-dtype trainable vectors into the zip archive (one entry per
-  scenario, O(1) peak memory; large on disk for released `full_ft`).
+Reference storage (`--reference-mode`, default `auto`):
+- `auto`: stores exact float64 `delta = final - init` for every `float64` scenario with
+  `numel <= 1,000,000` (100% of `tiny_random` float64 scenarios, all `5M` LoRA + `head_only`, and
+  all `28M` LoRA) and for any `float32`/`bf16` scenario with `numel <= 8192`; uses a deterministic
+  `k = 8192` float64 CountSketch (`64 KiB`/scenario) for larger vectors. Keeps `tiny_random` at
+  ~25 MiB (100% exact on float64) and `5M`+`28M` at ~37 MiB per world size with O(1) peak RAM.
+- `sketch`: uses `k = 8192` CountSketch whenever `numel > 8192` (~1.9 MiB on `tiny_random`,
+  ~4.8 MiB on `5M`+`28M`). CountSketch has ~0.78% relative L2 standard error well above its float64
+  bucket-accumulation noise floor `floor_rel = 0.25 * sqrt(n / k) * eps_f64` (~4.3e-16 at 490K,
+  ~1.4e-15 at 5M, ~3.2e-15 at 28M; measured 1.3x–7x inflation below ~1e-14 on 5M/28M). Any sketch
+  estimate within 10x of `floor_rel` is flagged `sketch_bound(floor~...)` in `notes`, and any
+  hash mismatch with zero sketch difference is flagged `sketch_underflow(sha_differs)`.
+- `exact`: streams full native-dtype `final_trainable` vectors into the zip archive (O(1) peak
+  memory; ~45 MiB on `tiny_random`, ~2.2 GiB on `5M`+`28M`).
+
+Column definitions:
+- `xr_eq`: exact 256-bit SHA-256 unanimity across all ranks over all `model.named_parameters()`
+  and all `model.named_buffers()`. (`TrainingResult` unanimity across all 10 fields is checked
+  separately; disagreement appends `RESULT_MISMATCH` to `notes` and fails deterministic runs.)
+- `xr_max`: `max_{r >= 1} ||state_r - state_0||_inf` in float64 over all `model.named_parameters()`
+  and all `model.named_buffers()` (propagates `NaN`).
+- `param_l2`, `upd_l2`: relative L2 of `final_trainable` and `delta = final_trainable - init_trainable`
+  computed over `trainer._trainable` only (for sensitivity in `head_only`/LoRA), against the
+  reference's exact float64 norms. Bitwise-identical non-finite vectors report `nan`, never `0`.
+- `loss_rel`, `val_rel`: NaN-propagating maximum relative step-loss and validation-loss difference.
+- `wall_s`: `max_r` wall time of `trainer.fit()` starting after a cross-rank barrier + CUDA sync.
+- `step_ms`: `max_r` mean per-step optimiser latency strictly after the first two optimiser steps
+  (timed per step from `optimizer.zero_grad` to the `optimizer.step` post-hook with CUDA sync,
+  excluding periodic validation passes and step-1/2 loader startup/compilation).
+- `tail_s`: `max_r` time from the final optimiser step to `fit()` returning (includes any final
+  validation, `finalize_best()`, `on_fit_end()`, and DataLoader worker teardown).
+- `vram_mib`: `max_r` peak `torch.cuda.max_memory_allocated()` during `fit()` in MiB (`2**20` bytes, CUDA only).
+- `val_s` (in `notes` when validating): `max_r` cumulative time spent inside `evaluate_val()`.
+- `graphs=s1:A->end:B(+C,bumps_post_s1=D)` (in `notes` for compiled scenarios): `A` is Dynamo
+  `unique_graphs` after optimiser step 1, `B` is `unique_graphs` after `fit()`, `+C = B - A` new
+  graphs compiled after step 1, and `D` is the number of distinct optimiser steps after step 1 on
+  which `unique_graphs` increased (`bumps_post_s1=1` indicates one specialisation, e.g. for the
+  shorter trailing batch, rather than repeated recompilation).
 
 See `docs/phases/phase-5-multi-gpu.md` §3 and `docs/SPEC.md` §5.6, §12.
 """
@@ -47,6 +76,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import dataclasses
 import datetime
 import gc
 import hashlib
@@ -66,15 +96,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import numpy as np
 import torch
 import torch.distributed as dist
-from _common import PATCH, SIZES, float64_reference, load, rel, tiny_random_forecaster
+from _common import SIZES, float64_reference, load, rel, tiny_random_forecaster
+from _dist_common import (
+    CTX_PATCHES,
+    DOM_HORIZON,
+    HOR_PATCHES,
+    REP_HORIZON,
+    check_tmpdir_for_workers,
+    cuda_env_banner_parts,
+    make_synthetic_dataset,
+    validate_distributed_device_map,
+)
 from torch import Tensor
 
 from timestral_tune import LoraConfig, ReplayConfig, TimestralTrainer, TrainingConfig
 from timestral_tune.config import AdaptationMode
-from timestral_tune.data import ColumnRoles, SeriesData, TimeSeriesDataset
+from timestral_tune.data import TimeSeriesDataset
 from timestral_tune.export import dataset_fingerprint
 from timestral_tune.models import TuneTimestralModel
 from timestral_tune.trainer import TrainingResult, compute_loss
@@ -90,25 +129,18 @@ def _torch_major_minor() -> tuple[int, int]:
 # PyTorch < 2.8 on macOS hangs at interpreter exit after DataLoader worker processes run (VERIFICATION.md §10).
 WORKERS_HANG_AT_EXIT = sys.platform == "darwin" and _torch_major_minor() < (2, 8)
 
-SCHEMA_VERSION = 3
-CTX_PATCHES = 2
-HOR_PATCHES = 2
-DOM_HORIZON = HOR_PATCHES * PATCH  # 64
-REP_HORIZON = PATCH + PATCH // 2  # 48 (non-multiple of PATCH; exercises distillation mask padding)
+SCHEMA_VERSION = 4
 DEFAULT_BATCH_SIZE = 2
 DEFAULT_REPLAY_BATCH_SIZE = 2
 DEFAULT_STEPS = 6
 DEFAULT_TIMEOUT_S = 180.0
 SKETCH_DIM = 8192
 SKETCH_CHUNK = 262_144
+AUTO_EXACT_F64_MAX_NUMEL = 1_000_000
+MOVED_WARMUP_STEPS = 3
+MOVED_WARMUP_BATCH_SIZE = 4
 
-# macOS AF_UNIX sun_path limit is 103 bytes (107 on Linux); torch_shm_manager reads raw getenv("TMPDIR")
-# (falling back to "/tmp") without stripping a trailing slash and opens
-# `<TMPDIR>/torch-shm-dir-XXXXXX/manager.sock`. If this overflows inside a DataLoader worker's
-# Queue._feed background thread, Queue._feed catches the RuntimeError, drops the batch, and leaves
-# workers alive while DataLoader waits forever.
-_SHM_SUFFIX_LEN = len("/torch-shm-dir-XXXXXX/manager.sock")
-_UNIX_PATH_MAX = 103 if sys.platform == "darwin" else 107
+ReferenceMode = Literal["auto", "sketch", "exact"]
 
 _DTYPE_FROM_NAME: dict[str, torch.dtype] = {
     "float64": torch.float64,
@@ -359,51 +391,7 @@ ALL_SCENARIOS: tuple[ScenarioSpec, ...] = build_scenarios()
 SCENARIO_BY_NAME: dict[str, ScenarioSpec] = {spec.name: spec for spec in ALL_SCENARIOS}
 
 
-# --------------------------------------------------------------------------- synthetic datasets & helpers
-
-
-def _make_dataset(
-    num_windows: int,
-    *,
-    horizon: int,
-    covariates: bool,
-    seed: int,
-    future_ramp: float = 0.0,
-) -> TimeSeriesDataset:
-    """Self-contained synthetic `TimeSeriesDataset` with unequal per-window scored counts."""
-    rng = np.random.default_rng(seed)
-    ctx_len = CTX_PATCHES * PATCH
-    total = ctx_len + horizon
-    ts = np.arange(total, dtype=np.int64)
-    empty_f = np.empty((0, total), dtype=np.float32)
-    empty_c = np.empty((0, total), dtype=np.float64)
-    ramp = np.linspace(0.0, future_ramp, horizon, dtype=np.float32) if future_ramp != 0.0 else None
-
-    series: list[SeriesData] = []
-    for i in range(num_windows):
-        values = (15.0 + 3.0 * np.sin(0.2 * ts + 0.5 * i) + rng.normal(0.0, 0.8, size=total)).astype(np.float32)
-        if ramp is not None:
-            values[ctx_len:] = values[ctx_len:] + ramp
-        # Drop a varying tail of horizon targets while keeping >= 1 scored step in every window.
-        drop = (i * 11) % max(1, horizon - 1)
-        if drop > 0:
-            values[total - drop :] = np.nan
-        if covariates:
-            past = rng.normal(0.0, 1.0, size=(1, total)).astype(np.float32)
-            known = rng.normal(0.0, 1.0, size=(1, total)).astype(np.float32)
-        else:
-            past, known = empty_f, empty_f
-        series.append(SeriesData(f"s{i}", ts, values[None, :], past, known, empty_c, empty_c))
-
-    roles = ColumnRoles(targets=("y",), past=("p0",) if covariates else (), known=("k0",) if covariates else ())
-    return TimeSeriesDataset(
-        series,
-        context_length=ctx_len,
-        forecast_horizon=horizon,
-        stride=horizon,
-        min_context=ctx_len,
-        roles=roles,
-    )
+# --------------------------------------------------------------------------- configs, digests & sketches
 
 
 def _lora_for(mode: AdaptationMode, dropout: float) -> LoraConfig | None:
@@ -422,6 +410,120 @@ def _scenario_lr(spec: ScenarioSpec, *, is_released: bool) -> float:
     return 1e-3 if spec.mode == "full_ft" else 1e-2
 
 
+def _moved_warmup_lr(*, is_released: bool) -> float:
+    return 1e-4 if is_released else 5e-3
+
+
+def _build_trainer_configs(
+    spec: ScenarioSpec,
+    *,
+    is_released: bool,
+    world_size: int,
+    per_rank_batch: int,
+    per_rank_replay_batch: int,
+    steps: int,
+    seed: int,
+    config_device: str,
+    distributed: bool,
+) -> tuple[TrainingConfig, LoraConfig | None, ReplayConfig | None]:
+    """Construct resolved `(TrainingConfig, LoraConfig, ReplayConfig)` for a scenario."""
+    eff_batch = per_rank_batch if distributed else world_size * per_rank_batch
+    eff_replay_batch = per_rank_replay_batch if distributed else world_size * per_rank_replay_batch
+    eff_steps = spec.steps_override if spec.steps_override is not None else steps
+    lr = _scenario_lr(spec, is_released=is_released)
+
+    cfg = TrainingConfig(
+        model_name_or_path="local-stage3-probe",
+        mode=spec.mode,
+        device=config_device,
+        batch_size=eff_batch,
+        epochs=max(1, eff_steps),
+        max_steps=eff_steps,
+        warmup_steps=1,
+        lr_schedule="cosine",
+        learning_rate=lr,
+        weight_decay=0.01,
+        gradient_clip_val=1.0,
+        mixed_precision=spec.mixed_precision,
+        eval_every=spec.eval_every,
+        eval_batch_size=eff_batch,
+        early_stopping_patience=spec.early_stopping_patience,
+        restore_best=spec.restore_best,
+        log_every=max(1000, eff_steps + 1),
+        shuffle=spec.shuffle,
+        sign_flip=spec.sign_flip,
+        cache_frozen_features=False,
+        compile_model=spec.compile_model,
+        compile_mode="default",
+        num_workers=spec.num_workers,
+        seed=seed + 107,
+    )
+    lora_cfg = _lora_for(spec.mode, spec.lora_dropout)
+    rcfg: ReplayConfig | None = None
+    if spec.uses_replay:
+        # In one-process mode, `_precompute_replay_base_outputs` casts cached teacher quantiles to
+        # `torch.float32` regardless of model dtype, so float64 references must run uncached
+        # (`cache_base_outputs=False`) to stay in float64 (matching T15). In float32/bf16, keep the
+        # default `cache_base_outputs=True` so multi-process live teachers compare against shipped defaults.
+        cache_base = spec.dtype != "float64"
+        rcfg = ReplayConfig(
+            replay_fraction=spec.replay_fraction,
+            distill_weight=spec.distill_weight,
+            batch_size=eff_replay_batch,
+            sign_flip=spec.sign_flip,
+            cache_base_outputs=cache_base,
+            smooth_beta=1e-3,
+        )
+    return cfg, lora_cfg, rcfg
+
+
+def _scenario_config_digest(
+    cfg: TrainingConfig,
+    lora_cfg: LoraConfig | None,
+    rcfg: ReplayConfig | None,
+    *,
+    spec: ScenarioSpec,
+    per_rank_batch: int,
+    per_rank_replay_batch: int,
+    is_released: bool,
+) -> str:
+    """Canonical SHA-256 of the actual resolved training/LoRA/replay configs (invariant across 1p vs mp)."""
+    cfg_dict: dict[str, Any] = {}
+    for field_info in dataclasses.fields(cfg):
+        if field_info.name in ("device", "output_dir"):
+            continue
+        val = getattr(cfg, field_info.name)
+        if isinstance(val, Path):
+            val = str(val)
+        cfg_dict[field_info.name] = val
+    # Normalise effective batch sizes to per-rank B so 1-process (N*B) and distributed (B) hash identically.
+    cfg_dict["batch_size"] = per_rank_batch
+    cfg_dict["eval_batch_size"] = per_rank_batch
+    cfg_dict["resolved_learning_rate"] = cfg.resolved_learning_rate
+
+    rcfg_dict = None
+    if rcfg is not None:
+        rcfg_dict = dict(rcfg.to_dict())
+        rcfg_dict["batch_size"] = per_rank_replay_batch
+
+    payload = {
+        "training_config": cfg_dict,
+        "lora_config": None if lora_cfg is None else lora_cfg.to_dict(),
+        "replay_config": rcfg_dict,
+        "moved_student_warmup": (
+            {
+                "steps": MOVED_WARMUP_STEPS,
+                "batch_size": MOVED_WARMUP_BATCH_SIZE,
+                "lr": _moved_warmup_lr(is_released=is_released),
+            }
+            if spec.moved_student
+            else None
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _flat_trainable_native(trainer: TimestralTrainer) -> Tensor:
     """Concatenate trainable parameters on CPU in their native dtype."""
     return torch.cat([p.detach().cpu().reshape(-1) for p in trainer._trainable])
@@ -432,13 +534,19 @@ def _tensor_sha256(tensor: Tensor) -> str:
     h = hashlib.sha256()
     h.update(str(tuple(arr.shape)).encode("utf-8"))
     h.update(str(arr.dtype).encode("utf-8"))
-    h.update(arr.view(torch.uint8).numpy().tobytes())
+    h.update(arr.reshape(-1).view(torch.uint8).numpy().tobytes())
     return h.hexdigest()
 
 
 def _sketch_seed(base_seed: int, model_name: str, scenario_name: str) -> int:
     digest = hashlib.sha256(f"timestral-tune:stage3-sketch:{base_seed}:{model_name}:{scenario_name}".encode()).digest()
     return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
+
+
+def _sketch_floor_rel(numel: int, sketch_dim: int) -> float:
+    """Estimated float64 bucket-accumulation relative noise floor: `0.25 * sqrt(n / k) * eps_f64`."""
+    eps_f64 = float(torch.finfo(torch.float64).eps)
+    return 0.25 * math.sqrt(max(1.0, float(numel) / float(sketch_dim))) * eps_f64
 
 
 def _count_sketch_delta(
@@ -451,9 +559,9 @@ def _count_sketch_delta(
     """Compute `(compact_vector_f64, final_norm_f64, update_norm_f64, kind)` in O(chunk) memory.
 
     When `numel <= sketch_dim`, returns the exact float64 `delta = final - init` vector (`exact_delta`).
-    Otherwise returns a deterministic linear CountSketch of `delta` in float64 (`count_sketch`),
-    giving an unbiased L2 estimator for `delta_mp - delta_ref == final_mp - final_ref` with
-    relative standard error <= `1 / sqrt(2 * sketch_dim)` (~0.78% at `sketch_dim = 8192`).
+    Otherwise returns a deterministic linear CountSketch of `delta` in float64 (`count_sketch`).
+    Above ~10x the float64 bucket-accumulation noise floor (`_sketch_floor_rel`), its relative L2
+    standard error is <= `1 / sqrt(2 * sketch_dim)` (~0.78% at `sketch_dim = 8192`).
     """
     n = init_native.numel()
     final_sq = 0.0
@@ -478,12 +586,38 @@ def _count_sketch_delta(
     return sketch, math.sqrt(final_sq), math.sqrt(upd_sq), "count_sketch"
 
 
+def _select_reference_payload(
+    init_vec: Tensor,
+    final_vec: Tensor,
+    *,
+    ref_mode: ReferenceMode,
+    spec: ScenarioSpec,
+    seed: int,
+    model_name: str,
+) -> tuple[Tensor, float, float, Literal["exact_final", "exact_delta", "count_sketch"]]:
+    """Choose and compute the reference tensor payload according to `ref_mode`."""
+    if ref_mode == "exact":
+        f64 = final_vec.double()
+        d64 = f64 - init_vec.double()
+        return final_vec, float(f64.norm().item()), float(d64.norm().item()), "exact_final"
+    if ref_mode == "auto" and spec.dtype == "float64" and final_vec.numel() <= AUTO_EXACT_F64_MAX_NUMEL:
+        f64 = final_vec.double()
+        d64 = f64 - init_vec.double()
+        return d64, float(f64.norm().item()), float(d64.norm().item()), "exact_delta"
+    return _count_sketch_delta(
+        init_vec,
+        final_vec,
+        sketch_dim=SKETCH_DIM,
+        seed=_sketch_seed(seed, model_name, spec.name),
+    )
+
+
 def _tensor_to_bytes(tensor: Tensor) -> tuple[bytes, str, list[int]]:
     arr = tensor.detach().cpu().contiguous()
     dtype_name = _NAME_FROM_DTYPE.get(arr.dtype)
     if dtype_name is None:
         raise ValueError(f"unsupported tensor dtype for archive: {arr.dtype}")
-    return arr.view(torch.uint8).numpy().tobytes(), dtype_name, list(arr.shape)
+    return arr.reshape(-1).view(torch.uint8).numpy().tobytes(), dtype_name, list(arr.shape)
 
 
 def _bytes_to_tensor(raw: bytes, dtype_name: str, shape: Sequence[int]) -> Tensor:
@@ -496,20 +630,47 @@ def _scalar_rel(a: float, b: float) -> float:
     return abs(a - b) / max(abs(b), 1e-300)
 
 
+def _max_history_rel_nan_safe(
+    got_hist: Sequence[tuple[int, float]],
+    ref_hist: Sequence[Sequence[Any]],
+) -> float:
+    """Compute max relative error across aligned `(step, value)` histories, propagating any non-finite value."""
+    if (
+        len(got_hist) != len(ref_hist)
+        or len(ref_hist) == 0
+        or not all(s_got == int(s_ref) for (s_got, _), (s_ref, _) in zip(got_hist, ref_hist, strict=True))
+    ):
+        return float("nan")
+    worst = 0.0
+    for (_, v_got), (_, v_ref_raw) in zip(got_hist, ref_hist, strict=True):
+        v_got_f = float(v_got)
+        v_ref_f = float(v_ref_raw)
+        if not math.isfinite(v_got_f) or not math.isfinite(v_ref_f):
+            return float("nan")
+        d = _scalar_rel(v_got_f, v_ref_f)
+        if d > worst:
+            worst = d
+    return worst
+
+
 def _encode_digest_words(digest: bytes) -> list[int]:
     return list(struct.unpack("<4q", hashlib.sha256(digest).digest()))
 
 
-def _hash_all_parameters(model: TuneTimestralModel) -> bytes:
-    """SHA-256 over every parameter in `sorted(model.named_parameters())` (name, shape, dtype, raw bytes)."""
+def _hash_model_state(model: TuneTimestralModel) -> bytes:
+    """SHA-256 over every parameter in `sorted(named_parameters())` and every buffer in `sorted(named_buffers())`."""
     h = hashlib.sha256()
-    for name, param in sorted(model.named_parameters(), key=lambda kv: kv[0]):
-        arr = param.detach().cpu().contiguous()
-        h.update(name.encode("utf-8"))
-        h.update(str(tuple(arr.shape)).encode("utf-8"))
-        h.update(str(arr.dtype).encode("utf-8"))
-        # View as uint8 to hash exact bit representation across fp64, fp32, and bf16.
-        h.update(arr.view(torch.uint8).numpy().tobytes())
+    for kind, items in (
+        (b"param", sorted(model.named_parameters(), key=lambda kv: kv[0])),
+        (b"buffer", sorted(model.named_buffers(), key=lambda kv: kv[0])),
+    ):
+        for name, tensor in items:
+            arr = tensor.detach().cpu().contiguous()
+            h.update(kind)
+            h.update(name.encode("utf-8"))
+            h.update(str(tuple(arr.shape)).encode("utf-8"))
+            h.update(str(arr.dtype).encode("utf-8"))
+            h.update(arr.reshape(-1).view(torch.uint8).numpy().tobytes())
     return h.digest()
 
 
@@ -577,27 +738,6 @@ def _skip_reason(spec: ScenarioSpec, *, is_cuda: bool) -> str | None:
     return None
 
 
-def _check_tmpdir_for_workers() -> None:
-    """Fail fast before spawning DataLoader workers if TMPDIR overflows torch_shm_manager's sun_path."""
-    try:
-        sharing = torch.multiprocessing.get_sharing_strategy()
-    except Exception:
-        sharing = "file_system" if sys.platform == "darwin" else "file_descriptor"
-    if sharing != "file_system":
-        return
-    # torch_shm_manager reads raw getenv("TMPDIR") (defaulting to "/tmp") without stripping a
-    # trailing slash and appends "/torch-shm-dir-XXXXXX/manager.sock" (34 bytes).
-    raw_tmp = os.environ.get("TMPDIR") or "/tmp"
-    raw_bytes = len(raw_tmp.encode("utf-8"))
-    sock_len = raw_bytes + _SHM_SUFFIX_LEN
-    if sock_len > _UNIX_PATH_MAX:
-        raise RuntimeError(
-            f"TMPDIR length ({raw_bytes} bytes) makes torch_shm_manager's Unix socket path "
-            f"{sock_len} bytes (> {_UNIX_PATH_MAX}-byte limit), which silently deadlocks DataLoader "
-            f"workers inside Queue._feed; re-run with TMPDIR=/tmp"
-        )
-
-
 def _build_datasets_for_scenario(
     spec: ScenarioSpec,
     *,
@@ -606,20 +746,17 @@ def _build_datasets_for_scenario(
     per_rank_replay_batch: int,
     seed: int,
 ) -> tuple[TimeSeriesDataset, TimeSeriesDataset | None, TimeSeriesDataset | None]:
-    # Trailing partial batch:
-    # - `empty_trailing_shard`: `N * B + 1` gives rank 0 a 1-window trailing batch and ranks 1..N-1 empty shards.
-    # - default: `N * B + max(1, N - 1)` gives unequal trailing counts and leaves rank N - 1 empty.
     trailing = 1 if spec.empty_trailing_shard else max(1, world_size - 1)
     dom_len = world_size * per_rank_batch + trailing
     dom_ramp = 40.0 if spec.early_stopping_patience is not None else 0.0
-    dom_ds = _make_dataset(dom_len, horizon=DOM_HORIZON, covariates=True, seed=seed + 1001, future_ramp=dom_ramp)
+    dom_ds = make_synthetic_dataset(
+        dom_len, horizon=DOM_HORIZON, covariates=True, seed=seed + 1001, future_ramp=dom_ramp
+    )
 
     val_ds: TimeSeriesDataset | None = None
     if spec.with_val:
-        # Uneven validation shards across ranks (`2 * N + 1` windows). Opposite future ramp vs train_ds
-        # causes validation loss to rise after initial steps so EarlyStopping and restore_best=True fire.
         val_ramp = -40.0 if spec.early_stopping_patience is not None else 0.0
-        val_ds = _make_dataset(
+        val_ds = make_synthetic_dataset(
             2 * world_size + 1,
             horizon=DOM_HORIZON,
             covariates=True,
@@ -630,23 +767,21 @@ def _build_datasets_for_scenario(
     rep_ds: TimeSeriesDataset | None = None
     if spec.uses_replay:
         rep_len = world_size * per_rank_replay_batch + max(1, world_size - 1)
-        rep_ds = _make_dataset(rep_len, horizon=REP_HORIZON, covariates=False, seed=seed + 1003)
+        rep_ds = make_synthetic_dataset(rep_len, horizon=REP_HORIZON, covariates=False, seed=seed + 1003)
 
     return dom_ds, val_ds, rep_ds
 
 
-def _build_moved_full_ft_state(
+def _build_moved_full_ft_params(
     base_model_cpu: TuneTimestralModel,
     dom_ds: TimeSeriesDataset,
     *,
     is_released: bool,
-    steps: int = 3,
-    batch_size: int = 4,
 ) -> dict[str, Tensor]:
-    """Run 3 deterministic domain-only `full_ft` steps on CPU (1 thread, float32) so student != teacher.
+    """Run deterministic domain-only `full_ft` warmup on CPU (1 thread, f32) and return **parameters only**.
 
-    Runs outside `TimestralTrainer` so it works identically in plain reference mode and inside a
-    live `torchrun` process group without triggering distributed startup collectives.
+    Returning parameters only (excluding registered buffers such as `transformer.rope.inv_freq`) ensures
+    that applying the warmed parameters never overwrites the trainer's device-built RoPE table.
     """
     prev_threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -654,25 +789,44 @@ def _build_moved_full_ft_state(
         model = copy.deepcopy(base_model_cpu).float().train()
         for p in model.parameters():
             p.requires_grad_(True)
-        lr = 1e-4 if is_released else 5e-3
-        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+        opt = torch.optim.AdamW(model.parameters(), lr=_moved_warmup_lr(is_released=is_released), weight_decay=0.0)
         collator = dom_ds.collator(model.config)
         n_win = len(dom_ds)
-        for step_idx in range(steps):
-            start = (step_idx * batch_size) % n_win
-            idxs = [(start + j) % n_win for j in range(min(batch_size, n_win))]
+        for step_idx in range(MOVED_WARMUP_STEPS):
+            start = (step_idx * MOVED_WARMUP_BATCH_SIZE) % n_win
+            idxs = [(start + j) % n_win for j in range(min(MOVED_WARMUP_BATCH_SIZE, n_win))]
             batch = collator([dom_ds[i] for i in idxs])
             batch.validate(model.config.patch_size)
             opt.zero_grad(set_to_none=True)
             compute_loss(model, batch, validate=False).loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        return {name: p.detach().cpu().clone() for name, p in model.named_parameters()}
     finally:
         torch.set_num_threads(prev_threads)
 
 
-# --------------------------------------------------------------------------- core execution
+# --------------------------------------------------------------------------- distributed helpers & checks
+
+
+def _propagate_rank_error(
+    local_err: Exception | None,
+    *,
+    device: torch.device,
+    world_size: int,
+    rank: int,
+    stage: str,
+) -> None:
+    """Coordinate a rank-local error across all ranks so no peer hangs in a later collective."""
+    flags = torch.zeros(world_size, dtype=torch.int64, device=device)
+    if local_err is not None:
+        flags[rank] = 1
+    dist.all_reduce(flags, op=dist.ReduceOp.SUM)
+    failing = [i for i, v in enumerate(flags.tolist()) if v != 0]
+    if local_err is not None:
+        raise local_err
+    if failing:
+        raise RuntimeError(f"peer rank(s) {failing} failed during {stage!r}")
 
 
 def _verify_cuda_device_binding(
@@ -691,6 +845,112 @@ def _verify_cuda_device_binding(
     for name, param in trainer.model.named_parameters():
         if param.device != expected:
             raise RuntimeError(f"rank {rank}: parameter {name!r} resides on {param.device}, expected {expected}")
+    for name, buf in trainer.model.named_buffers():
+        if buf.device != expected:
+            raise RuntimeError(f"rank {rank}: buffer {name!r} resides on {buf.device}, expected {expected}")
+
+
+def _apply_moved_student_params(
+    trainer: TimestralTrainer,
+    *,
+    model_name: str,
+    dom_fp: str,
+    base_model_cpu: TuneTimestralModel,
+    dom_ds: TimeSeriesDataset,
+    is_released: bool,
+    distributed: bool,
+    rank: int,
+    device: torch.device,
+    moved_params_cache: dict[str, dict[str, Tensor]],
+) -> None:
+    """Transfer moved-student parameters (never buffers) to `trainer.model`, keeping peers in lockstep."""
+    local_err: Exception | None = None
+    if not distributed or rank == 0:
+        try:
+            cache_key = f"{model_name}:{dom_fp}"
+            if cache_key not in moved_params_cache:
+                moved_params_cache[cache_key] = _build_moved_full_ft_params(
+                    base_model_cpu,
+                    dom_ds,
+                    is_released=is_released,
+                )
+            moved_params = moved_params_cache[cache_key]
+            model_params = dict(trainer.model.named_parameters())
+            if set(moved_params) != set(model_params):
+                raise RuntimeError("moved_student parameter keys do not match trainer.model.named_parameters()")
+            with torch.no_grad():
+                for name, param in model_params.items():
+                    param.copy_(moved_params[name].to(device=param.device, dtype=param.dtype))
+        except Exception as exc:
+            local_err = exc
+
+    if distributed:
+        flag = torch.tensor([1 if local_err is not None else 0], dtype=torch.int64, device=device)
+        dist.broadcast(flag, src=0)
+        if local_err is not None:
+            raise local_err
+        if int(flag.item()) != 0:
+            raise RuntimeError("rank 0 failed while preparing moved_student parameters")
+        with torch.no_grad():
+            for _, param in sorted(trainer.model.named_parameters(), key=lambda kv: kv[0]):
+                if param.device == device and param.is_contiguous():
+                    dist.broadcast(param.detach(), src=0)
+                else:
+                    staged = param.detach().to(device=device).contiguous()
+                    dist.broadcast(staged, src=0)
+                    param.copy_(staged)
+    elif local_err is not None:
+        raise local_err
+
+
+def _validate_exported_dir(
+    out_dir: Path,
+    *,
+    spec: ScenarioSpec,
+    distributed: bool,
+    world_size: int,
+    per_rank_batch: int,
+) -> tuple[bool, str]:
+    required_files = ["config.json", "model.safetensors", "tune_metadata.json", "LICENSE", "NOTICE"]
+    if spec.mode.startswith("lora_"):
+        required_files.extend(["adapter.safetensors", "adapter_config.json"])
+    missing = [fname for fname in required_files if not (out_dir / fname).is_file()]
+    if missing:
+        return False, f"missing expected export file(s): {missing}"
+
+    meta = json.loads((out_dir / "tune_metadata.json").read_text(encoding="utf-8"))
+    if distributed:
+        if meta.get("world_size") != world_size:
+            return False, f"world_size={meta.get('world_size')} != {world_size}"
+        if meta.get("effective_batch_size") != world_size * per_rank_batch:
+            return (
+                False,
+                f"effective_batch_size={meta.get('effective_batch_size')} != {world_size * per_rank_batch}",
+            )
+        hp = meta.get("hyperparameters") or {}
+        if hp.get("batch_size") != per_rank_batch:
+            return False, f"hyperparameters.batch_size={hp.get('batch_size')} != {per_rank_batch}"
+    else:
+        if "world_size" in meta or "effective_batch_size" in meta:
+            return False, "one-process export unexpectedly recorded world_size or effective_batch_size"
+
+    if spec.uses_replay and (meta.get("replay_config") is None or meta.get("replay_source") is None):
+        return False, "missing replay_config or replay_source in tune_metadata.json"
+    return True, ""
+
+
+def _broadcast_path(path_str: str, *, rank: int, device: torch.device) -> str:
+    """Broadcast a UTF-8 path string from rank 0 to all ranks using tensor collectives."""
+    raw = path_str.encode("utf-8") if rank == 0 else b""
+    length = torch.tensor([len(raw)], dtype=torch.int64, device=device)
+    dist.broadcast(length, src=0)
+    n = int(length.item())
+    if rank == 0:
+        buf = torch.tensor(list(raw), dtype=torch.uint8, device=device)
+    else:
+        buf = torch.empty(n, dtype=torch.uint8, device=device)
+    dist.broadcast(buf, src=0)
+    return bytes(buf.cpu().tolist()).decode("utf-8")
 
 
 def _verify_export(
@@ -701,44 +961,85 @@ def _verify_export(
     rank: int,
     world_size: int,
     per_rank_batch: int,
+    device: torch.device,
 ) -> tuple[bool, str]:
-    """Verify `export()`: rank 0 writes complete checkpoint + metadata, peers write nothing."""
-    with tempfile.TemporaryDirectory(prefix=f"tt_stage3_exp_r{rank}_") as tmpdir:
-        out_dir = Path(tmpdir) / "ckpt"
-        returned = trainer.export(out_dir)
-        if returned != out_dir:
-            return False, f"returned {returned} != {out_dir}"
-        if distributed and rank != 0:
-            if out_dir.exists():
-                return False, f"rank {rank} created export directory"
-            return True, ""
+    """Verify `export()` on both a shared `output_dir` (real multi-rank usage) and a private non-write check.
 
-        required_files = ["config.json", "model.safetensors", "tune_metadata.json", "LICENSE", "NOTICE"]
-        if spec.mode.startswith("lora_"):
-            required_files.extend(["adapter.safetensors", "adapter_config.json"])
-        missing = [fname for fname in required_files if not (out_dir / fname).is_file()]
-        if missing:
-            return False, f"missing expected export file(s): {missing}"
+    In distributed mode:
+    1. Every rank calls `trainer.export(shared_out_dir)` with the exact same path created by rank 0;
+       after a barrier, rank 0 verifies all files and `tune_metadata.json`, and all ranks verify no
+       error occurred and the returned path matches.
+    2. Each non-zero rank additionally calls `trainer.export(private_nonexistent_dir)` and asserts
+       that directory is NOT created, strictly proving non-zero ranks perform zero disk writes.
 
-        meta = json.loads((out_dir / "tune_metadata.json").read_text(encoding="utf-8"))
-        if distributed:
-            if meta.get("world_size") != world_size:
-                return False, f"world_size={meta.get('world_size')} != {world_size}"
-            if meta.get("effective_batch_size") != world_size * per_rank_batch:
-                return (
-                    False,
-                    f"effective_batch_size={meta.get('effective_batch_size')} != {world_size * per_rank_batch}",
+    Never raises: catches unexpected I/O or serialisation errors while preserving collective lockstep
+    so all ranks still reach `_gather_distributed_checks`.
+    """
+    if not distributed:
+        try:
+            with tempfile.TemporaryDirectory(prefix="tt_stage3_exp_1p_") as tmpdir:
+                out_dir = Path(tmpdir) / "ckpt"
+                returned = trainer.export(out_dir)
+                if returned != out_dir:
+                    return False, f"returned {returned} != {out_dir}"
+                return _validate_exported_dir(
+                    out_dir,
+                    spec=spec,
+                    distributed=False,
+                    world_size=world_size,
+                    per_rank_batch=per_rank_batch,
                 )
-            hp = meta.get("hyperparameters") or {}
-            if hp.get("batch_size") != per_rank_batch:
-                return False, f"hyperparameters.batch_size={hp.get('batch_size')} != {per_rank_batch}"
-        else:
-            if "world_size" in meta or "effective_batch_size" in meta:
-                return False, "one-process export unexpectedly recorded world_size or effective_batch_size"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
 
-        if spec.uses_replay and (meta.get("replay_config") is None or meta.get("replay_source") is None):
-            return False, "missing replay_config or replay_source in tune_metadata.json"
-        return True, ""
+    # Distributed mode: keep collectives (path broadcast + post-export/pre-cleanup barriers) outside
+    # the local try/except so every rank remains strictly in lockstep even if one rank fails.
+    shared_ctx = tempfile.TemporaryDirectory(prefix="tt_stage3_exp_shared_") if rank == 0 else contextlib.nullcontext()
+    ok = True
+    err = ""
+    with shared_ctx as shared_tmp:
+        shared_dir_str = str(Path(shared_tmp) / "ckpt") if rank == 0 else ""
+        shared_out_dir = Path(_broadcast_path(shared_dir_str, rank=rank, device=device))
+
+        # 1. Shared output_dir (exact real multi-rank usage).
+        try:
+            returned = trainer.export(shared_out_dir)
+            if returned != shared_out_dir:
+                ok, err = False, f"shared export returned {returned} != {shared_out_dir}"
+        except Exception as exc:
+            ok, err = False, f"shared export raised {type(exc).__name__}: {exc}"
+
+        # Synchronise so rank 0 has completed writing before verification and peers have returned.
+        dist.all_reduce(torch.zeros(1, dtype=torch.int64, device=device), op=dist.ReduceOp.SUM)
+
+        if rank == 0 and ok:
+            try:
+                ok, err = _validate_exported_dir(
+                    shared_out_dir,
+                    spec=spec,
+                    distributed=True,
+                    world_size=world_size,
+                    per_rank_batch=per_rank_batch,
+                )
+            except Exception as exc:
+                ok, err = False, f"shared export validation raised {type(exc).__name__}: {exc}"
+
+        # 2. Private non-write proof on non-zero ranks (proves peers never create output_dir).
+        if rank != 0 and ok:
+            try:
+                with tempfile.TemporaryDirectory(prefix=f"tt_stage3_exp_r{rank}_") as priv_tmp:
+                    priv_out_dir = Path(priv_tmp) / "ckpt"
+                    returned_priv = trainer.export(priv_out_dir)
+                    if returned_priv != priv_out_dir:
+                        ok, err = False, f"private export returned {returned_priv} != {priv_out_dir}"
+                    elif priv_out_dir.exists():
+                        ok, err = False, f"rank {rank} created private export directory"
+            except Exception as exc:
+                ok, err = False, f"private export check raised {type(exc).__name__}: {exc}"
+
+        # Keep shared_tmp alive on rank 0 until all ranks finish before context exit deletes it.
+        dist.all_reduce(torch.zeros(1, dtype=torch.int64, device=device), op=dist.ReduceOp.SUM)
+    return ok, err
 
 
 def _gather_distributed_checks(
@@ -749,19 +1050,19 @@ def _gather_distributed_checks(
     world_size: int,
     rank: int,
 ) -> dict[str, Any]:
-    """Collect cross-rank equality, max-abs parameter diff, and max-over-ranks telemetry via collectives.
+    """Collect cross-rank state equality, max-abs diff, and max-over-ranks telemetry via collectives.
 
     What is compared across ranks:
     - `result_eq`: SHA-256 of all ten `TrainingResult` fields (with exact `float.hex()` encodings)
       broadcast from rank 0 as 4 signed `int64` words and checked for unanimity via `all_reduce(SUM)`.
-    - `xrank_exact`: SHA-256 of every parameter in `sorted(model.named_parameters())` (both trainable
-      and frozen, including LoRA A/B adapters when present), hashing `(name, shape, dtype, raw uint8 bytes)`,
+    - `xrank_exact`: SHA-256 of every parameter in `sorted(model.named_parameters())` AND every
+      buffer in `sorted(model.named_buffers())` (hashing `(kind, name, shape, dtype, raw uint8 bytes)`),
       broadcast from rank 0 as 4 signed `int64` words and checked for unanimity via `all_reduce(SUM)`.
     - `xrank_max_abs`: exact elementwise `max(abs(rank_r.double() - rank_0.double()))` over every
-      parameter in `sorted(model.named_parameters())`, computed by broadcasting each parameter from
-      rank 0 to all ranks and reducing the per-rank maximum across ranks with `all_reduce(MAX)`.
-    - Timing/memory/compile counters (`wall_s`, `steady_step_ms`, `tail_s`, `peak_vram_mib`,
-      `total_graphs`, `extra_graphs`): maximum across ranks via `all_reduce(MAX)`.
+      parameter in `sorted(model.named_parameters())` AND every buffer in `sorted(model.named_buffers())`,
+      computed by broadcasting each tensor from rank 0 and reducing the per-rank maximum via `all_reduce(MAX)`.
+    - Timing/memory/compile counters (`wall_s`, `steady_step_ms`, `tail_s`, `val_s`, `peak_vram_mib`,
+      `graphs_s1`, `graphs_end`, `graph_bumps_post_s1`): maximum across ranks via `all_reduce(MAX)`.
     """
     device: torch.device = local["device"]
 
@@ -773,26 +1074,32 @@ def _gather_distributed_checks(
     dist.all_reduce(res_match, op=dist.ReduceOp.SUM)
     result_eq = int(res_match.item()) == world_size
 
-    # 2. Exact all-parameter bitwise equality via 4x int64 SHA-256 digest words.
-    param_words = _encode_digest_words(_hash_all_parameters(model))
-    param_buf = torch.tensor(param_words, dtype=torch.int64, device=device)
-    dist.broadcast(param_buf, src=0)
-    param_match = torch.tensor([1 if param_buf.tolist() == param_words else 0], dtype=torch.int64, device=device)
-    dist.all_reduce(param_match, op=dist.ReduceOp.SUM)
-    xrank_exact = int(param_match.item()) == world_size
+    # 2. Exact full model state (all parameters + all buffers) bitwise equality.
+    state_words = _encode_digest_words(_hash_model_state(model))
+    state_buf = torch.tensor(state_words, dtype=torch.int64, device=device)
+    dist.broadcast(state_buf, src=0)
+    state_match = torch.tensor([1 if state_buf.tolist() == state_words else 0], dtype=torch.int64, device=device)
+    dist.all_reduce(state_match, op=dist.ReduceOp.SUM)
+    xrank_exact = int(state_match.item()) == world_size
 
-    # 3. Cross-rank max-abs difference across every parameter in sorted(model.named_parameters()).
+    # 3. Cross-rank max-abs difference across every parameter and every buffer.
     local_max_abs = 0.0
     local_nonfinite_diff = 0.0
+    state_tensors = [
+        *[p for _, p in sorted(model.named_parameters(), key=lambda kv: kv[0])],
+        *[b for _, b in sorted(model.named_buffers(), key=lambda kv: kv[0])],
+    ]
     with torch.no_grad():
-        for _, param in sorted(model.named_parameters(), key=lambda kv: kv[0]):
-            if param.numel() == 0:
+        for tensor in state_tensors:
+            if tensor.numel() == 0:
                 continue
-            src_tensor = param.detach().to(device=device).contiguous()
-            buf = src_tensor.clone() if rank == 0 else torch.empty_like(src_tensor)
+            src_tensor = tensor.detach().to(device=device).contiguous()
+            # Cast bool buffers to uint8 for NCCL broadcast compatibility.
+            bcast_src = src_tensor.to(torch.uint8) if src_tensor.dtype == torch.bool else src_tensor
+            buf = bcast_src.clone() if rank == 0 else torch.empty_like(bcast_src)
             dist.broadcast(buf, src=0)
             if rank != 0:
-                diff = float((src_tensor.double() - buf.double()).abs().max().item())
+                diff = float((bcast_src.double() - buf.double()).abs().max().item())
                 if math.isnan(diff):
                     local_nonfinite_diff = 1.0
                 elif diff > local_max_abs:
@@ -807,9 +1114,11 @@ def _gather_distributed_checks(
             float(local["wall_s"]),
             steady_val,
             float(local["tail_s"]),
+            float(local["val_s"]),
             float(local["peak_vram_mib"]),
-            float(local["total_graphs"]),
-            float(local["extra_graphs"]),
+            float(local["graphs_s1"]),
+            float(local["graphs_end"]),
+            float(local["graph_bumps_post_s1"]),
             0.0 if local["export_ok"] else 1.0,
         ],
         dtype=torch.float64,
@@ -822,9 +1131,11 @@ def _gather_distributed_checks(
         wall_max_s,
         step_max_ms_raw,
         tail_max_s,
+        val_max_s,
         vram_max_mib,
-        graphs_max,
-        extra_graphs_max,
+        graphs_s1_max,
+        graphs_end_max,
+        graph_bumps_max,
         export_any_failed,
     ) = metrics_max.tolist()
     if nonfinite_diff_any > 0.0:
@@ -841,12 +1152,114 @@ def _gather_distributed_checks(
         "wall_max_s": wall_max_s,
         "step_max_ms": step_max_ms,
         "tail_max_s": tail_max_s,
+        "val_max_s": val_max_s,
         "vram_max_mib": vram_max_mib,
-        "graphs_max": int(round(graphs_max)),
-        "extra_graphs_max": int(round(extra_graphs_max)),
+        "graphs_s1_max": int(round(graphs_s1_max)),
+        "graphs_end_max": int(round(graphs_end_max)),
+        "graph_bumps_max": int(round(graph_bumps_max)),
         "export_all_ok": export_any_failed == 0.0,
         "export_pass_count": int(export_pass_count.item()),
     }
+
+
+def _timed_fit(
+    trainer: TimestralTrainer,
+    *,
+    spec: ScenarioSpec,
+    device: torch.device,
+    distributed: bool,
+) -> tuple[TrainingResult, float, float | None, float, float, float, int, int, int]:
+    """Execute `trainer.fit()` with a pre-`t0` barrier, per-step latency timing, and separate validation timing."""
+    step_t0: list[float | None] = [None]
+    step_durations: list[float] = []
+    last_step_end: list[float | None] = [None]
+    val_total_s: list[float] = [0.0]
+    step_graph_counts: list[int] = []
+
+    orig_zero_grad = trainer.optimizer.zero_grad
+    orig_make_strategy = trainer._make_fit_strategy
+
+    def _timed_zero_grad(*zg_args: Any, **zg_kwargs: Any) -> Any:
+        _cuda_sync_if_needed(device)
+        step_t0[0] = time.perf_counter()
+        return orig_zero_grad(*zg_args, **zg_kwargs)
+
+    def _on_opt_step(*_args: Any) -> None:
+        _cuda_sync_if_needed(device)
+        t_now = time.perf_counter()
+        if step_t0[0] is not None:
+            step_durations.append(t_now - step_t0[0])
+            step_t0[0] = None
+        last_step_end[0] = t_now
+        if spec.compile_model:
+            step_graph_counts.append(_dynamo_unique_graphs())
+
+    def _timed_make_strategy() -> Any:
+        strategy = orig_make_strategy()
+        orig_eval = strategy.evaluate_val
+
+        def _timed_eval() -> Any:
+            _cuda_sync_if_needed(device)
+            vt0 = time.perf_counter()
+            try:
+                return orig_eval()
+            finally:
+                _cuda_sync_if_needed(device)
+                val_total_s[0] += time.perf_counter() - vt0
+
+        strategy.evaluate_val = _timed_eval
+        return strategy
+
+    trainer.optimizer.zero_grad = _timed_zero_grad  # type: ignore[method-assign]
+    trainer._make_fit_strategy = _timed_make_strategy  # type: ignore[method-assign]
+    hook_handle = trainer.optimizer.register_step_post_hook(_on_opt_step)
+    try:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+        if distributed:
+            # 1-scalar all_reduce on `device` synchronises all ranks immediately before t0 without
+            # relying on `dist.barrier(device_ids=...)` warnings on NCCL.
+            dist.all_reduce(torch.zeros(1, dtype=torch.int64, device=device), op=dist.ReduceOp.SUM)
+        _cuda_sync_if_needed(device)
+        t0 = time.perf_counter()
+        result = trainer.fit()
+        _cuda_sync_if_needed(device)
+        t1 = time.perf_counter()
+    finally:
+        hook_handle.remove()
+        trainer.optimizer.zero_grad = orig_zero_grad  # type: ignore[method-assign]
+        trainer._make_fit_strategy = orig_make_strategy  # type: ignore[method-assign]
+
+    wall_s = t1 - t0
+    steady_step_ms: float | None = (
+        sum(step_durations[2:]) / len(step_durations[2:]) * 1000.0 if len(step_durations) >= 3 else None
+    )
+    tail_s = (t1 - last_step_end[0]) if last_step_end[0] is not None else wall_s
+    peak_vram_mib = float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0) if device.type == "cuda" else 0.0
+    if spec.compile_model:
+        graphs_s1 = step_graph_counts[0] if step_graph_counts else 0
+        graphs_end = _dynamo_unique_graphs()
+        graph_bumps_post_s1 = sum(
+            1 for prev, cur in zip(step_graph_counts, step_graph_counts[1:], strict=False) if cur > prev
+        )
+        if step_graph_counts and graphs_end > step_graph_counts[-1]:
+            graph_bumps_post_s1 += 1
+    else:
+        graphs_s1 = 0
+        graphs_end = 0
+        graph_bumps_post_s1 = 0
+    return (
+        result,
+        wall_s,
+        steady_step_ms,
+        tail_s,
+        val_total_s[0],
+        peak_vram_mib,
+        graphs_s1,
+        graphs_end,
+        graph_bumps_post_s1,
+    )
 
 
 def _run_scenario(
@@ -859,16 +1272,16 @@ def _run_scenario(
     per_rank_replay_batch: int,
     steps: int,
     seed: int,
-    config_device: str | None,
+    config_device: str,
     distributed: bool,
     rank: int,
     expected_cuda_index: int | None,
     binding_label: str,
-    moved_state_cache: dict[str, dict[str, Tensor]],
+    moved_params_cache: dict[str, dict[str, Tensor]],
 ) -> dict[str, Any]:
     """Execute one scenario in either 1-process reference mode or multi-rank mode."""
     if spec.num_workers > 0:
-        _check_tmpdir_for_workers()
+        check_tmpdir_for_workers()
 
     is_released = model_name != "tiny_random"
     dom_ds, val_ds, rep_ds = _build_datasets_for_scenario(
@@ -882,10 +1295,26 @@ def _run_scenario(
     val_fp = None if val_ds is None else dataset_fingerprint(val_ds)
     rep_fp = None if rep_ds is None else dataset_fingerprint(rep_ds)
 
-    eff_batch = per_rank_batch if distributed else world_size * per_rank_batch
-    eff_replay_batch = per_rank_replay_batch if distributed else world_size * per_rank_replay_batch
-    eff_steps = spec.steps_override if spec.steps_override is not None else steps
-    lr = _scenario_lr(spec, is_released=is_released)
+    cfg, lora_cfg, rcfg = _build_trainer_configs(
+        spec,
+        is_released=is_released,
+        world_size=world_size,
+        per_rank_batch=per_rank_batch,
+        per_rank_replay_batch=per_rank_replay_batch,
+        steps=steps,
+        seed=seed,
+        config_device=config_device,
+        distributed=distributed,
+    )
+    cfg_digest = _scenario_config_digest(
+        cfg,
+        lora_cfg,
+        rcfg,
+        spec=spec,
+        per_rank_batch=per_rank_batch,
+        per_rank_replay_batch=per_rank_replay_batch,
+        is_released=is_released,
+    )
 
     if spec.compile_model:
         _reset_dynamo()
@@ -893,49 +1322,6 @@ def _run_scenario(
     model = copy.deepcopy(base_model_cpu)
     if spec.dtype == "float64":
         model = model.double()
-
-    cfg = TrainingConfig(
-        model_name_or_path="local-stage3-probe",
-        mode=spec.mode,
-        device=config_device,  # type: ignore[arg-type]
-        batch_size=eff_batch,
-        epochs=max(1, eff_steps),
-        max_steps=eff_steps,
-        warmup_steps=1,
-        lr_schedule="cosine",
-        learning_rate=lr,
-        weight_decay=0.01,
-        gradient_clip_val=1.0,
-        mixed_precision=spec.mixed_precision,
-        eval_every=spec.eval_every,
-        eval_batch_size=eff_batch,
-        early_stopping_patience=spec.early_stopping_patience,
-        restore_best=spec.restore_best,
-        log_every=max(1000, eff_steps + 1),
-        shuffle=spec.shuffle,
-        sign_flip=spec.sign_flip,
-        cache_frozen_features=False,
-        compile_model=spec.compile_model,
-        compile_mode="default",
-        num_workers=spec.num_workers,
-        seed=seed + 107,
-    )
-
-    rcfg: ReplayConfig | None = None
-    if spec.uses_replay:
-        # In one-process mode, `_precompute_replay_base_outputs` casts cached teacher quantiles to
-        # `torch.float32` regardless of model dtype, so float64 references must run uncached
-        # (`cache_base_outputs=False`) to stay in float64 (matching T15). In float32/bf16, keep the
-        # default `cache_base_outputs=True` so multi-process live teachers compare against shipped defaults.
-        cache_base = spec.dtype != "float64"
-        rcfg = ReplayConfig(
-            replay_fraction=spec.replay_fraction,
-            distill_weight=spec.distill_weight,
-            batch_size=eff_replay_batch,
-            sign_flip=spec.sign_flip,
-            cache_base_outputs=cache_base,
-            smooth_beta=1e-3,
-        )
 
     ctx_mgr = float64_reference() if spec.dtype == "float64" else contextlib.nullcontext()
     trainer: TimestralTrainer | None = None
@@ -946,82 +1332,63 @@ def _run_scenario(
                 cfg,
                 dom_ds,
                 val_ds,
-                lora_config=_lora_for(spec.mode, spec.lora_dropout),
+                lora_config=lora_cfg,
                 replay_config=rcfg,
                 replay_dataset=rep_ds,
                 model=model,
             )
             device = trainer.device
             if distributed and expected_cuda_index is not None and device.type == "cuda":
-                _verify_cuda_device_binding(
-                    trainer,
+                bind_err: Exception | None = None
+                try:
+                    _verify_cuda_device_binding(
+                        trainer,
+                        rank=rank,
+                        expected_device_index=expected_cuda_index,
+                        label=binding_label,
+                    )
+                except Exception as exc:
+                    bind_err = exc
+                _propagate_rank_error(
+                    bind_err,
+                    device=device,
+                    world_size=world_size,
                     rank=rank,
-                    expected_device_index=expected_cuda_index,
-                    label=binding_label,
+                    stage="cuda_device_binding",
                 )
 
             if spec.moved_student:
-                # Load pre-warmed student weights AFTER `TimestralTrainer.__init__` so `_frozen_base`
-                # and cached teacher quantiles stay anchored at the original step-0 base model.
-                # In multi-rank mode, only rank 0 runs the CPU warmup and broadcasts to peers.
-                if not distributed or rank == 0:
-                    cache_key = f"{model_name}:{dom_fp}"
-                    if cache_key not in moved_state_cache:
-                        moved_state_cache[cache_key] = _build_moved_full_ft_state(
-                            base_model_cpu,
-                            dom_ds,
-                            is_released=is_released,
-                        )
-                    trainer.model.load_state_dict(moved_state_cache[cache_key])
-                if distributed:
-                    with torch.no_grad():
-                        for _, p in sorted(trainer.model.named_parameters(), key=lambda kv: kv[0]):
-                            if p.device == device and p.is_contiguous():
-                                dist.broadcast(p.detach(), src=0)
-                            else:
-                                staged = p.detach().to(device=device).contiguous()
-                                dist.broadcast(staged, src=0)
-                                p.copy_(staged)
+                _apply_moved_student_params(
+                    trainer,
+                    model_name=model_name,
+                    dom_fp=dom_fp,
+                    base_model_cpu=base_model_cpu,
+                    dom_ds=dom_ds,
+                    is_released=is_released,
+                    distributed=distributed,
+                    rank=rank,
+                    device=device,
+                    moved_params_cache=moved_params_cache,
+                )
 
-            init_trainable_native = _flat_trainable_native(trainer).clone()
-            init_sha256 = _tensor_sha256(init_trainable_native)
-
-            # Record optimiser-step completion timestamps (CUDA-synchronised) and step-1 Dynamo graph count.
-            step_times: list[float] = []
-            graphs_after_step1 = [0]
-
-            def _on_opt_step(*_args: Any) -> None:
-                assert device is not None
-                _cuda_sync_if_needed(device)
-                step_times.append(time.perf_counter())
-                if spec.compile_model and len(step_times) == 1:
-                    graphs_after_step1[0] = _dynamo_unique_graphs()
-
-            hook_handle = trainer.optimizer.register_step_post_hook(_on_opt_step)
-            try:
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-                    torch.cuda.reset_peak_memory_stats(device)
-                    torch.cuda.synchronize(device)
-                t0 = time.perf_counter()
-                result = trainer.fit()
-                _cuda_sync_if_needed(device)
-                t1 = time.perf_counter()
-            finally:
-                hook_handle.remove()
-
-            wall_s = t1 - t0
-            # Mean step time strictly after the first two optimiser steps.
-            if len(step_times) >= 3:
-                steady_step_ms: float | None = (step_times[-1] - step_times[1]) / (len(step_times) - 2) * 1000.0
-            else:
-                steady_step_ms = None
-            tail_s = (t1 - step_times[-1]) if step_times else wall_s
-            peak_vram_mib = (
-                float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0) if device.type == "cuda" else 0.0
+            init_model_sha256 = _hash_model_state(trainer.model).hex()
+            frozen_base_sha256 = (
+                _hash_model_state(trainer._frozen_base).hex() if trainer._frozen_base is not None else None
             )
-            total_graphs = _dynamo_unique_graphs() if spec.compile_model else 0
-            extra_graphs = max(0, total_graphs - graphs_after_step1[0]) if spec.compile_model else 0
+            init_trainable_native = _flat_trainable_native(trainer).clone()
+            init_trainable_sha256 = _tensor_sha256(init_trainable_native)
+
+            (
+                result,
+                wall_s,
+                steady_step_ms,
+                tail_s,
+                val_s,
+                peak_vram_mib,
+                graphs_s1,
+                graphs_end,
+                graph_bumps_post_s1,
+            ) = _timed_fit(trainer, spec=spec, device=device, distributed=distributed)
 
             export_ok = True
             export_err = ""
@@ -1033,26 +1400,34 @@ def _run_scenario(
                     rank=rank,
                     world_size=world_size,
                     per_rank_batch=per_rank_batch,
+                    device=device,
                 )
 
             final_trainable_native = _flat_trainable_native(trainer).clone()
-            final_sha256 = _tensor_sha256(final_trainable_native)
+            final_trainable_sha256 = _tensor_sha256(final_trainable_native)
+            final_all_finite = bool(torch.isfinite(final_trainable_native).all().item())
 
             summary: dict[str, Any] = {
                 "result": result,
+                "config_digest": cfg_digest,
+                "init_model_sha256": init_model_sha256,
+                "frozen_base_sha256": frozen_base_sha256,
                 "init_trainable_native": init_trainable_native,
-                "init_sha256": init_sha256,
+                "init_trainable_sha256": init_trainable_sha256,
                 "final_trainable_native": final_trainable_native,
-                "final_sha256": final_sha256,
+                "final_trainable_sha256": final_trainable_sha256,
+                "final_all_finite": final_all_finite,
                 "dom_fp": dom_fp,
                 "val_fp": val_fp,
                 "rep_fp": rep_fp,
                 "wall_s": wall_s,
                 "steady_step_ms": steady_step_ms,
                 "tail_s": tail_s,
+                "val_s": val_s,
                 "peak_vram_mib": peak_vram_mib,
-                "total_graphs": total_graphs,
-                "extra_graphs": extra_graphs,
+                "graphs_s1": graphs_s1,
+                "graphs_end": graphs_end,
+                "graph_bumps_post_s1": graph_bumps_post_s1,
                 "export_ok": export_ok,
                 "export_err": export_err,
                 "device": device,
@@ -1063,7 +1438,6 @@ def _run_scenario(
                     _gather_distributed_checks(trainer.model, result, summary, world_size=world_size, rank=rank)
                 )
     finally:
-        # Release model, frozen teacher, and optimiser buffers promptly so CUDA peak VRAM stays isolated per scenario.
         del trainer, model
         if device is not None and device.type == "cuda":
             gc.collect()
@@ -1075,27 +1449,87 @@ def _run_scenario(
 # --------------------------------------------------------------------------- reference archive I/O & validation
 
 
+def _expected_config_digests(
+    models: Sequence[tuple[str, TuneTimestralModel]],
+    scenarios: Sequence[ScenarioSpec],
+    *,
+    is_cuda: bool,
+    world_size: int,
+    per_rank_batch: int,
+    per_rank_replay_batch: int,
+    steps: int,
+    seed: int,
+) -> dict[str, str]:
+    """Precompute canonical per-(model, scenario) resolved config digests without touching GPU."""
+    digests: dict[str, str] = {}
+    for model_name, _ in models:
+        is_released = model_name != "tiny_random"
+        for spec in scenarios:
+            if not spec.compare_ref or _skip_reason(spec, is_cuda=is_cuda) is not None:
+                continue
+            cfg, lora_cfg, rcfg = _build_trainer_configs(
+                spec,
+                is_released=is_released,
+                world_size=world_size,
+                per_rank_batch=per_rank_batch,
+                per_rank_replay_batch=per_rank_replay_batch,
+                steps=steps,
+                seed=seed,
+                config_device="cpu",
+                distributed=True,
+            )
+            digests[f"{model_name}:{spec.name}"] = _scenario_config_digest(
+                cfg,
+                lora_cfg,
+                rcfg,
+                spec=spec,
+                per_rank_batch=per_rank_batch,
+                per_rank_replay_batch=per_rank_replay_batch,
+                is_released=is_released,
+            )
+    return digests
+
+
 def _make_run_spec(
     *,
     world_size: int,
     device_type: str,
-    model_names: Sequence[str],
+    models: Sequence[tuple[str, TuneTimestralModel]],
     scenarios: Sequence[ScenarioSpec],
     seed: int,
     per_rank_batch: int,
     per_rank_replay_batch: int,
     steps: int,
     cpu_threads: int | None,
-    reference_mode: Literal["sketch", "exact"],
+    reference_mode: ReferenceMode,
+    entry_keys: Sequence[str],
 ) -> dict[str, Any]:
+    is_cuda = device_type == "cuda"
+    executed_scenarios = [s for s in scenarios if s.compare_ref and _skip_reason(s, is_cuda=is_cuda) is None]
+    model_digests = {name: _hash_model_state(base_model).hex() for name, base_model in models}
+    cfg_digests = _expected_config_digests(
+        models,
+        executed_scenarios,
+        is_cuda=is_cuda,
+        world_size=world_size,
+        per_rank_batch=per_rank_batch,
+        per_rank_replay_batch=per_rank_replay_batch,
+        steps=steps,
+        seed=seed,
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "reference_mode": reference_mode,
-        "sketch_dim": SKETCH_DIM if reference_mode == "sketch" else None,
+        "sketch_dim": SKETCH_DIM if reference_mode in ("auto", "sketch") else None,
+        "sketch_chunk": SKETCH_CHUNK if reference_mode in ("auto", "sketch") else None,
+        "auto_exact_f64_max_numel": AUTO_EXACT_F64_MAX_NUMEL if reference_mode == "auto" else None,
         "world_size": world_size,
         "device_type": device_type,
-        "models": list(model_names),
-        "scenarios": [s.to_meta() for s in scenarios if s.compare_ref],
+        "models": [name for name, _ in models],
+        "model_digests": model_digests,
+        "scenarios": [s.to_meta() for s in executed_scenarios],
+        "scenario_config_digests": cfg_digests,
+        "entry_keys": sorted(entry_keys),
         "seed": seed,
         "per_rank_batch_size": per_rank_batch,
         "per_rank_replay_batch_size": per_rank_replay_batch,
@@ -1123,6 +1557,10 @@ class _StreamingReferenceWriter:
         self._entries: dict[str, dict[str, Any]] = {}
         self._next_idx = 0
         self._closed = False
+
+    @property
+    def entry_keys(self) -> list[str]:
+        return sorted(self._entries.keys())
 
     def add_entry(self, key: str, metadata: dict[str, Any], tensor: Tensor) -> None:
         member = f"tensors/{self._next_idx:04d}.bin"
@@ -1157,8 +1595,12 @@ class _ReferenceReader:
 
     def __init__(self, path: Path) -> None:
         self._zf = zipfile.ZipFile(path, mode="r")
-        self.meta: dict[str, Any] = json.loads(self._zf.read("spec.json").decode("utf-8"))
-        self.entries: dict[str, dict[str, Any]] = json.loads(self._zf.read("entries.json").decode("utf-8"))
+        try:
+            self.meta: dict[str, Any] = json.loads(self._zf.read("spec.json").decode("utf-8"))
+            self.entries: dict[str, dict[str, Any]] = json.loads(self._zf.read("entries.json").decode("utf-8"))
+        except BaseException:
+            self._zf.close()
+            raise
 
     def load_tensor(self, entry: dict[str, Any]) -> Tensor:
         raw = self._zf.read(entry["tensor_member"])
@@ -1168,35 +1610,43 @@ class _ReferenceReader:
         self._zf.close()
 
 
-def _read_reference_spec(path: Path) -> dict[str, Any]:
-    """Read only `spec.json` from the reference archive (fast, zero tensor memory)."""
+def _read_reference_metadata(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read and JSON-validate both `spec.json` and `entries.json` before `init_process_group`."""
     if not zipfile.is_zipfile(path):
-        raise ValueError("reference file is not a valid reference archive (missing spec.json)")
+        raise ValueError("reference file is not a valid zip archive")
     with zipfile.ZipFile(path, mode="r") as zf:
         names = set(zf.namelist())
         if "spec.json" not in names or "entries.json" not in names:
             raise ValueError("reference archive is malformed (missing 'spec.json' or 'entries.json')")
-        return json.loads(zf.read("spec.json").decode("utf-8"))
+        try:
+            meta = json.loads(zf.read("spec.json").decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"reference archive spec.json is malformed: {exc}") from exc
+        try:
+            entries = json.loads(zf.read("entries.json").decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"reference archive entries.json is malformed: {exc}") from exc
+        if not isinstance(entries, dict):
+            raise ValueError("reference archive entries.json is malformed (expected JSON object)")
+        return meta, entries
 
 
 def _validate_reference_spec(
     meta: dict[str, Any],
+    entries: dict[str, Any],
     *,
     world_size: int,
     device_type: str,
-    model_names: Sequence[str],
+    models: Sequence[tuple[str, TuneTimestralModel]],
     scenarios: Sequence[ScenarioSpec],
     seed: int,
     per_rank_batch: int,
     per_rank_replay_batch: int,
     steps: int,
     cpu_threads: int | None,
-) -> str:
-    """Refuse to compare if any run or scenario spec field mismatches, listing every difference.
-
-    Returns the reference archive's storage mode (`"sketch"` or `"exact"`).
-    """
-    if not isinstance(meta, dict) or "spec" not in meta:
+) -> ReferenceMode:
+    """Refuse to compare if any run, model, config, sketch, or scenario field mismatches, listing every difference."""
+    if not isinstance(meta, dict) or "spec" not in meta or not isinstance(meta["spec"], dict):
         raise ValueError("reference metadata is malformed (missing 'spec')")
     ref_spec = meta["spec"]
     diffs: list[str] = []
@@ -1205,12 +1655,21 @@ def _validate_reference_spec(
         diffs.append(f"schema_version: reference={ref_spec.get('schema_version')!r}, current={SCHEMA_VERSION!r}")
 
     ref_mode = ref_spec.get("reference_mode")
-    if ref_mode not in ("sketch", "exact"):
+    if ref_mode not in ("auto", "sketch", "exact"):
         diffs.append(f"reference_mode: unsupported value {ref_mode!r}")
-    elif ref_mode == "sketch" and ref_spec.get("sketch_dim") != SKETCH_DIM:
-        diffs.append(f"sketch_dim: reference={ref_spec.get('sketch_dim')!r}, current={SKETCH_DIM!r}")
+    else:
+        if ref_mode in ("auto", "sketch"):
+            if ref_spec.get("sketch_dim") != SKETCH_DIM:
+                diffs.append(f"sketch_dim: reference={ref_spec.get('sketch_dim')!r}, current={SKETCH_DIM!r}")
+            if ref_spec.get("sketch_chunk") != SKETCH_CHUNK:
+                diffs.append(f"sketch_chunk: reference={ref_spec.get('sketch_chunk')!r}, current={SKETCH_CHUNK!r}")
+        if ref_mode == "auto" and ref_spec.get("auto_exact_f64_max_numel") != AUTO_EXACT_F64_MAX_NUMEL:
+            diffs.append(
+                f"auto_exact_f64_max_numel: reference={ref_spec.get('auto_exact_f64_max_numel')!r}, "
+                f"current={AUTO_EXACT_F64_MAX_NUMEL!r}"
+            )
 
-    scalar_checks = (
+    scalar_checks: tuple[tuple[str, Any], ...] = (
         ("world_size", world_size),
         ("device_type", device_type),
         ("seed", seed),
@@ -1229,18 +1688,44 @@ def _validate_reference_spec(
         if actual != expected:
             diffs.append(f"{key}: reference={actual!r}, current={expected!r}")
 
+    model_names = [name for name, _ in models]
     ref_models = set(ref_spec.get("models", []))
     missing_models = [m for m in model_names if m not in ref_models]
     if missing_models:
         diffs.append(f"models: missing {missing_models} (reference has {sorted(ref_models)})")
 
-    ref_scen_by_name = {entry["name"]: entry for entry in ref_spec.get("scenarios", [])}
+    ref_model_digests = ref_spec.get("model_digests")
+    if not isinstance(ref_model_digests, dict):
+        diffs.append("model_digests: missing from reference spec")
+    else:
+        for model_name, base_model in models:
+            if model_name not in ref_models:
+                continue
+            cur_digest = _hash_model_state(base_model).hex()
+            ref_digest = ref_model_digests.get(model_name)
+            if ref_digest != cur_digest:
+                diffs.append(
+                    f"base model state {model_name!r} differs (ref={str(ref_digest)[:12]}, cur={cur_digest[:12]})"
+                )
+
     is_cuda = device_type == "cuda"
+    ref_scen_by_name = {entry["name"]: entry for entry in ref_spec.get("scenarios", [])}
+    ref_cfg_digests = ref_spec.get("scenario_config_digests")
+    cur_cfg_digests = _expected_config_digests(
+        models,
+        scenarios,
+        is_cuda=is_cuda,
+        world_size=world_size,
+        per_rank_batch=per_rank_batch,
+        per_rank_replay_batch=per_rank_replay_batch,
+        steps=steps,
+        seed=seed,
+    )
     for spec in scenarios:
         if not spec.compare_ref or _skip_reason(spec, is_cuda=is_cuda) is not None:
             continue
         if spec.name not in ref_scen_by_name:
-            diffs.append(f"scenario {spec.name!r}: missing from reference file")
+            diffs.append(f"scenario {spec.name!r}: missing from reference spec (possibly skipped when ref was built)")
             continue
         expected_meta = spec.to_meta()
         actual_meta = ref_scen_by_name[spec.name]
@@ -1252,11 +1737,197 @@ def _validate_reference_spec(
                 if actual_meta.get(k) != expected_meta.get(k)
             ]
             diffs.append(f"scenario {spec.name!r} differs in: {', '.join(field_diffs)}")
+        for model_name in model_names:
+            if model_name not in ref_models:
+                continue
+            key = f"{model_name}:{spec.name}"
+            if key not in entries:
+                diffs.append(f"entry {key!r}: missing from reference entries.json")
+                continue
+            cur_cd = cur_cfg_digests[key]
+            ref_cd = ref_cfg_digests.get(key) if isinstance(ref_cfg_digests, dict) else None
+            if ref_cd != cur_cd:
+                diffs.append(f"resolved config for {key!r} differs (ref={str(ref_cd)[:12]}, cur={cur_cd[:12]})")
 
     if diffs:
         raise ValueError("; ".join(diffs))
-    assert isinstance(ref_mode, str)
+    assert ref_mode in ("auto", "sketch", "exact")
     return ref_mode
+
+
+# --------------------------------------------------------------------------- comparison & row formatting
+
+
+def _compare_to_reference(
+    out: dict[str, Any],
+    reader: _ReferenceReader | None,
+    *,
+    model_name: str,
+    spec: ScenarioSpec,
+    seed: int,
+) -> tuple[float | None, float | None, float | None, float | None, list[str]]:
+    if reader is None or not spec.compare_ref:
+        return None, None, None, None, []
+
+    key = f"{model_name}:{spec.name}"
+    ref = reader.entries.get(key)
+    if ref is None:
+        raise ValueError(f"{key}: missing from reference archive")
+
+    # Guard against complete initial model state, frozen teacher, config, or dataset drift.
+    if ref.get("init_model_sha256") != out["init_model_sha256"]:
+        raise ValueError(f"{key}: initial full model state (params+buffers) SHA-256 differs from reference")
+    if ref.get("init_trainable_sha256") != out["init_trainable_sha256"]:
+        raise ValueError(f"{key}: initial trainable weights SHA-256 differs from reference")
+    if ref.get("frozen_base_sha256") is not None and out["frozen_base_sha256"] is not None:
+        if ref.get("frozen_base_sha256") != out["frozen_base_sha256"]:
+            raise ValueError(f"{key}: frozen_base teacher state SHA-256 differs from reference")
+    if ref.get("config_digest") != out["config_digest"]:
+        raise ValueError(f"{key}: resolved TrainingConfig/LoraConfig/ReplayConfig digest differs from reference")
+    for fp_key in ("dom_fp", "val_fp", "rep_fp"):
+        if ref.get(fp_key) != out[fp_key]:
+            raise ValueError(f"{key}: dataset fingerprint {fp_key!r} differs from reference")
+
+    init_native: Tensor = out["init_trainable_native"]
+    final_native: Tensor = out["final_trainable_native"]
+    if int(final_native.numel()) != int(ref["numel"]):
+        raise ValueError(f"{key}: trainable numel {final_native.numel()} != reference {ref['numel']}")
+
+    extra_notes: list[str] = []
+    storage_kind = ref["storage_kind"]
+    got_finite = bool(out.get("final_all_finite", bool(torch.isfinite(final_native).all().item())))
+    ref_finite = bool(ref.get("final_all_finite", True))
+
+    if not got_finite or not ref_finite:
+        # Never report 0.0 for bitwise-identical NaN/Inf vectors.
+        param_l2 = float("nan")
+        upd_l2 = float("nan")
+        extra_notes.append("NONFINITE_PARAMS")
+    elif out["final_trainable_sha256"] == ref["final_trainable_sha256"]:
+        param_l2 = 0.0
+        upd_l2 = 0.0
+    else:
+        ref_tensor = reader.load_tensor(ref)
+        if storage_kind == "exact_final":
+            init_f64 = init_native.double()
+            got_final_f64 = final_native.double()
+            ref_final_f64 = ref_tensor.double()
+            param_l2 = rel(got_final_f64, ref_final_f64)
+            upd_l2 = rel(got_final_f64 - init_f64, ref_final_f64 - init_f64)
+        elif storage_kind == "exact_delta":
+            got_delta_f64 = final_native.double() - init_native.double()
+            diff_norm = float((got_delta_f64 - ref_tensor.double()).norm().item())
+            param_l2 = diff_norm / max(float(ref["final_norm_f64"]), 1e-300)
+            upd_l2 = diff_norm / max(float(ref["update_norm_f64"]), 1e-300)
+        elif storage_kind == "count_sketch":
+            sketch_dim = int(ref_tensor.numel())
+            got_sketch, _, _, _ = _count_sketch_delta(
+                init_native,
+                final_native,
+                sketch_dim=sketch_dim,
+                seed=_sketch_seed(seed, model_name, spec.name),
+            )
+            diff_norm = float((got_sketch - ref_tensor.double()).norm().item())
+            param_l2 = diff_norm / max(float(ref["final_norm_f64"]), 1e-300)
+            upd_l2 = diff_norm / max(float(ref["update_norm_f64"]), 1e-300)
+            if diff_norm == 0.0:
+                extra_notes.append("sketch_underflow(sha_differs)")
+            else:
+                floor_rel = _sketch_floor_rel(int(final_native.numel()), sketch_dim)
+                if upd_l2 <= 10.0 * floor_rel:
+                    extra_notes.append(f"sketch_bound(floor~{floor_rel:.1e})")
+        else:
+            raise ValueError(f"{key}: unknown reference storage_kind {storage_kind!r}")
+
+    res: TrainingResult = out["result"]
+    ref_hist = ref["train_history"]
+    loss_rel = _max_history_rel_nan_safe(res.train_history, ref_hist)
+    if len(res.train_history) != len(ref_hist):
+        extra_notes.append(f"ref_steps={ref['steps']}")
+
+    val_rel: float | None = None
+    if spec.with_val:
+        val_rel = _max_history_rel_nan_safe(res.eval_history, ref["eval_history"])
+        if res.best_step != ref.get("best_step"):
+            extra_notes.append(f"ref_best_step={ref.get('best_step')}")
+        if res.restored_best != ref.get("restored_best"):
+            extra_notes.append(f"ref_restored={ref.get('restored_best')}")
+        if res.stopped_early != ref.get("stopped_early"):
+            extra_notes.append(f"ref_early={ref.get('stopped_early')}")
+
+    return param_l2, upd_l2, loss_rel, val_rel, extra_notes
+
+
+def _format_graph_note(graphs_s1: int, graphs_end: int, bumps_post_s1: int) -> str:
+    delta = max(0, graphs_end - graphs_s1)
+    return f"graphs=s1:{graphs_s1}->end:{graphs_end}(+{delta},bumps_post_s1={bumps_post_s1})"
+
+
+def _format_ref_row(spec: ScenarioSpec, out: dict[str, Any], *, is_cuda: bool) -> str:
+    res: TrainingResult = out["result"]
+    notes: list[str] = []
+    if spec.static_note:
+        notes.append(spec.static_note)
+    if spec.with_val:
+        notes.append(
+            f"early={res.stopped_early} restored={res.restored_best} best_step={res.best_step} val_s={out['val_s']:.2f}"
+        )
+    if spec.compile_model:
+        notes.append(_format_graph_note(out["graphs_s1"], out["graphs_end"], out["graph_bumps_post_s1"]))
+    if spec.test_export:
+        notes.append("export=ok" if out["export_ok"] else f"export=FAIL({out['export_err']})")
+    step_str = _format_num(out["steady_step_ms"], width=8, fmt=".2f")
+    vram_str = _format_num(out["peak_vram_mib"] if is_cuda else None, width=8, fmt=".1f")
+    return (
+        f"{spec.name:<42} {res.steps:>5d} {res.skipped_batches:>4d} "
+        f"{out['wall_s']:>7.2f} {step_str} {out['tail_s']:>7.2f} {vram_str}  {' | '.join(notes)}"
+    )
+
+
+def _format_dist_row(
+    spec: ScenarioSpec,
+    out: dict[str, Any],
+    *,
+    param_l2: float | None,
+    upd_l2: float | None,
+    loss_rel: float | None,
+    val_rel: float | None,
+    extra_notes: Sequence[str],
+    world_size: int,
+    is_cuda: bool,
+) -> str:
+    res: TrainingResult = out["result"]
+    notes: list[str] = []
+    if spec.static_note:
+        notes.append(spec.static_note)
+    if not out["xrank_exact"]:
+        notes.append("XRANK_STATE_MISMATCH")
+    if not out["result_eq"]:
+        notes.append("RESULT_MISMATCH")
+    if spec.with_val:
+        notes.append(
+            f"early={res.stopped_early} restored={res.restored_best} "
+            f"best_step={res.best_step} val_s={out['val_max_s']:.2f}"
+        )
+    if spec.compile_model:
+        notes.append(_format_graph_note(out["graphs_s1_max"], out["graphs_end_max"], out["graph_bumps_max"]))
+    if spec.test_export:
+        cnt = out["export_pass_count"]
+        notes.append(f"export={'ok' if out['export_all_ok'] else 'FAIL'}({cnt}/{world_size})")
+    if not spec.compare_ref:
+        notes.append("xrank_only")
+    notes.extend(extra_notes)
+
+    step_str = _format_num(out["step_max_ms"], width=8, fmt=".2f")
+    vram_str = _format_num(out["vram_max_mib"] if is_cuda else None, width=8, fmt=".1f")
+    return (
+        f"{spec.name:<42} {res.steps:>5d} {res.skipped_batches:>4d} "
+        f"{'yes' if out['xrank_exact'] else 'no':>5} {out['xrank_max_abs']:>9.2e} "
+        f"{_format_num(param_l2)} {_format_num(upd_l2)} "
+        f"{_format_num(loss_rel)} {_format_num(val_rel)} "
+        f"{out['wall_max_s']:>7.2f} {step_str} {out['tail_max_s']:>7.2f} {vram_str}  "
+        f"{' | '.join(notes)}"
+    )
 
 
 # --------------------------------------------------------------------------- CLI helpers
@@ -1304,6 +1975,14 @@ def _resolve_cpu_threads(args: argparse.Namespace, *, is_cuda: bool) -> int | No
     return threads
 
 
+def _ref_mode_label(ref_mode: ReferenceMode) -> str:
+    if ref_mode == "auto":
+        return f"auto(f64<={AUTO_EXACT_F64_MAX_NUMEL},k={SKETCH_DIM})"
+    if ref_mode == "sketch":
+        return f"sketch(k={SKETCH_DIM})"
+    return "exact"
+
+
 def _env_banner(
     *,
     mode_label: str,
@@ -1331,12 +2010,7 @@ def _env_banner(
     if ref_mode_label is not None:
         parts.append(f"ref_mode={ref_mode_label}")
     if device_label.startswith("cuda") and torch.cuda.is_available():
-        parts.append(f"cuda={torch.version.cuda}")
-        nccl_ver = torch.cuda.nccl.version() if hasattr(torch.cuda, "nccl") else None
-        if nccl_ver is not None:
-            parts.append(f"nccl={'.'.join(str(x) for x in nccl_ver)}")
-        parts.append(f"gpu={torch.cuda.get_device_name(0)}")
-        parts.append(f"gpu_count={torch.cuda.device_count()}")
+        parts.extend(cuda_env_banner_parts(allow_cuda_context=True))
     parts.extend(
         [
             f"threads={torch.get_num_threads()}",
@@ -1373,12 +2047,11 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
         return 2
     is_cuda = parsed_dev.type == "cuda"
     cpu_threads = _resolve_cpu_threads(args, is_cuda=is_cuda)
-    ref_mode: Literal["sketch", "exact"] = args.reference_mode
-    ref_mode_label = f"sketch(k={SKETCH_DIM})" if ref_mode == "sketch" else "exact"
+    ref_mode: ReferenceMode = args.reference_mode
+    ref_label = _ref_mode_label(ref_mode)
 
     models = _load_models(args.sizes, include_tiny=not args.no_tiny, seed=args.seed)
-    model_names = [name for name, _ in models]
-    if not model_names:
+    if not models:
         print("error: --no-tiny requires at least one --sizes entry", file=sys.stderr)
         return 2
 
@@ -1389,7 +2062,7 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
             world_size=args.world_size,
             device_label=device_str,
             device_map=None,
-            ref_mode_label=ref_mode_label,
+            ref_mode_label=ref_label,
             seed=args.seed,
             per_rank_batch=args.batch_size,
             per_rank_replay_batch=args.replay_batch_size,
@@ -1400,7 +2073,7 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
 
     out_path = Path(args.write_reference)
     writer = _StreamingReferenceWriter(out_path)
-    moved_state_cache: dict[str, dict[str, Tensor]] = {}
+    moved_params_cache: dict[str, dict[str, Tensor]] = {}
     had_failure = False
     entry_count = 0
 
@@ -1409,7 +2082,7 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
             print(f"\n=== Model: {model_name} (reference for N={args.world_size}) ===", flush=True)
             print(
                 f"{'scenario':<42} {'steps':>5} {'skip':>4} {'wall_s':>7} "
-                f"{'step_ms':>8} {'tail_s':>7} {'vram_mb':>8}  notes",
+                f"{'step_ms':>8} {'tail_s':>7} {'vram_mib':>8}  notes",
                 flush=True,
             )
             for spec in scenarios:
@@ -1442,7 +2115,7 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
                         rank=0,
                         expected_cuda_index=None,
                         binding_label="single-process",
-                        moved_state_cache=moved_state_cache,
+                        moved_params_cache=moved_params_cache,
                     )
                 except Exception as exc:
                     had_failure = True
@@ -1458,27 +2131,26 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
                 key = f"{model_name}:{spec.name}"
                 init_vec: Tensor = out["init_trainable_native"]
                 final_vec: Tensor = out["final_trainable_native"]
-
-                if ref_mode == "sketch":
-                    stored_tensor, final_norm, update_norm, storage_kind = _count_sketch_delta(
-                        init_vec,
-                        final_vec,
-                        sketch_dim=SKETCH_DIM,
-                        seed=_sketch_seed(args.seed, model_name, spec.name),
-                    )
-                else:
-                    stored_tensor = final_vec
-                    final_norm = float(final_vec.double().norm().item())
-                    update_norm = float((final_vec.double() - init_vec.double()).norm().item())
-                    storage_kind = "exact_final"
+                stored_tensor, final_norm, update_norm, storage_kind = _select_reference_payload(
+                    init_vec,
+                    final_vec,
+                    ref_mode=ref_mode,
+                    spec=spec,
+                    seed=args.seed,
+                    model_name=model_name,
+                )
 
                 writer.add_entry(
                     key,
                     {
                         "storage_kind": storage_kind,
                         "numel": int(final_vec.numel()),
-                        "init_sha256": out["init_sha256"],
-                        "final_sha256": out["final_sha256"],
+                        "config_digest": out["config_digest"],
+                        "init_model_sha256": out["init_model_sha256"],
+                        "frozen_base_sha256": out["frozen_base_sha256"],
+                        "init_trainable_sha256": out["init_trainable_sha256"],
+                        "final_trainable_sha256": out["final_trainable_sha256"],
+                        "final_all_finite": out["final_all_finite"],
                         "final_norm_f64": final_norm,
                         "update_norm_f64": update_norm,
                         "dom_fp": out["dom_fp"],
@@ -1495,32 +2167,15 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
                         "wall_s": out["wall_s"],
                         "steady_step_ms": out["steady_step_ms"],
                         "tail_s": out["tail_s"],
+                        "val_s": out["val_s"],
                         "peak_vram_mib": out["peak_vram_mib"],
                     },
                     stored_tensor,
                 )
                 entry_count += 1
-
-                notes: list[str] = []
-                if spec.static_note:
-                    notes.append(spec.static_note)
-                if spec.with_val:
-                    notes.append(f"early={res.stopped_early} restored={res.restored_best} best_step={res.best_step}")
-                if spec.compile_model:
-                    notes.append(
-                        f"graphs={out['total_graphs']} recompiled={'yes' if out['extra_graphs'] > 0 else 'no'}"
-                    )
-                if spec.test_export:
-                    notes.append("export=ok" if out["export_ok"] else f"export=FAIL({out['export_err']})")
-                    if not out["export_ok"]:
-                        had_failure = True
-                step_str = _format_num(out["steady_step_ms"], width=8, fmt=".2f")
-                vram_str = _format_num(out["peak_vram_mib"] if is_cuda else None, width=8, fmt=".1f")
-                print(
-                    f"{spec.name:<42} {res.steps:>5d} {res.skipped_batches:>4d} "
-                    f"{out['wall_s']:>7.2f} {step_str} {out['tail_s']:>7.2f} {vram_str}  {' | '.join(notes)}",
-                    flush=True,
-                )
+                if spec.test_export and not out["export_ok"]:
+                    had_failure = True
+                print(_format_ref_row(spec, out, is_cuda=is_cuda), flush=True)
 
         if had_failure:
             writer.abort()
@@ -1530,7 +2185,7 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
         run_spec = _make_run_spec(
             world_size=args.world_size,
             device_type=parsed_dev.type,
-            model_names=model_names,
+            models=models,
             scenarios=scenarios,
             seed=args.seed,
             per_rank_batch=args.batch_size,
@@ -1538,6 +2193,7 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
             steps=args.steps,
             cpu_threads=cpu_threads,
             reference_mode=ref_mode,
+            entry_keys=writer.entry_keys,
         )
         env_info = {
             "torch_version": torch.__version__,
@@ -1555,99 +2211,110 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
     size_mib = out_path.stat().st_size / (1024.0 * 1024.0)
     print(
         f"\nWrote {entry_count} reference entries for N={args.world_size} ({parsed_dev.type}, "
-        f"{ref_mode_label}, {size_mib:.2f} MiB).",
+        f"{ref_label}, {size_mib:.2f} MiB).",
         flush=True,
     )
     return 0
 
 
-def _compare_to_reference(
-    out: dict[str, Any],
-    reader: _ReferenceReader | None,
+def _prepare_distributed_setup(
+    args: argparse.Namespace,
+    scenarios: Sequence[ScenarioSpec],
     *,
-    model_name: str,
-    spec: ScenarioSpec,
-    seed: int,
-) -> tuple[float | None, float | None, float | None, float | None, list[str]]:
-    if reader is None or not spec.compare_ref:
-        return None, None, None, None, []
+    rank: int,
+    world_size: int,
+    local_rank: int,
+) -> tuple[
+    str,
+    int | None,
+    str,
+    str,
+    list[tuple[str, TuneTimestralModel]],
+    _ReferenceReader | None,
+    str | None,
+]:
+    """Validate device mapping, load CPU models, and validate reference archive on every rank before init."""
+    backend: Literal["gloo", "nccl"] = args.backend
+    is_cuda = backend == "nccl"
+    device_map: Literal["per-rank", "shared"] = args.device_map
+    cpu_threads = _resolve_cpu_threads(args, is_cuda=is_cuda)
 
-    key = f"{model_name}:{spec.name}"
-    ref = reader.entries.get(key)
-    if ref is None:
-        raise ValueError(f"{key}: missing from reference archive")
+    dev_err = validate_distributed_device_map(
+        backend=backend,
+        device_map=device_map,
+        world_size=world_size,
+        local_rank=local_rank,
+    )
+    if dev_err is not None:
+        if rank == 0:
+            print(f"error: {dev_err}", file=sys.stderr)
+        raise SystemExit(2)
 
-    # Guard against subtle weight-init or dataset drift between reference and multi-rank runs.
-    if ref.get("init_sha256") != out["init_sha256"]:
-        raise ValueError(f"{key}: initial trainable weights SHA-256 differs from reference")
-    for fp_key in ("dom_fp", "val_fp", "rep_fp"):
-        if ref.get(fp_key) != out[fp_key]:
-            raise ValueError(f"{key}: dataset fingerprint {fp_key!r} differs from reference")
+    if any(s.num_workers > 0 and _skip_reason(s, is_cuda=is_cuda) is None for s in scenarios):
+        try:
+            check_tmpdir_for_workers()
+        except Exception as exc:
+            if rank == 0:
+                print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
 
-    init_native: Tensor = out["init_trainable_native"]
-    final_native: Tensor = out["final_trainable_native"]
-    if int(final_native.numel()) != int(ref["numel"]):
-        raise ValueError(f"{key}: trainable numel {final_native.numel()} != reference {ref['numel']}")
-
-    extra_notes: list[str] = []
-    storage_kind = ref["storage_kind"]
-    if out["final_sha256"] == ref["final_sha256"]:
-        param_l2 = 0.0
-        upd_l2 = 0.0
-    else:
-        ref_tensor = reader.load_tensor(ref)
-        if storage_kind == "exact_final":
-            init_f64 = init_native.double()
-            got_final_f64 = final_native.double()
-            ref_final_f64 = ref_tensor.double()
-            param_l2 = rel(got_final_f64, ref_final_f64)
-            upd_l2 = rel(got_final_f64 - init_f64, ref_final_f64 - init_f64)
-        elif storage_kind == "exact_delta":
-            got_delta_f64 = final_native.double() - init_native.double()
-            diff_norm = float((got_delta_f64 - ref_tensor.double()).norm().item())
-            param_l2 = diff_norm / max(float(ref["final_norm_f64"]), 1e-300)
-            upd_l2 = diff_norm / max(float(ref["update_norm_f64"]), 1e-300)
-        elif storage_kind == "count_sketch":
-            got_sketch, _, _, _ = _count_sketch_delta(
-                init_native,
-                final_native,
-                sketch_dim=int(ref_tensor.numel()),
-                seed=_sketch_seed(seed, model_name, spec.name),
-            )
-            diff_norm = float((got_sketch - ref_tensor.double()).norm().item())
-            param_l2 = diff_norm / max(float(ref["final_norm_f64"]), 1e-300)
-            upd_l2 = diff_norm / max(float(ref["update_norm_f64"]), 1e-300)
+    if is_cuda:
+        if device_map == "shared":
+            config_device = "cuda:0"
+            expected_cuda_index: int | None = 0
+            binding_label = "shared"
+            device_label = "cuda:0 (shared)"
         else:
-            raise ValueError(f"{key}: unknown reference storage_kind {storage_kind!r}")
-
-    res: TrainingResult = out["result"]
-    ref_hist = ref["train_history"]
-    if (
-        len(res.train_history) == len(ref_hist)
-        and len(ref_hist) > 0
-        and all(s_got == s_ref for (s_got, _), (s_ref, _) in zip(res.train_history, ref_hist, strict=True))
-    ):
-        loss_rel: float | None = max(
-            _scalar_rel(l_got, l_ref) for (_, l_got), (_, l_ref) in zip(res.train_history, ref_hist, strict=True)
-        )
+            # Pass device="auto" and do NOT call torch.cuda.set_device beforehand so TimestralTrainer's
+            # DistributedContext.detect() binds cuda:LOCAL_RANK live.
+            config_device = "auto"
+            expected_cuda_index = local_rank
+            binding_label = "per-rank"
+            device_label = f"cuda:0..{world_size - 1}"
     else:
-        loss_rel = float("nan")
-        extra_notes.append(f"ref_steps={ref['steps']}")
+        config_device = "cpu"
+        expected_cuda_index = None
+        binding_label = "gloo"
+        device_label = "cpu"
 
-    val_rel: float | None = None
-    if spec.with_val:
-        ref_eval = ref["eval_history"]
-        if (
-            len(res.eval_history) == len(ref_eval)
-            and len(ref_eval) > 0
-            and all(s_got == s_ref for (s_got, _), (s_ref, _) in zip(res.eval_history, ref_eval, strict=True))
-        ):
-            val_rel = max(
-                _scalar_rel(v_got, v_ref) for (_, v_got), (_, v_ref) in zip(res.eval_history, ref_eval, strict=True)
+    models = _load_models(args.sizes, include_tiny=not args.no_tiny, seed=args.seed)
+    if not models:
+        if rank == 0:
+            print("error: --no-tiny requires at least one --sizes entry", file=sys.stderr)
+        raise SystemExit(2)
+
+    ref_reader: _ReferenceReader | None = None
+    ref_label: str | None = None
+    if args.reference is not None:
+        ref_path = Path(args.reference)
+        if not ref_path.is_file():
+            if rank == 0:
+                print(f"error: reference file not found: {ref_path}", file=sys.stderr)
+            raise SystemExit(2)
+        try:
+            ref_meta, ref_entries = _read_reference_metadata(ref_path)
+            ref_mode = _validate_reference_spec(
+                ref_meta,
+                ref_entries,
+                world_size=world_size,
+                device_type="cuda" if is_cuda else "cpu",
+                models=models,
+                scenarios=scenarios,
+                seed=args.seed,
+                per_rank_batch=args.batch_size,
+                per_rank_replay_batch=args.replay_batch_size,
+                steps=args.steps,
+                cpu_threads=cpu_threads,
             )
-        else:
-            val_rel = float("nan")
-    return param_l2, upd_l2, loss_rel, val_rel, extra_notes
+            ref_label = _ref_mode_label(ref_mode)
+            if rank == 0:
+                ref_reader = _ReferenceReader(ref_path)
+        except Exception as exc:
+            if rank == 0:
+                print(f"error: refusing to compare against reference file: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+
+    return config_device, expected_cuda_index, binding_label, device_label, models, ref_reader, ref_label
 
 
 def _run_distributed_mode(args: argparse.Namespace, scenarios: Sequence[ScenarioSpec]) -> int:
@@ -1670,104 +2337,40 @@ def _run_distributed_mode(args: argparse.Namespace, scenarios: Sequence[Scenario
     backend: Literal["gloo", "nccl"] = args.backend
     is_cuda = backend == "nccl"
     device_map: Literal["per-rank", "shared"] = args.device_map
-    cpu_threads = _resolve_cpu_threads(args, is_cuda=is_cuda)
 
-    if backend == "gloo" and device_map == "shared":
-        if rank == 0:
-            print("error: --device-map shared applies only to --backend nccl", file=sys.stderr)
-        return 2
-
-    if is_cuda:
-        if not torch.cuda.is_available():
-            if rank == 0:
-                print("error: --backend nccl requires CUDA, but torch.cuda.is_available() is False", file=sys.stderr)
-            return 2
-        if device_map == "shared":
-            if os.environ.get("NCCL_MULTI_RANK_GPU_ENABLE") != "1":
-                if rank == 0:
-                    print(
-                        "error: --device-map shared on NCCL requires NCCL_MULTI_RANK_GPU_ENABLE=1 in the environment "
-                        "(without it NCCL rejects multiple ranks on cuda:0 at init_process_group)",
-                        file=sys.stderr,
-                    )
-                return 2
-            config_device: str | None = "cuda:0"
-            expected_cuda_index: int | None = 0
-            binding_label = "shared"
-            device_label = "cuda:0 (shared)"
-        else:
-            gpu_count = torch.cuda.device_count()
-            if not (0 <= local_rank < gpu_count):
-                print(
-                    f"error: rank {rank} LOCAL_RANK={local_rank} out of range for {gpu_count} available GPU(s); "
-                    "use --device-map shared with NCCL_MULTI_RANK_GPU_ENABLE=1 on a single GPU",
-                    file=sys.stderr,
-                )
-                return 2
-            # Pass device=None and do NOT call torch.cuda.set_device beforehand so TimestralTrainer's own
-            # DistributedContext.detect() binds cuda:LOCAL_RANK live.
-            config_device = None
-            expected_cuda_index = local_rank
-            binding_label = "per-rank"
-            device_label = f"cuda:0..{world_size - 1}"
-    else:
-        config_device = "cpu"
-        expected_cuda_index = None
-        binding_label = "gloo"
-        device_label = "cpu"
-
-    model_names = (["tiny_random"] if not args.no_tiny else []) + list(args.sizes)
-    if not model_names:
-        if rank == 0:
-            print("error: --no-tiny requires at least one --sizes entry", file=sys.stderr)
-        return 2
-
-    # Validate the tiny `spec.json` member on EVERY rank BEFORE entering `init_process_group`.
-    # Every rank exits 2 cleanly on mismatch without entering a collective or touching GPU binding,
-    # while only rank 0 opens the archive for per-scenario lazy tensor reads.
-    ref_reader: _ReferenceReader | None = None
-    ref_mode_label: str | None = None
-    if args.reference is not None:
-        ref_path = Path(args.reference)
-        if not ref_path.is_file():
-            if rank == 0:
-                print(f"error: reference file not found: {ref_path}", file=sys.stderr)
-            return 2
-        try:
-            ref_meta = _read_reference_spec(ref_path)
-            ref_mode = _validate_reference_spec(
-                ref_meta,
-                world_size=world_size,
-                device_type="cuda" if is_cuda else "cpu",
-                model_names=model_names,
-                scenarios=scenarios,
-                seed=args.seed,
-                per_rank_batch=args.batch_size,
-                per_rank_replay_batch=args.replay_batch_size,
-                steps=args.steps,
-                cpu_threads=cpu_threads,
-            )
-            ref_mode_label = f"sketch(k={SKETCH_DIM})" if ref_mode == "sketch" else "exact"
-        except Exception as exc:
-            if rank == 0:
-                print(f"error: refusing to compare against reference file: {exc}", file=sys.stderr)
-            return 2
-        if rank == 0:
-            ref_reader = _ReferenceReader(ref_path)
-
-    # In shared single-GPU mode, bind cuda:0 before init_process_group; in per-rank mode, leave
-    # CUDA device binding to TimestralTrainer so the trainer's LOCAL_RANK path is genuinely exercised.
-    if is_cuda and device_map == "shared":
-        torch.cuda.set_device(0)
-
-    dist.init_process_group(
-        backend=backend,
-        timeout=datetime.timedelta(seconds=args.timeout),
-    )
-    had_failure = False
-    moved_state_cache: dict[str, dict[str, Tensor]] = {}
     try:
-        models = _load_models(args.sizes, include_tiny=not args.no_tiny, seed=args.seed)
+        (
+            config_device,
+            expected_cuda_index,
+            binding_label,
+            device_label,
+            models,
+            ref_reader,
+            ref_label,
+        ) = _prepare_distributed_setup(
+            args,
+            scenarios,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+        )
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 2
+
+    had_failure = False
+    clean_collective_exit = False
+    moved_params_cache: dict[str, dict[str, Tensor]] = {}
+    try:
+        # In shared single-GPU mode, bind cuda:0 before init_process_group; in per-rank mode, leave
+        # CUDA device binding to TimestralTrainer so the trainer's LOCAL_RANK path is genuinely exercised.
+        if is_cuda and device_map == "shared":
+            torch.cuda.set_device(0)
+
+        dist.init_process_group(
+            backend=backend,
+            timeout=datetime.timedelta(seconds=args.timeout),
+        )
+
         if rank == 0:
             print(
                 _env_banner(
@@ -1776,7 +2379,7 @@ def _run_distributed_mode(args: argparse.Namespace, scenarios: Sequence[Scenario
                     world_size=world_size,
                     device_label=device_label,
                     device_map=device_map if is_cuda else None,
-                    ref_mode_label=ref_mode_label,
+                    ref_mode_label=ref_label,
                     seed=args.seed,
                     per_rank_batch=args.batch_size,
                     per_rank_replay_batch=args.replay_batch_size,
@@ -1790,7 +2393,7 @@ def _run_distributed_mode(args: argparse.Namespace, scenarios: Sequence[Scenario
         header = (
             f"{'scenario':<42} {'steps':>5} {'skip':>4} {'xr_eq':>5} {'xr_max':>9} "
             f"{'param_l2':>9} {'upd_l2':>9} {'loss_rel':>9} {'val_rel':>9} "
-            f"{'wall_s':>7} {'step_ms':>8} {'tail_s':>7} {'vram_mb':>8}  notes"
+            f"{'wall_s':>7} {'step_ms':>8} {'tail_s':>7} {'vram_mib':>8}  notes"
         )
         for model_name, base_model in models:
             if rank == 0:
@@ -1823,7 +2426,7 @@ def _run_distributed_mode(args: argparse.Namespace, scenarios: Sequence[Scenario
                         rank=rank,
                         expected_cuda_index=expected_cuda_index,
                         binding_label=binding_label,
-                        moved_state_cache=moved_state_cache,
+                        moved_params_cache=moved_params_cache,
                     )
                 except Exception as exc:
                     had_failure = True
@@ -1833,21 +2436,29 @@ def _run_distributed_mode(args: argparse.Namespace, scenarios: Sequence[Scenario
                         flush=True,
                     )
                     traceback.print_exc(file=sys.stderr)
-                    # Abort immediately so ranks cannot desynchronise on subsequent scenarios.
+                    # Leave clean_collective_exit=False so finally skips destroy_process_group()
+                    # and torchrun reaps peers promptly without stalling on broken NCCL teardown.
                     raise
 
-                # Exit non-zero only on cross-rank mismatch in a deterministic scenario or export failure.
+                if spec.test_export and not out["export_ok"]:
+                    print(
+                        f"[rank {rank}] export check failed in {model_name}:{spec.name}: {out['export_err']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
                 if (spec.deterministic and (not out["xrank_exact"] or not out["result_eq"])) or (
                     spec.test_export and not out["export_all_ok"]
                 ):
                     had_failure = True
 
-                # Rank 0 compares against reference; broadcast a 1-scalar error flag so any reference
-                # content mismatch (e.g. init_sha256 or dataset fingerprint drift) aborts all ranks in lockstep.
+                # Rank 0 compares against reference and broadcasts ref_error_flag BEFORE row formatting
+                # so no formatting exception can ever desynchronise the collective.
                 ref_error_flag = torch.zeros(1, dtype=torch.int64, device=out["device"])
+                cmp_result: tuple[float | None, float | None, float | None, float | None, list[str]] | None = None
                 if rank == 0:
                     try:
-                        param_l2, upd_l2, loss_rel, val_rel, extra_notes = _compare_to_reference(
+                        cmp_result = _compare_to_reference(
                             out,
                             ref_reader,
                             model_name=model_name,
@@ -1857,48 +2468,33 @@ def _run_distributed_mode(args: argparse.Namespace, scenarios: Sequence[Scenario
                     except Exception as exc:
                         ref_error_flag.fill_(1)
                         print(f"error: reference comparison failed: {exc}", file=sys.stderr, flush=True)
-                    else:
-                        res: TrainingResult = out["result"]
-                        notes: list[str] = []
-                        if spec.static_note:
-                            notes.append(spec.static_note)
-                        if not out["xrank_exact"]:
-                            notes.append("XRANK_PARAM_MISMATCH")
-                        if not out["result_eq"]:
-                            notes.append("RESULT_MISMATCH")
-                        if spec.with_val:
-                            notes.append(
-                                f"early={res.stopped_early} restored={res.restored_best} best_step={res.best_step}"
-                            )
-                        if spec.compile_model:
-                            recomp = "yes" if out["extra_graphs_max"] > 0 else "no"
-                            notes.append(f"graphs={out['graphs_max']} recompiled={recomp}")
-                        if spec.test_export:
-                            cnt = out["export_pass_count"]
-                            notes.append(f"export={'ok' if out['export_all_ok'] else 'FAIL'}({cnt}/{world_size})")
-                        if not spec.compare_ref:
-                            notes.append("xrank_only")
-                        notes.extend(extra_notes)
-
-                        step_str = _format_num(out["step_max_ms"], width=8, fmt=".2f")
-                        vram_str = _format_num(out["vram_max_mib"] if is_cuda else None, width=8, fmt=".1f")
-                        print(
-                            f"{spec.name:<42} {res.steps:>5d} {res.skipped_batches:>4d} "
-                            f"{'yes' if out['xrank_exact'] else 'no':>5} {out['xrank_max_abs']:>9.2e} "
-                            f"{_format_num(param_l2)} {_format_num(upd_l2)} "
-                            f"{_format_num(loss_rel)} {_format_num(val_rel)} "
-                            f"{out['wall_max_s']:>7.2f} {step_str} {out['tail_max_s']:>7.2f} {vram_str}  "
-                            f"{' | '.join(notes)}",
-                            flush=True,
-                        )
 
                 dist.broadcast(ref_error_flag, src=0)
                 if int(ref_error_flag.item()) != 0:
+                    clean_collective_exit = True
                     return 2
+
+                if rank == 0 and cmp_result is not None:
+                    param_l2, upd_l2, loss_rel, val_rel, extra_notes = cmp_result
+                    print(
+                        _format_dist_row(
+                            spec,
+                            out,
+                            param_l2=param_l2,
+                            upd_l2=upd_l2,
+                            loss_rel=loss_rel,
+                            val_rel=val_rel,
+                            extra_notes=extra_notes,
+                            world_size=world_size,
+                            is_cuda=is_cuda,
+                        ),
+                        flush=True,
+                    )
+        clean_collective_exit = True
     finally:
         if ref_reader is not None:
             ref_reader.close()
-        if dist.is_initialized():
+        if clean_collective_exit and dist.is_initialized():
             dist.destroy_process_group()
 
     return 1 if had_failure else 0
@@ -1927,12 +2523,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reference-mode",
-        choices=("sketch", "exact"),
-        default="sketch",
+        choices=("auto", "sketch", "exact"),
+        default="auto",
         help=(
-            f"Reference vector storage for --write-reference: 'sketch' (default; exact when numel <= {SKETCH_DIM}, "
-            f"else deterministic float64 CountSketch of dim {SKETCH_DIM} = 64 KiB/scenario) or 'exact' "
-            "(full native-dtype trainable vectors streamed to zip)."
+            f"Reference vector storage for --write-reference: 'auto' (default; exact float64 delta when "
+            f"dtype=float64 and numel <= {AUTO_EXACT_F64_MAX_NUMEL:,} or numel <= {SKETCH_DIM}, else "
+            f"CountSketch dim {SKETCH_DIM}), 'sketch' (CountSketch whenever numel > {SKETCH_DIM}), "
+            "or 'exact' (full native-dtype trainable vectors streamed to zip)."
         ),
     )
     parser.add_argument(
@@ -1951,7 +2548,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--device-map",
         choices=("per-rank", "shared"),
         default="per-rank",
-        help="NCCL device mapping: per-rank (device=None -> cuda:LOCAL_RANK) or shared (cuda:0 on all ranks).",
+        help="NCCL device mapping: per-rank (device='auto' -> cuda:LOCAL_RANK) or shared (cuda:0 on all ranks).",
     )
     parser.add_argument(
         "--device",
@@ -2022,6 +2619,19 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_numeric_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.batch_size < 1:
+        parser.error(f"--batch-size must be >= 1, got {args.batch_size}")
+    if args.replay_batch_size < 1:
+        parser.error(f"--replay-batch-size must be >= 1, got {args.replay_batch_size}")
+    if args.steps < 1:
+        parser.error(f"--steps must be >= 1, got {args.steps}")
+    if args.timeout <= 0:
+        parser.error(f"--timeout must be > 0, got {args.timeout}")
+    if args.cpu_threads is not None and args.cpu_threads < 1:
+        parser.error(f"--cpu-threads must be >= 1, got {args.cpu_threads}")
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -2048,6 +2658,7 @@ def main() -> int:
             print(f"{spec.name:<42} ({', '.join(flags)})")
         return 0
 
+    _validate_numeric_args(parser, args)
     scenarios = _select_scenarios(args.only, args.skip)
 
     if args.write_reference is not None:
