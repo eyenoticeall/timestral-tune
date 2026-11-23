@@ -1,8 +1,5 @@
 """Stage 2 multi-process replay and distillation tests.
 
-Also temporarily hosts unit tests for `DistributedBatchCycle` (from `trainer/distributed.py`),
-which can be moved into `tests/test_distributed.py` once parallel test edits merge.
-
 - Spec: `docs/SPEC.md` §5.3, §5.6, §9 (T15), D22–D35
 """
 
@@ -11,31 +8,30 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
+import json
 import logging
 import sys
+import tempfile
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
 
 from timestral_tune import LoraConfig, ReplayConfig, TimestralTrainer, TrainingConfig
+from timestral_tune import export as export_module
 from timestral_tune.data import ColumnRoles, SeriesData, TimeSeriesDataset, TrainingBatch
+from timestral_tune.export import dataset_fingerprint
 from timestral_tune.models import TuneTimestralModel, inject_lora, lora_parameters
 from timestral_tune.replay import SyntheticReplaySource
 from timestral_tune.trainer import RankFailureError, compute_loss
-from timestral_tune.trainer.distributed import (
-    DistributedBatchCycle,
-    DistributedBatchSampler,
-    DistributedContext,
-    rank_seed,
-    rank_step_indices,
-)
+from timestral_tune.trainer import trainer as trainer_module
+from timestral_tune.trainer.distributed import DistributedContext, rank_seed
 
-from .distributed_harness import run_scenarios, unwrap_results
+from .distributed_harness import run_distributed, run_scenarios, unwrap_results
 from .helpers import as_double, float64_reference, l2_rel, make_tiny_forecaster
 
 # PyTorch < 2.8 on macOS hangs at process exit after DataLoader worker processes run (docs/VERIFICATION.md §10).
@@ -46,157 +42,6 @@ CTX_STEPS = 4 * PATCH  # 16
 DOM_HORIZON = 2 * PATCH  # 8
 REP_HORIZON = 6  # deliberately different from DOM_HORIZON (non-multiple of PATCH)
 COV_ROWS = 3
-
-
-class _IndexDataset(Dataset[int]):
-    """Minimal picklable dataset returning each sample's integer index."""
-
-    def __init__(self, size: int) -> None:
-        self._size = size
-
-    def __len__(self) -> int:
-        return self._size
-
-    def __getitem__(self, index: int) -> int:
-        return index
-
-
-def _identity_collate(items: list[int]) -> list[int]:
-    return list(items)
-
-
-# --------------------------------------------------------------------------- DistributedBatchCycle unit tests
-# (Located here due to parallel file ownership; candidate to move to tests/test_distributed.py.)
-
-
-def test_distributed_batch_cycle_validation_and_docstrings() -> None:
-    empty_sampler = DistributedBatchSampler(0, world_size=2, rank=0, batch_size=2)
-    with pytest.raises(ValueError, match="non-empty"):
-        DistributedBatchCycle(empty_sampler, [])
-    with pytest.raises(TypeError, match="DistributedBatchSampler"):
-        DistributedBatchCycle(object(), [])  # type: ignore[arg-type]
-
-    assert DistributedBatchCycle.__doc__
-    for attr_name in ("epoch", "step_in_epoch", "global_step", "next_batch"):
-        attr = getattr(DistributedBatchCycle, attr_name)
-        target = attr.fget if isinstance(attr, property) else attr
-        assert target is not None and target.__doc__, f"DistributedBatchCycle.{attr_name} missing docstring"
-
-
-@pytest.mark.parametrize(
-    "num_items,world_size,batch_size",
-    [
-        (1, 2, 2),  # shorter than world_size: rank 1 empty on every step
-        (2, 4, 2),  # shorter than world_size: ranks 2, 3 empty on every step
-        (5, 2, 2),  # not a multiple of N*b: trailing partial step (rank 0 gets 1, rank 1 empty)
-        (10, 4, 2),  # trailing step has 2 items across 4 ranks (ranks 0, 1 get 1; ranks 2, 3 empty)
-        (11, 4, 2),  # trailing step has 3 items across 4 ranks
-        (16, 4, 2),  # exact multiple of N*b
-    ],
-)
-@pytest.mark.parametrize("shuffle", [False, True])
-def test_distributed_batch_cycle_wraps_epochs_and_matches_union(
-    num_items: int, world_size: int, batch_size: int, shuffle: bool
-) -> None:
-    dataset = _IndexDataset(num_items)
-    cycles: list[DistributedBatchCycle[list[int]]] = []
-    iter_counts = [0] * world_size
-
-    class _CountingLoader:
-        def __init__(self, rank_idx: int, inner: DataLoader[list[int]]) -> None:
-            self._rank_idx = rank_idx
-            self._inner = inner
-
-        def __iter__(self):
-            iter_counts[self._rank_idx] += 1
-            return iter(self._inner)
-
-    for rank in range(world_size):
-        sampler = DistributedBatchSampler(
-            num_items,
-            world_size=world_size,
-            rank=rank,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            seed=2_000_009,
-        )
-        loader: DataLoader[list[int]] = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            collate_fn=_identity_collate,
-            num_workers=0,
-            generator=torch.Generator().manual_seed(100 + rank),
-        )
-        cycles.append(DistributedBatchCycle(sampler, _CountingLoader(rank, loader)))
-
-    steps_per_ep = cycles[0]._sampler.num_global_steps
-    total_steps = steps_per_ep * 3 + 1
-
-    # Also build one-process cycling reference at batch_size = world_size * batch_size for shuffle=False.
-    global_batch = world_size * batch_size
-    one_proc_batches: list[list[int]] = [
-        list(range(start, min(start + global_batch, num_items))) for start in range(0, num_items, global_batch)
-    ]
-
-    for gstep in range(total_steps):
-        expected_epoch, expected_step = divmod(gstep, steps_per_ep)
-        step_union: list[int] = []
-        for rank, cycle in enumerate(cycles):
-            assert cycle.epoch == expected_epoch
-            assert cycle.step_in_epoch == expected_step
-            assert cycle.global_step == gstep
-            got = cycle.next_batch()
-            expected_indices = rank_step_indices(
-                num_items,
-                world_size,
-                batch_size,
-                rank,
-                expected_step,
-                shuffle=shuffle,
-                seed=2_000_009,
-                epoch=expected_epoch,
-            )
-            if not expected_indices:
-                assert got is None
-            else:
-                assert got == expected_indices
-                step_union.extend(got)
-
-        if not shuffle:
-            assert step_union == one_proc_batches[expected_step]
-
-    # Ranks that never had a non-empty slice in any epoch must never have invoked iter(loader).
-    for rank in range(world_size):
-        if rank >= num_items:
-            assert iter_counts[rank] == 0
-        else:
-            assert iter_counts[rank] == 4  # 3 full epochs + 1 step into epoch 3
-
-
-@pytest.mark.skipif(WORKERS_HANG_AT_EXIT, reason="PyTorch < 2.8 on macOS: DataLoader worker hangs at process exit")
-def test_distributed_batch_cycle_with_persistent_workers_and_global_rng() -> None:
-    dataset = _IndexDataset(10)
-    sampler = DistributedBatchSampler(10, world_size=4, rank=0, batch_size=2, shuffle=True, seed=2_000_009)
-    loader: DataLoader[list[int]] = DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        collate_fn=_identity_collate,
-        num_workers=1,
-        persistent_workers=True,
-        generator=torch.Generator().manual_seed(42),
-    )
-    cycle = DistributedBatchCycle(sampler, loader)
-
-    rng_before = torch.get_rng_state()
-    seen = [cycle.next_batch() for _ in range(sampler.num_global_steps * 3)]
-    assert torch.equal(torch.get_rng_state(), rng_before)
-
-    expected = [
-        rank_step_indices(10, 4, 2, 0, s, shuffle=True, seed=2_000_009, epoch=ep)
-        for ep in range(3)
-        for s in range(sampler.num_global_steps)
-    ]
-    assert seen == [idx if idx else None for idx in expected]
 
 
 # --------------------------------------------------------------------------- multi-process helpers
@@ -998,6 +843,127 @@ def _sc_caches_logs_startup_and_stochastic(rank: int, world_size: int) -> dict[s
     return out
 
 
+# --------------------------------------------------------------------------- Scenario 6: Export with replay
+
+
+def _sc_export_with_replay(rank: int, world_size: int) -> dict[str, Any]:
+    dom_ds = _make_single_window_dataset(world_size * 2, seed=80, covariates=True, horizon=DOM_HORIZON)
+    rep_ds = _make_single_window_dataset(world_size * 2 + 1, seed=81, covariates=False, horizon=REP_HORIZON)
+
+    explicit_rcfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False)
+    synth_rcfg = ReplayConfig(replay_fraction=0.2, distill_weight=0.3, batch_size=2, cache_base_outputs=False)
+
+    t_explicit = TimestralTrainer(
+        _base_config(mode="head_only", batch_size=2, max_steps=1),
+        dom_ds,
+        replay_config=explicit_rcfg,
+        replay_dataset=rep_ds,
+        model=_fresh_model(9),
+    )
+    t_synth = TimestralTrainer(
+        _base_config(mode="lora_temporal", batch_size=2, max_steps=1),
+        dom_ds,
+        lora_config=LoraConfig(axes=("time",), dropout=0.0),
+        replay_config=synth_rcfg,
+        model=_fresh_model(9),
+    )
+    t_explicit.fit()
+    t_synth.fit()
+
+    out: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix=f"tt_rep_exp_r{rank}_") as tmpdir:
+        base = Path(tmpdir)
+        orig_fp = trainer_module.dataset_fingerprint
+        orig_export_fn = trainer_module.export_checkpoint
+        orig_save = export_module.save_file
+
+        def _forbid(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("non-zero rank export() must not hash datasets, build replay_source, or write")
+
+        if rank != 0:
+            trainer_module.dataset_fingerprint = _forbid
+            trainer_module.export_checkpoint = _forbid
+            export_module.save_file = _forbid
+        try:
+            explicit_dir = base / "explicit_ckpt"
+            synth_dir = base / "synth_ckpt"
+            out["explicit_returned"] = t_explicit.export(explicit_dir) == explicit_dir
+            out["synth_returned"] = t_synth.export(synth_dir) == synth_dir
+            out["explicit_exists"] = explicit_dir.exists()
+            out["synth_exists"] = synth_dir.exists()
+            if rank == 0:
+                out["explicit_metadata"] = json.loads((explicit_dir / "tune_metadata.json").read_text(encoding="utf-8"))
+                out["synth_metadata"] = json.loads((synth_dir / "tune_metadata.json").read_text(encoding="utf-8"))
+        finally:
+            trainer_module.dataset_fingerprint = orig_fp
+            trainer_module.export_checkpoint = orig_export_fn
+            export_module.save_file = orig_save
+    return out
+
+
+# --------------------------------------------------------------------------- Scenario 7: Repeated fit() with replay
+
+
+def _sc_repeated_fit_restarts_replay(rank: int, world_size: int) -> dict[str, Any]:
+    del rank
+    dom_len = 2 * world_size * 2 + 1
+    rep_len = world_size * 2 + (world_size // 2)  # 5 at N=2, 10 at N=4 (2 steps/epoch; 3 steps stops mid-epoch 1)
+    dom_ds = _make_single_window_dataset(dom_len, seed=90, covariates=True, horizon=DOM_HORIZON)
+    rep_ds = _make_single_window_dataset(rep_len, seed=91, covariates=False, horizon=REP_HORIZON)
+    cfg = _base_config(
+        mode="head_only",
+        batch_size=2,
+        max_steps=3,
+        learning_rate=2e-3,
+        warmup_steps=1,
+        lr_schedule="cosine",
+        weight_decay=0.01,
+        gradient_clip_val=1.0,
+        seed=17,
+    )
+    rcfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False)
+    trainer = TimestralTrainer(cfg, dom_ds, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(11))
+
+    real_make = trainer._make_fit_strategy
+    fit_cursors: list[list[tuple[int, int, int]]] = []
+
+    def _wrapped_make():
+        strat = real_make()
+        real_prepare = strat.prepare_fit
+        call_log: list[tuple[int, int, int]] = []
+        fit_cursors.append(call_log)
+
+        def _wrapped_prepare() -> None:
+            real_prepare()
+            assert strat._replay_cycle is not None
+            real_next = strat._replay_cycle.next_batch
+
+            def _spied_next():
+                cycle = strat._replay_cycle
+                assert cycle is not None
+                call_log.append((cycle.epoch, cycle.step_in_epoch, cycle.global_step))
+                return real_next()
+
+            strat._replay_cycle.next_batch = _spied_next  # type: ignore[method-assign]
+
+        strat.prepare_fit = _wrapped_prepare  # type: ignore[method-assign]
+        return strat
+
+    trainer._make_fit_strategy = _wrapped_make  # type: ignore[method-assign]
+
+    res1 = trainer.fit()
+    params1 = _flat_tensors(trainer._trainable)
+    res2 = trainer.fit()
+    params2 = _flat_tensors(trainer._trainable)
+    return {
+        "fit1_result": res1,
+        "fit2_result": res2,
+        "fit1_params": params1,
+        "fit2_params": params2,
+        "fit_cursors": fit_cursors,
+    }
+
+
 # --------------------------------------------------------------------------- Main multi-process test entry points
 
 
@@ -1009,6 +975,8 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
         "skipped_domain": _sc_skipped_domain_step_preserves_replay,
         "failures": _sc_replay_failures,
         "caches_and_startup": _sc_caches_logs_startup_and_stochastic,
+        "export_with_replay": _sc_export_with_replay,
+        "repeated_fit": _sc_repeated_fit_restarts_replay,
     }
     outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=15.0, wall_timeout=120.0)
 
@@ -1237,3 +1205,141 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
             assert mm["exc_type"] is RankFailureError
             assert mm["failing_ranks"] == (1,)
             assert mm["stage"] == "startup_consistency"
+
+    # --- 6. export() with replay: non-zero ranks skip dataset hashing/replay_source/writes; rank 0 metadata ---
+    exp = unwrap_results(outcomes["export_with_replay"])
+    expected_rep_ds = _make_single_window_dataset(world_size * 2 + 1, seed=81, covariates=False, horizon=REP_HORIZON)
+    expected_explicit_rcfg = ReplayConfig(
+        replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False
+    )
+    expected_synth_rcfg = ReplayConfig(replay_fraction=0.2, distill_weight=0.3, batch_size=2, cache_base_outputs=False)
+
+    for r in range(world_size):
+        assert exp[r]["explicit_returned"] is True
+        assert exp[r]["synth_returned"] is True
+        if r == 0:
+            assert exp[r]["explicit_exists"] is True
+            assert exp[r]["synth_exists"] is True
+        else:
+            assert exp[r]["explicit_exists"] is False
+            assert exp[r]["synth_exists"] is False
+
+    em = exp[0]["explicit_metadata"]
+    assert em["replay_config"] == expected_explicit_rcfg.to_dict()
+    assert em["world_size"] == world_size
+    assert em["effective_batch_size"] == world_size * 2
+    assert em["replay_source"] == {
+        "type": "TimeSeriesDataset",
+        "num_series": len(expected_rep_ds.series),
+        "num_windows": len(expected_rep_ds),
+        "context_length": expected_rep_ds.context_length,
+        "forecast_horizon": expected_rep_ds.forecast_horizon,
+        "data_fingerprint": dataset_fingerprint(expected_rep_ds),
+    }
+
+    sm = exp[0]["synth_metadata"]
+    assert sm["replay_config"] == expected_synth_rcfg.to_dict()
+    assert sm["world_size"] == world_size
+    assert sm["effective_batch_size"] == world_size * 2
+    assert isinstance(sm["replay_source"], dict)
+    assert sm["replay_source"]["type"] == "SyntheticReplaySource"
+    assert isinstance(sm["replay_source"]["data_fingerprint"], str) and len(sm["replay_source"]["data_fingerprint"])
+    for key in ("num_series", "num_windows", "context_length", "forecast_horizon", "seed", "families", "missing_rate"):
+        assert key in sm["replay_source"]
+
+    # --- 7. Repeated fit() with replay restarts replay cursor from (epoch=0, step=0) like 1-process ---
+    rf_out = unwrap_results(outcomes["repeated_fit"])
+    dom_len = 2 * world_size * 2 + 1
+    rep_len = world_size * 2 + (world_size // 2)
+    ref_dom = _make_single_window_dataset(dom_len, seed=90, covariates=True, horizon=DOM_HORIZON)
+    ref_rep = _make_single_window_dataset(rep_len, seed=91, covariates=False, horizon=REP_HORIZON)
+    ref_rep_trainer = TimestralTrainer(
+        _base_config(
+            mode="head_only",
+            batch_size=world_size * 2,
+            max_steps=3,
+            learning_rate=2e-3,
+            warmup_steps=1,
+            lr_schedule="cosine",
+            weight_decay=0.01,
+            gradient_clip_val=1.0,
+            seed=17,
+        ),
+        ref_dom,
+        replay_config=ReplayConfig(
+            replay_fraction=0.25, distill_weight=0.5, batch_size=world_size * 2, cache_base_outputs=False
+        ),
+        replay_dataset=ref_rep,
+        model=_fresh_model(11),
+    )
+    ref_res1 = ref_rep_trainer.fit()
+    ref_p1 = _flat_tensors(ref_rep_trainer._trainable)
+    ref_res2 = ref_rep_trainer.fit()
+    ref_p2 = _flat_tensors(ref_rep_trainer._trainable)
+
+    expected_cursor = [(0, 0, 0), (0, 1, 1), (1, 0, 2)]
+    r0_rf = rf_out[0]
+    assert r0_rf["fit_cursors"] == [expected_cursor, expected_cursor]
+    assert r0_rf["fit1_result"].steps == ref_res1.steps == 3
+    assert r0_rf["fit2_result"].steps == ref_res2.steps == 3
+    assert not torch.equal(r0_rf["fit2_params"], r0_rf["fit1_params"])
+    for (s_got, l_got), (s_ref, l_ref) in zip(r0_rf["fit1_result"].train_history, ref_res1.train_history, strict=True):
+        assert s_got == s_ref and abs(l_got - l_ref) <= 1e-4 * max(1.0, abs(l_ref))
+    for (s_got, l_got), (s_ref, l_ref) in zip(r0_rf["fit2_result"].train_history, ref_res2.train_history, strict=True):
+        assert s_got == s_ref and abs(l_got - l_ref) <= 1e-4 * max(1.0, abs(l_ref))
+    assert l2_rel(r0_rf["fit1_params"], ref_p1) <= 1e-4
+    assert l2_rel(r0_rf["fit2_params"], ref_p2) <= 1e-4
+    for r in range(1, world_size):
+        assert rf_out[r]["fit_cursors"] == [expected_cursor, expected_cursor]
+        assert rf_out[r]["fit1_result"] == r0_rf["fit1_result"]
+        assert rf_out[r]["fit2_result"] == r0_rf["fit2_result"]
+        assert torch.equal(rf_out[r]["fit1_params"], r0_rf["fit1_params"])
+        assert torch.equal(rf_out[r]["fit2_params"], r0_rf["fit2_params"])
+
+
+# --------------------------------------------------------------------------- Persistent DataLoader workers with replay
+
+
+def _worker_fit_replay_persistent_workers(rank: int, world_size: int) -> dict[str, Any]:
+    del rank
+    dom_ds = _make_single_window_dataset(2 * world_size * 2 + 1, seed=101, covariates=True, horizon=DOM_HORIZON)
+    rep_ds = _make_single_window_dataset(world_size * 2 + 1, seed=102, covariates=False, horizon=REP_HORIZON)
+    val_ds = _make_single_window_dataset(world_size * 2 + 1, seed=103, covariates=True, horizon=DOM_HORIZON)
+    rcfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.3, batch_size=2, sign_flip=True)
+
+    outputs: dict[str, Any] = {}
+    for workers in (0, 1):
+        cfg = _base_config(
+            mode="head_only",
+            batch_size=2,
+            max_steps=4,
+            eval_every=2,
+            restore_best=True,
+            num_workers=workers,
+            shuffle=True,
+            sign_flip=True,
+            seed=23,
+        )
+        trainer = TimestralTrainer(
+            cfg, dom_ds, val_ds, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(12)
+        )
+        res = trainer.fit()
+        outputs[f"result_w{workers}"] = res
+        outputs[f"params_w{workers}"] = _flat_tensors(trainer._trainable)
+        outputs[f"training_after_w{workers}"] = trainer.model.training
+    return outputs
+
+
+@pytest.mark.skipif(WORKERS_HANG_AT_EXIT, reason="PyTorch < 2.8 on macOS: DataLoader worker hangs at process exit")
+def test_distributed_fit_with_replay_and_persistent_workers() -> None:
+    """Multi-process `fit()` with `num_workers=1`, validation, and replay matches `num_workers=0` bitwise."""
+    results = unwrap_results(
+        run_distributed(_worker_fit_replay_persistent_workers, world_size=2, pg_timeout=20.0, wall_timeout=60.0)
+    )
+    for r in range(2):
+        assert results[r]["training_after_w0"] is False
+        assert results[r]["training_after_w1"] is False
+        assert results[r]["result_w1"] == results[r]["result_w0"]
+        assert torch.equal(results[r]["params_w1"], results[r]["params_w0"])
+    assert results[1]["result_w1"] == results[0]["result_w1"]
+    assert torch.equal(results[1]["params_w1"], results[0]["params_w1"])

@@ -772,7 +772,11 @@ class TimestralTrainer:
         indices: Sequence[int] | None = None,
         bucket_to_max: int | None = None,
     ) -> DataLoader:
-        """Build a `DataLoader` over `dataset` (or an index `Subset`) with a model-matched `DHFDataCollator`."""
+        """Build a `DataLoader` over `dataset` (or an index `Subset`) with a model-matched `DHFDataCollator`.
+
+        When `config.num_workers > 0`, enables `persistent_workers=True`, so each distinct loader
+        constructed via this helper retains its own worker pool until released.
+        """
         if batch_sampler is not None and (batch_size is not None or shuffle or indices is not None):
             raise ValueError("batch_sampler cannot be combined with batch_size, shuffle, or indices")
         if batch_sampler is None and batch_size is None:
