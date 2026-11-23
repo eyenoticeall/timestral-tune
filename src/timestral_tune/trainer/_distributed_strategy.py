@@ -134,8 +134,7 @@ class _DistributedStrategy:
         status, out_value = broadcast_status(self._ctx)
         if status is ControlStatus.FAILED:
             raise RankFailureError((0,), stage=stage)
-        if status is ControlStatus.STOP:
-            self._trainer.should_stop = True
+        self._trainer.should_stop = status is ControlStatus.STOP
         return out_value
 
     def on_fit_start(self) -> None:

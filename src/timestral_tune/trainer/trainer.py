@@ -764,8 +764,10 @@ class TimestralTrainer:
         config = self.config
         self.device = dist_ctx.device
 
-        # Step (a): shared steps (i) and (ii) plus multi-process trainable invariants inside failure protection.
+        # Step (a): shared steps (i) and (ii), multi-process trainable invariants, and startup digest
+        # inside failure protection so any single-rank error propagates via step (b).
         local_error: Exception | None = None
+        startup_digest: bytes | None = None
         try:
             self._init_core_components(
                 train_dataset=train_dataset,
@@ -787,6 +789,7 @@ class TimestralTrainer:
             if any(parameter.device != self.device for parameter in self._trainable):
                 raise ValueError(f"all trainable parameters must reside on {self.device}")
             self.callbacks = self._build_callbacks(val_dataset, callbacks)
+            startup_digest = self._startup_consistency_digest()
         except Exception as exc:
             if is_oom_error(exc):
                 raise
@@ -796,7 +799,8 @@ class TimestralTrainer:
         dist_ctx.propagate_failure(local_error, stage="startup")
 
         # Step (c): consistency digest check (mismatched ranks raise ValueError; matching peers raise RankFailureError).
-        dist_ctx.check_consistency(self._startup_consistency_digest(), stage="startup_consistency")
+        assert startup_digest is not None
+        dist_ctx.check_consistency(startup_digest, stage="startup_consistency")
 
         # Step (d): broadcast all parameters and all buffers from rank 0.
         broadcast_module_state(dist_ctx, self.model)

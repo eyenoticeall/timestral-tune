@@ -1429,3 +1429,55 @@ def test_run_fit_loop_drives_custom_non_primary_strategy(tiny_forecaster):
         "on_fit_end",
         "cleanup",
     ]
+
+
+def test_distributed_rank0_hook_clears_should_stop_on_continue(tiny_forecaster, monkeypatch):
+    from timestral_tune.trainer import _distributed_strategy as strat_mod
+    from timestral_tune.trainer.distributed import ControlStatus, DistributedContext
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    trainer = TimestralTrainer(config_for(batch_size=4, max_steps=2), dataset, model=fresh_model(tiny_forecaster))
+    ctx = DistributedContext(rank=1, world_size=2, backend="gloo", device=torch.device("cpu"))
+    strategy = strat_mod._DistributedStrategy(trainer, ctx)
+
+    replies = iter([(ControlStatus.STOP, 0.5), (ControlStatus.CONTINUE, 0.25)])
+    monkeypatch.setattr(strat_mod, "broadcast_status", lambda _ctx, *_a, **_kw: next(replies))
+
+    assert strategy._broadcast_rank0_hook("on_step_end", lambda: 0.0) == 0.5
+    assert trainer.should_stop is True
+    assert strategy._broadcast_rank0_hook("on_evaluate", lambda: 0.0) == 0.25
+    assert trainer.should_stop is False
+
+
+def test_init_distributed_routes_digest_error_through_startup_failure(tiny_forecaster, monkeypatch):
+    from timestral_tune.trainer.distributed import DistributedContext
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    ctx = DistributedContext(rank=1, world_size=2, backend="gloo", device=torch.device("cpu"))
+    monkeypatch.setattr(DistributedContext, "detect", classmethod(lambda cls, _dev="auto": ctx))
+
+    def _bad_digest(self) -> bytes:
+        raise TypeError("unserialisable config value")
+
+    monkeypatch.setattr(TimestralTrainer, "_startup_consistency_digest", _bad_digest)
+
+    propagated: list[tuple[Exception | None, str]] = []
+
+    def _record_propagate(self, local_error: Exception | None, *, stage: str) -> None:
+        propagated.append((local_error, stage))
+        if local_error is not None:
+            raise local_error
+
+    monkeypatch.setattr(DistributedContext, "propagate_failure", _record_propagate)
+    monkeypatch.setattr(
+        DistributedContext,
+        "check_consistency",
+        lambda *_a, **_kw: pytest.fail("check_consistency should not run after startup failure"),
+    )
+
+    with pytest.raises(TypeError, match="unserialisable config value"):
+        TimestralTrainer(config_for(batch_size=4, max_steps=2), dataset, model=fresh_model(tiny_forecaster))
+
+    assert len(propagated) == 1
+    assert isinstance(propagated[0][0], TypeError)
+    assert propagated[0][1] == "startup"
