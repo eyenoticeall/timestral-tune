@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -239,6 +240,77 @@ def _serialise_training_config(config: TrainingConfig) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class _ValidatedExport:
+    """Validated export inputs and in-memory JSON payloads produced without I/O or weight merges."""
+
+    model_has_lora: bool
+    effective_lora: LoraConfig | None
+    adapter_config_json: str | None
+    conformal_json: str | None
+    replay_source_dict: dict[str, Any] | None
+    metrics_dict: dict[str, Any] | None
+
+
+def _validate_export_inputs(
+    model: TimestralModel,
+    *,
+    lora_config: LoraConfig | None = None,
+    calibrator: ConformalCalibrator | OnlineConformalCalibrator | None = None,
+    metrics: Mapping[str, Any] | None = None,
+    license_path: str | Path | None = None,
+    replay_source: Mapping[str, Any] | None = None,
+    data_fingerprint: str | None = None,
+) -> _ValidatedExport:
+    """Validate `export_checkpoint` inputs without Hub calls, weight merges, or disk writes.
+
+    Checks, in the same order as `export_checkpoint`: fitted `ConformalCalibrator`, LoRA config
+    match and presence when the model has adapters, strict (`allow_nan=False`) JSON serialisability
+    of adapter config, calibrator, `replay_source`, `data_fingerprint`, and `metrics`, and existence
+    of an explicit `license_path`.
+    """
+    if isinstance(calibrator, ConformalCalibrator) and not calibrator.is_fitted:
+        raise ValueError("cannot export an unfitted ConformalCalibrator; call fit() first")
+
+    model_has_lora = has_lora(model)
+    injected_lora = getattr(model, "_lora_config", None)
+    if model_has_lora:
+        if injected_lora is not None and lora_config is not None and lora_config != injected_lora:
+            raise ValueError(
+                f"passed lora_config={lora_config!r} does not match the model's injected {injected_lora!r}"
+            )
+        effective_lora = lora_config if lora_config is not None else injected_lora
+        if effective_lora is None:
+            raise ValueError("cannot export LoRA adapters without a LoraConfig; pass lora_config=")
+    else:
+        effective_lora = None
+
+    adapter_config_json = _dumps_json(effective_lora.to_dict()) if effective_lora is not None else None
+    conformal_json = _dumps_json(calibrator.to_dict()) if calibrator is not None else None
+    replay_source_dict = None if replay_source is None else dict(replay_source)
+    metrics_dict = None if metrics is None else dict(metrics)
+    if replay_source_dict is not None:
+        _dumps_json(replay_source_dict)
+    if data_fingerprint is not None:
+        _dumps_json(data_fingerprint)
+    if metrics_dict is not None:
+        _dumps_json(metrics_dict)
+
+    if license_path is not None:
+        src = Path(license_path)
+        if not src.is_file():
+            raise FileNotFoundError(f"license_path {str(src)!r} does not exist")
+
+    return _ValidatedExport(
+        model_has_lora=model_has_lora,
+        effective_lora=effective_lora,
+        adapter_config_json=adapter_config_json,
+        conformal_json=conformal_json,
+        replay_source_dict=replay_source_dict,
+        metrics_dict=metrics_dict,
+    )
+
+
 def export_checkpoint(
     model: TimestralModel,
     output_dir: str | Path,
@@ -264,21 +336,19 @@ def export_checkpoint(
     never leave a partial export without `LICENSE` or `NOTICE`. Stale conditional files from a
     previous export in `output_dir` are removed when not part of this export.
     """
-    if isinstance(calibrator, ConformalCalibrator) and not calibrator.is_fitted:
-        raise ValueError("cannot export an unfitted ConformalCalibrator; call fit() first")
-
-    model_has_lora = has_lora(model)
-    injected_lora = getattr(model, "_lora_config", None)
-    if model_has_lora:
-        if injected_lora is not None and lora_config is not None and lora_config != injected_lora:
-            raise ValueError(
-                f"passed lora_config={lora_config!r} does not match the model's injected {injected_lora!r}"
-            )
-        effective_lora = lora_config if lora_config is not None else injected_lora
-        if effective_lora is None:
-            raise ValueError("cannot export LoRA adapters without a LoraConfig; pass lora_config=")
-    else:
-        effective_lora = None
+    validated = _validate_export_inputs(
+        model,
+        lora_config=lora_config,
+        calibrator=calibrator,
+        metrics=metrics,
+        license_path=license_path,
+        replay_source=replay_source,
+        data_fingerprint=data_fingerprint,
+    )
+    model_has_lora = validated.model_has_lora
+    effective_lora = validated.effective_lora
+    adapter_config_json = validated.adapter_config_json
+    conformal_json = validated.conformal_json
 
     resolved_base = (
         base_repo_or_path
@@ -292,8 +362,6 @@ def export_checkpoint(
 
     # Prepare and validate all serialised payloads in memory BEFORE touching `output_dir`.
     config_json = json.dumps(model.config.to_dict(), indent=2) + "\n"
-    adapter_config_json = _dumps_json(effective_lora.to_dict()) if effective_lora is not None else None
-    conformal_json = _dumps_json(calibrator.to_dict()) if calibrator is not None else None
     metadata: dict[str, Any] = {
         "base_model": None if resolved_base is None else str(resolved_base),
         "base_revision": resolved_revision,
@@ -302,10 +370,10 @@ def export_checkpoint(
         "hyperparameters": None if training_config is None else _serialise_training_config(training_config),
         "lora_config": None if effective_lora is None else effective_lora.to_dict(),
         "replay_config": None if replay_config is None else replay_config.to_dict(),
-        "replay_source": None if replay_source is None else dict(replay_source),
+        "replay_source": validated.replay_source_dict,
         "has_conformal": calibrator is not None,
         "data_fingerprint": data_fingerprint,
-        "metrics": None if metrics is None else dict(metrics),
+        "metrics": validated.metrics_dict,
         "library_version": _library_version(),
         "vendored_upstream_commit": _vendored_upstream_commit(),
     }

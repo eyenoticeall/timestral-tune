@@ -224,3 +224,84 @@ def test_export_fingerprint_splits_mismatched_lora_atomic_metrics_and_chained_li
         export_checkpoint(tiny_forecaster.model, ptr_dir, license_path=ok_dir / "LICENSE")
     assert "no verbatim LICENSE was found" in (ptr_dir / "NOTICE").read_text(encoding="utf-8")
     assert any("fallback pointer" in r.getMessage() for r in caplog.records)
+
+
+def test_validate_export_inputs_checks_errors_in_order_without_io_or_merge(tiny_forecaster, tmp_path, monkeypatch):
+    from timestral_tune import export as export_module
+    from timestral_tune.models import inject_lora
+
+    def _forbid(*args, **kwargs):
+        raise AssertionError("validation helper must not call Hub, merge weights, or write files")
+
+    monkeypatch.setattr(export_module, "hf_hub_download", _forbid)
+    monkeypatch.setattr(export_module, "merged_state_dict", _forbid)
+    monkeypatch.setattr(export_module, "extract_lora_state_dict", _forbid)
+    monkeypatch.setattr(export_module, "save_file", _forbid)
+
+    adapted = copy.deepcopy(tiny_forecaster.model)
+    lora_cfg = LoraConfig(r=4, lora_alpha=8, axes=("variate",), targets=("q", "v"))
+    inject_lora(adapted, lora_cfg)
+    missing_license = tmp_path / "missing-license"
+    valid_license = tmp_path / "LICENSE"
+    valid_license.write_text("license text\n", encoding="utf-8")
+
+    # 1. Unfitted calibrator beats LoRA mismatch and missing license_path.
+    with pytest.raises(ValueError, match="unfitted"):
+        export_module._validate_export_inputs(
+            adapted,
+            lora_config=LoraConfig(r=8, axes=("variate",)),
+            calibrator=ConformalCalibrator(0.80),
+            metrics={"bad": float("nan")},
+            license_path=missing_license,
+        )
+
+    # 2. LoRA mismatch beats invalid metrics and missing license_path.
+    with pytest.raises(ValueError, match="does not match"):
+        export_module._validate_export_inputs(
+            adapted,
+            lora_config=LoraConfig(r=8, axes=("variate",)),
+            metrics={"bad": float("nan")},
+            license_path=missing_license,
+        )
+
+    # 3. Missing LoraConfig on adapted model without `_lora_config` raises ValueError.
+    no_attr_model = copy.deepcopy(adapted)
+    delattr(no_attr_model, "_lora_config")
+    with pytest.raises(ValueError, match="without a LoraConfig"):
+        export_module._validate_export_inputs(no_attr_model, license_path=missing_license)
+
+    # 4. Non-JSON / NaN metrics fail with allow_nan=False before missing license_path.
+    with pytest.raises(ValueError, match="JSON compliant"):
+        export_module._validate_export_inputs(adapted, metrics={"bad": float("nan")}, license_path=missing_license)
+    with pytest.raises(TypeError):
+        export_module._validate_export_inputs(adapted, metrics={"bad": object()}, license_path=missing_license)
+
+    # 5. Calibrator JSON with NaN fails before metrics and missing license_path.
+    class _BadCalibrator:
+        def to_dict(self):
+            return {"bad": float("inf")}
+
+    with pytest.raises(ValueError, match="JSON compliant"):
+        export_module._validate_export_inputs(
+            adapted,
+            calibrator=_BadCalibrator(),  # type: ignore[arg-type]
+            metrics={"bad": object()},
+            license_path=missing_license,
+        )
+
+    # 6. Missing explicit license_path raises FileNotFoundError once earlier checks pass.
+    with pytest.raises(FileNotFoundError, match="license_path"):
+        export_module._validate_export_inputs(adapted, metrics={"loss": np.float32(0.5)}, license_path=missing_license)
+
+    # 7. Valid inputs succeed with no Hub call, weight merge, or disk write.
+    validated = export_module._validate_export_inputs(
+        adapted,
+        lora_config=lora_cfg,
+        metrics={"loss": np.float32(0.5)},
+        license_path=valid_license,
+    )
+    assert validated.model_has_lora is True
+    assert validated.effective_lora == lora_cfg
+    assert validated.adapter_config_json is not None
+    assert validated.conformal_json is None
+    assert validated.metrics_dict == {"loss": np.float32(0.5)}
