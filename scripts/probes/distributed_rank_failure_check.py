@@ -18,7 +18,9 @@ Recognised survivor abort criteria (strict allow-list):
   `ConnectionResetError`, `ConnectionAbortedError`, `ConnectionRefusedError`) or a `RuntimeError` /
   `OSError` whose message matches a known Gloo/NCCL/c10d transport or collective failure pattern
   (such as macOS Gloo `"Timed out waiting ... for recv/send operation"`, Linux Gloo `"Read error"` /
-  `"Connection closed by peer"`, or NCCL `"watchdog"` / `"communicator was aborted"` / `"ProcessGroup"`).
+  `"Connection closed by peer"` / `"Software caused connection abort"` / `"short read"`, or NCCL /
+  c10d `"ncclRemoteError"` / `"ncclInternalError"` / `"watchdog"` / `"communicator was aborted"` /
+  `"work was aborted"` / `"remote process exited"` / `"ProcessGroup"`).
 - Any other exception is reported as `FAIL (unrecognised exception, treated as FAIL)` with its class
   and message so unrelated bugs can never silently pass as a clean abort.
 
@@ -104,20 +106,25 @@ _EXPECTED_ABORT_MESSAGE_RE = re.compile(
             r"\btimed out\b",
             r"read error",
             r"write error",
+            r"\bshort read\b",
             r"connection closed by peer",
             r"connection reset by peer",
             r"connection refused",
-            r"connection aborted",
+            r"software caused connection abort",
+            r"connection abort(?:ed)?",
             r"broken pipe",
             r"\beof\b",
             r"\bgloo\b",
             r"\bnccl\b",
+            r"\bnccl(?:[a-z]*error|invalid[a-z]*)\b",
             r"\bc10d\b",
             r"process\s*group",
             r"\bwatchdog\b",
             r"\bcollective\b",
             r"communicator was aborted",
             r"comm aborted",
+            r"work was aborted",
+            r"remote process exited",
             r"remote peer",
             r"\btransport\b",
             r"\bsocket\b",
