@@ -377,8 +377,10 @@ Re-measure before relying on them.
 
 ## 12. Facts read from sources, not measured
 
-These `[H]` and `[U]` facts were read, not run: the four checkpoints' `config.json` values (spec §3.1), and
-that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
+These `[H]`, `[U]`, and dependency-source facts were read, not run:
+
+- The four checkpoints' `config.json` values (spec §3.1), and that the released `quantile_width_factor` is 3.0 while the code default is 2.0.
+- `huggingface_hub` per-file download locking (spec §5.6, D29; source reading only, not a concurrent-download test): in both installed `huggingface_hub==2.4.0` (`_snapshot_download.py:521`; `file_download.py:1258, 1273, 1485, 1503`) and the declared floor `huggingface_hub==0.23.0` (inspected 2026-11-23 via `uv run --isolated --no-project --python 3.12 --with "huggingface_hub==0.23.0"`: `_snapshot_download.py:267-268` delegates to `hf_hub_download`; `file_download.py:797, 1366, 1478, 1485` acquires `WeakFileLock`), `snapshot_download` routes file downloads through `hf_hub_download` with `WeakFileLock`.
 
 ## 13. CUDA
 
@@ -579,12 +581,12 @@ Training entries run **one optimiser step** and assert `torch.isfinite(loss)` (n
 
 Also covered in pytest by `tests/test_loader_device.py::test_mps_long_context_and_large_checkpoint_parity` (`@pytest.mark.network`).
 
-## 16. Distributed training-step parity prototype (§5.6, approved 2026-11-23, not yet implemented)
+## 16. Distributed training-step parity prototype (§5.6, standalone probe outside `src/`)
 
-Backs the `[V]` claims in spec §5.6 and §9 T15 (referenced by D22, D24, and D26). Every number below
-measures a **standalone prototype outside `src/`** (`scripts/probes/distributed_parity.py`) run with
-`torch.multiprocessing.spawn` on loopback (`127.0.0.1`), CPU, `gloo` backend, on `2026-11-23` (macOS
-arm64). Nothing in `src/` or `tests/` implements multi-process training yet.
+Backs the prototype `[V]` claims in spec §5.6 and §9 T15 (referenced by D22, D24, and D26). Every number in
+this section measures the **standalone prototype outside `src/`** (`scripts/probes/distributed_parity.py`)
+run with `torch.multiprocessing.spawn` on loopback (`127.0.0.1`), CPU, `gloo` backend, on `2026-11-23`
+(macOS arm64). Implemented Stage 1 trainer tests (T15) are recorded separately in §17.
 
 The prototype checks distributed steps against two single-process references: `probe_ref` (a union-batch
 `_local_step`, run for every case and model) and independent `shipped_trainer` (a one-process
@@ -644,8 +646,36 @@ LoRA step-0/1 invariants, and `[5]` clipping-parity and skipped-step no-op invar
 | `[5]` 10-active-step (+1 skip) trajectories vs `probe_ref` (`full_ft` & `lora_variate`, `N=2` & `N=4`, 16 values) | Prototype outside `src/` (**ungraded `[INFO]`**) | none | `full_ft`: `final_params` `3.37e-13`–`4.48e-13` f64 / `2.85e-05`–`3.02e-05` f32, `param_update` `5.35e-10`–`7.40e-10` f64 / `4.70e-02`–`4.80e-02` f32; `lora_variate`: `final_params` `2.70e-14`–`1.12e-13` f64 / `5.25e-05`–`1.22e-04` f32, `param_update` `2.33e-12`–`9.60e-12` f64 / `4.57e-03`–`1.06e-02` f32 |
 | **Summary (`tiny_random` + `Timestral-5M`)** | Prototype outside `src/` | enforced only | **`516/516` passed (`326` tiny + `190` `5M`), `0` failed, `68` `[INFO]` (ungraded `5M` body backprop)** |
 
-**Not verified anywhere (all design choices `[D]`, spec §12):** CUDA, NCCL, `cuda:{LOCAL_RANK}` / `cuda:{rank}` device
-binding, `bf16` autocast, `torch.compile`, `torchrun` on Linux, released checkpoints `28M`/`123M`/`209M`,
-multi-GPU throughput or scaling efficiency, and rank-failure behaviour under NCCL. The `ReduceOp.AVG` vs
-`ReduceOp.SUM` check on CPU `gloo` across PyTorch 2.4.0 and 2.15.0 is recorded as a one-off result in §11
-(not covered by this probe).
+**Not verified by the prototype (all design choices `[D]`, spec §12):** CUDA, NCCL, `cuda:{LOCAL_RANK}` /
+`cuda:{rank}` device binding, `bf16` autocast, `torch.compile`, `torchrun` on Linux, released checkpoints
+`28M`/`123M`/`209M`, multi-GPU throughput or scaling efficiency, and rank-failure behaviour under NCCL. The
+`ReduceOp.AVG` vs `ReduceOp.SUM` check on CPU `gloo` across PyTorch 2.4.0 and 2.15.0 is recorded as a
+one-off result in §11 (not covered by this probe).
+
+## 17. Phase 5 Stage 1: Implemented multi-process training (CPU/`gloo`)
+
+Measured on `2026-11-23` at commit `e4fdeb4` on Apple M4 (macOS arm64, Python `3.12.13`), exercising the
+implemented multi-process trainer (`src/timestral_tune/trainer/distributed.py`, `_distributed_strategy.py`,
+`_types.py`, `trainer.py`, and `export.py`) on CPU/`gloo` via `tests/distributed_harness.py` (`spawn`,
+file-based rendezvous, 1 intra-op CPU thread per worker, hard wall-clock deadlines). T15 was hardened by a
+mutation campaign of deliberate breakages during Stage 1 verification.
+
+Commands run:
+
+```bash
+TMPDIR=/tmp uv run pytest tests/acceptance/test_distributed.py -v
+TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/acceptance/test_distributed.py tests/test_distributed.py -v
+```
+
+| Suite | PyTorch `2.15.0` (`CPU`/`gloo`, Python `3.12.13`) | PyTorch `2.4.0` (`CPU`/`gloo`, Python `3.12.13`) |
+|---|---|---|
+| Acceptance test T15 (`tests/acceptance/test_distributed.py`, cases `(a)–(i)`, `N = 2` and `N = 4`, tiny random model) | **`25 passed`** in `80.22 s` (`0` skipped, `0` failed; includes `test_t15_f_dataloader_workers` at `N = 4` and 2-rank CPU `test_t15_h_compile_default_smoke`) | **`24 passed, 1 skipped`** (`test_t15_f_dataloader_workers` skipped on macOS PyTorch `< 2.8` per §10; `test_t15_h_compile_default_smoke` passed) |
+| Primitives & harness (`tests/test_distributed.py`, `N = 2` and `N = 4`) | **`87 passed`** (`0` skipped, run in `pytest -m "not network"`: `483 passed, 15 skipped`, excluding the known failing `test_distributed_trainer_whitebox_internals` at `e4fdeb4`) | **`86 passed, 1 skipped`** (`test_batch_sampler_with_persistent_workers` skipped on macOS PyTorch `< 2.8` per §10); combined run `110 passed, 2 skipped` in `39.52 s` |
+
+**Not verified anywhere (Stage 2 & Stage 3, spec §10 & §12):** CUDA/NCCL hardware, real
+`torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests only), `bf16` autocast and CUDA
+`compile_mode="default"` (including trailing-shape recompilation) across ranks, `torchrun` on Linux and
+Linux `DataLoader` worker teardown timing, Stage 2 multi-process `ReplayConfig` / distillation, live
+concurrent `huggingface_hub==0.23.0` downloads (source reading only, §12), released-weights T15 bounds,
+multi-GPU throughput/VRAM/scaling (including per-parameter pack/unpack, three collectives per step, and
+keeping the flat gradient buffer allocated across validation), and NCCL rank-failure behaviour.
