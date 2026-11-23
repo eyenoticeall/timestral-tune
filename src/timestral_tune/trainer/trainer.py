@@ -392,8 +392,8 @@ class _FitStrategy(Protocol):
         """Evaluate `val_dataset` for `fit()` (rank-local in 1-process, sharded in multi-process)."""
         ...
 
-    def on_evaluate(self, step: int, result: EvalResult) -> float:
-        """Run `on_evaluate` callbacks (and sync status/loss); return authoritative `result.loss`."""
+    def on_evaluate(self, step: int, result: EvalResult, bookkeeper: _FitBookkeeper) -> None:
+        """Record eval loss (and best snapshot on primary), run `on_evaluate` callbacks, and sync."""
         ...
 
     def finalize_best(self, bookkeeper: _FitBookkeeper, current_step: int) -> bool:
@@ -472,10 +472,10 @@ class _SingleProcessStrategy:
     def evaluate_val(self) -> EvalResult:
         return self._trainer.evaluate()
 
-    def on_evaluate(self, step: int, result: EvalResult) -> float:
+    def on_evaluate(self, step: int, result: EvalResult, bookkeeper: _FitBookkeeper) -> None:
+        bookkeeper.record_eval(step, result.loss, self._trainer._trainable)
         for callback in self._trainer.callbacks:
             callback.on_evaluate(self._trainer, step, result)
-        return result.loss
 
     def finalize_best(self, bookkeeper: _FitBookkeeper, current_step: int) -> bool:
         return bookkeeper.restore_best_weights(
@@ -1622,7 +1622,9 @@ class TimestralTrainer:
     def _make_fit_strategy(self) -> _FitStrategy:
         """Select the execution strategy for `fit()`."""
         if self._dist is not None:
-            raise NotImplementedError("multi-process fit() strategy is not wired yet")
+            from ._distributed_strategy import _DistributedStrategy
+
+            return _DistributedStrategy(self, self._dist)
         return _SingleProcessStrategy(self)
 
     def _run_fit_loop(self, strategy: _FitStrategy) -> TrainingResult:
@@ -1641,9 +1643,7 @@ class TimestralTrainer:
 
         def evaluate_now() -> None:
             result = strategy.evaluate_val()
-            bookkeeper.record_eval(self.global_step, result.loss, self._trainable)
-            loss = strategy.on_evaluate(self.global_step, result)
-            bookkeeper.set_last_eval_loss(loss)
+            strategy.on_evaluate(self.global_step, result, bookkeeper)
 
         try:
             strategy.prepare_fit()

@@ -1387,9 +1387,9 @@ def test_run_fit_loop_drives_custom_non_primary_strategy(tiny_forecaster):
             events.append("evaluate_val")
             return EvalResult(loss=0.5, scored_positions=10, batches=2)
 
-        def on_evaluate(self, step: int, result: EvalResult) -> float:
+        def on_evaluate(self, step: int, result: EvalResult, bookkeeper) -> None:
             events.append(f"on_evaluate:{step}")
-            return 0.42 if step == 2 else 0.55
+            bookkeeper.record_eval(step, 0.42 if step == 2 else 0.55, trainer._trainable)
 
         def finalize_best(self, bookkeeper, current_step: int) -> bool:
             events.append(f"finalize_best:{current_step}")
