@@ -1,4 +1,4 @@
-"""Multi-process training acceptance tests (spec §5.6, §7.4, §9 T15, D22–D35).
+"""Multi-process training acceptance tests (spec §5.6, §7.4, §9 T15, D22–D37).
 
 Covers T15 cases (a)–(l) (Stage 1 domain loss and Stage 2 replay/distillation) network-free on CPU/`gloo`
 for `N = 2` and `N = 4` using the tiny random model and `tests/distributed_harness.py` (spawn start

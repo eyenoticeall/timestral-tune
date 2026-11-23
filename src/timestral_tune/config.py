@@ -160,7 +160,8 @@ class ReplayConfig:
             LoRA avoid both a second copy of the base model in accelerator memory and a second
             forward pass every step. Falls back to live frozen-base evaluation (`disable_lora`
             for LoRA; a frozen model copy on the device for `full_ft`) above the cap or when
-            False.
+            False. Multi-process mode never builds this cache and always uses the live
+            evaluation (`docs/SPEC.md` §5.6).
         smooth_beta: Huber/Smooth-L1 transition threshold passed to `distillation_loss` (`>= 0`).
             Default `1e-3` avoids `+/-1` subgradient kicks from `~1e-7` fp32 GEMM tiling
             round-off at step 0; set to `0.0` for exact unsmoothed L1.

@@ -15,7 +15,7 @@ This module covers only white-box internals and invariants that §9 does not spe
   bypass notice when `cache_frozen_features=False`, and per-rank/effective replay batch sizes
   logged when `replay_config` is set).
 
-- Spec: `docs/SPEC.md` §5.6, §7.4, D22–D35
+- Spec: `docs/SPEC.md` §5.6, §7.4, D22–D37
 """
 
 from __future__ import annotations

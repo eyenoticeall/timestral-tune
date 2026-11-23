@@ -1,11 +1,11 @@
 """Multi-process execution strategy for `TimestralTrainer._run_fit_loop`.
 
-Implements the five-stage distributed training step (domain loss, optional sharded replay mixing,
+Implements the six-stage distributed training step (domain loss, optional sharded replay mixing,
 and frozen-base distillation), main-process epoch batch sampling and replay epoch cycling,
 rank-offset stochastic streams, rank-0 callback / best-state ownership with fixed-size `float64`
 control broadcasts, and internal sharded validation of spec §5.6 (all four modes, no caches).
 
-- Spec: `docs/SPEC.md` §5.3, §5.6, §9 (T15), §11 (D22–D35)
+- Spec: `docs/SPEC.md` §5.3, §5.6, §9 (T15), §11 (D22–D37)
 """
 
 from __future__ import annotations

@@ -18,7 +18,7 @@ This module keeps only checks that are white-box or complementary to T15:
 - Real multi-process `fit()` with `num_workers=1`, validation, and replay verifying training and
   validation run in worker processes while replay runs in the main process, matching `num_workers=0`.
 
-- Spec: `docs/SPEC.md` §5.3, §5.6, §9 (T15), D22–D35
+- Spec: `docs/SPEC.md` §5.3, §5.6, §9 (T15), D22–D37
 """
 
 from __future__ import annotations

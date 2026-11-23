@@ -21,7 +21,7 @@ the sampling and seeding section (`steps_per_epoch`, `rank_slice_size`, `rank_st
 along with `is_oom_error`, `RankFailureError`, `ControlStatus`, and read-only properties, is pure
 and rank-local (0 collectives).
 
-- Spec: `docs/SPEC.md` §5.6, D22–D35
+- Spec: `docs/SPEC.md` §5.6, D22–D37
 """
 
 from __future__ import annotations
