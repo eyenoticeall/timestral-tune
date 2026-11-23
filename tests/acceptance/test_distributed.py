@@ -335,6 +335,31 @@ class _BoomCallback(Callback):
             raise KeyError("callback_end_boom")
 
 
+class _SetClearStopCallback(Callback):
+    """Sets `trainer.should_stop = True` in one hook and clears it to `False` in a subsequent reachable hook."""
+
+    def __init__(self, mode: str) -> None:
+        self._mode = mode
+        self.steps: list[int] = []
+        self.evals: list[int] = []
+
+    def on_fit_start(self, trainer: TimestralTrainer) -> None:
+        if self._mode == "fit_start_to_step0_eval":
+            trainer.should_stop = True
+
+    def on_step_end(self, trainer: TimestralTrainer, step: int, loss: float, learning_rate: float) -> None:
+        del loss, learning_rate
+        self.steps.append(step)
+        if self._mode == "step_end_to_eval" and step <= 2:
+            trainer.should_stop = True
+
+    def on_evaluate(self, trainer: TimestralTrainer, step: int, result: EvalResult) -> None:
+        del result
+        self.evals.append(step)
+        if self._mode in ("step_end_to_eval", "fit_start_to_step0_eval"):
+            trainer.should_stop = False
+
+
 # --------------------------------------------------------------------------- T15 (a): multi-epoch trajectory parity
 
 
@@ -1200,6 +1225,102 @@ def test_t15_e_stop_restore_and_training_result(world_size: int) -> None:
         assert l2_rel(out["params"], ref_es["params"]) <= TRAJ_TOL["float32"]
         if r > 0:
             assert out["cb"] == {"started": 0, "ended": 0, "steps": [], "lrs": [], "eval_steps": [], "eval_scored": []}
+
+
+def _run_t15e_set_clear_stop(world_size: int, *, mode: str, per_rank_batch: int) -> dict[str, Any]:
+    train_ds = _make_uneven_dataset([8, 4, 6, 2] * world_size, seed=505, covariates=True)
+    val_ds = _make_uneven_dataset([8, 2, 7, 3, 5], seed=506, covariates=True)
+    cfg = _base_config(
+        mode="head_only",
+        batch_size=per_rank_batch,
+        eval_batch_size=2,
+        max_steps=4,
+        eval_every=1,
+        learning_rate=1e-2,
+        lr_schedule="constant",
+        restore_best=False,
+        seed=44,
+    )
+    cb = _SetClearStopCallback(mode)
+    trainer = TimestralTrainer(cfg, train_ds, val_ds, callbacks=[cb], model=_fresh_tiny_model(seed=8))
+    res = trainer.fit()
+    return {
+        "result": res,
+        "should_stop": trainer.should_stop,
+        "cb_steps": list(cb.steps),
+        "cb_evals": list(cb.evals),
+        "params": _flat_trainable(trainer),
+        "all_params": _flat_params(trainer.model),
+    }
+
+
+def _worker_t15e_should_stop_cleared(rank: int, world_size: int) -> dict[str, Any]:
+    del rank
+    # Reachable set->clear order 1: `on_fit_start` sets True, post-loop step-0 `on_evaluate` clears False
+    # (`_run_fit_loop` skips the while loop, then runs final `evaluate_now()` because `last_evaluated_step != 0`).
+    start_to_eval = _run_t15e_set_clear_stop(world_size, mode="fit_start_to_step0_eval", per_rank_batch=2)
+    dist.barrier()
+    # Reachable set->clear order 2: `on_step_end` sets True, same-step `on_evaluate` (`eval_every=1`) clears False
+    # before the loop's `if self.global_step >= final_step or self.should_stop: break` check.
+    # (Reverse orders -- `on_evaluate` -> next `on_step_end`, and `on_fit_start` -> first `on_step_end` -- are
+    # unreachable in `_run_fit_loop`, which immediately checks `self.should_stop` before entering the next step.)
+    step_to_eval = _run_t15e_set_clear_stop(world_size, mode="step_end_to_eval", per_rank_batch=2)
+    return {
+        "fit_start_to_step0_eval": start_to_eval,
+        "step_end_to_eval": step_to_eval,
+    }
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_t15_e_should_stop_cleared_after_set(world_size: int) -> None:
+    """T15(e) regression. Clearing `trainer.should_stop` after an earlier hook set it must sync
+    `should_stop = False` on every non-zero rank so training continues to `max_steps` without
+    deadlocking and matches one-process `fit()` with the same callback.
+    """
+    ref_step = _run_t15e_set_clear_stop(world_size, mode="step_end_to_eval", per_rank_batch=2 * world_size)
+    assert ref_step["result"].steps == 4 and not ref_step["result"].stopped_early
+    assert ref_step["should_stop"] is False
+    assert ref_step["cb_steps"] == [1, 2, 3, 4] and ref_step["cb_evals"] == [1, 2, 3, 4]
+
+    ref_start = _run_t15e_set_clear_stop(world_size, mode="fit_start_to_step0_eval", per_rank_batch=2 * world_size)
+    assert ref_start["result"].steps == 0 and ref_start["result"].stopped_early
+    assert ref_start["should_stop"] is False
+    assert ref_start["cb_steps"] == [] and ref_start["cb_evals"] == [0]
+
+    outs = unwrap_results(
+        run_distributed(
+            _worker_t15e_should_stop_cleared,
+            world_size=world_size,
+            pg_timeout=3.0,
+            wall_timeout=15.0,
+        )
+    )
+
+    r0_step = outs[0]["step_end_to_eval"]
+    assert r0_step["cb_steps"] == [1, 2, 3, 4] and r0_step["cb_evals"] == [1, 2, 3, 4]
+    for r, out in enumerate(outs):
+        se = out["step_end_to_eval"]
+        assert se["result"] == r0_step["result"], f"step_end_to_eval r{r}: TrainingResult differs from rank 0"
+        assert se["result"].steps == 4 and not se["result"].stopped_early
+        assert se["should_stop"] is False, f"step_end_to_eval r{r}: should_stop left True on non-zero rank"
+        assert torch.equal(se["all_params"], r0_step["all_params"]), f"step_end_to_eval r{r}: params differ"
+        assert l2_rel(se["params"], ref_step["params"]) <= TRAJ_TOL["float32"]
+        for (s, loss), (rs, rloss) in zip(se["result"].train_history, ref_step["result"].train_history, strict=True):
+            assert s == rs and _scalar_rel(loss, rloss) <= TRAJ_TOL["float32"]
+        for (s, loss), (rs, rloss) in zip(se["result"].eval_history, ref_step["result"].eval_history, strict=True):
+            assert s == rs and _scalar_rel(loss, rloss) <= TRAJ_TOL["float32"]
+        if r > 0:
+            assert se["cb_steps"] == [] and se["cb_evals"] == []
+
+        fs = out["fit_start_to_step0_eval"]
+        assert fs["result"] == outs[0]["fit_start_to_step0_eval"]["result"]
+        assert fs["result"].steps == 0 and fs["result"].stopped_early
+        assert fs["should_stop"] is False, f"fit_start_to_step0_eval r{r}: should_stop left True on non-zero rank"
+        if r == 0:
+            assert fs["cb_steps"] == [] and fs["cb_evals"] == [0]
+        else:
+            assert fs["cb_steps"] == [] and fs["cb_evals"] == []
 
 
 # --------------------------------------------------------------------------- T15 (f): sampling, workers, and flips
@@ -2125,3 +2246,33 @@ def test_t15_i_single_rank_failure_propagation(world_size: int) -> None:
     assert getattr(trainer_pkg, "RankFailureError", None) is RankFailureError, (
         "RankFailureError must be exported from timestral_tune.trainer (spec §5.6)"
     )
+
+
+def _worker_t15i_startup_digest_failure(rank: int, world_size: int) -> dict[str, Any]:
+    ds = _make_uneven_dataset([8, 4, 6, 2], seed=909, covariates=True)
+    # Non-JSON-serialisable `model_name_or_path` with explicit `model=` bypasses `load_model()` in
+    # step (a) and raises `TypeError` inside `_startup_consistency_digest()` on rank 1 only.
+    bad_path: Any = object() if rank == 1 else "tiny-local-test"
+    cfg = _base_config(model_name_or_path=bad_path, mode="head_only", batch_size=2, max_steps=1, seed=31)
+    return _record_propagated_exception(
+        lambda: TimestralTrainer(cfg, ds, model=_fresh_tiny_model(seed=17)),
+        world_size,
+    )
+
+
+@pytest.mark.acceptance
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_t15_i_startup_digest_failure_propagation(world_size: int) -> None:
+    """T15(i) regression. A single-rank failure while computing the startup consistency digest
+    must propagate (`TypeError` on the failing rank, `RankFailureError` naming it on every peer)
+    and leave the process group clean for follow-up collectives instead of timing out peers.
+    """
+    outs = unwrap_results(
+        run_distributed(
+            _worker_t15i_startup_digest_failure,
+            world_size=world_size,
+            pg_timeout=3.0,
+            wall_timeout=15.0,
+        )
+    )
+    _assert_propagated(outs, world_size, {1: TypeError}, "init_digest_r1")
