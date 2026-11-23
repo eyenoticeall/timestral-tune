@@ -16,9 +16,9 @@ minor releases, and such changes are called out under **Changed**.
   resolution and rank-0 startup logging, and replay-only pre-check collective), count-weighted gradient
   reduction (`ReduceOp.SUM`), startup consistency checks and rank-0 weight/buffer broadcast, sharded
   validation inside `fit()`, rank-0 callbacks/early-stopping/restore with identical `TrainingResult` fields
-  across ranks, and best-effort single-rank failure propagation (`docs/SPEC.md` §5.6). Verified on
-  CPU/`gloo` on macOS arm64 (`N = 2` and `N = 4`, acceptance test T15 cases `(a)–(l)`); multi-rank NCCL has
-  never executed and GPU hardware verification remains open (Stage 3).
+  across ranks, and best-effort single-rank failure propagation (`docs/SPEC.md` §5.6). Experimental: verified
+  on CPU/`gloo` (macOS arm64 and Linux x86_64, `N = 2` and `N = 4`, acceptance test T15 cases `(a)–(l)`), with
+  first GPU checks on one NVIDIA L4; multi-GPU verification remains open (Stage 3).
 - **`RankFailureError`** exported from `timestral_tune.trainer` (`RuntimeError` subclass raised on healthy
   peers when another rank fails during multi-process setup, training, validation, or rank-0 callbacks).
 - **Multi-process export metadata:** optional paired `world_size` and `effective_batch_size` arguments on

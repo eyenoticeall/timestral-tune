@@ -15,8 +15,12 @@ When you add a `[V]` claim to the spec, add its probe or test and a row here in 
 | Python | 3.13 for the probes; 3.10, 3.12 and 3.13 for the test suite |
 | Checkpoints | Timestral-5M and Timestral-28M at the Hub revisions pinned in `docs/UPSTREAM.md` |
 
-CUDA results (§13) come from a second machine: a Google Cloud VM with one NVIDIA L4 (23 GB), 4 CPU threads,
-Ubuntu 22.04, PyTorch 2.15.0+cu132, Python 3.12.16.
+CUDA results (§13) come from Linux x86_64 cloud VMs with one NVIDIA L4 (23 GB), Ubuntu 22.04, PyTorch
+2.15.0+cu132: Phase 1–4 runs used 4 CPU threads and Python 3.12.16 (`89ac249`), and the 2026-11-23 Phase 5
+run (§11, §13, §16, §17) used driver `580.178.04`, CUDA runtime `13.2`, NCCL `2.30.7`, and `uv`-selected
+Python `3.15.2` (outside the CI matrix of Python `3.10–3.13`). Linux CPU results in §11, §16, and §17 come
+from 8-vCPU Linux x86_64 cloud VMs (Ubuntu 22.04, including an AMD EPYC 7B12 VM for post-fix runs) with
+`uv`-managed Python `3.12.16` (`torch 2.15.0+cu132`) and `3.10.22` (`torch 2.14.1+cu130`).
 
 The 123M and 209M checkpoints were measured later and separately: on CUDA in §13 and §14, and on the
 Apple GPU in §15. Sections that do not name them used 5M and 28M only.
@@ -374,6 +378,11 @@ Re-measure before relying on them.
 | Why `attention_context("math")` regresses on T14's 5M `past_only_covariates` batch on CPU | 100% of layer 5 decoder `dq` squared error sits at one query `(row=3, head=2, query=11)` whose top-2 keys sit at ~351,272 with true float64 gap 3.4577 (float32 ULP 0.03125): `default` quantized the gap to 3.4375 (`p2` +2.0%, grad rel L2 2.24e-3), `explicit` to 3.46875 (`p2` −1.1%, 1.16e-3), and `math` to 3.375 (`p2` +8.3%, 9.02e-3) |
 | 25-seed CPU sweep on T14-shaped 5M `past_only_covariates` batches | `default` median 1.89e-3 (max 3.67e-3); `math` median 2.12e-5 (max 5.38e-3); `explicit` median 2.31e-5 (max 1.40e-2 on seed 8, where `math` gave 9.57e-4) |
 | `ReduceOp.AVG` vs `ReduceOp.SUM` on CPU `gloo` (2026-11-23, macOS arm64; 1-rank `gloo` group on `tcp://127.0.0.1:<free port>`, `all_reduce` on a 1-element `float64` tensor, run under `uv run python -c ...` and `uv run --isolated --python 3.12 --with "torch==2.4.0" python -c ...`) | PyTorch 2.4.0: `ReduceOp.SUM` succeeds (`[2.0]`); `ReduceOp.AVG` raises `RuntimeError: Cannot use ReduceOp.AVG with Gloo`. PyTorch 2.15.0: both `ReduceOp.SUM` and `ReduceOp.AVG` succeed (`[2.0]`) |
+| One-process bit-identity vs pre-implementation commit `57a781c` (2026-11-23; out-of-repo 12-scenario script covering all 4 modes, replay/distillation, cached/streamed `head_only`, sign flips, early stopping, and restore, run twice at `57a781c` for self-reproduction and once at branch tip) | Linux x86_64 CPU (8-vCPU VM at `3347f70`, and L4 VM CPU at `71514a6`): `57a781c` self-reproduction `BITWISE MATCH`, tip vs `57a781c` `BITWISE MATCH`. NVIDIA L4 CUDA (`71514a6`, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`): `57a781c` self-reproduction `BITWISE MATCH`, tip vs `57a781c` `BITWISE MATCH` |
+| One-process float32 intra-op thread sensitivity on T15(j) scenarios and pre-fix thread-count reproduction (2026-11-23, commit `3347f70`, 8-vCPU Linux x86_64 VM, out-of-repo script running one-process `fit()` only at 1, 2, and 4 threads with no multi-process code; plus acceptance file alone at default 4 threads vs `OMP_NUM_THREADS=1`) | One-process `param_update` rel L2 across threads `1/2/4` was identical on `torch 2.14.1+cu130` (Python `3.10.12`) and `torch 2.15.0+cu132` (Python `3.12.16`): worst `N=2 lora_variate distill_only` `1.14e-04` (`1v2`), `4.23e-05` (`1v4`), `7.65e-05` (`2v4`); next worst `N=4 lora_variate both` `4.71e-05` (`1v4`) and `N=4 lora_variate replay_only` `4.33e-05` (`2v4`); `head_only distill_only` `4.48e-08`–`2.73e-06`; `full_ft replay_only` `2.92e-06`–`6.93e-06`. Running `tests/acceptance/test_distributed.py` alone (subset of 6 tests) passed `6/6` at default 4 threads and failed the exact 2 float32 `param_update` checks at `OMP_NUM_THREADS=1` (`lora_variate_distill_only_wrap_float32` `1.07e-04` and `default_synth` `1.71e-04` vs `1e-4`), identically on both PyTorch versions |
+| Pre-fix 10×-tightened float32 margin scans (2026-11-23, commit `3347f70`, out-of-repo edit dividing every float32 tier by 10; lower bounds on what was thin because each test stops at its first failing assert) | macOS arm64: `9 failed, 24 passed, 4 deselected` (`param_update` up to `4.82e-05` in `T15(l)[4]`, `3.32e-05` in `T15(j)[4]`, `2.97e-05` in `T15(a)[4]`; `T15(b)[4]` step-0 `param` `1.67e-05`). Linux x86_64 (8-vCPU VM, threads `1/2/4`): `12 failed / 21 passed` (`t=1`), `9 failed / 24 passed` (`t=2`), `12 failed / 21 passed` (`t=4`), `4 deselected` — `param_update` up to `1.94e-04` (`t=2`, `T15(l)[4]` `default_synth` before switching to `lora_temporal`), `1.71e-04` (`t=1`), `7.78e-05` (`t=4`, `T15(a)[4]`); single-step `param` up to `3.38e-06` (`t=2`, replay whitebox `lora_variate:b_replay_zero_one_rank`) and `1.07e-05` (`t=1`, `T15(b)[4]` step 1 at old `lr=1e-2`); single-step `grad` `1.03e-06` (`t=4`, `T15(b)[4]` step 1 at old `lr=1e-2`) |
+| Single-rank NCCL collective-dtype and primitive smoke (2026-11-23, commit `71514a6`, one NVIDIA L4, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`, out-of-repo script) | `19/19 passed`: `all_reduce_sum` (`float64` n=8, `int64` n=4, `float32` n=1,048,576, `bfloat16` n=1,024), `broadcast` (`float32`, `float64`, `bfloat16`, `float16`, `int64`, `int32`, `bool`), `propagate_failure` (no error), `check_consistency`, `broadcast_status`, `broadcast_module_state` (`tiny` 47 f32, `5M` 75 f32, `5M` 75 bf16), and `GradientReducer` (`tiny` 47 tensors / `490,624` elements, reduce `1.50 ms`; `5M` 75 tensors / `5,208,960` elements, reduce `2.15 ms`) |
+| Multi-rank NCCL trainer trial on one shared GPU (2026-11-23, commit `71514a6`, one NVIDIA L4, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`, NCCL `2.30.7`, out-of-repo script run with `NCCL_MULTI_RANK_GPU_ENABLE=1` because NCCL refuses multiple ranks on one GPU by default; 23 6-step scenarios each at `N = 2` and `N = 4` vs one-process CUDA on the same GPU) | `N = 2` exit `[0, 0]`, `hung=[]`, wall `19 s`; `N = 4` exit `[0, 0, 0, 0]`, `hung=[]`, wall `35 s`; **`xrank_equal=True`** (bitwise cross-rank equality) across all 46 runs. **`float64`** (10 scenarios × 2: all 4 modes `none`, plus `head_only`/`lora_variate`/`full_ft` `replay_only` and `both`): `final_rel` `7.28e-17`–`1.43e-15`, `update_rel` `6.10e-16`–`2.99e-14`, `loss_rel` `1.33e-16`–`6.51e-16`. **`float32`** (`bf16=False`, same 10 scenarios × 2): `final_rel` `6.81e-08`–`9.86e-06`, `update_rel` `4.56e-07`–`1.80e-04` (peaks on `lora_variate`: `1.37e-04` at `N=2 none`, `1.80e-04` at `N=4 both`), `loss_rel` `7.76e-08`–`1.88e-05`. **`bf16`** (3 scenarios × 2: `lora_temporal none`, `full_ft none`, `full_ft both`; no parity tier set): `N = 2` `final_rel` `1.70e-04`–`8.14e-04`, `update_rel` `1.05e-02`–`1.89e-02`, `loss_rel` `1.96e-03`–`2.28e-03`; `N = 4` `final_rel` `1.77e-04`–`1.17e-03`, `update_rel` `1.03e-02`–`2.50e-02`, `loss_rel` `6.59e-04`–`2.85e-03` |
 
 ## 12. Facts read from sources, not measured
 
@@ -398,6 +407,23 @@ float64-RMSNorm reference of §6.
 | `step_timing.py --device cuda --bf16 --compile default` (`full_ft`, batch 32, ctx 1,024; `b0980cb`) | 5M uni 21 ms / 0.18 GiB, cov5 25 ms / 0.58 GiB; 28M uni 32 ms / 0.73 GiB, cov5 62 ms / 1.90 GiB |
 | `step_timing.py --device cuda --mode lora_variate --bf16 --compile reduce-overhead` (`b0980cb`) | 5M cov5 18 ms; 28M cov5 43 ms |
 | Real Hub export of `mistralai/Timestral-5M` (`lora_variate`, `bf16`, run at `3fe5bc9`) | Copies verbatim 1,687-byte `Modified MIT License` from Hub; reloads via upstream `load_model(..., strict=True)` on CUDA (`5,208,960` params) |
+
+Phase 5 branch re-run of `bash scripts/cuda_check.sh` on `2026-11-23` at commit `71514a6` (`40a580a` differs
+in comments only) on one NVIDIA L4 (`23034 MiB`, driver `580.178.04`, Linux x86_64, `torch 2.15.0+cu132`,
+CUDA runtime `13.2`, `nvidia-nccl-cu13==2.30.7`, `triton==3.9.0`; `uv sync --locked` selected `CPython 3.15.2`,
+which is outside the CI matrix of Python `3.10–3.13`):
+
+| Check (`71514a6`, one NVIDIA L4, Python `3.15.2`) | Result |
+|---|---|
+| T14 and all other device-parametrised tests | `266 passed, 3 skipped` (`188.12 s`; 3 Apple GPU tests skipped) |
+| Whole suite (`uv run pytest -q`, including T1–T14, network tests, and all 142 CPU/`gloo` multi-process items) | `735 passed, 4 skipped` (`603.65 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) |
+| `head_only` gradients on CUDA against the reference | At most `1.68e-6` (bound `1e-5`) |
+| `device_parity.py --device cuda` (`5M` / `28M`) | `5M` fwd `1.19e-7`–`1.49e-5` (`bf16` `1.49e-2`, `fp16` `1.96e-3`), grad `1.15e-2`; `28M` fwd `1.04e-7`–`2.20e-6` (`bf16` `5.74e-2`, `fp16` `5.92e-3`), grad `2.24e-3` |
+| `gradient_accuracy.py --device cuda` (`default` / `math` / `explicit`) | Tiny `1.6e-7`–`3.1e-7`; `5M` `1.7e-3`–`1.2e-2` / `3.6e-6`–`5.4e-5` / `6.0e-6`–`2.5e-5`; `28M` `1.4e-3`–`2.8e-3` / `4.8e-6`–`7.8e-5` / `3.5e-6`–`7.0e-5` |
+| `step_timing.py --device cuda` (`full_ft`, `fp32`, eager, batch 32, ctx 1,024, `cpu threads 8`) | `5M` uni `52 ms` / `0.27 GiB` (`3.7×` vs CPU `190 ms`), cov5 `55 ms` / `1.10 GiB` (`14.3×` vs `786 ms`); `28M` uni `68 ms` / `0.98 GiB` (`9.7×` vs `654 ms`), cov5 `209 ms` / `3.39 GiB` (`14.7×` vs `3,081 ms`) |
+
+One-off CUDA checks on the same L4 VM (one-process bit-identity vs `57a781c`, single-rank NCCL collective-dtype
+smoke, and 2-/4-rank shared-GPU NCCL trainer trial with `NCCL_MULTI_RANK_GPU_ENABLE=1`) are recorded in §11.
 
 The first attempt at this run (at `163ae4a`, one commit earlier) failed
 `test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_overhead` because
@@ -619,6 +645,9 @@ uv run python scripts/probes/distributed_parity.py --sizes 5M
 | `[6]` `DistributedSampler` (10 items, 4 replicas, `shuffle=False`) | Prototype outside `src/` | observation | `drop_last=False`: `duplicated=[0, 1]`, `dropped=[]`; `drop_last=True`: `duplicated=[]`, `dropped=[8, 9]` | identical |
 | **Summary (`tiny_random`)** | Prototype outside `src/` | all enforced | **`326/326` passed, `0` failed** | **`326/326` passed, `0` failed** |
 
+Also run on Linux x86_64 (`CPU`/`gloo`, `tiny_random`, `2026-11-23`): **`326/326` passed, `0` failed** on both
+`torch 2.14.1+cu130` (8-vCPU cloud VM at `3347f70`) and `torch 2.15.0+cu132` (L4 VM's CPU at `71514a6`).
+
 ### 16.2 Released `Timestral-5M` run (`--sizes 5M`, PyTorch 2.15.0, Python 3.12.13, `CPU`/`gloo`)
 
 The `--sizes 5M` run reports `516/516 passed, 0 failed, 68 info (ungraded)`: the `516` enforced passes are
@@ -654,34 +683,62 @@ one-off result in §11 (not covered by this probe).
 
 ## 17. Phase 5 Stages 1–2: Implemented multi-process training (CPU/`gloo`)
 
-### 17.1 Multi-process trainer and acceptance test runs (CPU/`gloo`)
+### 17.1 Multi-process trainer, acceptance test, and headroom runs (CPU/`gloo`)
 
-Measured on `2026-11-23` at commit `3347f70` on Apple M4 (macOS arm64, Python `3.12.13`), exercising the
-implemented Stages 1–2 multi-process trainer (`src/timestral_tune/trainer/distributed.py`,
-`_distributed_strategy.py`, `_types.py`, `trainer.py`, and `export.py`) on CPU/`gloo` via
-`tests/distributed_harness.py` (`spawn`, file-based rendezvous, 1 intra-op CPU thread per worker, hard
-wall-clock deadlines; tiny random model).
+Measured on `2026-11-23` across macOS arm64 (commit `40a580a`, Apple M4, Python `3.12.13`) and Linux x86_64
+(commit `71514a6`—`40a580a` differs in comments only—on an 8-vCPU AMD EPYC 7B12 Ubuntu 22.04 cloud VM and on
+the single-L4 VM's CPU), exercising the implemented Stages 1–2 multi-process trainer
+(`src/timestral_tune/trainer/distributed.py`, `_distributed_strategy.py`, `_types.py`, `trainer.py`, and
+`export.py`) on CPU/`gloo` via `tests/distributed_harness.py` (`spawn`, file-based rendezvous, 1 intra-op CPU
+thread per worker restored in `finally`, shared parity tiers and `TIMESTRAL_TEST_F32_TOL_SCALE` headroom knob,
+hard wall-clock deadlines; tiny random model).
 
-Commands run:
+Commands run on macOS arm64 (`40a580a`):
 
 ```bash
 uv run pytest tests/acceptance/test_distributed.py --collect-only -q
 TMPDIR=/tmp uv run pytest -m "not network" -q -p no:cacheprovider
-TMPDIR=/tmp uv run pytest tests/acceptance/test_distributed.py -q -p no:cacheprovider
+TMPDIR=/tmp TIMESTRAL_TEST_F32_TOL_SCALE=0.1 uv run pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py -q -p no:cacheprovider
 TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py -q -p no:cacheprovider
 ```
 
-| Suite | PyTorch `2.15.0` (`CPU`/`gloo`, Python `3.12.13`) | PyTorch `2.4.0` (`CPU`/`gloo`, Python `3.12`) |
+| Suite (macOS arm64, `40a580a`) | PyTorch `2.15.0` (`CPU`/`gloo`, Python `3.12.13`) | PyTorch `2.4.0` (`CPU`/`gloo`, Python `3.12`) |
 |---|---|---|
-| Full network-free suite (`-m "not network"`) | **`510 passed, 15 skipped, 213 deselected`** (`0` failed; skips: 1 optional `lacuna`, 14 CUDA `bf16`) | Not run in full here (four distributed files below) |
-| Acceptance test T15 (`tests/acceptance/test_distributed.py`, cases `(a)–(l)`, 19 test functions / 34 collected items, `N = 2` and `N = 4`, tiny random model) | **`34 passed`** (`0` skipped, `0` failed; includes `test_t15_f_dataloader_workers` at `N = 4`, `test_t15_h_compile_default_smoke`, and `test_t15_l_compile_default_replay_distill_smoke`) | **`33 passed, 1 skipped`** within the 4-file run below (`test_t15_f_dataloader_workers` skipped on macOS PyTorch `< 2.8` per §10; both compiled smoke tests passed) |
-| All four multi-process test files (`tests/test_distributed.py`, `tests/test_trainer_distributed.py`, `tests/test_trainer_distributed_replay.py`, `tests/acceptance/test_distributed.py`; `141` items collected) | **`141 passed`** (`0` skipped, run inside `-m "not network"` above) | **`137 passed, 4 skipped`** (all 4 skips are `num_workers > 0` on macOS PyTorch `< 2.8` per §10: 2 in `tests/test_distributed.py`, 1 in `tests/test_trainer_distributed_replay.py`, 1 in `tests/acceptance/test_distributed.py`) |
+| Full network-free suite (`-m "not network"`) | **`511 passed, 15 skipped, 213 deselected`** (`265.63 s`, `0` failed; skips: 1 optional `lacuna`, 14 CUDA `bf16`) | Not run in full here (four distributed files below) |
+| Acceptance test T15 (`tests/acceptance/test_distributed.py`, cases `(a)–(l)`, 19 test functions / 34 collected items, `N = 2` and `N = 4`, tiny random model) | **`34 passed`** (`0` skipped, `0` failed, within both the `-m "not network"` run above and the `scale=0.1` 4-file run below; includes `test_t15_f_dataloader_workers` at `N = 4`, `test_t15_h_compile_default_smoke`, and `test_t15_l_compile_default_replay_distill_smoke`) | **`33 passed, 1 skipped`** within the 4-file run below (`test_t15_f_dataloader_workers` skipped on macOS PyTorch `< 2.8` per §10; both compiled smoke tests passed) |
+| All four multi-process test files (`tests/test_distributed.py`, `tests/test_trainer_distributed.py`, `tests/test_trainer_distributed_replay.py`, `tests/acceptance/test_distributed.py`; `142` items collected) | **`142 passed`** at default scale (`1.0`, inside `-m "not network"`) and **`142 passed`** at **`TIMESTRAL_TEST_F32_TOL_SCALE=0.1`** (`139.02 s`, `>= 10×` float32 headroom) | **`138 passed, 4 skipped`** (`142.43 s`; all 4 skips are `num_workers > 0` on macOS PyTorch `< 2.8` per §10: 2 in `tests/test_distributed.py`, 1 in `tests/test_trainer_distributed_replay.py`, 1 in `tests/acceptance/test_distributed.py`) |
+
+Linux x86_64 runs (`71514a6`, 8-vCPU AMD EPYC 7B12 Ubuntu 22.04 VM with `uv`-managed Python `3.12.16` /
+`torch 2.15.0+cu132` and `uv`-managed Python `3.10.22` / `torch 2.14.1+cu130`; plus standalone 4-file run on
+the L4 VM's CPU with Python `3.15.2` / `torch 2.15.0+cu132`):
+
+| Suite & configuration (Linux x86_64, `71514a6`, `CPU`/`gloo`) | Result |
+|---|---|
+| Full network-free suite (`-m "not network"`), Python `3.12.16` / `torch 2.15.0+cu132` | **`469 passed, 24 skipped, 169 deselected`** (`265.26 s`; skips: 6 device parity, 1 `lacuna`, 2 MPS loader, 1 `test_pinball`, 14 CUDA `bf16`) |
+| Full network-free suite (`-m "not network"`), managed Python `3.10.22` / `torch 2.14.1+cu130` | **`469 passed, 24 skipped, 169 deselected`** (`424.19 s`; identical skip breakdown) |
+| Four multi-process files (`142` items), Python `3.12.16` / `torch 2.15.0+cu132`, `TIMESTRAL_TEST_F32_TOL_SCALE=0.2` (`>= 5×` headroom), `OMP_NUM_THREADS=1` / `2` / `4` (acceptance file last) | **`142 passed`** at `t=1` (`229.72 s`), **`142 passed`** at `t=2` (`167.44 s`), **`142 passed`** at `t=4` (`167.43 s`) |
+| Four multi-process files (`142` items), Python `3.12.16` / `torch 2.15.0+cu132`, `TIMESTRAL_TEST_F32_TOL_SCALE=0.2`, acceptance file first (default threads) | **`142 passed`** (`167.33 s`) |
+| Four multi-process files (`142` items), Python `3.12.16` / `torch 2.15.0+cu132`, `TIMESTRAL_TEST_F32_TOL_SCALE=0.1` (`>= 10×` headroom), default threads | **`142 passed`** (`168.02 s`) |
+| Four multi-process files (`142` items), managed Python `3.10.22` / `torch 2.14.1+cu130`, `TIMESTRAL_TEST_F32_TOL_SCALE=0.2`, `OMP_NUM_THREADS=2` | **`142 passed`** (`177.22 s`) |
+| Four multi-process files (`142` items), L4 VM CPU, Python `3.15.2` / `torch 2.15.0+cu132`, default scale (`1.0`) | **`142 passed`** (`199.97 s`) |
+
+*Pre-fix Linux x86_64 baseline (`3347f70`, separate 8-vCPU Ubuntu 22.04 VM):* `-m "not network"` passed with
+`468 passed, 24 skipped, 169 deselected` on both managed Python `3.12.16` (`468.61 s`) and managed Python
+`3.10.22` (`573.93 s`; running under Ubuntu's system Python `3.10.12` failed the 5 `torch.compile` tests on
+missing `Python.h`, an environment artefact). Running the four multi-process files alone (`acceptance` last)
+failed two float32 `param_update` checks (`1.07e-04` in `T15(j)[2]` and `1.71e-04` in `T15(l)[4]` vs `1e-4`;
+`2 failed, 139 passed` on Python `3.12.16`, and `4 failed, 137 passed` across three repeats under headerless
+system Python `3.10.12` where the two compiled smoke tests also hit missing `Python.h`) because `_worker_main`
+leaked `num_threads=1` into the pytest parent process (`e33cbf5` fixed the leak and added `_guard_torch_global_state`
+in `tests/conftest.py`; `0f80f4c` recalibrated the float32 tiers).
 
 ### 17.2 PyTorch `F.linear` `requires_grad` dispatch probe (`scripts/probes/linear_requires_grad_dispatch.py`)
 
-Backs the `[V]` claims in spec §9 T15(j) and §12. Measured on `2026-11-23` at commit `3347f70` on macOS arm64
-CPU (`threads=4`, `seed=0`). **Only macOS arm64 CPU has been measured**; other BLAS backends and GPUs are
-unmeasured.
+Backs the `[V]` claims in spec §9 T15(j) and §12. Measured on `2026-11-23` on CPU (`threads=4`, `seed=0`)
+across macOS arm64 (at `3347f70`, PyTorch `2.15.0` and `2.4.0`) and three Linux x86_64 cloud VMs: VM 1 (at
+`3347f70`, 8 vCPU, `torch 2.14.1+cu130`), VM 2 (at `71514a6`, 8 vCPU AMD EPYC 7B12, `torch 2.15.0+cu132` and
+`torch 2.14.1+cu130`), and the L4 VM's CPU (at `71514a6`, `torch 2.15.0+cu132`). GPU/CUDA `F.linear` dispatch
+is unmeasured by this CPU-only probe.
 
 Commands run:
 
@@ -689,6 +746,8 @@ Commands run:
 uv run python scripts/probes/linear_requires_grad_dispatch.py
 uv run --isolated --python 3.12 --with "torch==2.4.0" python scripts/probes/linear_requires_grad_dispatch.py
 ```
+
+**macOS arm64 CPU:**
 
 | Probe section & case | PyTorch `2.15.0` (macOS arm64 CPU) | PyTorch `2.4.0` (macOS arm64 CPU) |
 |---|---|---|
@@ -702,12 +761,50 @@ uv run --isolated --python 3.12 --with "torch==2.4.0" python scripts/probes/line
 | `[c]` Step-0 `distillation_loss` & `grad_l2`, `frozen(rg=F)` teacher, `float32` | Non-zero on uni `bs=2,4,8` and cov `bs=1,2` (zero on uni `bs=1`, cov `bs=4,8`): `beta=1e-3` loss `9.11e-12`–`1.25e-11`, `grad_l2` `8.82e-05`–`3.04e-04` (peak cov `bs=1`); `beta=0.0` loss `1.05e-07`–`1.21e-07`, `grad_l2` `5.69e-01`–`1.76e+00` | **Differs from 2.15.0:** Non-zero on uni `bs=1,2,4,8` and cov `bs=1,2` (zero on cov `bs=4,8`): `beta=1e-3` loss `6.73e-12`–`1.31e-11`, `grad_l2` `8.58e-05`–`2.55e-04` (peak uni `bs=2`); `beta=0.0` loss `8.88e-08`–`1.20e-07`, `grad_l2` `5.41e-01`–`1.47e+00` |
 | `[c]` Step-0 `distillation_loss` & `grad_l2`, `frozen(rg=F)` teacher, `float64` | `0.00e+00` / `0.00e+00` in every cell | **Differs from 2.15.0:** Uni `bs=1`: `beta=1e-3` loss `3.53e-29`, `grad_l2` `5.07e-13`; `beta=0.0` loss `2.17e-16`, `grad_l2` `1.76e+00`; all other 7 cells `0.00e+00` / `0.00e+00` |
 
-**Not verified anywhere (Stage 3, spec §10 & §12):** Stage 2 multi-process replay and distillation are now
-verified on CPU/`gloo` on macOS arm64 only; **multi-rank NCCL has never executed**. Unverified: CUDA/NCCL
-hardware, real `torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests only), `bf16`
-autocast and CUDA `compile_mode="default"` (including trailing-shape recompilation and replay) across ranks,
-`torchrun` on Linux and Linux `DataLoader` worker teardown timing, live concurrent `huggingface_hub==0.23.0`
-downloads (source reading only, §12), released-weights T15 bounds (with or without replay), multi-GPU
-throughput/VRAM/scaling (including per-parameter pack/unpack, 3–4 collectives per step, flat gradient buffer
-live through validation, and per-rank `_frozen_base` VRAM in `full_ft` distillation), `F.linear`
-`requires_grad` dispatch on other BLAS backends or GPUs, and NCCL rank-failure behaviour.
+**Linux x86_64 CPU (three cloud VMs; contiguous `[a]`, `rgT:g-ng`, `rgF:g-ng`, and `unfrozen(rg=T)` `[b]`/`[c]` are `0.00e+00` in every cell on all three VMs):**
+
+| Probe section & case | VM 1 (`3347f70`, `torch 2.14.1+cu130`) | VM 2 AMD EPYC 7B12 (`71514a6`, `torch 2.15.0+cu132` & `2.14.1+cu130`, cell-for-cell identical) | L4 VM CPU (`71514a6`, `torch 2.15.0+cu132`) |
+|---|---|---|---|
+| `[a]` Standalone `F.linear`, `float32` permuted `(1, 0, 2)` (`grad:T-F == nograd:T-F`) | 5/7 non-zero: `(8,5,32)->32`: `4.77e-06`; `(2,6,64)->64`: `9.54e-06`; `(8,6,64)->64`: `7.63e-06`; `(2,6,64)->192`: `5.72e-06`; `(8,6,64)->192`: `7.63e-06`; `(1,6,64)->64` & `(4,6,64)->64`: `0.00e+00` | 2/7 non-zero: `(2,6,64)->64`: `1.14e-05`; `(2,6,64)->192`: `7.63e-06`; other 5 shapes `0.00e+00` | Same 2/7 non-zero, different magnitudes: `(2,6,64)->64`: `9.54e-06`; `(2,6,64)->192`: `6.68e-06`; other 5 shapes `0.00e+00` |
+| `[a]` Standalone `F.linear`, `float64` permuted `(1, 0, 2)` (`grad:T-F == nograd:T-F`) | **Non-zero (3/7):** `(8,5,32)->32`: `5.77e-15`; `(2,6,64)->64`: `1.42e-14`; `(8,6,64)->64`: `1.07e-14`; other 4 shapes `0.00e+00` | **Non-zero (2/7):** `(2,6,64)->64`: `1.42e-14`; `(2,6,64)->192`: `1.78e-14`; other 5 shapes `0.00e+00` | **Non-zero (2/7):** `(2,6,64)->64`: `1.07e-14`; `(2,6,64)->192`: `1.78e-14`; other 5 shapes `0.00e+00` |
+| `[b]` Tiny random model, `frozen(rg=F)`, `float32` | Uni `bs=1`: `0.00e+00`; other 7/8 cells non-zero (incl. `cov bs=4,8`): `max_abs` `4.17e-07`–`7.15e-07` (`rel_l2` `1.42e-07`–`2.47e-07`) | Uni `bs=1`: `0.00e+00`; other 7/8 cells non-zero: `max_abs` `4.17e-07`–`6.56e-07` (`rel_l2` `1.48e-07`–`2.50e-07`) | Uni `bs=1`: `0.00e+00`; other 7/8 cells non-zero: `max_abs` `4.77e-07`–`5.96e-07` (`rel_l2` `1.50e-07`–`2.18e-07`) |
+| `[b]` Tiny random model, `frozen(rg=F)`, `float64` | Uni `bs=1`: `0.00e+00`; other 7/8 cells non-zero: `max_abs` `8.88e-16`–`1.11e-15` (`rel_l2` `1.57e-16`–`4.08e-16`) | Uni `bs=1`: `0.00e+00`; other 7/8 cells non-zero: `max_abs` `8.88e-16`–`1.33e-15` (`rel_l2` `3.12e-16`–`4.71e-16`) | Uni `bs=1`: `0.00e+00`; other 7/8 cells non-zero: `max_abs` `8.88e-16`–`1.33e-15` (`rel_l2` `2.80e-16`–`3.99e-16`) |
+| `[c]` Step-0 `distillation_loss` & `grad_l2`, `frozen(rg=F)`, `float32` (7 non-zero cells) | `beta=1e-3`: loss `5.06e-12`–`1.48e-11`, `grad_l2` `7.82e-05`–`2.94e-04` (peak cov `bs=1`); `beta=0.0`: loss `6.76e-08`–`1.37e-07`, `grad_l2` `4.97e-01`–`1.46e+00` | `beta=1e-3`: loss `5.74e-12`–`1.52e-11`, `grad_l2` `4.99e-05`–`2.72e-04` (peak uni `bs=2`); `beta=0.0`: loss `7.92e-08`–`1.32e-07`, `grad_l2` `3.83e-01`–`1.71e+00` | `beta=1e-3`: loss `5.91e-12`–`1.16e-11`, `grad_l2` `6.82e-05`–`2.16e-04` (peak cov `bs=1`); `beta=0.0`: loss `7.97e-08`–`1.16e-07`, `grad_l2` `4.57e-01`–`1.61e+00` |
+| `[c]` Step-0 `distillation_loss` & `grad_l2`, `frozen(rg=F)`, `float64` (7 non-zero cells) | `beta=1e-3`: loss `6.20e-30`–`4.17e-29`, `grad_l2` `8.36e-14`–`5.42e-13`; `beta=0.0`: loss `4.03e-17`–`2.22e-16`, `grad_l2` `2.53e-01`–`1.65e+00` | `beta=1e-3`: loss `2.57e-29`–`5.40e-29`, `grad_l2` `1.18e-13`–`5.31e-13`; `beta=0.0`: loss `1.66e-16`–`2.67e-16`, `grad_l2` `4.37e-01`–`1.40e+00` | `beta=1e-3`: loss `1.98e-29`–`3.88e-29`, `grad_l2` `1.05e-13`–`6.19e-13`; `beta=0.0`: loss `1.47e-16`–`2.23e-16`, `grad_l2` `4.99e-01`–`1.96e+00` |
+
+### 17.3 Float32 intra-op thread trajectory noise probe (`scripts/probes/float32_trajectory_noise.py`)
+
+Backs the `[V]` platform thread-sensitivity claim in spec §9 (T15 shared tolerance tiers). Runs deterministic
+6-step one-process `float32` `TimestralTrainer.fit()` trajectories on `tiny_random` across all four modes and
+all four replay/distillation regimes (`bs=[4, 8]`, `seed=0`) at intra-op thread counts `1`, `2`, and `4`.
+
+Commands run:
+
+```bash
+uv run python scripts/probes/float32_trajectory_noise.py
+uv run --isolated --python 3.12 --with "torch==2.4.0" python scripts/probes/float32_trajectory_noise.py
+```
+
+| Platform & PyTorch | `max_param_update_rel_l2` (worst cell) | `max_final_params_rel_l2` | `max_loss_rel` | Pattern across thread pairs (`1v2`, `1v4`, `2v4`) |
+|---|---|---|---|---|
+| macOS arm64 (`40a580a`, `threads=4`), PyTorch `2.15.0` and `2.4.0` | `0.00e+00` (all 32 rows) | `0.00e+00` | `0.00e+00` | Bit-identical across threads `1`, `2`, and `4` in every cell on both versions |
+| Linux x86_64 AMD EPYC 7B12 (`71514a6`, `threads=4`), PyTorch `2.15.0+cu132` and `2.14.1+cu130` (cell-for-cell identical) | `8.08e-06` (`bs=4 full_ft/both (1v2)`) | `2.66e-07` (`bs=4 lora_temporal/both`) | `7.84e-07` (`bs=4 lora_temporal/both`) | `1v4` is `0.00e+00` in every row; `1v2 == 2v4` is non-zero (`1.22e-07`–`8.08e-06`) across all 32 rows |
+
+Note: this probe demonstrates that Linux x86_64 one-process `float32` trajectories depend on intra-op thread
+count while macOS arm64 trajectories do not; on this synthetic workload the probe reaches `8.08e-06`, whereas
+the larger `1.14e-04` one-process thread-count difference that motivated `TRAJ_UPDATE_TOL["float32"] = 1e-3`
+occurred on a T15(j) `lora_variate` distillation scenario (one-off measurement in §11).
+
+**Not verified anywhere (Stage 3, spec §10 & §12):** Stages 1–2 multi-process training is verified on
+CPU/`gloo` on macOS arm64 and Linux x86_64, and on one NVIDIA L4 the full suite (`scripts/cuda_check.sh`, §13)
+plus one-off single-rank NCCL smoke and 2-/4-rank shared-GPU NCCL trainer trials (`NCCL_MULTI_RANK_GPU_ENABLE=1`,
+§11) have run. Still unverified: T15 on NCCL (requires adding a backend and per-rank device switch to
+`tests/distributed_harness.py`, which currently restricts to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`), ranks on
+separate GPUs and real multi-GPU `torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests
+only), `torchrun` launch and `DataLoader` worker teardown timing under CUDA/NCCL, CUDA `compile_mode="default"`
+(including trailing-shape recompilation and replay) across ranks, `bf16` parity tiers (only 3 single-GPU trial
+scenarios measured in §11; no tier set), NCCL rank-failure behaviour, multi-GPU throughput/VRAM/scaling
+(including per-parameter pack/unpack, 3–4 collectives per step, flat gradient buffer live through validation,
+and per-rank `_frozen_base` VRAM in `full_ft` distillation), released-weights T15 bounds (with or without
+replay), live concurrent `huggingface_hub==0.23.0` downloads (source reading only, §12), and `F.linear`
+`requires_grad` dispatch on GPUs/CUDA.

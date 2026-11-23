@@ -59,8 +59,8 @@ src/timestral_tune/
   integrations/          Optional Lacuna integration (`timestral-tune[lacuna]`, Python 3.11+)
   replay/                Replay sources and distillation to the frozen base model
 tests/
-  conftest.py, helpers.py   Fixtures and builders shared by all tests
-  distributed_harness.py    Multi-process CPU/gloo spawn harness (file rendezvous, hard timeouts)
+  conftest.py, helpers.py   Fixtures, global PyTorch state leak guard, and builders shared by all tests
+  distributed_harness.py    Multi-process CPU/gloo spawn harness, shared parity tiers, and headroom knob
   test_*.py                 Unit tests per module (including test_distributed.py, test_trainer_distributed.py, test_trainer_distributed_replay.py)
   acceptance/               T1–T15 from spec §9 (all 15 implemented and passing; T15 on CPU/gloo)
 scripts/
@@ -113,19 +113,38 @@ a batch with upstream's own input assembly as ground truth).
   floor without touching the project environment. Each such run downloads a PyTorch build of a few hundred
   megabytes into the uv cache; `uv cache prune` reclaims the space afterwards.
 - **Training tests** copy the model first (`copy.deepcopy`); the fixtures are shared across tests.
+- **Global PyTorch state leak guard.** An autouse fixture (`_guard_torch_global_state` in `tests/conftest.py`)
+  records `torch.get_num_threads()`, `torch.is_grad_enabled()`, and `torch.get_default_dtype()` around every
+  test, restores any mutated value, and fails the test if anything leaked. Any test or helper (such as
+  `tests/distributed_harness.py::_worker_main`) that changes process-global PyTorch state must restore it in
+  `finally`.
 - **Multi-process tests** (`tests/acceptance/test_distributed.py` for T15 cases `(a)–(l)`,
   `tests/test_distributed.py` for primitives and the harness, `tests/test_trainer_distributed.py` for
   white-box trainer internals, and `tests/test_trainer_distributed_replay.py` for multi-process replay and
   distillation) spawn separate Python processes on CPU/`gloo` through `tests/distributed_harness.py`. The
   harness uses the `spawn` start method, file-based rendezvous inside a fresh temporary directory (avoiding
-  ephemeral TCP port collisions), `torch.set_num_threads(1)` per worker, `run_scenarios` to amortise process
-  startup across balanced scenarios, and a hard wall-clock deadline that terminates/kills stuck workers
-  (`DistributedTimeoutError`) so collective hangs fail fast. Run them with:
+  ephemeral TCP port collisions), `torch.set_num_threads(1)` per worker (restored in `finally`),
+  `run_scenarios` to amortise process startup across balanced scenarios, and a hard wall-clock deadline that
+  terminates/kills stuck workers (`DistributedTimeoutError`) so collective hangs fail fast. Run them with:
   `TMPDIR=/tmp uv run pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py`
   (`TMPDIR=/tmp` avoids macOS socket path-length failures with multi-process `DataLoader`s), or on the floor
   with
   `TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py`
   (the four `num_workers > 0` tests skip on macOS below PyTorch 2.8; see `docs/VERIFICATION.md` §10, §17).
+- **Float32 multi-process parity tolerances & headroom knob.** All five parity tiers (`EVAL_TOL`, `STEP_TOL`,
+  `STEP_PARAM_TOL`, `TRAJ_TOL`, `TRAJ_UPDATE_TOL`) live in `tests/distributed_harness.py`. The `float64`
+  tiers check the distributed logic and are never scaled; `TIMESTRAL_TEST_F32_TOL_SCALE` (default `1.0`,
+  validated finite positive float) multiplies the `float32` tiers only. Use a value below `1.0` to verify
+  headroom (`TIMESTRAL_TEST_F32_TOL_SCALE=0.1` checks `>= 10×` headroom on macOS arm64; `0.2` checks `>= 5×`
+  on Linux x86_64), or above `1.0` when exploring a new platform to measure where assertions land before
+  calibrating a tier. Any new or tightened `float32` tolerance must be checked on Linux x86_64 (across
+  intra-op thread counts `1`, `2`, and `4`) as well as macOS arm64: on macOS arm64 one-process `fit()` is
+  bit-identical across thread counts, whereas on Linux x86_64 it is not (`scripts/probes/float32_trajectory_noise.py`,
+  `docs/VERIFICATION.md` §11, §17.1, §17.3).
+- **Ubuntu system Python & `torch.compile` tests.** Ubuntu's system Python (for example `/usr/bin/python3.10`)
+  ships without `Python.h` unless `python3-dev` is installed, causing all `torch.compile` tests to fail with
+  a C++ compiler error even on CPU. Use a `uv`-managed Python (which includes the headers, e.g.
+  `UV_PYTHON_PREFERENCE=only-managed uv sync --python 3.10`) when running the suite on Linux.
 
 ## Devices
 

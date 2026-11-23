@@ -1219,3 +1219,105 @@ probe, verified the full network-free and multi-process suites on CPU/`gloo` on 
 - Maintainer decisions on the two candidate remedies for PyTorch's `F.linear` `requires_grad` dispatch in
   `full_ft` distillation and on the ten pre-existing one-process observations recorded in spec §12.
 - Optional gradient accumulation (unticked, unscheduled).
+
+---
+
+## 2026-11-23 — Linux x86_64 validation, float32 tolerance recalibration, and single-L4 CUDA/NCCL checks
+
+**What was found on Linux x86_64 (at `3347f70`).** Running the Stages 1–2 suite on a rented 8-vCPU Linux
+x86_64 cloud VM (Ubuntu 22.04) surfaced three platform differences not visible on macOS arm64:
+
+1. **Test-order-dependent float32 `param_update` failures caused by a thread leak plus Linux thread-count
+   sensitivity.** The full network-free suite (`-m "not network"`, where `tests/acceptance/test_distributed.py`
+   runs before `tests/test_trainer_distributed.py`) passed on both managed Python `3.12.16` (`torch 2.15.0+cu132`)
+   and managed Python `3.10.22` (`torch 2.14.1+cu130`). Running the four multi-process files alone (with the
+   acceptance file last) failed two float32 `param_update` checks against the old `1e-4` bound:
+   `T15(j)[2]` `lora_variate_distill_only_wrap_float32` (`1.07e-04`) and `T15(l)[4]` `default_synth`
+   (`1.71e-04`). Root causes:
+   - `tests/test_trainer_distributed.py::test_harness_preserves_scenario_error_when_destroy_process_group_raises`
+     called `distributed_harness._worker_main` in-process, which set `torch.set_num_threads(1)` without
+     restoring it, leaking 1 intra-op thread into every later test in the parent process.
+   - Unlike macOS arm64 (where one-process `fit()` is bit-identical across intra-op thread counts), Linux
+     x86_64 one-process `fit()` varies with thread count: a one-off pure one-process check on T15(j) scenarios
+     showed `param_update` rel L2 up to `1.14e-04` between 1 and 2 threads (`N=2 lora_variate distill_only`),
+     identically on `torch 2.14.1+cu130` and `torch 2.15.0+cu132`, and pre-fix 10×-tightened margin scans
+     showed `T15(l)[4]` `default_synth` reaching `1.94e-04` at 2 threads even without the leak (because
+     `default_synth` used `lora_variate`, whose Q/K slices are inert on univariate `SyntheticReplaySource`
+     windows per `validate_lora_for_rows` and were dominated by near-$\epsilon$ AdamW amplification;
+     `docs/VERIFICATION.md` §11).
+2. **`F.linear` `requires_grad` dispatch on Linux x86_64 is non-zero in `float64` too and varies across CPUs.**
+   Re-running `scripts/probes/linear_requires_grad_dispatch.py` across three Linux x86_64 VMs showed
+   non-zero standalone permuted differences in `float64` as well as `float32`, non-zero tiny-model differences
+   in 7 of 8 cells (including `cov bs=4,8`, which are zero on macOS arm64), identical results across
+   `torch 2.14.1+cu130` and `2.15.0+cu132` on the AMD EPYC 7B12 VM, and different shapes/magnitudes across
+   x86_64 CPUs even on the same PyTorch wheel (`docs/VERIFICATION.md` §17.2).
+3. **Ubuntu's system Python `3.10.12` lacks `Python.h`.** Running with `/usr/bin/python3.10` failed all five
+   `torch.compile` tests on missing `Python.h`; switching to `uv`-managed Python `3.10.22` (which ships its
+   headers) passed cleanly (`docs/VERIFICATION.md` §17.1).
+
+**Fixes (`e33cbf5`, `0f80f4c`, `71514a6`, `40a580a`).**
+
+- `e33cbf5`: `_worker_main` in `tests/distributed_harness.py` restores the caller's thread count in `finally`;
+  added autouse `_guard_torch_global_state` in `tests/conftest.py` to fail any test leaking `num_threads`,
+  `grad_enabled`, or `default_dtype`.
+- `0f80f4c`: centralised all five parity tiers (`EVAL_TOL`, `STEP_TOL`, `STEP_PARAM_TOL`, `TRAJ_TOL`,
+  `TRAJ_UPDATE_TOL`) and the validated `TIMESTRAL_TEST_F32_TOL_SCALE` headroom knob (default `1.0`, scaling
+  float32 tiers only) in `tests/distributed_harness.py` with unit coverage in `tests/test_distributed.py`;
+  set `TRAJ_UPDATE_TOL["float32"] = 1e-3` (keeping `TRAJ_TOL["float32"] = 1e-4` for losses and
+  `final_trainable`); split `STEP_PARAM_TOL` (`1e-12` float64 / `1e-4` float32), tightening T15(b)'s float64
+  post-step parameter tier from `1e-10` to `1e-12` while aligning T15(b) to a uniform `learning_rate=1e-3`;
+  and switched T15(l)'s `default_synth` check to `mode="lora_temporal"` (with an explicit `> 1e-4` update-norm
+  check).
+- `71514a6` & `40a580a`: added standalone `scripts/probes/float32_trajectory_noise.py` and aligned harness/probe
+  comments with the actual measured headroom and Linux numbers.
+
+**Development history (not `[V]` claims):**
+
+- The Stage 1–2 float32 parity tiers had originally been calibrated on macOS arm64 only and failed on Linux
+  x86_64 when first exercised there.
+- The earlier mutation campaign was **not** re-run after `TRAJ_UPDATE_TOL["float32"]` was loosened from `1e-4`
+  to `1e-3`; the `float64` tiers that guard the distributed logic were untouched (and T15(b)'s `float64`
+  post-step parameter bound was tightened from `1e-10` to `1e-12`).
+
+**Single-L4 CUDA/NCCL results (at `71514a6`, one NVIDIA L4, driver `580.178.04`, `uv`-selected Python `3.15.2`,
+`torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`):**
+
+- `bash scripts/cuda_check.sh` passed (`266 passed, 3 skipped` device tests; `735 passed, 4 skipped` whole
+  suite including all 142 CPU/`gloo` multi-process items; `docs/VERIFICATION.md` §13). Note that `uv` selected
+  `CPython 3.15.2`, which is outside the CI matrix (`3.10–3.13`). An L4 was available in only one of roughly
+  ten zones tried.
+- One-off 12-scenario one-process bit-identity check against pre-implementation `57a781c` matched bitwise
+  (`BITWISE MATCH`, including `57a781c` self-reproduction) on both CPU and CUDA (`docs/VERIFICATION.md` §11).
+- One-off single-rank NCCL smoke passed `19/19`, confirming NCCL accepts all collective dtypes and CUDA
+  primitive paths (`docs/VERIFICATION.md` §11).
+- One-off multi-rank NCCL trainer trial ran 2 and 4 ranks sharing the single L4 (requiring
+  `NCCL_MULTI_RANK_GPU_ENABLE=1` because NCCL `2.30.7` refuses multiple ranks per GPU by default): all 23
+  scenarios per rank count exited cleanly with bitwise cross-rank equality (`xrank_equal=True`), `float64`
+  parity `<= 2.99e-14`, `float32` `update_rel <= 1.80e-04`, and `bf16` `update_rel` `1.03e-02`–`2.50e-02`
+  (no `bf16` tier set; `docs/VERIFICATION.md` §11).
+
+**Evidence (`40a580a` on macOS arm64; `71514a6` on Linux x86_64 and one NVIDIA L4; full commands and tables in
+`docs/VERIFICATION.md` §11, §13, §16, §17):**
+
+- macOS arm64 (`40a580a`, PyTorch `2.15.0`): `-m "not network"` `511 passed, 15 skipped, 213 deselected`; four
+  multi-process files `142 passed` at `TIMESTRAL_TEST_F32_TOL_SCALE=0.1`; `torch==2.4.0` `138 passed, 4 skipped`;
+  `float32_trajectory_noise.py` all `0.00e+00` on `2.15.0` and `2.4.0`.
+- Linux x86_64 AMD EPYC 7B12 (`71514a6`): `-m "not network"` `469 passed, 24 skipped, 169 deselected` on both
+  managed Python `3.12.16` (`2.15.0+cu132`) and managed Python `3.10.22` (`2.14.1+cu130`); four multi-process
+  files `142 passed` at `TIMESTRAL_TEST_F32_TOL_SCALE=0.2` across `OMP_NUM_THREADS` `1`, `2`, `4`, acceptance
+  first, and Python `3.10.22` (`t=2`), plus `142 passed` at `0.1` at default threads; `float32_trajectory_noise.py`
+  max `8.08e-06` (`2.15.0+cu132` and `2.14.1+cu130`, identical).
+- `uv run ruff check .` and `uv run ruff format --check .` clean.
+
+**Not done / open:**
+
+- **Stage 3 (multi-GPU CUDA/NCCL hardware verification):** prerequisite backend/device switch in
+  `tests/distributed_harness.py` (currently CPU/`gloo` only via `_ALLOWED_CPU_BACKENDS`), T15 on NCCL, ranks
+  on separate GPUs and real `LOCAL_RANK` binding, `torchrun`, `bf16` parity tier calibration, CUDA
+  `compile_mode="default"` and `num_workers > 0` across ranks, NCCL rank-failure behaviour, throughput/VRAM/
+  scaling, and released-weights T15 bounds (`docs/phases/phase-5-multi-gpu.md` §3, spec §10 & §12).
+- Live concurrent multi-process Hub download check at `huggingface_hub==0.23.0` (source reading only,
+  `docs/VERIFICATION.md` §12).
+- Maintainer decisions on `F.linear` `requires_grad` dispatch remedies and the ten pre-existing one-process
+  observations in spec §12.
+- Optional gradient accumulation (unticked, unscheduled).
