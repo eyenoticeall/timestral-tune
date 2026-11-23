@@ -1910,57 +1910,52 @@ def test_cli_help_and_error_survive_closed_stdout_and_stderr_pipes() -> None:
     assert "Traceback" not in r_uni.stderr
 
 
-def test_wrapper_uv_fallback_parses_python_flag_and_execs_directly(tmp_path: Path) -> None:
+def test_wrapper_interpreter_fallback_order_and_opaque_arg_passthrough(tmp_path: Path) -> None:
     bash_bin = "/bin/bash" if os.path.isfile("/bin/bash") else shutil.which("bash")
     assert bash_bin is not None
 
     repo = _make_stub_repo(tmp_path, with_git=False)
-    bin_dir = tmp_path / "fallback_bin"
-    bin_dir.mkdir()
-    # Stub `python3` to exit 1 so the wrapper must take its `uv` fallback path.
-    fake_py3 = bin_dir / "python3"
-    fake_py3.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    fake_py3.chmod(0o755)
-    for tool in ("dirname", "pwd", "ps"):
-        tp = shutil.which(tool)
-        if tp is not None:
-            os.symlink(tp, bin_dir / tool)
 
-    find_log = tmp_path / "uv_find.log"
-    pid_probe_ready = tmp_path / "py_pid.txt"
+    def _base_bin(name: str) -> Path:
+        bd = tmp_path / name
+        bd.mkdir()
+        for tool in ("dirname", "pwd", "ps"):
+            tp = shutil.which(tool)
+            if tp is not None:
+                os.symlink(tp, bd / tool)
+        return bd
+
+    # 1. `python3 >= 3.10` on PATH is preferred directly without calling `uv python find`,
+    #    passes `--python` and awkward forms like `--only --python` through untouched, and execs directly.
+    bin_py3 = _base_bin("bin_py3")
+    os.symlink(sys.executable, bin_py3 / "python3")
+    uv_log_1 = tmp_path / "uv_calls_1.log"
+    pid_probe = tmp_path / "orch_pid.txt"
     uv_stub_body = f"""\
 import json, os, pathlib, sys, uuid, zipfile
 
 argv = sys.argv[1:]
 joined = " ".join(argv)
+with open({str(uv_log_1)!r}, "a", encoding="utf-8") as uf:
+    uf.write(joined + "\\n")
 if argv[:2] == ["python", "find"]:
-    with open({str(find_log)!r}, "a", encoding="utf-8") as ff:
-        ff.write(" ".join(argv) + "\\n")
-    req = argv[-1]
-    if req == "3.9":
-        sys.exit(1)
     print({sys.executable!r})
     sys.exit(0)
 if argv and argv[0] == "sync":
     sys.exit(0)
 if "sys.executable" in joined and "torch.version.cuda" in joined:
-    print("stub-rt-fallback")
+    print("stub-rt-wrapper")
     sys.exit(0)
 if "tree_state_method=" in joined:
     print("tree_state_method=content_hash tree_state_sig=000000000000")
     sys.exit(0)
 if "--write-reference" in argv:
-    # Record the orchestrator's parent PID (ppid of this stage is the orchestrator PID).
-    pathlib.Path({str(pid_probe_ready)!r}).write_text(str(os.getppid()), encoding="utf-8")
+    pathlib.Path({str(pid_probe)!r}).write_text(str(os.getppid()), encoding="utf-8")
     ref_path = pathlib.Path(argv[argv.index("--write-reference") + 1])
     ref_path.parent.mkdir(parents=True, exist_ok=True)
     spec_doc = {{"spec": {{"schema_version": 5}}, "environment": {{"archive_id": uuid.uuid4().hex}}}}
     entries_doc = {{
-        "tiny_random:s": {{
-            "tensor_member": "tensors/0000.bin",
-            "tensor_dtype": "float32",
-            "tensor_shape": [4],
-        }}
+        "tiny_random:s": {{"tensor_member": "tensors/0000.bin", "tensor_dtype": "float32", "tensor_shape": [4]}}
     }}
     with zipfile.ZipFile(ref_path, "w", compression=zipfile.ZIP_STORED) as zf:
         zf.writestr("tensors/0000.bin", b"\\x00" * 16)
@@ -1969,37 +1964,50 @@ if "--write-reference" in argv:
     sys.exit(0)
 sys.exit(0)
 """
-    _write_stub_uv(bin_dir, uv_stub_body)
-    env = _clean_tracked_env({"PATH": str(bin_dir)})
-
-    # 1. `--only --python` must NOT mis-parse `--ranks` as the `--python` version.
-    find_log.unlink(missing_ok=True)
-    r_only = subprocess.run(
+    _write_stub_uv(bin_py3, uv_stub_body)
+    proc1 = subprocess.Popen(
         [
             bash_bin,
             str(repo / "scripts" / "multi_gpu_check.sh"),
             "--backend",
             "gloo",
-            "--only",
-            "--python",
             "--ranks",
             "2",
+            "--python",
+            "3.12",
+            "--only",
+            "--python",
             "--log-dir",
-            str(tmp_path / "logs_only"),
+            str(tmp_path / "logs_py3"),
         ],
         cwd=repo,
-        env=env,
-        capture_output=True,
+        env=_clean_tracked_env({"PATH": str(bin_py3)}),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=30,
+        start_new_session=True,
     )
-    assert r_only.returncode == 0, r_only.stderr
-    assert find_log.read_text(encoding="utf-8").splitlines() == ["python find --no-project --resolve-links >=3.10"]
+    try:
+        _, err1 = proc1.communicate(timeout=30)
+    finally:
+        _kill_process_group_quiet(proc1)
+    assert proc1.returncode == 0, err1
+    assert int(pid_probe.read_text(encoding="utf-8").strip()) == proc1.pid
+    calls1 = uv_log_1.read_text(encoding="utf-8").splitlines()
+    assert not any(c.startswith("python find") for c in calls1)
+    assert any(c.startswith("sync ") and "--python 3.12" in c for c in calls1)
+    assert any("--write-reference" in c and "--only --python" in c and "--python 3.12" in c for c in calls1)
 
-    # 2. Repeated `--python` must honour the LAST value, and `exec` must let Python own proc.pid directly.
-    find_log.unlink(missing_ok=True)
-    pid_probe_ready.unlink(missing_ok=True)
-    proc = subprocess.Popen(
+    # 2. When `python3` fails the >= 3.10 check, wrapper resolves via `uv python find --no-project ">=3.10"`
+    #    (ignoring any `--python` or awkward CLI tokens) and `exec`s the resolved interpreter directly.
+    bin_find = _base_bin("bin_find")
+    fake_py3 = bin_find / "python3"
+    fake_py3.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_py3.chmod(0o755)
+    uv_log_1.unlink()
+    pid_probe.unlink()
+    _write_stub_uv(bin_find, uv_stub_body)
+    proc2 = subprocess.Popen(
         [
             bash_bin,
             str(repo / "scripts" / "multi_gpu_check.sh"),
@@ -2011,23 +2019,85 @@ sys.exit(0)
             "3.9",
             "--python",
             "3.12",
+            "--only",
+            "--python",
             "--log-dir",
-            str(tmp_path / "logs_rep"),
+            str(tmp_path / "logs_find"),
         ],
         cwd=repo,
-        env=env,
+        env=_clean_tracked_env({"PATH": str(bin_find)}),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
     )
     try:
-        out, err = proc.communicate(timeout=30)
+        _, err2 = proc2.communicate(timeout=30)
     finally:
-        _kill_process_group_quiet(proc)
-    assert proc.returncode == 0, err
-    assert find_log.read_text(encoding="utf-8").splitlines() == ["python find --no-project --resolve-links 3.12"]
-    assert int(pid_probe_ready.read_text(encoding="utf-8").strip()) == proc.pid
+        _kill_process_group_quiet(proc2)
+    assert proc2.returncode == 0, err2
+    assert int(pid_probe.read_text(encoding="utf-8").strip()) == proc2.pid
+    calls2 = uv_log_1.read_text(encoding="utf-8").splitlines()
+    find_calls = [c for c in calls2 if c.startswith("python find")]
+    assert find_calls == ["python find --no-project --resolve-links >=3.10"]
+    assert any(c.startswith("sync ") and "--python 3.12" in c for c in calls2)
+    assert any("--write-reference" in c and "--only --python" in c for c in calls2)
+
+    # 3. When `uv python find` fails, wrapper falls back to `exec uv run --no-project --python ">=3.10" python ...`
+    #    passing all user flags through untouched.
+    bin_run = _base_bin("bin_run")
+    fake_py3_run = bin_run / "python3"
+    fake_py3_run.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_py3_run.chmod(0o755)
+    uv_run_log = tmp_path / "uv_run_fallback.log"
+    uv_run_stub = f"""\
+import os, sys
+argv = sys.argv[1:]
+with open({str(uv_run_log)!r}, "a", encoding="utf-8") as f:
+    f.write(" ".join(argv) + "\\n")
+if argv[:2] == ["python", "find"]:
+    sys.exit(1)
+if argv[:5] == ["run", "--no-project", "--python", ">=3.10", "python"]:
+    os.execv({sys.executable!r}, [{sys.executable!r}, *argv[5:]])
+sys.exit(99)
+"""
+    _write_stub_uv(bin_run, uv_run_stub)
+    r_run = subprocess.run(
+        [
+            bash_bin,
+            str(repo / "scripts" / "multi_gpu_check.sh"),
+            "--python",
+            "3.13",
+            "--help",
+        ],
+        cwd=repo,
+        env=_clean_tracked_env({"PATH": str(bin_run)}),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert r_run.returncode == 0, r_run.stderr
+    assert "Usage: bash scripts/multi_gpu_check.sh [options]" in r_run.stdout
+    run_calls = uv_run_log.read_text(encoding="utf-8").splitlines()
+    assert run_calls[:2] == [
+        "python find --no-project --resolve-links >=3.10",
+        "python find --no-project >=3.10",
+    ]
+    assert run_calls[2].startswith("run --no-project --python >=3.10 python ")
+    assert run_calls[2].endswith("multi_gpu_check.py --python 3.13 --help")
+
+    # 4. When neither Python >= 3.10 nor `uv` is available on PATH, wrapper exits 2 with a clear error.
+    bin_none = _base_bin("bin_none")
+    r_none = subprocess.run(
+        [bash_bin, str(repo / "scripts" / "multi_gpu_check.sh"), "--help"],
+        cwd=repo,
+        env={"PATH": str(bin_none), "TMPDIR": "/tmp"},
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert r_none.returncode == 2
+    assert "Python >= 3.10 or 'uv' is required" in r_none.stderr
 
 
 def test_main_installs_signal_handlers_immediately_after_parse_args(tmp_path: Path) -> None:
