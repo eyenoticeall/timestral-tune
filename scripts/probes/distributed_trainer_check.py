@@ -54,14 +54,22 @@ Column definitions:
   computed over `trainer._trainable` only (for sensitivity in `head_only`/LoRA), against the
   reference's exact float64 norms. Bitwise-identical non-finite vectors report `nan`, never `0`.
 - `loss_rel`, `val_rel`: NaN-propagating maximum relative step-loss and validation-loss difference.
-- `wall_s`: `max_r` wall time of `trainer.fit()` starting after a cross-rank barrier + CUDA sync.
-- `step_ms`: `max_r` mean per-step optimiser latency strictly after the first two optimiser steps
-  (timed per step from `optimizer.zero_grad` to the `optimizer.step` post-hook with CUDA sync,
-  excluding periodic validation passes and step-1/2 loader startup/compilation).
-- `tail_s`: `max_r` time from the final optimiser step to `fit()` returning (includes any final
-  validation, `finalize_best()`, `on_fit_end()`, and DataLoader worker teardown).
+- `wall_s`: `max_r` wall time of `trainer.fit()` starting after a cross-rank barrier + CUDA sync
+  and ending after a final CUDA sync.
+- `step_ms`: `max_r` mean full per-step wall time strictly after the first two optimiser steps
+  (steps `3..K`), measured symmetrically in both one-process reference and multi-process modes from
+  the end of `strategy.on_step_end(k-1)` to the end of `strategy.on_step_end(k)` (with CUDA sync)
+  minus any validation time (`strategy.evaluate_val()` + `strategy.on_evaluate()`) occurring between
+  them. Includes epoch rollover, DataLoader fetch, batch/replay preparation and host-to-device
+  transfer, `zero_grad`, forward, loss, backward, distributed collectives, gradient clipping,
+  `optimizer.step()`, `scheduler.step()`, and `on_step_end` callbacks/sync; excludes step-1/2
+  startup/compilation and all periodic validation (including lazy validation worker spawn).
+- `tail_s`: `max_r` wall time from the end of the final `strategy.on_step_end(K)` (with CUDA sync)
+  to `fit()` returning (includes any final-step validation, `finalize_best()`, `on_fit_end()`, and
+  DataLoader worker teardown).
 - `vram_mib`: `max_r` peak `torch.cuda.max_memory_allocated()` during `fit()` in MiB (`2**20` bytes, CUDA only).
-- `val_s` (in `notes` when validating): `max_r` cumulative time spent inside `evaluate_val()`.
+- `val_s` (in `notes` when validating): `max_r` cumulative wall time spent inside
+  `strategy.evaluate_val()` and `strategy.on_evaluate()` (including lazy validation worker spawn).
 - `graphs=s1:A->end:B(+C,bumps_post_s1=D)` (in `notes` for compiled scenarios): `A` is Dynamo
   `unique_graphs` after optimiser step 1, `B` is `unique_graphs` after `fit()`, `+C = B - A` new
   graphs compiled after step 1, and `D` is the number of distinct optimiser steps after step 1 on
@@ -90,8 +98,9 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -106,16 +115,20 @@ from _dist_common import (
     REP_HORIZON,
     check_tmpdir_for_workers,
     cuda_env_banner_parts,
+    files_sha256,
+    git_head_commit,
     make_synthetic_dataset,
+    require_positive_finite,
     validate_distributed_device_map,
 )
+from safetensors.torch import load_file as safetensors_load_file
 from torch import Tensor
 
 from timestral_tune import LoraConfig, ReplayConfig, TimestralTrainer, TrainingConfig
 from timestral_tune.config import AdaptationMode
-from timestral_tune.data import TimeSeriesDataset
+from timestral_tune.data import DHFDataCollator, TimeSeriesDataset
 from timestral_tune.export import dataset_fingerprint
-from timestral_tune.models import TuneTimestralModel
+from timestral_tune.models import TuneTimestralModel, denormalise_quantiles, load_model, training_forward
 from timestral_tune.trainer import TrainingResult, compute_loss
 
 
@@ -129,7 +142,7 @@ def _torch_major_minor() -> tuple[int, int]:
 # PyTorch < 2.8 on macOS hangs at interpreter exit after DataLoader worker processes run (VERIFICATION.md §10).
 WORKERS_HANG_AT_EXIT = sys.platform == "darwin" and _torch_major_minor() < (2, 8)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_BATCH_SIZE = 2
 DEFAULT_REPLAY_BATCH_SIZE = 2
 DEFAULT_STEPS = 6
@@ -149,6 +162,15 @@ _DTYPE_FROM_NAME: dict[str, torch.dtype] = {
     "float16": torch.float16,
 }
 _NAME_FROM_DTYPE: dict[torch.dtype, str] = {v: k for k, v in _DTYPE_FROM_NAME.items()}
+_DTYPE_NBYTES: dict[str, int] = {"float64": 8, "float32": 4, "bfloat16": 2, "float16": 2}
+_PROBE_SOURCE_FILES: tuple[Path, ...] = (
+    Path(__file__).resolve(),
+    Path(__file__).resolve().with_name("_dist_common.py"),
+)
+
+
+def _current_script_sha256() -> str:
+    return files_sha256(_PROBE_SOURCE_FILES)
 
 
 # --------------------------------------------------------------------------- declarative scenarios
@@ -906,11 +928,13 @@ def _apply_moved_student_params(
 def _validate_exported_dir(
     out_dir: Path,
     *,
+    trainer: TimestralTrainer,
     spec: ScenarioSpec,
     distributed: bool,
     world_size: int,
     per_rank_batch: int,
 ) -> tuple[bool, str]:
+    """Verify exported files, metadata, strict reloadability via `load_model`, and forecast parity."""
     required_files = ["config.json", "model.safetensors", "tune_metadata.json", "LICENSE", "NOTICE"]
     if spec.mode.startswith("lora_"):
         required_files.extend(["adapter.safetensors", "adapter_config.json"])
@@ -936,6 +960,54 @@ def _validate_exported_dir(
 
     if spec.uses_replay and (meta.get("replay_config") is None or meta.get("replay_source") is None):
         return False, "missing replay_config or replay_source in tune_metadata.json"
+
+    if spec.mode.startswith("lora_"):
+        reloaded_lora = LoraConfig.from_dict(json.loads((out_dir / "adapter_config.json").read_text(encoding="utf-8")))
+        if trainer.lora_config is not None and reloaded_lora != trainer.lora_config:
+            return False, f"reloaded adapter_config {reloaded_lora} != trainer.lora_config {trainer.lora_config}"
+        adapter_tensors = safetensors_load_file(str(out_dir / "adapter.safetensors"))
+        if not adapter_tensors or not all(torch.isfinite(t).all() for t in adapter_tensors.values()):
+            return False, "adapter.safetensors is empty or contains non-finite tensors"
+
+    # Reload merged checkpoint offline with strict=True via load_model and verify forecast parity
+    # against the live in-memory model on a deterministic window from trainer.train_dataset.
+    model_dtype = next(trainer.model.parameters()).dtype
+    reloaded = load_model(out_dir, device=trainer.device, dtype=model_dtype, local_files_only=True)
+    try:
+        patch = trainer.model.config.patch_size
+        collator = DHFDataCollator.for_model(trainer.model.config, trainer.train_dataset.context_length)
+        sample_batch = collator([trainer.train_dataset[0]]).to(trainer.device)
+        was_training = trainer.model.training
+        trainer.model.eval()
+        try:
+            with torch.no_grad():
+                live_out = training_forward(trainer.model, sample_batch, validate=False)
+                live_raw = denormalise_quantiles(
+                    trainer.model, live_out.quantiles, live_out.anchor_loc, live_out.anchor_scale
+                )
+                reloaded_raw = reloaded.predict_block(
+                    sample_batch.context,
+                    sample_batch.context_mask,
+                    sample_batch.group_ids,
+                    sample_batch.horizon_steps // patch,
+                    sample_batch.role_ids,
+                    sample_batch.known_future,
+                    sample_batch.known_future_mask,
+                )
+        finally:
+            trainer.model.train(was_training)
+        if not torch.isfinite(live_raw).all() or not torch.isfinite(reloaded_raw).all():
+            return False, "non-finite forecast produced during export reload parity check"
+        if live_raw.shape != reloaded_raw.shape:
+            return False, f"reloaded forecast shape {tuple(reloaded_raw.shape)} != live {tuple(live_raw.shape)}"
+        max_abs = float((reloaded_raw.double() - live_raw.double()).abs().max().item())
+        scale = max(float(live_raw.double().abs().max().item()), 1e-12)
+        rel_err = max_abs / scale
+        tol = 1e-10 if model_dtype == torch.float64 else 1e-4
+        if not math.isfinite(rel_err) or rel_err > tol:
+            return False, f"export forecast parity mismatch: rel_err={rel_err:.2e} > tol={tol:.1e}"
+    finally:
+        del reloaded
     return True, ""
 
 
@@ -967,8 +1039,9 @@ def _verify_export(
 
     In distributed mode:
     1. Every rank calls `trainer.export(shared_out_dir)` with the exact same path created by rank 0;
-       after a barrier, rank 0 verifies all files and `tune_metadata.json`, and all ranks verify no
-       error occurred and the returned path matches.
+       after a barrier, rank 0 verifies all files, `tune_metadata.json`, strict reloadability via
+       `load_model(..., local_files_only=True)`, and forecast parity against `trainer.model`, while
+       all ranks verify no error occurred and the returned path matches.
     2. Each non-zero rank additionally calls `trainer.export(private_nonexistent_dir)` and asserts
        that directory is NOT created, strictly proving non-zero ranks perform zero disk writes.
 
@@ -984,6 +1057,7 @@ def _verify_export(
                     return False, f"returned {returned} != {out_dir}"
                 return _validate_exported_dir(
                     out_dir,
+                    trainer=trainer,
                     spec=spec,
                     distributed=False,
                     world_size=world_size,
@@ -1016,6 +1090,7 @@ def _verify_export(
             try:
                 ok, err = _validate_exported_dir(
                     shared_out_dir,
+                    trainer=trainer,
                     spec=spec,
                     distributed=True,
                     world_size=world_size,
@@ -1169,34 +1244,39 @@ def _timed_fit(
     device: torch.device,
     distributed: bool,
 ) -> tuple[TrainingResult, float, float | None, float, float, float, int, int, int]:
-    """Execute `trainer.fit()` with a pre-`t0` barrier, per-step latency timing, and separate validation timing."""
-    step_t0: list[float | None] = [None]
-    step_durations: list[float] = []
-    last_step_end: list[float | None] = [None]
+    """Execute `trainer.fit()` with a pre-`t0` barrier, symmetric per-step wall timing, and validation timing.
+
+    Measures full per-step wall time identically in one-process and multi-process modes: each step
+    interval spans from the end of `strategy.on_step_end(k-1)` to the end of `strategy.on_step_end(k)`
+    (both with CUDA sync) minus any `strategy.evaluate_val()` + `strategy.on_evaluate()` duration
+    executed between those two steps. `steady_step_ms` averages steps `3..K` (`step_intervals[1:]`).
+    """
+    step_end_times: list[float] = []
+    step_intervals: list[float] = []
+    val_since_last_step: list[float] = [0.0]
     val_total_s: list[float] = [0.0]
     step_graph_counts: list[int] = []
 
-    orig_zero_grad = trainer.optimizer.zero_grad
     orig_make_strategy = trainer._make_fit_strategy
-
-    def _timed_zero_grad(*zg_args: Any, **zg_kwargs: Any) -> Any:
-        _cuda_sync_if_needed(device)
-        step_t0[0] = time.perf_counter()
-        return orig_zero_grad(*zg_args, **zg_kwargs)
-
-    def _on_opt_step(*_args: Any) -> None:
-        _cuda_sync_if_needed(device)
-        t_now = time.perf_counter()
-        if step_t0[0] is not None:
-            step_durations.append(t_now - step_t0[0])
-            step_t0[0] = None
-        last_step_end[0] = t_now
-        if spec.compile_model:
-            step_graph_counts.append(_dynamo_unique_graphs())
 
     def _timed_make_strategy() -> Any:
         strategy = orig_make_strategy()
+        orig_on_step_end = strategy.on_step_end
         orig_eval = strategy.evaluate_val
+        orig_on_eval = strategy.on_evaluate
+
+        def _timed_on_step_end(step: int, loss: float, learning_rate: float) -> float:
+            ret = orig_on_step_end(step, loss, learning_rate)
+            _cuda_sync_if_needed(device)
+            t_now = time.perf_counter()
+            if step_end_times:
+                raw_dt = t_now - step_end_times[-1]
+                step_intervals.append(max(0.0, raw_dt - val_since_last_step[0]))
+            val_since_last_step[0] = 0.0
+            step_end_times.append(t_now)
+            if spec.compile_model:
+                step_graph_counts.append(_dynamo_unique_graphs())
+            return ret
 
         def _timed_eval() -> Any:
             _cuda_sync_if_needed(device)
@@ -1205,14 +1285,27 @@ def _timed_fit(
                 return orig_eval()
             finally:
                 _cuda_sync_if_needed(device)
-                val_total_s[0] += time.perf_counter() - vt0
+                dt = time.perf_counter() - vt0
+                val_total_s[0] += dt
+                val_since_last_step[0] += dt
 
+        def _timed_on_eval(step: int, result: Any, bookkeeper: Any) -> Any:
+            _cuda_sync_if_needed(device)
+            vt0 = time.perf_counter()
+            try:
+                return orig_on_eval(step, result, bookkeeper)
+            finally:
+                _cuda_sync_if_needed(device)
+                dt = time.perf_counter() - vt0
+                val_total_s[0] += dt
+                val_since_last_step[0] += dt
+
+        strategy.on_step_end = _timed_on_step_end
         strategy.evaluate_val = _timed_eval
+        strategy.on_evaluate = _timed_on_eval
         return strategy
 
-    trainer.optimizer.zero_grad = _timed_zero_grad  # type: ignore[method-assign]
     trainer._make_fit_strategy = _timed_make_strategy  # type: ignore[method-assign]
-    hook_handle = trainer.optimizer.register_step_post_hook(_on_opt_step)
     try:
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1227,15 +1320,13 @@ def _timed_fit(
         _cuda_sync_if_needed(device)
         t1 = time.perf_counter()
     finally:
-        hook_handle.remove()
-        trainer.optimizer.zero_grad = orig_zero_grad  # type: ignore[method-assign]
         trainer._make_fit_strategy = orig_make_strategy  # type: ignore[method-assign]
 
     wall_s = t1 - t0
-    steady_step_ms: float | None = (
-        sum(step_durations[2:]) / len(step_durations[2:]) * 1000.0 if len(step_durations) >= 3 else None
-    )
-    tail_s = (t1 - last_step_end[0]) if last_step_end[0] is not None else wall_s
+    # step_intervals[0] is step 2 (1->2); step_intervals[1:] covers steps 3..K (strictly after steps 1-2).
+    steady_intervals = step_intervals[1:]
+    steady_step_ms: float | None = sum(steady_intervals) / len(steady_intervals) * 1000.0 if steady_intervals else None
+    tail_s = (t1 - step_end_times[-1]) if step_end_times else wall_s
     peak_vram_mib = float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0) if device.type == "cuda" else 0.0
     if spec.compile_model:
         graphs_s1 = step_graph_counts[0] if step_graph_counts else 0
@@ -1610,13 +1701,13 @@ class _ReferenceReader:
         self._zf.close()
 
 
-def _read_reference_metadata(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Read and JSON-validate both `spec.json` and `entries.json` before `init_process_group`."""
+def _read_reference_metadata(path: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, int]]:
+    """Read and JSON-validate `spec.json`, `entries.json`, and zip member byte sizes before `init_process_group`."""
     if not zipfile.is_zipfile(path):
         raise ValueError("reference file is not a valid zip archive")
     with zipfile.ZipFile(path, mode="r") as zf:
-        names = set(zf.namelist())
-        if "spec.json" not in names or "entries.json" not in names:
+        member_sizes = {info.filename: info.file_size for info in zf.infolist()}
+        if "spec.json" not in member_sizes or "entries.json" not in member_sizes:
             raise ValueError("reference archive is malformed (missing 'spec.json' or 'entries.json')")
         try:
             meta = json.loads(zf.read("spec.json").decode("utf-8"))
@@ -1628,12 +1719,13 @@ def _read_reference_metadata(path: Path) -> tuple[dict[str, Any], dict[str, Any]
             raise ValueError(f"reference archive entries.json is malformed: {exc}") from exc
         if not isinstance(entries, dict):
             raise ValueError("reference archive entries.json is malformed (expected JSON object)")
-        return meta, entries
+        return meta, entries, member_sizes
 
 
 def _validate_reference_spec(
     meta: dict[str, Any],
     entries: dict[str, Any],
+    member_sizes: Mapping[str, int],
     *,
     world_size: int,
     device_type: str,
@@ -1644,12 +1736,20 @@ def _validate_reference_spec(
     per_rank_replay_batch: int,
     steps: int,
     cpu_threads: int | None,
-) -> ReferenceMode:
-    """Refuse to compare if any run, model, config, sketch, or scenario field mismatches, listing every difference."""
+    allow_env_mismatch: bool = False,
+) -> tuple[ReferenceMode, list[str]]:
+    """Refuse to compare if any run, model, config, member, or environment field mismatches.
+
+    Returns `(ref_mode, env_warnings)`. Environment/script-revision differences are refused unless
+    `allow_env_mismatch=True`, in which case they are returned in `env_warnings` for rank 0 to print.
+    Missing/corrupt zip members, schema, model, config, and scenario mismatches are always refused.
+    """
     if not isinstance(meta, dict) or "spec" not in meta or not isinstance(meta["spec"], dict):
         raise ValueError("reference metadata is malformed (missing 'spec')")
     ref_spec = meta["spec"]
+    ref_env = meta.get("environment")
     diffs: list[str] = []
+    env_diffs: list[str] = []
 
     if ref_spec.get("schema_version") != SCHEMA_VERSION:
         diffs.append(f"schema_version: reference={ref_spec.get('schema_version')!r}, current={SCHEMA_VERSION!r}")
@@ -1687,6 +1787,25 @@ def _validate_reference_spec(
         actual = ref_spec.get(key)
         if actual != expected:
             diffs.append(f"{key}: reference={actual!r}, current={expected!r}")
+
+    # Environment and script-revision checks (overridable only via --allow-env-mismatch).
+    if not isinstance(ref_env, dict):
+        env_diffs.append("environment metadata missing from reference spec.json")
+    else:
+        if ref_env.get("torch_version") != torch.__version__:
+            env_diffs.append(
+                f"torch_version: reference={ref_env.get('torch_version')!r}, current={torch.__version__!r}"
+            )
+        if device_type == "cuda" and ref_env.get("cuda_version") != torch.version.cuda:
+            env_diffs.append(f"cuda_version: reference={ref_env.get('cuda_version')!r}, current={torch.version.cuda!r}")
+        cur_script_sha = _current_script_sha256()
+        ref_script_sha = ref_env.get("script_sha256")
+        if ref_script_sha != cur_script_sha:
+            env_diffs.append(f"script_sha256: reference={str(ref_script_sha)[:12]!r}, current={cur_script_sha[:12]!r}")
+        cur_git_head = git_head_commit(Path(__file__).resolve().parent)
+        ref_git_head = ref_env.get("git_head")
+        if ref_git_head is not None and cur_git_head is not None and ref_git_head != cur_git_head:
+            env_diffs.append(f"git_head: reference={ref_git_head[:12]!r}, current={cur_git_head[:12]!r}")
 
     model_names = [name for name, _ in models]
     ref_models = set(ref_spec.get("models", []))
@@ -1744,15 +1863,36 @@ def _validate_reference_spec(
             if key not in entries:
                 diffs.append(f"entry {key!r}: missing from reference entries.json")
                 continue
+            entry = entries[key]
+            if not isinstance(entry, dict):
+                diffs.append(f"entry {key!r}: malformed entry record")
+                continue
+            member = entry.get("tensor_member")
+            dtype_name = entry.get("tensor_dtype")
+            shape = entry.get("tensor_shape")
+            if not isinstance(member, str) or member not in member_sizes:
+                diffs.append(f"entry {key!r}: tensor member {member!r} missing from zip archive")
+            elif dtype_name not in _DTYPE_NBYTES or not isinstance(shape, list):
+                diffs.append(f"entry {key!r}: invalid tensor_dtype={dtype_name!r} or tensor_shape={shape!r}")
+            else:
+                expected_bytes = math.prod(int(d) for d in shape) * _DTYPE_NBYTES[dtype_name]
+                actual_bytes = member_sizes[member]
+                if actual_bytes != expected_bytes:
+                    diffs.append(
+                        f"entry {key!r}: tensor member {member!r} has {actual_bytes} bytes, expected {expected_bytes}"
+                    )
             cur_cd = cur_cfg_digests[key]
             ref_cd = ref_cfg_digests.get(key) if isinstance(ref_cfg_digests, dict) else None
             if ref_cd != cur_cd:
                 diffs.append(f"resolved config for {key!r} differs (ref={str(ref_cd)[:12]}, cur={cur_cd[:12]})")
 
+    if env_diffs and not allow_env_mismatch:
+        diffs.extend(f"{d} (pass --allow-env-mismatch to override)" for d in env_diffs)
+
     if diffs:
         raise ValueError("; ".join(diffs))
     assert ref_mode in ("auto", "sketch", "exact")
-    return ref_mode
+    return ref_mode, (env_diffs if allow_env_mismatch else [])
 
 
 # --------------------------------------------------------------------------- comparison & row formatting
@@ -2202,6 +2342,9 @@ def _run_write_reference(args: argparse.Namespace, scenarios: Sequence[ScenarioS
             "device": device_str,
             "cuda_version": torch.version.cuda if is_cuda else None,
             "threads": torch.get_num_threads(),
+            "script_sha256": _current_script_sha256(),
+            "git_head": git_head_commit(Path(__file__).resolve().parent),
+            "archive_id": uuid.uuid4().hex,
         }
         writer.commit(spec=run_spec, env=env_info)
     except BaseException:
@@ -2292,10 +2435,11 @@ def _prepare_distributed_setup(
                 print(f"error: reference file not found: {ref_path}", file=sys.stderr)
             raise SystemExit(2)
         try:
-            ref_meta, ref_entries = _read_reference_metadata(ref_path)
-            ref_mode = _validate_reference_spec(
+            ref_meta, ref_entries, ref_member_sizes = _read_reference_metadata(ref_path)
+            ref_mode, env_warnings = _validate_reference_spec(
                 ref_meta,
                 ref_entries,
+                ref_member_sizes,
                 world_size=world_size,
                 device_type="cuda" if is_cuda else "cpu",
                 models=models,
@@ -2305,7 +2449,14 @@ def _prepare_distributed_setup(
                 per_rank_replay_batch=args.replay_batch_size,
                 steps=args.steps,
                 cpu_threads=cpu_threads,
+                allow_env_mismatch=args.allow_env_mismatch,
             )
+            if env_warnings and rank == 0:
+                print(
+                    f"warning: overriding reference environment mismatch (--allow-env-mismatch): "
+                    f"{'; '.join(env_warnings)}",
+                    file=sys.stderr,
+                )
             ref_label = _ref_mode_label(ref_mode)
             if rank == 0:
                 ref_reader = _ReferenceReader(ref_path)
@@ -2539,6 +2690,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to a reference archive written by --write-reference (validated before init, loaded on rank 0).",
     )
     parser.add_argument(
+        "--allow-env-mismatch",
+        action="store_true",
+        help=(
+            "Allow comparing against a reference archive built with a different torch/CUDA version or "
+            "probe script revision (prints a warning with every difference; never overrides schema, "
+            "model, config, or missing-member mismatches)."
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=("gloo", "nccl"),
         default=None,
@@ -2626,8 +2786,7 @@ def _validate_numeric_args(parser: argparse.ArgumentParser, args: argparse.Names
         parser.error(f"--replay-batch-size must be >= 1, got {args.replay_batch_size}")
     if args.steps < 1:
         parser.error(f"--steps must be >= 1, got {args.steps}")
-    if args.timeout <= 0:
-        parser.error(f"--timeout must be > 0, got {args.timeout}")
+    require_positive_finite(parser, "--timeout", args.timeout)
     if args.cpu_threads is not None and args.cpu_threads < 1:
         parser.error(f"--cpu-threads must be >= 1, got {args.cpu_threads}")
 
