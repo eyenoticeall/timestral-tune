@@ -10,6 +10,7 @@ import signal
 import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -1206,7 +1207,10 @@ def test_device_qualified_cpu_gloo_backend_rejected_in_real_group() -> None:
         assert "cpu:gloo" in res.error.message
 
 
-def _worker_unbalanced_hang(rank: int, world_size: int) -> str:
+def _worker_unbalanced_hang(rank: int, world_size: int, ready_dir: str) -> str:
+    # Synchronise once after startup, then signal readiness via file before blocking.
+    dist.barrier()
+    Path(ready_dir, f"rank_{rank}.ready").write_text("ready", encoding="utf-8")
     if rank == 0:
         # Rank 0 blocks in a collective that rank 1 will never enter.
         dist.all_reduce(torch.ones(1), op=dist.ReduceOp.SUM)
@@ -1216,26 +1220,45 @@ def _worker_unbalanced_hang(rank: int, world_size: int) -> str:
     return "unreachable"
 
 
-def test_harness_kills_blocked_group_quickly_and_reports_unfinished_ranks() -> None:
+def test_harness_kills_blocked_group_quickly_and_reports_unfinished_ranks(tmp_path: Path) -> None:
     t0 = time.monotonic()
     with pytest.raises(DistributedTimeoutError) as exc_info:
-        run_distributed(_worker_unbalanced_hang, world_size=2, pg_timeout=30.0, wall_timeout=1.5)
+        run_distributed(
+            _worker_unbalanced_hang,
+            world_size=2,
+            args=(str(tmp_path),),
+            pg_timeout=30.0,
+            wall_timeout=6.0,
+        )
     elapsed = time.monotonic() - t0
-    assert elapsed < 10.0, f"harness took too long to kill blocked group: {elapsed:.2f}s"
+    assert elapsed < 20.0, f"harness took too long to kill blocked group: {elapsed:.2f}s"
+    assert (tmp_path / "rank_0.ready").is_file() and (tmp_path / "rank_1.ready").is_file(), (
+        "workers did not finish start-up and reach the blocking point before wall_timeout"
+    )
     msg = str(exc_info.value)
     assert "unfinished ranks" in msg
     assert "0" in msg and "1" in msg
 
 
-def _worker_only_rank1_blocks(rank: int, world_size: int) -> str:
+def _worker_only_rank1_blocks(rank: int, world_size: int, ready_dir: str) -> str:
+    Path(ready_dir, f"rank_{rank}.ready").write_text("ready", encoding="utf-8")
     if rank == 1:
         time.sleep(60.0)
     return "finished"
 
 
-def test_harness_reports_only_unfinished_rank_on_timeout() -> None:
+def test_harness_reports_only_unfinished_rank_on_timeout(tmp_path: Path) -> None:
     with pytest.raises(DistributedTimeoutError) as exc_info:
-        run_distributed(_worker_only_rank1_blocks, world_size=2, pg_timeout=10.0, wall_timeout=1.5)
+        run_distributed(
+            _worker_only_rank1_blocks,
+            world_size=2,
+            args=(str(tmp_path),),
+            pg_timeout=30.0,
+            wall_timeout=6.0,
+        )
+    assert (tmp_path / "rank_0.ready").is_file() and (tmp_path / "rank_1.ready").is_file(), (
+        "workers did not finish start-up before wall_timeout"
+    )
     assert "unfinished ranks: [1]" in str(exc_info.value)
 
 
