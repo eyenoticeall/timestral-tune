@@ -1595,3 +1595,142 @@ sys.exit(0)
     assert "runtime environment probe failed (exit 1)" in err3
     assert "POST_SYNC_TORCH_IMPORT_ERROR" in err3
     assert (cfg3.log_dir / "summary.txt").is_file()
+
+
+# --------------------------------------------------------------------------- 11. artifact cleanup & resume guard
+
+
+def test_failed_timeout_and_corrupt_ref_stages_remove_partial_archive_and_tmp(tmp_path: Path) -> None:
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs", stage_timeout=0.35)
+    runner = DRIVER.SessionRunner(
+        config=cfg, repo_root=tmp_path, env=_clean_tracked_env(), teardown_grace_s=0.25, teardown_reap_s=0.5
+    )
+    runner.log_dir.mkdir(parents=True, exist_ok=True)
+    runner.refs_dir.mkdir(parents=True, exist_ok=True)
+    runner.tree_method, runner.tree_sig = "content_hash", "0" * 64
+
+    ref_zip = runner.refs_dir / "ref_gloo_tiny_n2.zip"
+    ref_tmp = Path(f"{ref_zip}.tmp")
+
+    # 1. Stage timeout (124) after writing partial .zip and .tmp must remove both.
+    out_to = runner.run_stage(
+        "ref_timeout",
+        ref_zip,
+        [
+            sys.executable,
+            "-c",
+            f"import pathlib, time; pathlib.Path({str(ref_zip)!r}).write_bytes(b'corrupt'); "
+            f"pathlib.Path({str(ref_tmp)!r}).write_bytes(b'partial'); time.sleep(10)",
+        ],
+    )
+    assert not out_to.ok and out_to.returncode == 124
+    assert not ref_zip.exists() and not ref_tmp.exists()
+
+    # 2. Non-zero exit (1) after writing partial .zip and .tmp must remove both.
+    out_fail = runner.run_stage(
+        "ref_fail",
+        ref_zip,
+        [
+            sys.executable,
+            "-c",
+            f"import pathlib, sys; pathlib.Path({str(ref_zip)!r}).write_bytes(b'corrupt'); "
+            f"pathlib.Path({str(ref_tmp)!r}).write_bytes(b'partial'); sys.exit(1)",
+        ],
+    )
+    assert not out_fail.ok and out_fail.returncode == 1
+    assert not ref_zip.exists() and not ref_tmp.exists()
+
+    # 3. Exit 0 with corrupt archive + leftover .tmp must remove both .zip and .tmp.
+    out_corrupt = runner.run_stage(
+        "ref_corrupt",
+        ref_zip,
+        [
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path({str(ref_zip)!r}).write_bytes(b'badzip'); "
+            f"pathlib.Path({str(ref_tmp)!r}).write_bytes(b'leftover')",
+        ],
+    )
+    assert not out_corrupt.ok and out_corrupt.returncode == 1
+    assert not ref_zip.exists() and not ref_tmp.exists()
+
+
+def test_interrupt_during_resume_check_preserves_disk_and_skips_stage_recording(tmp_path: Path) -> None:
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs", ranks=(2,), ranks_specified=True)
+    runner = DRIVER.SessionRunner(config=cfg, repo_root=tmp_path, env=_clean_tracked_env())
+    runner.log_dir.mkdir(parents=True, exist_ok=True)
+    runner.refs_dir.mkdir(parents=True, exist_ok=True)
+    runner.tree_method, runner.tree_sig = "content_hash", "0" * 64
+
+    ref_zip = runner.refs_dir / "ref.zip"
+    ref_zip.write_bytes(b"preexisting-archive")
+    done_file = runner.log_dir / "st1.done"
+    done_file.write_text("sig=stale_sig\nartifact_sha256=stale\n", encoding="utf-8")
+    log_file = runner.log_dir / "st1.log"
+    log_file.write_text("previous good log\n", encoding="utf-8")
+
+    # Interrupt arriving while is_stage_resumed() runs (returning False) must not touch disk or record st1.
+    orig_is_resumed = runner.is_stage_resumed
+
+    def _interrupt_on_check(name: str, sig: str, req: Path | None) -> tuple[bool, str]:
+        res = orig_is_resumed(name, sig, req)
+        runner.interrupted_sig_num = int(signal.SIGTERM)
+        return res
+
+    with mock.patch.object(runner, "is_stage_resumed", side_effect=_interrupt_on_check):
+        out = runner.run_stage("st1", ref_zip, [sys.executable, "-c", "print('must not run')"])
+    assert not out.ok and out.returncode == 143 and out.interrupted_sig == int(signal.SIGTERM)
+    assert done_file.is_file()
+    assert ref_zip.read_bytes() == b"preexisting-archive"
+    assert log_file.read_text(encoding="utf-8") == "previous good log\n"
+    assert runner.stages == []
+
+    # Same guard inside run_torchrun_stage() when interrupt arrives during resume check.
+    runner.interrupted_sig_num = None
+    with mock.patch.object(runner, "is_stage_resumed", side_effect=_interrupt_on_check):
+        out_tr = runner.run_torchrun_stage("04_gloo_tiny_n2", 2, "a" * 64, ["driver.py"])
+    assert not out_tr.ok and out_tr.returncode == 143 and out_tr.interrupted_sig == int(signal.SIGTERM)
+    assert runner.stages == []
+
+
+def test_relative_log_dir_keeps_stage_args_signatures_and_errors_relative(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret_parent = tmp_path / "secret_user_checkout_dir"
+    repo = _make_stub_repo(secret_parent, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    call_log = tmp_path / "calls.log"
+    _write_stub_uv(bin_dir, _standard_stub_uv_body(call_log=call_log))
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+
+    # Run with relative --log-dir; stage arguments and .done signatures must stay relative.
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=Path("rel_logs"), ranks=(2,), ranks_specified=True)
+    runner = DRIVER.SessionRunner(config=cfg, repo_root=repo, env=env)
+    rc = runner.run()
+    assert rc == 0
+    calls = call_log.read_text(encoding="utf-8")
+    assert "--write-reference rel_logs/refs/ref_gloo_tiny_n2.zip" in calls
+    assert "--reference rel_logs/refs/ref_gloo_tiny_n2.zip" in calls
+    assert "secret_user_checkout_dir" not in calls
+
+    # Relocating the repo directory preserves .done signatures when --log-dir is relative.
+    relocated_repo = tmp_path / "other_checkout_dir" / "repo"
+    shutil.copytree(repo, relocated_repo)
+    call_log.unlink()
+    runner2 = DRIVER.SessionRunner(config=cfg, repo_root=relocated_repo, env=env)
+    assert runner2.run() == 0
+    s2 = (relocated_repo / "rel_logs" / "summary.txt").read_text(encoding="utf-8")
+    assert s2.count("0 (resumed)") == 4
+
+    # Corrupt-artifact stderr diagnostic must also use the relative path (no machine path leak).
+    _write_stub_uv(bin_dir, _standard_stub_uv_body(corrupt_ref_n={2}))
+    cfg_corrupt = DRIVER.SessionConfig(
+        backend="gloo", sizes=(), log_dir=Path("rel_logs"), ranks=(2,), ranks_specified=True, force=True
+    )
+    capsys.readouterr()
+    rc_corrupt = DRIVER.SessionRunner(config=cfg_corrupt, repo_root=repo, env=env).run()
+    err_corrupt = capsys.readouterr().err
+    assert rc_corrupt == 1
+    assert "rel_logs/refs/ref_gloo_tiny_n2.zip" in err_corrupt
+    assert "secret_user_checkout_dir" not in err_corrupt

@@ -366,7 +366,7 @@ def _capture_subprocess_bytes(
                 time.sleep(min(0.02, rem))
     finally:
         sel.close()
-        if proc.poll() is None:
+        if proc.poll() is None or open_fds:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except OSError:
@@ -651,6 +651,8 @@ def _try_git_tree_state(
 
     if untracked:
         for rel_b in sorted(x for x in untracked.split(b"\0") if x):
+            if is_interrupted is not None and is_interrupted():
+                raise _SessionInterrupted()
             rel_path = Path(os.fsdecode(rel_b))
             if any(_is_bytecode_cache(part) for part in rel_path.parts):
                 continue
@@ -666,6 +668,8 @@ def _try_git_tree_state(
             elif full_path.is_file():
                 with open(full_path, "rb") as f:
                     while True:
+                        if is_interrupted is not None and is_interrupted():
+                            raise _SessionInterrupted()
                         chunk = f.read(1024 * 1024)
                         if not chunk:
                             break
@@ -906,8 +910,12 @@ def read_proc_table(ps_bin: str | None) -> tuple[dict[int, list[int]], dict[int,
     children: dict[int, list[int]] = {}
     pgids: dict[int, int] = {}
     if os.path.isdir("/proc"):
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
+        try:
+            proc_entries = os.listdir("/proc")
+        except OSError:
+            proc_entries = []
+        for entry in proc_entries:
+            if not (entry.isascii() and entry.isdigit()):
                 continue
             pid = int(entry)
             try:
@@ -922,7 +930,7 @@ def read_proc_table(ps_bin: str | None) -> tuple[dict[int, list[int]], dict[int,
                 pgid = int(fields[2])
                 children.setdefault(ppid, []).append(pid)
                 pgids[pid] = pgid
-            except OSError:
+            except (OSError, ValueError):
                 continue
         if pgids:
             return children, pgids
@@ -938,7 +946,7 @@ def read_proc_table(ps_bin: str | None) -> tuple[dict[int, list[int]], dict[int,
             if out.returncode == 0:
                 for line in out.stdout.splitlines():
                     parts = line.split()
-                    if len(parts) >= 4 and all(p.isdigit() for p in parts[:3]):
+                    if len(parts) >= 4 and all(p.isascii() and p.isdigit() for p in parts[:3]):
                         if parts[3].startswith("Z"):
                             continue
                         pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
@@ -1182,6 +1190,22 @@ class SessionRunner:
     @property
     def refs_dir(self) -> Path:
         return self.log_dir / "refs"
+
+    def _stage_arg_path(self, path: Path) -> str:
+        """Keep stage paths relative to `repo_root` when `--log-dir` is relative so machine paths never leak."""
+        if not self.config.log_dir.is_absolute():
+            try:
+                return path.relative_to(self.repo_root).as_posix()
+            except ValueError:
+                pass
+        return str(path)
+
+    @staticmethod
+    def _unlink_artifact(artifact: Path | None) -> None:
+        if artifact is None:
+            return
+        artifact.unlink(missing_ok=True)
+        Path(f"{artifact}.tmp").unlink(missing_ok=True)
 
     def _on_signal(self, signum: int, _frame: Any) -> None:
         # Record first signal only; ignore duplicates so teardown cannot be aborted mid-cleanup.
@@ -1637,7 +1661,8 @@ class SessionRunner:
                 self._write_stderr_bytes(warn_msg)
             return exit_code, None
         except BaseException as exc:
-            log_write_enabled = False
+            if isinstance(exc, OSError):
+                log_write_enabled = False
             killed_n = 0
             if proc is not None:
                 killed_n = _kill_stage_tree(raise_on_log_error=False)
@@ -1646,6 +1671,7 @@ class SessionRunner:
             err_msg = (
                 f"ERROR: stage {stage_name} aborted due to {type(exc).__name__}: {exc} (killed {killed_n} pid(s))\n"
             ).encode()
+            _safe_write_log(err_msg)
             self._write_stderr_bytes(err_msg)
             if self.interrupted_sig_num is not None:
                 return _log_interrupted(killed_n, context=f"after {type(exc).__name__}")
@@ -1686,23 +1712,23 @@ class SessionRunner:
         shown_log = log_file.name
 
         resumed, artifact_sha = self.is_stage_resumed(name, sig, required_artifact)
+        if self.interrupted_sig_num is not None:
+            return StageOutcome(
+                ok=False, returncode=128 + self.interrupted_sig_num, interrupted_sig=self.interrupted_sig_num
+            )
         if resumed:
             self._print_line(f"== [SKIP resumed] {name} ==")
             self.record_stage(name, "0 (resumed)", shown_log)
             return StageOutcome(ok=True, returncode=0, resumed=True, artifact_sha256=artifact_sha)
 
         done_file.unlink(missing_ok=True)
-        if required_artifact is not None:
-            required_artifact.unlink(missing_ok=True)
-            Path(f"{required_artifact}.tmp").unlink(missing_ok=True)
+        self._unlink_artifact(required_artifact)
 
         self._print_line(f"== [RUN] {name} ==")
         rc, int_sig = self.run_stage_process(name, log_file, cmd)
         if int_sig is not None:
             done_file.unlink(missing_ok=True)
-            if required_artifact is not None:
-                required_artifact.unlink(missing_ok=True)
-                Path(f"{required_artifact}.tmp").unlink(missing_ok=True)
+            self._unlink_artifact(required_artifact)
             _, short_sig = signal_names(int_sig)
             self.record_stage(name, f"{128 + int_sig} (interrupted:SIG{short_sig})", shown_log)
             self.any_failed = 1
@@ -1715,11 +1741,13 @@ class SessionRunner:
                     write_done_marker(done_file, sig, produced_sha)
                     self.record_stage(name, "0", shown_log)
                     return StageOutcome(ok=True, returncode=0, artifact_sha256=produced_sha)
+                display_artifact = self._stage_arg_path(required_artifact)
                 self._write_stderr_bytes(
-                    f"error: stage {name} exited 0, but artifact {required_artifact} "
+                    f"error: stage {name} exited 0, but artifact {display_artifact} "
                     "failed integrity verification\n".encode()
                 )
-                required_artifact.unlink(missing_ok=True)
+                done_file.unlink(missing_ok=True)
+                self._unlink_artifact(required_artifact)
                 self.any_failed = 1
                 self.record_stage(name, "1 (corrupt artifact)", shown_log)
                 return StageOutcome(ok=False, returncode=1)
@@ -1727,6 +1755,8 @@ class SessionRunner:
             self.record_stage(name, "0", shown_log)
             return StageOutcome(ok=True, returncode=0)
 
+        done_file.unlink(missing_ok=True)
+        self._unlink_artifact(required_artifact)
         self.any_failed = 1
         status_str = f"{rc} ({self._last_stage_status_note})" if self._last_stage_status_note else str(rc)
         self.record_stage(name, status_str, shown_log)
@@ -1753,6 +1783,10 @@ class SessionRunner:
         sig_parts = [name, "torchrun", f"n={world_size}", f"ref_sha={ref_sha}", *self.config.uv_py_args, *driver_args]
         sig = stage_signature(self.tree_method, self.tree_sig, self.runtime_env_sig, sig_parts, env=self.env)
         resumed, _ = self.is_stage_resumed(name, sig, None)
+        if self.interrupted_sig_num is not None:
+            return StageOutcome(
+                ok=False, returncode=128 + self.interrupted_sig_num, interrupted_sig=self.interrupted_sig_num
+            )
         if resumed:
             self._print_line(f"== [SKIP resumed] {name} ==")
             self.record_stage(name, "0 (resumed)", shown_log)
@@ -1765,6 +1799,10 @@ class SessionRunner:
             self.any_failed = 1
             self.record_stage(name, "1 (no port)", shown_log)
             return StageOutcome(ok=False, returncode=1)
+        if self.interrupted_sig_num is not None:
+            return StageOutcome(
+                ok=False, returncode=128 + self.interrupted_sig_num, interrupted_sig=self.interrupted_sig_num
+            )
 
         cmd = [
             self.uv_bin,
@@ -1806,6 +1844,7 @@ class SessionRunner:
         extra_model_args: Sequence[str],
     ) -> bool:
         """Run one reference stage followed by its dependent `torchrun` stage. Returns False if interrupted."""
+        cli_ref = self._stage_arg_path(ref_file)
         ref_cmd = [
             self.uv_bin,
             "run",
@@ -1814,7 +1853,7 @@ class SessionRunner:
             "python",
             "scripts/probes/distributed_trainer_check.py",
             "--write-reference",
-            str(ref_file),
+            cli_ref,
             "--reference-mode",
             self.config.reference_mode,
             "--device",
@@ -1838,7 +1877,7 @@ class SessionRunner:
                 self.config.step_timeout,
                 *extra_model_args,
                 "--reference",
-                str(ref_file),
+                cli_ref,
                 *self.config.extra_driver_args,
             ]
             self.run_torchrun_stage(dist_stage_name, world_size, ref_out.artifact_sha256, driver_args)
