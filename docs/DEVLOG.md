@@ -1020,3 +1020,26 @@ now lives only in the Summary.
 
 **Not done / open.** `main` is not pushed. Other long README sections (Quick start, Choosing how much
 to change, Memory and speed, Calibrate intervals) were left as they are.
+
+## 2026-11-24 — Results chart: German power replaces stock volatility
+
+**Done.** The maintainer asked whether there was anything stronger to show than the 6% to 8% lead over
+gradient boosting. Against the released model there is: `28M full_ft` on `de_power_15m` cuts wQL by
+`23.0%` (by series `[-25.5%, -18.9%]`, `10/10`; by day `[-27.6%, -17.7%]`, `24/25`; three seeds
+`0.1001 / 0.0989 / 0.0991`), on a test period entirely after the release. With the maintainer's approval
+the chart's second panel changed from stock volatility to German power, and the README headline, alt
+text and caption and the Summary in `docs/BENCHMARKS.md` followed. `scripts/make_results_chart.py` reads
+the new panel from `docs/benchmarks/wp3_unfamiliar_domains.json`; the retail panel still comes from
+`sig_v2.json` and did not move. Stock volatility is now a bullet under "what else we found", numbers kept.
+
+**Decisions.**
+
+- Both panels keep the shared zero-based scale (`X_MAX = 0.5`); the power bars are shorter because the
+  error values are smaller, and no per-panel rescaling was applied.
+- The classical bar for German power is `classical_domain` (`0.1117`), named explicitly in the script. The
+  grid operators' own day-ahead forecast (`0.1170`) is not a model and is not drawn.
+- The tuned GBT (`0.0972`) would be the shortest bar on that panel and is not drawn. The caption says in
+  words that fine-tuned `28M` is level with it there and that the dataset was picked because the released
+  model does poorly on it. A fourth bar for it is an open option for the maintainer.
+
+**Not done / open.** `main` is not pushed.

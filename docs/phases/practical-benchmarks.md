@@ -101,7 +101,8 @@ zero leftover GPU VMs/disks; `README.md` and `assets/results.png` were left unto
 *After the merge (2026-11-24):* the branch was squash-merged into `main`. The README's Results section
 now states the tuned-GBT comparison for `28M` in one sentence; the fuller plain-language account,
 including `5M`, is the Summary at the top of `docs/BENCHMARKS.md` (`docs/DEVLOG.md`, 2026-11-24). The
-chart is unchanged.
+chart's second panel was then changed from stock volatility to `de_power_15m` (`28M full_ft` against the
+released model, `−23.0%`); the tuned GBT is not drawn, and the caption states that it is level.
 
 ### Methodological disclosures (including all three GBT search revisions)
 
