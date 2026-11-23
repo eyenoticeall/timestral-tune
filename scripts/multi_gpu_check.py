@@ -1163,8 +1163,9 @@ class StageProcess:
         env: Mapping[str, str],
         ps_bin: str | None,
         stage_timeout: float,
-        teardown_grace_s: float,
-        teardown_reap_s: float,
+        post_exit_eof_grace_s: float = 2.0,
+        teardown_grace_s: float = 3.0,
+        teardown_reap_s: float = 2.0,
         tree_method: TreeStateMethod,
         tree_sig: str,
         get_interrupted_sig: Callable[[], int | None],
@@ -1180,6 +1181,7 @@ class StageProcess:
         self.env = env
         self.ps_bin = ps_bin
         self.stage_timeout = stage_timeout
+        self.post_exit_eof_grace_s = post_exit_eof_grace_s
         self.teardown_grace_s = teardown_grace_s
         self.teardown_reap_s = teardown_reap_s
         self.tree_method = tree_method
@@ -1335,19 +1337,25 @@ class StageProcess:
 
     def _wait_until_exit_or_deadline(self, deadline: float) -> bool:
         assert self._proc is not None and self._sel is not None
+        eof_deadline: float | None = None
         while True:
             if self._get_interrupted_sig() is not None:
                 return False
             rc = self._proc.poll()
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            remaining = deadline - now
             if rc is not None:
                 self._drain_available()
                 if self._eof:
                     return False
-                if remaining <= 0:
-                    return True
+                if eof_deadline is None:
+                    eof_deadline = min(deadline, now + self.post_exit_eof_grace_s)
+                eof_remaining = eof_deadline - time.monotonic()
+                if eof_remaining <= 0:
+                    self._drain_available()
+                    return False
                 try:
-                    events = self._sel.select(timeout=min(0.05, remaining))
+                    events = self._sel.select(timeout=min(0.05, eof_remaining))
                 except InterruptedError:
                     continue
                 if events:
@@ -1456,8 +1464,9 @@ class StageProcess:
                 return self._log_interrupted(killed_n, context="at stage exit")
 
             exit_code = 128 + (-rc) if rc < 0 else rc
-            # Sweep any surviving token-carrying descendants (for example backgrounded workers
-            # with closed/redirected stdio) so finished stages never leak processes or GPU memory.
+            # Sweep any surviving token-carrying descendants (whether they hold stdout/stderr open
+            # past the post-exit EOF grace or closed/redirected stdio) so finished stages never
+            # stall until --stage-timeout or leak processes/GPU memory.
             survivor_pids, survivor_pgids = self._collect_targets()
             if survivor_pids or survivor_pgids:
                 killed_n = self._kill_tree()
@@ -1466,6 +1475,13 @@ class StageProcess:
                 warn_msg = (
                     f"WARNING: stage {self.stage_name} exited ({exit_code}) with surviving descendants; "
                     f"killed stage tree (signalled {killed_n} pid(s))\n"
+                ).encode()
+                self._safe_write_log(warn_msg)
+                self._write_stderr(warn_msg)
+            elif not self._eof:
+                warn_msg = (
+                    f"WARNING: stage {self.stage_name} exited ({exit_code}) with surviving descendants "
+                    "holding stdio open (signalled 0 pid(s))\n"
                 ).encode()
                 self._safe_write_log(warn_msg)
                 self._write_stderr(warn_msg)
@@ -1504,6 +1520,7 @@ class SessionRunner:
     env: dict[str, str] = field(default_factory=lambda: dict(os.environ))
     uv_bin: str = "uv"
     helper_timeout_s: float = 180.0
+    post_exit_eof_grace_s: float = 2.0
     teardown_grace_s: float = 3.0
     teardown_reap_s: float = 2.0
     on_before_stage_spawn: Callable[[str], None] | None = None
@@ -1776,6 +1793,7 @@ class SessionRunner:
             env=self.env,
             ps_bin=self._ps_bin,
             stage_timeout=self.config.stage_timeout,
+            post_exit_eof_grace_s=self.post_exit_eof_grace_s,
             teardown_grace_s=self.teardown_grace_s,
             teardown_reap_s=self.teardown_reap_s,
             tree_method=self.tree_method,

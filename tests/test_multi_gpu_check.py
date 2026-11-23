@@ -1310,6 +1310,151 @@ def test_post_exit_survivor_descendant_is_killed_and_logged(tmp_path: Path) -> N
     assert "signalled 1 pid(s)" in log_text
 
 
+@pytest.mark.parametrize("leader_rc", [0, 5])
+def test_post_exit_open_pipe_survivor_returns_leader_exit_code_with_warning(tmp_path: Path, leader_rc: int) -> None:
+    cfg = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs", stage_timeout=20.0)
+    runner = DRIVER.SessionRunner(
+        config=cfg,
+        repo_root=tmp_path,
+        env=_clean_tracked_env(),
+        post_exit_eof_grace_s=0.3,
+        teardown_grace_s=0.3,
+        teardown_reap_s=0.5,
+    )
+    runner.log_dir.mkdir(parents=True, exist_ok=True)
+    runner.tree_method, runner.tree_sig = "content_hash", "0" * 64
+
+    pidfile = tmp_path / f"open_pipe_{leader_rc}.pid"
+    ready = tmp_path / f"open_pipe_{leader_rc}.ready"
+    child_code = f"import pathlib, time; pathlib.Path({str(ready)!r}).write_text('ready'); time.sleep(60)"
+    stage_code = (
+        "import pathlib, subprocess, sys, time; "
+        f"p = subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(p.pid)); "
+        f"deadline = time.monotonic() + 10.0\n"
+        f"while not pathlib.Path({str(ready)!r}).exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        "print('leader done', flush=True); "
+        f"sys.exit({leader_rc})"
+    )
+    stage_name = f"open_pipe_rc{leader_rc}"
+    t0 = time.monotonic()
+    try:
+        outcome = runner.run_stage_with_sig(stage_name, "sig_open_pipe", None, [sys.executable, "-c", stage_code])
+        dt = time.monotonic() - t0
+        assert dt < 3.0, f"finished stage stalled waiting for stage_timeout: dt={dt:.2f}s"
+        assert outcome.returncode == leader_rc
+        assert outcome.ok is (leader_rc == 0)
+        assert outcome.interrupted_sig is None
+        assert ready.exists()
+        child_pid = int(pidfile.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+
+    log_text = (runner.log_dir / f"{stage_name}.log").read_text(encoding="utf-8")
+    assert "leader done" in log_text
+    assert "WARNING:" in log_text
+    assert "surviving descendants" in log_text
+    assert "signalled 1 pid(s)" in log_text
+    assert "timed out" not in log_text
+    assert (runner.log_dir / f"{stage_name}.done").exists() is (leader_rc == 0)
+
+
+def test_post_exit_open_pipe_flushing_child_completes_without_warning_and_interrupt_wins(tmp_path: Path) -> None:
+    # 1. A child that legitimately finishes flushing output within post_exit_eof_grace_s completes
+    #    cleanly with all output captured and no spurious WARNING.
+    cfg1 = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs_flush", stage_timeout=20.0)
+    runner1 = DRIVER.SessionRunner(
+        config=cfg1,
+        repo_root=tmp_path,
+        env=_clean_tracked_env(),
+        post_exit_eof_grace_s=1.5,
+        teardown_grace_s=0.3,
+        teardown_reap_s=0.5,
+    )
+    runner1.log_dir.mkdir(parents=True, exist_ok=True)
+    runner1.tree_method, runner1.tree_sig = "content_hash", "0" * 64
+
+    flush_child = "import sys, time; time.sleep(0.1); print('POST_EXIT_FLUSH_SENTINEL', flush=True)"
+    flush_stage = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {flush_child!r}]); sys.exit(0)"
+    log1 = runner1.log_dir / "flush_stage.log"
+    rc1, int_sig1 = runner1.run_stage_process("flush_stage", log1, [sys.executable, "-c", flush_stage])
+    assert (rc1, int_sig1) == (0, None)
+    text1 = log1.read_text(encoding="utf-8")
+    assert "POST_EXIT_FLUSH_SENTINEL" in text1
+    assert "WARNING:" not in text1
+
+    # 2. A session interrupt arriving during the post-exit EOF grace window still wins over the
+    #    leader's exit code and terminates the surviving descendant promptly.
+    cfg2 = DRIVER.SessionConfig(backend="gloo", sizes=(), log_dir=tmp_path / "logs_int", stage_timeout=20.0)
+    runner2 = DRIVER.SessionRunner(
+        config=cfg2,
+        repo_root=tmp_path,
+        env=_clean_tracked_env(),
+        post_exit_eof_grace_s=5.0,
+        teardown_grace_s=0.3,
+        teardown_reap_s=0.5,
+    )
+    runner2.log_dir.mkdir(parents=True, exist_ok=True)
+    runner2.tree_method, runner2.tree_sig = "content_hash", "0" * 64
+
+    child_pidfile = tmp_path / "int_grace_child.pid"
+    child_ready = tmp_path / "int_grace_child.ready"
+    leader_pidfile = tmp_path / "int_grace_leader.pid"
+    child_code = f"import pathlib, time; pathlib.Path({str(child_ready)!r}).write_text('ready'); time.sleep(60)"
+    stage_code = (
+        "import os, pathlib, subprocess, sys, time; "
+        f"pathlib.Path({str(leader_pidfile)!r}).write_text(str(os.getpid())); "
+        f"p = subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(child_pidfile)!r}).write_text(str(p.pid)); "
+        f"deadline = time.monotonic() + 10.0\n"
+        f"while not pathlib.Path({str(child_ready)!r}).exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        "sys.exit(0)"
+    )
+
+    def _interrupt_during_grace() -> None:
+        deadline = time.monotonic() + 10.0
+        while not (child_ready.exists() and leader_pidfile.exists()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        lpid = int(leader_pidfile.read_text(encoding="utf-8").strip())
+        # Wait until StageProcess._wait_until_exit_or_deadline() has reaped the exited leader
+        # via proc.poll(), guaranteeing we are inside the post_exit_eof_grace_s window.
+        while time.monotonic() < deadline:
+            try:
+                os.kill(lpid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        runner2.interrupted_sig_num = int(signal.SIGTERM)
+
+    th = threading.Thread(target=_interrupt_during_grace, daemon=True)
+    th.start()
+    log2 = runner2.log_dir / "int_grace_stage.log"
+    t0 = time.monotonic()
+    try:
+        rc2, int_sig2 = runner2.run_stage_process("int_grace_stage", log2, [sys.executable, "-c", stage_code])
+        dt2 = time.monotonic() - t0
+        th.join(timeout=5.0)
+        assert (rc2, int_sig2) == (143, int(signal.SIGTERM))
+        assert dt2 < 2.5, f"interrupt during post-exit EOF grace waited too long: dt={dt2:.2f}s"
+        cpid = int(child_pidfile.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(cpid, 0)
+    finally:
+        th.join(timeout=2.0)
+        if child_pidfile.exists():
+            try:
+                os.kill(int(child_pidfile.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+    assert "interrupted by SIGTERM" in log2.read_text(encoding="utf-8")
+
+
 def test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order(tmp_path: Path) -> None:
     ps_bin = DRIVER._resolve_ps_bin()
     base_token = f"tt_exact_{os.getpid()}"
