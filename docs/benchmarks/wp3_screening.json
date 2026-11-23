@@ -1,0 +1,73 @@
+{
+  "model": "mistralai/Timestral-28M",
+  "device": "mps",
+  "disclosure": "Initial ad-hoc screening prior to pre-registration evaluated zero-shot 28M vs an exploratory Ridge baseline on the test split. This script records both validation-split and test-split comparisons against the final run_tuned_classical baseline.",
+  "datasets": {
+    "de_power_15m": {
+      "source": "akderekaan/de-power-forecast-data@2dba9a08d042 (10 regional TSO x tech 15-minute series + ENTSO-E a69_da)",
+      "license": "CC BY 4.0",
+      "test_date_range": "2026-10-28 to 2026-11-21",
+      "classical_config": {
+        "transform": "raw",
+        "alpha": 10.0
+      },
+      "validation": {
+        "classical_wql": 0.088382,
+        "zs_28m_wql": 0.094143,
+        "zs_vs_classical_rel": 0.0652,
+        "meets_5pct_rule_on_val": true
+      },
+      "test": {
+        "naive_wql": 0.466006,
+        "classical_wql": 0.11173,
+        "zs_28m_wql": 0.128953,
+        "zs_vs_classical_rel": 0.1541,
+        "meets_5pct_rule_on_test": true
+      }
+    },
+    "india_air_quality_daily": {
+      "source": "AkshayKarthick/india-weather-air-quality@ba3f7ad78883 (50 Indian cities daily PM2.5 + 12 weather/pollutant covariates)",
+      "license": "CC BY 4.0",
+      "test_date_range": "2026-10-28 to 2026-11-21",
+      "classical_config": {
+        "transform": "log1p",
+        "alpha": 10.0
+      },
+      "validation": {
+        "classical_wql": 0.207141,
+        "zs_28m_wql": 0.197906,
+        "zs_vs_classical_rel": -0.0446,
+        "meets_5pct_rule_on_val": false
+      },
+      "test": {
+        "naive_wql": 0.350771,
+        "classical_wql": 0.231539,
+        "zs_28m_wql": 0.231184,
+        "zs_vs_classical_rel": -0.0015,
+        "meets_5pct_rule_on_test": false
+      }
+    },
+    "sl_marine_waves_daily": {
+      "source": "tharinduperera/sl-fisheries-weather-daily@3bca7287be47 (16 Sri Lanka coastal sites daily ERA5 wave height + weather)",
+      "license": "CC BY 4.0",
+      "test_date_range": "2026-10-28 to 2026-11-16",
+      "classical_config": {
+        "transform": "raw",
+        "alpha": 10.0
+      },
+      "validation": {
+        "classical_wql": 0.075222,
+        "zs_28m_wql": 0.081627,
+        "zs_vs_classical_rel": 0.0852,
+        "meets_5pct_rule_on_val": true
+      },
+      "test": {
+        "naive_wql": 0.192426,
+        "classical_wql": 0.089055,
+        "zs_28m_wql": 0.097927,
+        "zs_vs_classical_rel": 0.0996,
+        "meets_5pct_rule_on_test": true
+      }
+    }
+  }
+}

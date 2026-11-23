@@ -90,4 +90,111 @@ Selected **strictly before running any fine-tuning** using zero-shot `Timestral-
 
 ## Execution Log
 
-*(To be filled in after experiments complete.)*
+Completed `2026-11-23` on branch `practical-benchmarks`. Following maintainer review, all six GBT
+baselines (`retail_demand`, `realised_volatility`, `realised_volatility_2026_10m`, `de_power_15m`,
+`india_air_quality_daily`, `sl_marine_waves_daily`) and all WP1 (`5M`–`209M`) and WP3 (`28M`, `5M`)
+paired comparisons were regenerated together in one single pass from the tip code on a short-lived
+OS-Login NVIDIA L4 VM (`g2-standard-32`, `OMP_NUM_THREADS=4` per baseline, `bf16` training on L4).
+All temporary VMs were deleted immediately afterward with verified empty GCP project metadata and
+zero leftover GPU VMs/disks; `README.md` and `assets/results.png` remain untouched.
+
+### Methodological disclosures (including all three GBT search revisions)
+
+- **WP3 screening split & India rule (`docs/benchmarks/wp3_screening.json`):** The initial exploratory
+  screening numbers written in §WP3 above had evaluated zero-shot `28M` vs an ad-hoc Ridge baseline on
+  the **test split**, which can inflate "beats the released model" on the three new datasets (it does
+  not favour Timestral over GBT). Re-checking with committed `screen_wp3_candidates.py` against the
+  final `run_tuned_classical` baseline confirms `de_power_15m` (`+6.5%` val / `+15.4%` test) and
+  `sl_marine_waves_daily` (`+8.5%` val / `+10.0%` test) meet the `>= 5%` rule on validation, whereas
+  `india_air_quality_daily` (`−4.5%` val / `−0.2%` test) does **not** meet the `>= 5%` classical-gap
+  rule and qualifies under the niche-domain branch only.
+- **German power `a69_da` publication timing:** Under EU Transparency Regulation 543/2013 (Art. 14.1.d),
+  ENTSO-E day-ahead forecasts (`a69_da`) are published by 18:00 CET/CEST on D−1 for the German CET/CEST
+  delivery day. Because `load_de_power_15m` aligns windows to `00:00 UTC`, the first 92 winter (88 summer)
+  steps come from day D's D−1 publication while the final 4 winter (`23:00–23:45 UTC`) / 8 summer
+  (`22:00–23:45 UTC`) steps belong to day D+1's publication (17:00/16:00 UTC on day D). **Consequence:**
+  for the last hour of each German power window in winter (and the last two hours in summer), every method
+  (Timestral and all baselines alike) sees a day-ahead forecast that had not yet been published at the
+  `00:00 UTC` forecast origin. Source parquets carry no publication timestamps; Timestral and all baselines
+  receive the exact same `da_mw` array, so relative comparisons are symmetric. Exact zero-target fraction
+  in `de_power_15m` training targets is `10.22%` (`41,496 / 406,080`; `19.59%` val, `23.85%` test).
+- **3-seed cluster+seed paired bootstraps:** Every paired CI in `wp1_decision_metrics.json`,
+  `wp3_unfamiliar_domains.json`, and `wp4_covariate_ablation.json` draws both training seed
+  `s ∈ {0, 1, 2}` and clusters (`10,000` resamples), with zero consistency violations between 3-seed
+  means and 95% CIs.
+- **Three GBT baseline search revisions & cross-machine spread:**
+  1. *Revision 1 (initial run):* 24-config grid (`2` scalings `{raw, context_norm}` × `3` leaf pairs
+     `{(15,50), (31,30), (63,20)}` × `2` LRs `{0.03, 0.08}` × `2` L2 `{0.0, 1.0}`, fixed `max_iter ∈
+     {200, 350}`, no early stopping). Four of six splits hit the smallest leaf corner `(15, 50)`.
+  2. *Revision 2 (first review pass):* ~46-config two-stage grid (`2` scalings × `5` leaf pairs
+     `(4,200)..(63,20)` × `3` LRs `{0.02, 0.05, 0.10}`, Stage 1 fixed `l2=1.0`, Stage 2 `l2 ∈ {0, 1,
+     10, 50}`, chronological early stopping `1..800` via `staged_predict`). Exposed a scikit-learn
+     `loss="quantile"` bug on zero-inflated `de_power_15m`: `l2=1.0` froze `tau=0.10` at a constant
+     (`281.63`), rejecting `raw` and forcing `context_norm` (`0.1143`).
+  3. *Revision 3 (tip code, single pass across all 6 splits):* 45 Stage-1 configs (`3` scalings
+     `{raw, context_norm, median_residual}` × `5` leaf pairs × `3` LRs at `l2=0.0`) carrying the best
+     Stage-1 config of each scaling into Stage 2 across `l2 ∈ {0, 1, 10, 50}` and adjacent leaf pairs
+     (`71–85` total configs), with exact per-quantile chronological early stopping (`1..800`) via
+     `staged_predict` and separate 4-thread CPU `fit_time_s` / `tuning_time_s` reporting (no GPU-vs-CPU
+     speed ratios). All six splits and all WP1/WP3 comparisons in the committed JSONs were regenerated
+     together from Revision 3 in one pass. Four of six splits (all four post-release slices) have zero
+     boundary hits; retail (`max_leaves=63`, `max_iter`) and 10m volatility (`max_iter`) touch upper
+     bounds only.
+  - *Cross-machine baseline spread:* running the same `HistGradientBoostingRegressor` code across
+    different CPU architectures (macOS arm64 vs Linux x86_64) introduces up to `~0.4%` relative wQL
+    spread from floating-point histogram/tie-breaking differences (e.g., `retail_demand` `0.2121` on
+    Apple M4 vs `0.2114` on x86_64, `0.33%`; `sl_marine_waves_daily` Revision 1 `0.0824` vs `0.0823`);
+    the committed single-pass Revision-3 numbers all come from one uniform x86_64 machine (`g2-standard-32`).
+
+### Outcome against pre-registered thresholds
+
+- **WP1 — Width at matched coverage (`>= 10%` narrower within `2 pp` of `zero_shot + CQR`):**
+  **PASSES cleanly on retail `28M`** (`−19.9%`, `[-21.5%, -18.4%]`, cov `+1.2 pp`) and **`de_power_15m`**
+  (`−31.9%`, cov `−1.4 pp`), and is **borderline on retail `5M`** (`full_ft` `−16.0%` at `−2.0 pp`; LoRA
+  `−14.6%..−16.0%` at `−1.6..−1.8 pp`). **FAILS the equal-coverage condition on retail `123M` (`−4.6 pp`)
+  and `209M` (`−4.0 pp`)** (released CQR over-covered at `83%–84%`, fine-tuned landed near `79%–80%`),
+  **MIXED/FAILS on volatility** (`28M`/`123M` post-release `full_ft` hit `−10.3%`/`−12.6%`, `5M` `−2.4%`,
+  `209M` `−8.9%`, 10m 2026 `−3.1%` with CI `[-6.8%, +0.5%]`), and **FAILS on daily air/marine**
+  (`india_air_quality_daily`: `+6.1%` wider for `+4.5 pp` cov; `sl_marine_waves_daily`: `−7.2%`).
+- **WP1 — Winkler score (`>= 5%` vs zero-shot and vs CQR alone):** **PASSES** across all four sizes on
+  retail (`−11.3%` to `−18.4%`, confirming real interval-quality gains even on `123M`/`209M`), on
+  `5M`/`28M`/`209M` post-release volatility (`−5.3%` to `−7.5%`; `123M` misses at `−3.4%..−3.6%`), on
+  `28M` 10m volatility (`−5.8%`), and on all three WP3 post-release domains (`−9.7%` to `−23.9%`).
+- **WP1 — 90% service-level cost (`>= 5%`):** **PASSES** across all four sizes on retail (`−13.7%` to
+  `−22.9%`), on `5M`/`28M`/`209M` post-release volatility (`−5.2%` to `−6.9%`; `123M` misses at `−1.8%..−2.5%`),
+  on `28M full_ft` 10m volatility (`−5.3%`), and across all three WP3 domains (`−15.0%` to `−26.1%`).
+- **WP1 — Cross-size claim (`5M` fine-tuned vs larger released):** **PASSES decisively on retail**
+  (`−8.1%` vs `28M`, `−6.8%` vs `123M`, `−9.6%` vs `209M`, all 3-seed CIs `< 0`) and on all three WP3
+  domains vs `28M ZS` by series (`−5.8%` to `−16.8%`). On volatility, `5M full_ft` beats `28M ZS`
+  (`−4.1%` post-rel, `−3.8%` 10m) and **ties `123M`/`209M ZS` (`−0.1%`/`−0.1%`)**.
+- **WP2 — Scaling curves:** `28M` retail plateaus by `200` steps (`0.1951` across `200..2,000`); `5M`
+  gains `1.3 pp` at `500` steps then flattens. `30%` of training series (`15–19` series) captures
+  `80%–113%` of full-data gain (`10%` / `5–6` series: `41%–78%`).
+- **WP3 — Unfamiliar non-hourly post-release domains vs Revision-3 GBT:**
+  - *Beats released `28M` (`>= 10%`):* **PASSES** on `de_power_15m` (`−23.0%`) and `sl_marine_waves_daily`
+    (`−22.6%`); narrowly misses on `india_air_quality_daily` (`−9.0%`). *(Caveat: test-split initial screening.)*
+  - *Beats tuned GBT (`>= 3%`) — `28M` and `5M`:*
+    - **Pre-release / mostly-pre-release splits (PASS):** fine-tuned `28M full_ft` leads cleanly on
+      retail (`−7.7%`, `[-9.5%, -5.9%]`, time `[-11.3%, -4.7%]`) and 10m volatility (`−6.0%`,
+      `[-7.9%, -4.2%]`, time `[-8.6%, -3.3%]`). Fine-tuned `5M full_ft` also beats tuned GBT on both:
+      retail `−4.7%` (`[-6.4%, -3.0%]`, time `[-9.2%, -0.4%]`, `47/64`) and 10m volatility `−3.9%`
+      (`[-5.6%, -2.1%]`, time `[-6.2%, -1.4%]`, `34/51`).
+    - **All 4 clean post-release test slices (FAIL — registered conclusion):** fine-tuned `28M full_ft`
+      fails to beat tuned GBT on any of the four post-release slices: 18-day post-release volatility
+      `+2.7%` (`[-1.5%, +7.3%]`, GBT ahead), `de_power_15m` `+2.3%` (`[-0.9%, +6.4%]`, GBT ahead),
+      `india_air_quality_daily` `−0.1%` (`[-2.1%, +2.2%]`, dead tie), and `sl_marine_waves_daily`
+      `−5.1%` (`[-13.3%, +2.9%]`, time `[-20.5%, +10.5%]`, not separable). Fine-tuned `5M` trails GBT
+      on all four post-release slices — significantly on three of the four: 18-day post-release
+      volatility `+4.5%` (`[+0.9%, +8.3%]`, `15/51`; all four `5M` modes `+3.9%..+4.7%`), `de_power_15m`
+      `+10.4%` (`[+6.5%, +14.9%]`, `0/10`), `india_air_quality_daily` `+3.4%` (`[+0.5%, +6.7%]` for
+      `full_ft`; `+1.9%`, `[-0.3%, +4.1%]` for `lora_variate`), and `sl_marine_waves_daily` `+3.3%`
+      (`[-5.2%, +12.6%]`, `5/16`). **Registered conclusion:** per §WP3 above, because fine-tuned
+      Timestral (`5M` or `28M`) only ties or loses to tuned GBT across all four clean post-release
+      domains, **gradient boosting is the better practical choice for those domains.**
+- **WP4 — Breadth & serving:** `123M`/`209M` 3-seed means match §3 within `0.0022` wQL. Retail covariate
+  ablation shows zero-shot ignores covariates (`+0.1%`/`+0.4%`) while fine-tuning unlocks `−2.1%`/`−2.6%`
+  (`54–56/64` SKUs). Serving `5M` in place of `209M` is `11.9×` faster on L4 `bf16` (`B=64`, `6.0×` less
+  VRAM), `18.9×` on L4 `fp32`, `24.4×` on x86 CPU (`B=16`, 2 default physical-core threads), and `17.5×`/`25.1×`
+  on Apple M4 CPU (`4` default P-core threads) / MPS.
+- **Artefacts:** `docs/benchmarks/{wp1_decision_metrics,wp2_scaling,wp3_unfamiliar_domains,wp3_screening,wp4_covariate_ablation,wp4_inference_latency_cuda_cpu,wp4_inference_latency_apple}.json`, `docs/BENCHMARKS.md` §6, `docs/VERIFICATION.md` §16.
+

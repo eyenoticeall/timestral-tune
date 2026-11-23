@@ -16,7 +16,7 @@
 | Replay & distillation | `ReplayConfig` (default `replay_fraction=0.0, distill_weight=0.1, smooth_beta=1e-3`), `SyntheticReplaySource` (5 classical families), `distillation_loss`, `disable_lora` zero-VRAM bypass, CPU-cached frozen-base teacher outputs, and `replay_source` export provenance (D21); empirically ablated with lower-LR and pool-size controls in `docs/BENCHMARKS.md` §5 |
 | Conformal calibration | `ConformalCalibrator` (static split CQR), `OnlineConformalCalibrator` (online ACI, forecast-count rolling window, Lemma 4.1 anti-windup), and `collect_conformal_data` helper, with anchor-aware monotonicity repair and JSON persistence |
 | Evaluation & metrics | `utils/metrics.py`: raw-space `pinball_loss_raw`, `weighted_quantile_loss`, `mase`, `coverage`, `interval_width`, `evaluate_forecaster`, and `evaluate_forgetting` |
-| Benchmarks & sweeps | `scripts/benchmarks/` + `docs/BENCHMARKS.md`: `5M`–`209M` tables + raw JSONs (`docs/benchmarks/`) across all modes, forgetting metrics, 123M/209M 3-seed decision sweeps, and 28M significance & classical baselines |
+| Benchmarks & sweeps | `scripts/benchmarks/` + `docs/BENCHMARKS.md`: `5M`–`209M` 3-seed tables, decision metrics (Winkler score, CQR matched-coverage width, 0.80/0.90/0.95 service-level pinball), scaling curves (`200..2,000` steps, `10%/30%/100%` series), three non-hourly post-`2026-10-27` datasets vs tuned GBT, retail covariate ablation, and L4/CPU/Apple serving latency (`docs/benchmarks/wp*.json`) |
 | Optional Lacuna integration | `integrations/lacuna.py` (`timestral-tune[lacuna]`, Python 3.11+): `LacunaExporter` (`ExperimentRegistry`) and `write_signal_frame` (`SignalStudy`), verified live against `lacuna-quant==0.14.1` |
 | Export | `export_checkpoint` and `TimestralTrainer.export()`: upstream-loadable `config.json` + merged `model.safetensors`, unmerged LoRA adapters (`load_lora`), `conformal.json`, `tune_metadata.json`, `LICENSE`, `NOTICE` |
 | Verifiers | `timestral_tune.utils.run_checks`: parity, label isolation, firewall, known-future sensitivity, loss mask |
@@ -41,7 +41,7 @@ All locally on Apple M4 (macOS, PyTorch 2.4/2.8/2.14/2.15) and on an NVIDIA L4 (
 - Device parity and gradients on CPU, Apple GPU, and CUDA (T14), plus `bf16` autocast and `torch.compile` on L4 CUDA (3.3× faster 28M steps, 45% less VRAM).
 - Decision D15 resolved on CUDA: 20-step training trajectories under `fp32` default SDPA, `fp32` unfused math, and `bf16` match closely in validation loss across `lora_variate`, `lora_temporal`, and `full_ft`.
 
-- Real-dataset benchmarks and sweeps across all four checkpoints (`5M`, `28M`, `123M`, `209M`) on realised volatility (post-Oct 27, 2026), retail demand, and GIFT-Eval forgetting (`docs/BENCHMARKS.md`), `123M`/`209M` CUDA gradient accuracy and `fp32`/`math`/`bf16` training parity (`docs/VERIFICATION.md` §13), live `lacuna-quant==0.14.1` integration, Phase 4 replay/distillation forgetting ablations (`docs/BENCHMARKS.md` §5), and Apple GPU `123M`/`209M`/long-context (`4,096..32,768`) parity & training (`docs/VERIFICATION.md` §15).
+- Real-dataset benchmarks and sweeps across all four checkpoints (`5M`, `28M`, `123M`, `209M`) on realised volatility (post-Oct 27, 2026), retail demand, three non-hourly strictly post-Oct 27 domains (`de_power_15m`, `india_air_quality_daily`, `sl_marine_waves_daily`), and GIFT-Eval forgetting (`docs/BENCHMARKS.md` §1–§6), decision metrics & tuned GBT comparisons, scaling curves, retail covariate ablation, L4/CPU/Apple serving latency (`docs/VERIFICATION.md` §16), `123M`/`209M` CUDA gradient accuracy and `fp32`/`math`/`bf16` training parity (`docs/VERIFICATION.md` §13), live `lacuna-quant==0.14.1` integration, Phase 4 replay/distillation forgetting ablations (`docs/BENCHMARKS.md` §5), and Apple GPU `123M`/`209M`/long-context (`4,096..32,768`) parity & training (`docs/VERIFICATION.md` §15).
 
 Not verified anywhere: multi-GPU, real general-domain replay datasets (only built-in synthetic replay was benchmarked), long-context (`4,096..32,768`) gradient parity on MPS, any checkpoint larger than 209M (other sizes are supported by design and tested only on small random models; spec §3.1).
 
@@ -62,6 +62,7 @@ Full list in spec §12. The ones that matter next:
 
 ## Branch state
 
-- `main`: Phases 0–4 (rescoped Phase 4 fast-forwarded from `phase-4` at `9261c75` on 2026-11-22). All prior branches (`phase-1`, `perf/phase1-kernels`, `fix/math-sdpa-backend`, `phase-2`, `phase-3`, `phase-4`) are closed and deleted locally and on `origin`.
+- `main`: Phases 0–4 and v0.1.0 release (`v0.1.0` published on PyPI).
+- `practical-benchmarks` (unpushed, unmerged): practical-value benchmarks (WP1–WP4: decision metrics, scaling curves, three non-hourly post-release datasets vs tuned GBT, covariate ablation, serving latency; `README.md` untouched).
 
 Branch policy is in `AGENTS.md` §6.

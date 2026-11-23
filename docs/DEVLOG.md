@@ -848,3 +848,128 @@ README gained an "Other model sizes" section; spec §3.1, `docs/VERIFICATION.md`
 
 **Not done / open.** Nothing above 209M has been run. Full fine-tuning at that scale would need
 features the library lacks (multi-GPU, gradient accumulation, resumable runs).
+
+---
+
+## 2026-11-23 — Practical-value benchmarks (WP1–WP4) on branch `practical-benchmarks`
+
+**Done (branch `practical-benchmarks`, unpushed/unmerged; `README.md` and version `0.1.0` untouched).**
+Pre-registered all comparisons, metrics, non-hourly dataset selections (screened on zero-shot vs
+classical before any fine-tuning), and quantitative success thresholds in
+`docs/phases/practical-benchmarks.md`, then executed WP1–WP4 on a short-lived OS-Login NVIDIA L4 VM
+plus local Apple M4 CPU/MPS serving latency:
+
+- **Harness & tests (`scripts/benchmarks/`, `tests/test_benchmark_helpers.py`):** added Winkler
+  interval scores, 0.80/0.90/0.95 service-level pinball costs, paired cluster bootstraps across
+  decision metrics (`decision_metrics.py`), validation-tuned direct ARX Ridge and 24-config
+  21-quantile `HistGradientBoostingRegressor` baselines (`baselines.py`), three strictly
+  post-`2026-10-27` `CC BY 4.0` non-hourly datasets (`de_power_15m`, `india_air_quality_daily`,
+  `sl_marine_waves_daily`), retail covariate toggle, and series-fraction subsetting (`datasets.py`).
+  Unit test caught backward-anchored `TimeSeriesDataset` origin alignment, leading to exact
+  `00:00 UTC` / `2026-10-28` boundary alignment across all three new datasets.
+- **WP1 & WP4a (`docs/benchmarks/wp1_decision_metrics.json`):** 3-seed decision metrics across all
+  four sizes (`5M`–`209M`) on retail and volatility (`123M`/`209M` 3-seed means match §3 within
+  `0.0022` wQL, zero README contradictions). On retail, fine-tuning cuts CQR 80% width `−16.0%` to
+  `−27.7%` at equal/higher coverage, cuts 90% newsvendor cost `−13.7%` to `−22.9%`, beats CQR alone
+  by `−11.3%` to `−18.4%` Winkler_80, beats tuned GBT (`−5.7%` to `−9.1%`), and `5M full_ft` beats
+  released `28M`/`123M`/`209M` (`−8.3%`/`−7.0%`/`−9.8%`, all 95% CIs `< 0`). On volatility, raw ZS
+  under-covers post-release (`0.663–0.734`); ACI restores `0.782–0.791` for `+12.5%–+29.4%` width;
+  CQR width reduction is smaller (`−1%` to `−12.6%`, often raising coverage instead); `28M full_ft`
+  beats `gbt_tuned` on the 49-block 2026 holdout (`−6.5%`, `45/51`) but trails `gbt_tuned` (`0.2099`)
+  on the 3-block post-release slice (`+3.1%`, CI `[-1.1%, +7.4%]`).
+- **WP2 (`docs/benchmarks/wp2_scaling.json`):** `28M` retail plateaus by `200` steps (`0.1951`
+  across `200..2,000`); `5M` gains `~1.3 pp` to `500` steps then flattens. `30%` of training series
+  (`15–19` series) captures `80%–113%` of full-data gain (`10%` / `5–6` series captures `41%–78%`)
+  without inflating forgetting.
+- **WP3 (`docs/benchmarks/wp3_unfamiliar_domains.json`):** on all three non-hourly post-release
+  domains, `28M full_ft` (36–46 s, forgetting `−0.8%..+1.3%`) cuts wQL `−9.0%` to `−23.0%` and
+  `pb90` `−15.0%` to `−26.1%` vs zero-shot. Against tuned GBT (287–912 s): statistical tie on
+  `de_power_15m` (`−0.8%`, `[-4.2%, +3.4%]`), small wQL edge + clear CQR Winkler_80 win (`−4.0%`,
+  `[-7.1%, -0.6%]`) on `india_air_quality_daily`, and clear wQL win (`−8.4%`, `[-13.4%, -3.4%]`,
+  `13/16` sites) on `sl_marine_waves_daily`. `head_only` forgets `+20.8%–+21.6%` on both daily sets.
+- **WP4b/4c (`wp4_covariate_ablation.json`, `wp4_inference_latency_{cuda_cpu,apple}.json`):**
+  zero-shot ignores retail covariates (`+0.1%`/`+0.4%`) while fine-tuning unlocks `−2.2%`/`−2.6%`
+  (`55/64` SKUs) on top of univariate adaptation. Serving `5M` instead of `209M` (`ctx=256, cov=8,
+  sym=True`) is `11.9×` faster on L4 `bf16` (`B=64`, `6.0×` less VRAM), `18.9×` on L4 `fp32`,
+  `24.4×` on x86 CPU (`B=16`), and `17.5×`/`25.1×` on Apple M4 CPU/MPS.
+- **Cloud cleanup verified:** OS-Login L4 VM deleted; `gcloud compute instances list` and `disks
+  list` confirm only the pre-existing `e2-medium` VM and its 40 GB disk remain; `commonInstanceMetadata`
+  remains completely empty (zero project-wide SSH keys added).
+
+**Not done / open.** Branch `practical-benchmarks` is unpushed and unmerged awaiting maintainer
+review; `README.md` and `assets/results.png` were deliberately left unchanged.
+
+---
+
+## 2026-11-23 — Review follow-up on `practical-benchmarks` (all 7 findings addressed)
+
+**Done.** Addressed every methodological and reporting issue flagged during branch review:
+
+1. **Screening audit & India rule (`scripts/benchmarks/screen_wp3_candidates.py`, `docs/benchmarks/wp3_screening.json`):**
+   committed a reproducible zero-shot `28M` vs final `run_tuned_classical` screening script reporting both
+   validation and test splits; disclosed plainly that initial exploratory screening used test splits and
+   that `india_air_quality_daily` does not meet the `>= 5%` classical-gap rule under the final baseline
+   (`−4.5%` val / `−0.2%` test; niche-domain branch only).
+2. **Upgraded chronologically early-stopped GBT (`scripts/benchmarks/baselines.py`):** expanded the search
+   to a two-stage bracketed grid (`4..63` leaves, `min_samples_leaf 20..200`, `l2 0..50`) with exact
+   per-quantile chronological validation early stopping via `staged_predict` (`1..800` trees), separating
+   single-model CPU `fit_time_s` (`55–492 s`) from full-grid `tuning_time_s` (`502–996 s`) and removing
+   all GPU-default-vs-CPU-grid speed ratios. Also caught and fixed a scikit-learn `loss="quantile"` bug
+   exposed on `de_power_15m` (~14% night-time solar zeros): fixing Stage 1 to `l2=0.0` (avoiding `l2 > 0`
+   split freeze on `tau <= 0.10`) and adding validation-selected `target_transform="median_residual"`
+   (fit L1 median `p50`, then fit quantile residuals `y - p50`) eliminated lower-tail collapse, bringing
+   `de_power_15m` GBT from broken `0.1143` to `0.0972` with zero boundary hits (`28M full_ft` `+2.3%`,
+   CI `[-0.9%, +6.4%]` — not separable, GBT slightly ahead). Across all splits, no dataset hit the
+   small-tree corner (`4` leaves); GBT tightened on retail (`0.2134 → 0.2114`), 10m volatility
+   (`0.1942 → 0.1935`), India PM2.5 (`0.2138 → 0.2114`, dead tie `−0.5%`), and German power (`0.1009 → 0.0972`,
+   not separable `+2.3%`), and stayed flat on post-release volatility (`0.2102`) and Sri Lanka waves (`0.0826`).
+3. **3-seed cluster+seed paired bootstraps (`scripts/benchmarks/decision_metrics.py`, `tests/test_benchmark_helpers.py`):**
+   upgraded all WP1, WP3, and WP4b paired CIs to resample both training seed `s ∈ {0, 1, 2}` and clusters,
+   verified zero consistency violations across all artefacts (fixing e.g. `28M` 10m volatility CQR width
+   `−3.1%`, now CI `[-6.8%, +0.5%]`), and re-ran WP1, WP3, and WP4b on a fresh short-lived OS-Login L4 VM.
+4. **Tightened framing (`docs/BENCHMARKS.md` §6, `docs/VERIFICATION.md` §16, `docs/phases/practical-benchmarks.md`):**
+   explicitly stated that retail equal-coverage width passes cleanly only for `28M` (`123M`/`209M` give up
+   `4.0–4.6 pp` coverage, failing the registered condition, though CQR Winkler improves `14%–18%`), counted
+   5 distinct datasets rather than double-counting overlapping volatility splits, and stated plainly that
+   against tuned GBT fine-tuned `28M` leads on the two pre-release/mostly-pre-release splits and is not
+   cleanly separable across the four post-release test slices.
+5. **Cloud cleanup verified:** deleted the second OS-Login L4 VM immediately after WP1/WP3/WP4b completed;
+   `gcloud compute instances list`, `disks list`, and `commonInstanceMetadata` confirm zero temporary VMs,
+   disks, or project-wide SSH keys remain.
+
+**Not done / open.** Branch `practical-benchmarks` remains unpushed and unmerged awaiting maintainer
+review; `README.md`, `assets/results.png`, and version `0.1.0` remain untouched.
+
+---
+
+## 2026-11-23 — Single-pass Revision-3 baseline regeneration across all 6 splits on `practical-benchmarks`
+
+**Done.** Regenerated all six GBT baselines (`retail_demand`, `realised_volatility`,
+`realised_volatility_2026_10m`, `de_power_15m`, `india_air_quality_daily`, `sl_marine_waves_daily`)
+and all WP1 (`5M`–`209M`) and WP3 (`28M`, `5M`) paired comparisons in one pass from the tip
+Revision-3 code on a single short-lived OS-Login `g2-standard-32` (`OMP_NUM_THREADS=4` per baseline,
+L4 `bf16` training), removing all stale Revision-2 rows:
+
+- **Updated tip-code GBT baselines & `28M full_ft` 3-seed cluster+seed comparisons:**
+  - `retail_demand` (2024 pre-release): GBT `0.2114` (`−7.7%`, `[-9.5%, -5.9%]`, time `[-11.3%, -4.7%]` — clear lead).
+  - `realised_volatility_2026_10m` (mostly pre-release): GBT `0.1928` (`−6.0%`, `[-7.9%, -4.2%]`, time `[-8.6%, -3.3%]` — clear lead).
+  - `realised_volatility` (18d post-release tail, zero boundary hits): GBT `0.2104` (`+2.7%`, `[-1.5%, +7.3%]` — not separable, GBT ahead).
+  - `de_power_15m` (post-release, zero boundary hits): GBT `0.0972` (`+2.3%`, `[-0.9%, +6.4%]` — not separable, GBT ahead).
+  - `india_air_quality_daily` (post-release, zero boundary hits): GBT `0.2106` (`−0.1%`, `[-2.1%, +2.2%]` — dead tie).
+  - `sl_marine_waves_daily` (post-release, zero boundary hits): GBT `0.0798` (`−5.1%`, `[-13.3%, +2.9%]`, time `[-20.5%, +10.5%]` — not separable; loses prior "lead by series" label).
+  - `5M full_ft` vs tip GBT: beats GBT on pre-release/mostly-pre-release retail (`−4.7%`, `[-6.4%, -3.0%]`) and 10m volatility (`−3.9%`, `[-5.6%, -2.1%]`), and trails GBT on all four post-release slices (`+4.5%` 18d vol, `+10.4%` German power, `+3.4%` India PM2.5, `+3.3%` Sri Lanka waves). Registered conclusion stated plainly: gradient boosting is the better practical choice for the four clean post-release domains.
+- **Disclosures & smaller items addressed:** recorded Revision 3 explicitly alongside Revisions 1–2 and
+  up to `~0.4%` cross-machine GBT CPU spread in `docs/phases/practical-benchmarks.md` and `docs/BENCHMARKS.md`,
+  fixed `run_tuned_gbt` docstring (`45` Stage-1 configs across `3` scalings, ~`85` total), corrected
+  `de_power_15m` training zero-target percentage to measured `10.22%` (`41,496 / 406,080`), documented
+  `a69_da` CET/CEST vs `00:00 UTC` delivery-day timing — explicitly noting that for the last hour of each
+  winter window (last two hours in summer) every method sees a day-ahead forecast not yet published at the
+  `00:00 UTC` origin — documented PyTorch's physical/performance core thread defaults (`2` on `g2-standard-4`
+  vs `4` on Apple M4) in `docs/BENCHMARKS.md` §6.5, and documented the intentional `pytest.importorskip("sklearn")`
+  skip in plain CI in `docs/VERIFICATION.md` §16.
+- **Cloud cleanup verified:** temporary OS-Login L4 VM deleted; `gcloud compute instances list`, `disks list`,
+  and `commonInstanceMetadata` confirm zero temporary VMs, disks, or project-wide SSH keys remain.
+
+**Not done / open.** Branch `practical-benchmarks` remains unpushed and unmerged awaiting maintainer
+review; `README.md`, `assets/results.png`, and version `0.1.0` remain untouched.
+

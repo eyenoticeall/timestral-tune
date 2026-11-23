@@ -507,3 +507,312 @@ Note: most `head_only` runs select their final step (`200`), so longer schedules
   - `lora_temporal` `5M` volatility (3 seeds): `3e-3 + distill_0.1` eliminates the `+31.3%` cliff down to `+0.6%` worst-seed forgetting (mean `−0.2%`) and beats shipped `1e-3` on 3/3 seeds (`0.2178` vs `0.2186`, worst `+0.6%` vs `+1.6%`), though the mean wQL difference (`0.0008`) is small relative to seed spread (`~0.0013–0.0023`). By contrast, `3e-3 + replay_0.25` (`0.2181`, worst `+1.1%`) is indistinguishable from shipped `1e-3`.
 - **Where lowering the learning rate is as good as synthetic replay/distillation:** on `5M full_ft` retail, plain `lr=2e-4` (`0.1995`, worst forg `+1.3%`) matches or slightly beats `3e-4 + distill_0.1` (`0.1999`, worst `+1.3%`, mean `+0.9%` vs `+1.2%`), and plain `lr=1e-4` (`0.2016`, worst `+0.6%`) strictly beats `3e-4 + distill_0.5` (`0.2016`, worst `+1.1%`). On `28M head_only` volatility (1 seed), plain `1e-3` gives lower wQL (`0.2169` vs `0.2195`–`0.2196`). Single-run `28M` wall times vary across sessions (`−36%` to `+16%` relative to `none`, due to background thermal/MPS variance).
 - **Synthetic pool size vs generator mismatch (`full_ft`):** expanding the `SyntheticReplaySource` pool from 64 series (256 windows, cycled ~6×) to 256 series (1,024 windows, cycled ~1.5×) dropped `full_ft 3e-4` synthetic-pinball worst-seed forgetting from `+4.1%` back to `+2.8%`, showing that memorising a small pool explained the `+4.1%` spike — while synthetic pinball still did not improve forgetting over plain `3e-4` (`+2.8%`), consistent with D7. Real general-domain replay sets remain untested.
+
+---
+
+## 6. Practical Value Benchmarks: Decision Metrics, Scaling, Non-Hourly Post-Release Domains vs GBT, Covariate Ablation & Serving Cost
+
+All GPU training and CUDA/CPU serving runs below were measured on one NVIDIA L4 (`g2-standard-4` /
+`g2-standard-32`, PyTorch `2.15.0+cu132`, Python `3.12`, `bf16` autocast for training) on `2026-11-23`;
+all six Revision-3 tip-code GBT baselines (`scikit-learn==1.6.1`, `OMP_NUM_THREADS=4` each) and all
+WP1/WP3 Timestral comparisons were regenerated together in one single pass on `g2-standard-32`; Apple
+CPU/MPS inference latency was measured on an Apple M4 (macOS, PyTorch `2.15.0`, `fp32`). Pre-registered
+comparisons, metrics, dataset selections, and thresholds are documented in
+`docs/phases/practical-benchmarks.md`. Every fine-tuned cell runs across `seeds = (0, 1, 2)`. Every
+paired 95% confidence interval uses a **single-run cluster+seed paired bootstrap** (`10,000` draws
+sampling both training seed `s ∈ {0, 1, 2}` and data clusters with replacement, separately by series
+and by non-overlapping time block), so point estimates match the exact 3-seed means and intervals
+reflect both cluster and between-seed variance.
+
+### 6.1 Decision metrics, calibration, 3-seed `5M`–`209M` tables & cross-size CIs (`docs/benchmarks/wp1_decision_metrics.json`)
+
+Reproduce:
+
+```bash
+uv run --with scikit-learn==1.6.1 python scripts/benchmarks/baselines.py --output-dir /tmp/pre_baselines
+uv run --with scikit-learn==1.6.1 python scripts/benchmarks/run_wp1_decision_metrics.py \
+  --device cuda --bf16 --sizes 5M 28M 123M 209M --seeds 0 1 2 \
+  --precomputed-baselines-dir /tmp/pre_baselines \
+  --output docs/benchmarks/wp1_decision_metrics.json
+```
+
+#### Calibration as released (80% & 90% coverage, width, and Winkler score before/after static CQR and online ACI)
+
+| Dataset | Size | Raw 80% cov / width / Winkler | Static CQR 80% cov / width (`Δw`) / Winkler | Online ACI 80% cov / width (`Δw`) / Winkler | Raw 90% cov → CQR → ACI |
+|---|---|---|---|---|---|
+| **Retail** | `5M` | `0.823 / 1.282 / 1.799` | `0.823 / 1.282 (+0.0%) / 1.799` | `0.815 / 1.277 (−0.4%) / 1.799` | `0.923 → 0.923 → 0.914` |
+| **Retail** | `28M` | `0.766 / 1.253 / 1.825` | `0.768 / 1.254 (+0.1%) / 1.825` | `0.795 / 1.272 (+1.5%) / 1.824` | `0.882 → 0.883 → 0.896` |
+| **Retail** | `123M` | `0.841 / 1.320 / 1.783` | `0.841 / 1.320 (+0.0%) / 1.783` | `0.778 / 1.290 (−2.2%) / 1.782` | `0.934 → 0.934 → 0.894` |
+| **Retail** | `209M` | `0.832 / 1.400 / 1.851` | `0.832 / 1.400 (+0.0%) / 1.851` | `0.810 / 1.357 (−3.1%) / 1.845` | `0.923 → 0.923 → 0.901` |
+| **Vol (post-rel)** | `5M` | `0.663 / 0.0060 / 0.0137` | `0.689 / 0.0063 (+5.1%) / 0.0136` | `0.783 / 0.0078 (+29.4%) / 0.0141` | `0.796 → 0.825 → 0.868` |
+| **Vol (post-rel)** | `28M` | `0.702 / 0.0064 / 0.0134` | `0.712 / 0.0065 (+1.9%) / 0.0134` | `0.791 / 0.0077 (+20.4%) / 0.0139` | `0.825 → 0.834 → 0.865` |
+| **Vol (post-rel)** | `123M` | `0.734 / 0.0066 / 0.0128` | `0.735 / 0.0066 (+0.2%) / 0.0128` | `0.790 / 0.0074 (+12.5%) / 0.0131` | `0.842 → 0.847 → 0.872` |
+| **Vol (post-rel)** | `209M` | `0.731 / 0.0064 / 0.0131` | `0.736 / 0.0064 (+0.6%) / 0.0131` | `0.782 / 0.0072 (+12.5%) / 0.0134` | `0.835 → 0.837 → 0.864` |
+| **Vol (2026 10m)** | `5M` | `0.763 / 0.0053 / 0.0098` | `0.788 / 0.0056 (+5.5%) / 0.0098` | `0.797 / 0.0059 (+10.6%) / 0.0099` | `0.868 → 0.891 → 0.895` |
+| **Vol (2026 10m)** | `28M` | `0.784 / 0.0055 / 0.0097` | `0.783 / 0.0055 (−0.0%) / 0.0097` | `0.796 / 0.0058 (+6.0%) / 0.0099` | `0.882 → 0.885 → 0.893` |
+
+#### Retail demand — decision metrics, 3-seed means (`5M`–`209M`), baselines & CQR comparison (`384` test windows, `64` SKUs × `6` blocks; 2024 pre-release)
+
+Non-foundation baselines on identical splits: `seasonal_naive` (`wQL 0.2939`, `wink80 2.3531`, `pb90 0.1191`),
+tuned `classical_domain` (`raw, alpha=10.0`: `wQL 0.2141`, `wink80 1.7127`, `pb90 0.0929`),
+Revision-3 chronologically early-stopped `gbt_tuned` (`context_norm, leaves=63, min_leaf=30, lr=0.10, l2=0.0, median_best_iter=540`, `77` grid configs: **`wQL 0.2114`**, `wink80 1.6615`, `pb90 0.0873`, CQR `cov80 0.781 / w80 1.1202`; 4-thread CPU single-model fit `357 s`, grid tune `1,510 s`).
+
+| Size | Mode | wQL (`mean ± std`) | `pb80 / pb90 / pb95` (`Δpb90` vs ZS) | CQR 80% cov (`Δcov`) / width (`Δw80`, 3-seed series CI) | CQR 80% Winkler (`Δ` vs ZS+CQR, 3-seed CI) | `ΔwQL` vs `gbt_tuned` (series 95% CI, wins) | Macro Forg (`mean / worst`) | GPU Time / VRAM |
+|---|---|---:|---|---|---|---|---:|---|
+| `5M` | `zero_shot` | `0.2210` | `0.1473 / 0.1005 / 0.0657` | `0.823 / 1.2820` | `1.7987` | `+4.5%` | `+0.0%` | — |
+| `5M` | `head_only` | `0.2098 ± 0.0001` | `0.1350 / 0.0880 / 0.0543` (`−12.4%`) | `0.813 (−1.0pp) / 1.1554` (`−9.9%`, `[-11.2%, -8.5%]`) | `1.6395` (`−8.9%`, `[-9.9%, -7.8%]`) | `−0.8%` (`[-2.4%, +0.7%]`, `30/64`) | `+5.0% / +5.1%` | `6.1 s / 0.10 GiB` |
+| `5M` | `lora_variate` | `0.2027 ± 0.0009` | `0.1327 / 0.0877 / 0.0547` (`−12.8%`) | `0.805 (−1.8pp) / 1.0945` (`−14.6%`, `[-16.2%, -13.1%]`) | `1.6074` (`−10.6%`, `[-12.1%, -9.2%]`) | `−4.1%` (`[-5.9%, -2.3%]`, `44/64`) | `+1.6% / +2.0%` | `10.8 s / 0.21 GiB` |
+| `5M` | `lora_temporal` | `0.2036 ± 0.0012` | `0.1346 / 0.0891 / 0.0556` (`−11.3%`) | `0.807 (−1.6pp) / 1.0766` (`−16.0%`, `[-17.7%, -14.2%]`) | `1.6256` (`−9.6%`, `[-10.9%, -8.3%]`) | `−3.7%` (`[-5.6%, -1.8%]`, `45/64`) | `+2.0% / +3.0%` | `15.3 s / 0.33 GiB` |
+| `5M` | `full_ft` | **`0.2015 ± 0.0005`** | `0.1320 / 0.0867 / 0.0532` (`−13.7%`) | `0.803 (−2.0pp) / 1.0766` (`−16.0%`, `[-17.3%, -14.6%]`) | `1.5964` (`−11.3%`, `[-12.5%, -10.0%]`) | **`−4.7%`** (`[-6.4%, -3.0%]`, `47/64`) | `+0.6% / +0.7%` | `13.3 s / 0.47 GiB` |
+| `28M` | `zero_shot` | `0.2193` | `0.1482 / 0.1034 / 0.0673` | `0.768 / 1.2541` | `1.8248` | `+3.7%` | `+0.0%` | — |
+| `28M` | `head_only` | `0.2071 ± 0.0000` | `0.1344 / 0.0878 / 0.0536` (`−15.0%`) | `0.811 (+4.3pp) / 1.1526` (`−8.1%`, `[-9.7%, -6.1%]`) | `1.6422` (`−10.0%`, `[-11.4%, -8.6%]`) | `−2.0%` (`[-3.7%, -0.4%]`, `34/64`) | `+6.7% / +6.9%` | `5.4 s / 0.24 GiB` |
+| `28M` | `lora_variate` | `0.1979 ± 0.0010` | `0.1296 / 0.0850 / 0.0521` (`−17.8%`) | `0.783 (+1.6pp) / 1.0369` (`−17.3%`, `[-18.9%, -15.5%]`) | `1.5715` (`−13.9%`, `[-15.5%, -12.2%]`) | `−6.4%` (`[-8.4%, -4.4%]`, `49/64`) | `−2.0% / −1.6%` | `15.5 s / 0.75 GiB` |
+| `28M` | `lora_temporal` | `0.1977 ± 0.0001` | `0.1297 / 0.0849 / 0.0517` (`−17.8%`) | `0.780 (+1.2pp) / 1.0141` (`−19.1%`, `[-21.2%, -16.5%]`) | `1.5715` (`−13.9%`, `[-15.6%, -12.1%]`) | `−6.5%` (`[-8.3%, -4.6%]`, `50/64`) | `+0.5% / +1.6%` | `21.6 s / 1.00 GiB` |
+| `28M` | `full_ft` | **`0.1951 ± 0.0004`** | `0.1265 / 0.0821 / 0.0496` (**`−20.6%`**) | `0.780 (+1.2pp) / 1.0040` (**`−19.9%`**, `[-21.5%, -18.4%]`) | `1.5393` (**`−15.6%`**, `[-17.5%, -13.8%]`) | **`−7.7%`** (`[-9.5%, -5.9%]`, `50/64`, `6/6` blk) | `−1.0% / −0.8%` | `18.9 s / 1.50 GiB` |
+| `123M` | `zero_shot` | `0.2163` | `0.1439 / 0.0995 / 0.0646` | `0.841 / 1.3197` | `1.7829` | `+2.3%` | `+0.0%` | — |
+| `123M` | `head_only` | `0.2060 ± 0.0003` | `0.1342 / 0.0877 / 0.0540` (`−11.8%`) | `0.813 (−2.8pp) / 1.1275` (`−14.6%`, `[-16.7%, -12.6%]`) | `1.6388` (`−8.1%`, `[-9.2%, -6.9%]`) | `−2.5%` (`[-4.5%, -0.7%]`, `34/64`) | `+5.3% / +5.5%` | `12.6 s / 0.59 GiB` |
+| `123M` | `lora_variate` | `0.1952 ± 0.0006` | `0.1267 / 0.0827 / 0.0504` (`−16.9%`) | `0.774 (−6.6pp*) / 1.0024` (`−24.0%`, `[-28.0%, -19.9%]`) | `1.5441` (`−13.4%`, `[-14.8%, -11.9%]`) | `−7.7%` (`[-9.6%, -5.7%]`, `54/64`) | `−0.1% / +0.2%` | `30.8 s / 2.49 GiB` |
+| `123M` | `lora_temporal` | `0.1962 ± 0.0004` | `0.1277 / 0.0833 / 0.0506` (`−16.3%`) | `0.787 (−5.4pp*) / 0.9976` (`−24.4%`, `[-26.2%, -22.9%]`) | `1.5501` (`−13.1%`, `[-14.4%, -11.8%]`) | `−7.2%` (`[-9.0%, -5.4%]`, `53/64`) | `+4.3% / +5.5%` | `36.3 s / 3.00 GiB` |
+| `123M` | `full_ft` | **`0.1940 ± 0.0004`** | `0.1253 / 0.0812 / 0.0490` (`−18.3%`) | `0.795 (−4.6pp*) / 1.0064` (`−23.7%`, `[-25.6%, -21.4%]`) | `1.5281` (`−14.3%`, `[-15.7%, -12.9%]`) | **`−8.3%`** (`[-10.2%, -6.4%]`, `54/64`, `6/6` blk) | `+2.0% / +2.5%` | `28.9 s / 3.13 GiB` |
+| `209M` | `zero_shot` | `0.2230` | `0.1482 / 0.1034 / 0.0681` | `0.832 / 1.3999` | `1.8508` | `+5.5%` | `+0.0%` | — |
+| `209M` | `head_only` | `0.2103 ± 0.0001` | `0.1381 / 0.0909 / 0.0563` (`−12.0%`) | `0.799 (−3.3pp*) / 1.1332` (`−19.1%`, `[-20.1%, -17.9%]`) | `1.6819` (`−9.1%`, `[-10.2%, -8.0%]`) | `−0.5%` (`[-2.4%, +1.2%]`, `30/64`) | `+6.6% / +7.3%` | `14.7 s / 0.93 GiB` |
+| `209M` | `lora_variate` | `0.1960 ± 0.0024` | `0.1269 / 0.0828 / 0.0506` (`−19.9%`) | `0.766 (−6.6pp*) / 0.9993` (`−28.6%`, `[-31.4%, -26.0%]`) | `1.5511` (`−16.2%`, `[-18.2%, -14.1%]`) | `−7.3%` (`[-9.6%, -4.6%]`, `53/64`) | `−0.3% / +0.2%` | `44.2 s / 3.84 GiB` |
+| `209M` | `lora_temporal` | `0.1946 ± 0.0009` | `0.1259 / 0.0819 / 0.0496` (`−20.8%`) | `0.784 (−4.8pp*) / 0.9989` (`−28.6%`, `[-31.1%, -25.1%]`) | `1.5378` (`−16.9%`, `[-18.5%, -15.4%]`) | `−8.0%` (`[-9.8%, -6.1%]`, `56/64`) | `+2.9% / +4.6%` | `51.2 s / 4.51 GiB` |
+| `209M` | `full_ft` | **`0.1920 ± 0.0002`** | `0.1234 / 0.0797 / 0.0479` (**`−22.9%`**) | `0.792 (−4.0pp*) / 1.0123` (`−27.7%`, `[-29.7%, -25.4%]`) | `1.5104` (**`−18.4%`**, `[-19.9%, -16.9%]`) | **`−9.2%`** (`[-10.9%, -7.5%]`, `59/64`, `6/6` blk) | `+1.0% / +1.7%` | `35.9 s / 4.91 GiB` |
+
+*\*Coverage-match note:* On retail, only **`28M`** (`+1.2 pp` to `+4.3 pp` higher coverage than released + CQR) and **`5M`** (`−1.0 pp` to `−2.0 pp`, borderline for `full_ft`) satisfy the pre-registered `within 2 pp` equal-coverage condition. Released `123M` (`84.1%`) and `209M` (`83.2%`) over-covered while fine-tuned CQR landed near nominal `79%–80%`, giving up `4.0–6.6 pp` of coverage and failing the equal-coverage width condition; the proper CQR Winkler score (`−13.1%` to `−18.4%`, all CIs `< 0`) measures the net interval-quality gain cleanly across coverage differences.
+
+#### Realised volatility — strict post-release (`2026-11-03`..`20`, 3 blocks / 153 windows) & extended 2026 (`49` blocks / `2,499` windows)
+
+These two splits evaluate the same 51-equity volatility series over overlapping windows (the 3-block post-release split is the tail of the 49-block 2026 holdout).
+- **Post-release (`3` blocks)** baselines: `seasonal_naive` (`0.2967`), `classical_domain` (`log1p, alpha=100`: `0.2327`), Revision-3 `gbt_tuned` (`raw, leaves=31, min_leaf=30, lr=0.02, l2=10.0, median_best_iter=300`, `71` grid configs, zero boundary hits: **`wQL 0.2104`**, `wink80 0.0118`, CQR `cov80 0.689 / w80 0.0055`; 4-thread CPU single-model fit `510 s`, grid tune `1,273 s`).
+- **10-month 2026 (`49` blocks, mostly pre-release)** baselines: `seasonal_naive` (`0.2639`), `classical_domain` (`log1p, alpha=100`: `0.1926`), Revision-3 `gbt_tuned` (`raw, leaves=31, min_leaf=30, lr=0.02, l2=0.0, median_best_iter=720`, `85` grid configs: `wQL 0.1928`, `wink80 0.0097`, CQR `cov80 0.802 / w80 0.0052`; 4-thread CPU single-model fit `413 s`, grid tune `1,229 s`).
+
+| Split | Size | Mode | wQL (`mean ± std`) | `Δpb90` vs ZS (series CI) | CQR 80% cov (`Δcov`) / width (`Δw80`, 3-seed CI) | CQR 80% Winkler (`Δ` vs ZS+CQR, CI) | `ΔwQL` vs `gbt_tuned` (series 95% CI, wins) | Macro Forg (`mean / worst`) | GPU Time / VRAM |
+|---|---|---|---:|---|---|---|---|---:|---|
+| **Post-rel** | `5M` | `zero_shot` | `0.2360` | — | `0.689 / 0.0063` | `0.0136` | `+12.2%` | `+0.0%` | — |
+| **Post-rel** | `5M` | `full_ft` | `0.2199 ± 0.0006` | `−5.2%` (`[-8.7%, -1.6%]`) | `0.730 (+4.1pp) / 0.0062` (`−2.4%`, `[-4.9%, -0.2%]`) | `0.0129` (`−5.3%`, `[-8.3%, -2.2%]`) | `+4.5%` (`[+0.9%, +8.3%]`, `15/51`) | `−1.0% / −0.5%` | `14.7 s / 0.36 GiB` |
+| **Post-rel** | `28M` | `zero_shot` | `0.2293` | — | `0.712 / 0.0065` | `0.0134` | `+9.0%` | `+0.0%` | — |
+| **Post-rel** | `28M` | `lora_temporal` | `0.2171 ± 0.0016` | `−6.4%` (`[-10.1%, -2.3%]`) | `0.718 (+0.5pp) / 0.0059` (`−9.8%`, `[-13.8%, -5.6%]`) | `0.0126` (`−5.9%`, `[-9.2%, -2.5%]`) | `+3.2%` (`[-0.8%, +7.5%]`, `18/51`) | `−1.5% / −0.6%` | `25.0 s / 0.78 GiB` |
+| **Post-rel** | `28M` | `full_ft` | **`0.2161 ± 0.0012`** | `−6.9%` (`[-10.6%, -2.7%]`) | `0.720 (+0.8pp) / 0.0059` (`−10.3%`, `[-15.0%, -5.0%]`) | `0.0125` (`−6.6%`, `[-10.0%, -3.1%]`) | `+2.7%` (`[-1.5%, +7.3%]`, `19/51`) | `−0.7% / −0.2%` | `21.1 s / 1.21 GiB` |
+| **Post-rel** | `123M` | `zero_shot` | `0.2201` | — | `0.735 / 0.0066` | `0.0128` | `+4.6%` | `+0.0%` | — |
+| **Post-rel** | `123M` | `lora_variate` | **`0.2119 ± 0.0002`** | `−2.5%` (`[-6.5%, +2.3%]`) | `0.739 (+0.3pp) / 0.0061` (`−7.4%`, `[-14.7%, -0.3%]`) | `0.0123` (`−3.4%`, `[-7.0%, +0.4%]`) | `+0.7%` (`[-2.9%, +4.6%]`, `23/51`) | `−1.2% / −1.0%` | `33.2 s / 2.00 GiB` |
+| **Post-rel** | `123M` | `full_ft` | `0.2121 ± 0.0013` | `−1.8%` (`[-6.8%, +3.8%]`) | `0.733 (−0.2pp) / 0.0057` (`−12.6%`, `[-16.8%, -8.4%]`) | `0.0123` (`−3.6%`, `[-7.6%, +0.4%]`) | `+0.8%` (`[-3.3%, +5.2%]`, `26/51`) | `−1.1% / −1.0%` | `37.1 s / 2.75 GiB` |
+| **Post-rel** | `209M` | `zero_shot` | `0.2201` | — | `0.736 / 0.0064` | `0.0131` | `+4.6%` | `+0.0%` | — |
+| **Post-rel** | `209M` | `lora_temporal` | **`0.2106 ± 0.0028`** | `−6.8%` (`[-12.3%, -0.1%]`) | `0.722 (−1.4pp) / 0.0059` (`−7.9%`, `[-12.3%, -2.8%]`) | `0.0121` (`−7.5%`, `[-11.7%, -2.4%]`) | `+0.1%` (`[-4.5%, +5.2%]`, `24/51`) | `−0.0% / +0.5%` | `53.7 s / 3.60 GiB` |
+| **Post-rel** | `209M` | `full_ft` | `0.2128 ± 0.0012` | `−4.8%` (`[-9.3%, +1.1%]`) | `0.718 (−1.8pp) / 0.0059` (`−8.9%`, `[-14.2%, -3.8%]`) | `0.0122` (`−6.3%`, `[-9.7%, -2.1%]`) | `+1.1%` (`[-3.2%, +5.8%]`, `22/51`) | `−1.3% / −1.0%` | `46.2 s / 4.37 GiB` |
+| **2026 10m** | `5M` | `zero_shot` | `0.1971` | — | `0.788 / 0.0056` | `0.0098` | `+2.2%` | `+0.0%` | — |
+| **2026 10m** | `5M` | `full_ft` | **`0.1854 ± 0.0002`** | `−4.2%` (`[-5.2%, -3.1%]`) | `0.798 (+1.0pp) / 0.0054` (`−2.8%`, `[-4.0%, -1.6%]`) | `0.0094` (`−4.3%`, `[-5.2%, -3.3%]`) | **`−3.9%`** (`[-5.6%, -2.1%]`, `34/51`, `32/49` blk) | `−1.1% / −0.5%` | `13.5 s / 0.36 GiB` |
+| **2026 10m** | `28M` | `zero_shot` | `0.1926` | — | `0.783 / 0.0055` | `0.0097` | `−0.1%` | `+0.0%` | — |
+| **2026 10m** | `28M` | `lora_temporal` | `0.1818 ± 0.0002` | `−4.5%` (`[-5.8%, -3.0%]`) | `0.806 (+2.3pp) / 0.0054` (`−0.7%`, `[-3.4%, +1.9%]`) | `0.0092` (`−5.1%`, `[-6.0%, -4.0%]`) | **`−5.7%`** (`[-7.5%, -3.9%]`, `42/51`, `39/49` blk) | `+0.4% / +2.0%` | `22.9 s / 0.78 GiB` |
+| **2026 10m** | `28M` | `full_ft` | **`0.1812 ± 0.0007`** | `−5.3%` (`[-7.1%, -3.8%]`) | `0.802 (+1.9pp) / 0.0053` (`−3.1%`, `[-6.8%, +0.5%]`) | `0.0091` (`−5.8%`, `[-7.1%, -4.8%]`) | **`−6.0%`** (`[-7.9%, -4.2%]`, `44/51`, `37/49` blk) | `−0.3% / +0.0%` | `19.5 s / 1.21 GiB` |
+
+*Paired vs `gbt_tuned` on volatility:* **the two volatility windows disagree.** On the 49-block 10-month 2026
+holdout (mostly pre-release), `28M full_ft` (`0.1812`) beats `gbt_tuned` (`0.1928`) by `−6.0%` (`series CI [-7.9%, -4.2%]`,
+`time CI [-8.6%, -3.3%]`). On the 3-block post-release tail (`2026-11-03..20`), `gbt_tuned` (`0.2104`) is ahead of
+`5M` (`+4.5%`, `[+0.9%, +8.3%]`) and not statistically separable on wQL from `28M` (`+2.7%`, `[-1.5%, +7.3%]`; GBT leads
+`28M` on CQR Winkler by `+7.2%`, `[+0.2%, +15.1%]`), `123M` (`+0.7%`), and `209M` (`+0.1%`). On 10-month volatility,
+CQR width narrowing for `28M full_ft` (`−3.1%`) has a 3-seed cluster+seed CI of `[-6.8%, +0.5%]` (not distinguishable
+from zero; the gain is instead `+1.9 pp` coverage and `−5.8%` Winkler score). Full rows for every mode are in
+`wp1_decision_metrics.json`.
+
+#### Cross-size paired 95% CIs (3-seed cluster+seed): fine-tuned `5M` vs larger sizes as released
+
+| Dataset | Comparison | `ΔwQL` (series 95% CI, wins) | Time-block 95% CI on `ΔwQL` | CQR `Δwidth_80` (series 95% CI) |
+|---|---|---|---|---|
+| **Retail** | `5M full_ft` vs `28M ZS` | **`−8.1%`** (`[-9.2%, -7.1%]`, `62/64`) | `[-11.0%, -5.3%]` | `−14.2%` (`[-15.6%, -12.7%]`) |
+| **Retail** | `5M full_ft` vs `123M ZS` | **`−6.8%`** (`[-7.8%, -5.8%]`, `63/64`) | `[-10.1%, -4.3%]` | `−18.4%` (`[-19.8%, -17.0%]`) |
+| **Retail** | `5M full_ft` vs `209M ZS` | **`−9.6%`** (`[-10.7%, -8.6%]`, `64/64`) | `[-13.5%, -6.9%]` | `−23.1%` (`[-24.1%, -22.0%]`) |
+| **Vol (post-rel)** | `5M full_ft` vs `28M ZS` | **`−4.1%`** (`[-7.0%, -1.2%]`, `35/51`) | `[-10.0%, +0.2%]` | `−5.3%` (`[-8.9%, -1.8%]`) |
+| **Vol (post-rel)** | `5M full_ft` vs `123M ZS` | `−0.1%` (`[-3.2%, +3.3%]`, `26/51`) | `[-8.4%, +6.1%]` | `−5.9%` (`[-9.1%, -2.6%]`) |
+| **Vol (post-rel)** | `5M full_ft` vs `209M ZS` | `−0.1%` (`[-2.7%, +2.7%]`, `29/51`) | `[-4.4%, +3.0%]` | `−3.8%` (`[-6.5%, -1.2%]`) |
+| **Vol (2026 10m)** | `5M full_ft` vs `28M ZS` | **`−3.8%`** (`[-4.6%, -2.9%]`, `48/51`) | `[-5.3%, -2.4%]` | `−0.8%` (`[-1.9%, +0.3%]`) |
+
+---
+
+### 6.2 Where the gain levels off: training-length & data-size scaling (`docs/benchmarks/wp2_scaling.json`)
+
+Reproduce:
+
+```bash
+uv run python scripts/benchmarks/run_wp2_scaling.py \
+  --device cuda --bf16 --sizes 5M 28M --seeds 0 1 2 \
+  --output docs/benchmarks/wp2_scaling.json
+```
+
+#### Training length (`max_steps ∈ {200, 500, 1000, 2000}`, validation early stopping `patience=6`, 3 seeds)
+
+| Size | Dataset (ZS wQL) | Mode | `200` steps (`wQL / best / forg / s`) | `500` steps | `1,000` steps | `2,000` steps | Peak VRAM |
+|---|---|---|---|---|---|---|---|
+| `5M` | Retail (`0.2210`) | `lora_temporal` | `0.2036 / 200 / +2.0% / 16s` | `0.2007 / 333 / +4.1% / 38s` | `0.2000 / 400 / +3.5% / 53s` | `0.2004 / 467 / +3.4% / 58s` | `0.33 GiB` |
+| `5M` | Retail (`0.2210`) | `full_ft` | `0.2015 / 187 / +0.6% / 14s` | `0.1987 / 350 / +1.1% / 33s` | `0.1985 / 450 / +1.4% / 49s` | `0.1982 / 450 / +1.6% / 53s` | `0.47 GiB` |
+| `5M` | Volatility (`0.2360`) | `lora_temporal` | `0.2196 / 160 / −0.6% / 19s` | `0.2162 / 317 / +0.8% / 45s` | `0.2133 / 633 / +4.9% / 80s` | `0.2130 / 450 / +4.5% / 68s` | `0.24 GiB` |
+| `5M` | Volatility (`0.2360`) | `full_ft` | `0.2199 / 133 / −1.0% / 16s` | `0.2173 / 317 / −0.3% / 38s` | `0.2186 / 733 / +1.8% / 74s` | `0.2179 / 800 / +3.2% / 84s` | `0.36 GiB` |
+| `28M` | Retail (`0.2193`) | `lora_temporal` | `0.1977 / 133 / +0.5% / 24s` | `0.1971 / 217 / +0.1% / 53s` | `0.1978 / 283 / −0.1% / 67s` | `0.1980 / 317 / +1.4% / 71s` | `1.00 GiB` |
+| `28M` | Retail (`0.2193`) | `full_ft` | `0.1951 / 187 / −1.0% / 20s` | `0.1951 / 217 / −0.7% / 46s` | `0.1959 / 300 / −0.1% / 60s` | `0.1951 / 233 / −0.6% / 53s` | `1.50 GiB` |
+| `28M` | Volatility (`0.2293`) | `lora_temporal` | `0.2171 / 187 / −1.5% / 27s` | `0.2171 / 417 / +1.0% / 63s` | `0.2121 / 383 / +1.7% / 81s` | `0.2159 / 450 / +0.7% / 88s` | `0.78 GiB` |
+| `28M` | Volatility (`0.2293`) | `full_ft` | `0.2161 / 187 / −0.7% / 21s` | `0.2146 / 350 / +1.4% / 51s` | `0.2143 / 350 / +1.9% / 67s` | `0.2152 / 200 / −0.0% / 51s` | `1.21 GiB` |
+
+#### Training data size (`10%`, `30%`, `100%` of training series; identical full `val` & `test`, `max_steps=500`, `patience=5`, 3 seeds)
+
+| Size | Dataset | Mode | `10%` series (`wQL`, `% of full gain`, `forg`) | `30%` series | `100%` series |
+|---|---|---|---|---|---|
+| `5M` | Retail (`6 / 19 / 64` SKUs) | `lora_temporal` | `0.2094` (`−5.2%`, **57%**, `+3.7%`) | `0.2024` (`−8.4%`, **91%**, `+3.4%`) | `0.2005` (`−9.3%`, `+3.9%`) |
+| `5M` | Retail (`6 / 19 / 64` SKUs) | `full_ft` | `0.2075` (`−6.1%`, **61%**, `+1.5%`) | `0.2004` (`−9.3%`, **94%**, `+1.7%`) | `0.1990` (`−10.0%`, `+1.0%`) |
+| `5M` | Volatility (`5 / 15 / 51` stocks) | `lora_temporal` | `0.2205` (`−6.5%`, **78%**, `+1.8%`) | `0.2194` (`−7.0%`, **84%**, `+0.5%`) | `0.2162` (`−8.4%`, `+0.8%`) |
+| `5M` | Volatility (`5 / 15 / 51` stocks) | `full_ft` | `0.2223` (`−5.8%`, **71%**, `−0.9%`) | `0.2204` (`−6.6%`, **80%**, `−0.4%`) | `0.2166` (`−8.2%`, `−0.4%`) |
+| `28M` | Retail (`6 / 19 / 64` SKUs) | `lora_temporal` | `0.2053` (`−6.4%`, **63%**, `−1.6%`) | `0.1996` (`−9.0%`, **89%**, `+2.2%`) | `0.1971` (`−10.1%`, `+0.1%`) |
+| `28M` | Retail (`6 / 19 / 64` SKUs) | `full_ft` | `0.2037` (`−7.1%`, **65%**, `−2.1%`) | `0.1969` (`−10.2%`, **93%**, `−0.6%`) | `0.1951` (`−11.0%`, `−0.7%`) |
+| `28M` | Volatility (`5 / 15 / 51` stocks) | `lora_temporal` | `0.2229` (`−2.8%`, **55%**, `+0.5%`) | `0.2161` (`−5.8%`, **113%**, `−1.4%`) | `0.2176` (`−5.1%`, `+0.1%`) |
+| `28M` | Volatility (`5 / 15 / 51` stocks) | `full_ft` | `0.2229` (`−2.8%`, **41%**, `−0.4%`) | `0.2151` (`−6.2%`, **91%**, `−0.5%`) | `0.2136` (`−6.8%`, `+0.5%`) |
+
+*Takeaway:* `28M` saturates by `200–400` steps (`5M` benefits slightly up to `500` steps); `1,000–2,000` steps
+rarely add `> 1%` beyond `500` and raise forgetting on `5M`. Just `30%` of training series (`15–19` series)
+already captures **`80%–113%`** of the full-data gain, and `10%` (`5–6` series) captures **`41%–78%`** without
+inflating forgetting.
+
+---
+
+### 6.3 Three non-hourly, strictly post-release niche datasets vs tuned GBT (`docs/benchmarks/wp3_unfamiliar_domains.json`, `docs/benchmarks/wp3_screening.json`)
+
+Reproduce screening & WP3:
+
+```bash
+uv run python scripts/benchmarks/screen_wp3_candidates.py --device mps --output docs/benchmarks/wp3_screening.json
+uv run --with scikit-learn==1.6.1 python scripts/benchmarks/run_wp3_unfamiliar.py \
+  --device cuda --bf16 --sizes 28M 5M --seeds 0 1 2 \
+  --precomputed-baselines-dir /tmp/pre_baselines \
+  --output docs/benchmarks/wp3_unfamiliar_domains.json
+```
+
+All three datasets have `CC BY 4.0` licences, pinned Hugging Face Hub revisions, zero missing values or timestamp
+gaps, strictly **post-`2026-10-27`** test targets (zero pretraining contamination on test), and two non-hourly
+sampling rates (`15-minute` and `daily`). On all three datasets, `full_ft` achieved the lowest validation loss
+among the four Timestral modes.
+
+**Screening disclosure (`docs/benchmarks/wp3_screening.json`):** Initial exploratory screening prior to
+pre-registration evaluated zero-shot `28M` against an ad-hoc Ridge baseline on the **test split** rather than
+the validation split; that selection can inflate "beats the released model" on these three datasets (it does
+not favour Timestral against GBT). Re-auditing zero-shot `28M` against the final `run_tuned_classical`
+baseline (`screen_wp3_candidates.py`) shows:
+- `de_power_15m`: validation `+6.5%` (`0.0941` vs `0.0884`, meets `>= 5%` rule on val), test `+15.4%` (`0.1290` vs `0.1117`).
+- `sl_marine_waves_daily`: validation `+8.5%` (`0.0816` vs `0.0752`, meets `>= 5%` rule on val), test `+10.0%` (`0.0979` vs `0.0891`).
+- `india_air_quality_daily`: validation `−4.5%` (`0.1979` vs `0.2071`), test `−0.2%` (`0.2312` vs `0.2315`) — **does not meet the `>= 5%` classical-gap rule** under the final baseline (retained under the niche-domain branch only; an earlier unpenalised screening Ridge without city dummies had scored `0.2163` on test).
+
+| Dataset (rate, test dates, windows) | Method | wQL (`3-seed mean ± std`) | `ΔwQL` vs `gbt_tuned` (3-seed series CI / time CI) | `pb90` (`Δ` vs ZS) | CQR 80% cov / width (`Δw80`) / Winkler (`Δ` vs ZS+CQR) | Macro Forg | Fit / Tune Time |
+|---|---|---:|---|---|---|---|---:|
+| **`de_power_15m`** (15-min, `2026-10-28..11-21`, 10 series × 25 days, MW) | `seasonal_naive` (`s=96`) | `0.4660` | — | `455.34` | `0.832 / 3448.9 / 7582.1` | — | `4.0 s` CPU |
+| | `tso_day_ahead` (ENTSO-E) | `0.1170` | — | `115.53` | `0.812 / 931.2 / 1938.2` | — | `3.8 s` CPU |
+| | `classical_domain` (`raw, a=10`) | `0.1117` | — | `106.94` | `0.828 / 972.8 / 1783.1` | — | `10.5 s` CPU |
+| | `gbt_tuned` (`median_residual, l=7, ml=100, l2=10, it=220`) | **`0.0972`** | baseline (zero boundary hits) | `74.71` | `0.822 / 775.0 / 1357.1` | — | `616 s` fit / `1,054 s` tune CPU |
+| | `28M zero_shot` (+ CQR / ACI) | `0.1290` | `+32.7%` | `98.33` | `0.847 / 1383.1 / 1810.7` (ACI `0.748`) | `+0.0%` | — |
+| | `28M head_only` | `0.1142 ± 0.0005` | `+17.6%` (`[+13.7%, +22.2%]` / `[+7.0%, +29.3%]`) | `82.75` (`−15.8%`) | `0.833 / 1017.2` (`−26.5%`) / `1553.1` (`−14.2%`) | `−1.1%` | `12.4 s` L4 |
+| | `28M lora_variate` | `0.1000 ± 0.0007` | `+3.0%` (`[-1.0%, +8.0%]` / `[-5.0%, +11.6%]`) | `73.25` (`−25.5%`) | `0.838 / 955.3` (`−30.9%`) / `1392.1` (`−23.1%`) | `−2.7%` | `33.2 s` L4 |
+| | `28M lora_temporal` | `0.0999 ± 0.0009` | `+2.8%` (`[-0.8%, +7.1%]` / `[-4.6%, +11.1%]`) | `72.61` (`−26.2%`) | `0.840 / 953.4` (`−31.1%`) / `1381.0` (`−23.7%`) | `−0.4%` | `45.5 s` L4 |
+| | **`28M full_ft`** | `0.0994 ± 0.0006` | **`+2.3%`** (`[-0.9%, +6.4%]` / `[-5.0%, +10.3%]`, `4/10`) | `72.63` (**`−26.1%`**) | `0.834 / 942.2` (**`−31.9%`**) / `1377.1` (**`−23.9%`**; vs GBT `+1.5%`) | `−0.8%` | `39.5 s` L4 |
+| | `5M full_ft` (vs `5M ZS 0.1471`) | `0.1073 ± 0.0008` | `+10.4%` (`[+6.5%, +14.9%]` / `[+0.3%, +22.0%]`) | `83.92` (`−31.6%`) | `0.829 / 1036.2` (`−34.2%`) / `1518.3` (`−29.3%`) | `−0.8%` | `28.3 s` L4 |
+| **`india_air_quality_daily`** (daily, `2026-10-28..11-21`, 50 cities × 5 blocks, µg/m³) | `seasonal_naive` (`s=7`) | `0.3508` | — | `7.23` | `0.540 / 33.96 / 131.00` | — | `1.2 s` CPU |
+| | `classical_domain` (`log1p, a=10`) | `0.2315` | — | `4.25` | `0.763 / 46.45 / 73.54` | — | `17.3 s` CPU |
+| | `gbt_tuned` (`raw, l=15, ml=100, lr=0.1, l2=10, it=360`) | `0.2106` | baseline (zero boundary hits) | `3.95` | `0.727 / 38.74 / 70.01` | — | `183 s` fit / `1,279 s` tune CPU |
+| | `28M zero_shot` (+ CQR / ACI) | `0.2312` | `+9.8%` | `4.28` | `0.698 / 39.08 / 74.08` (ACI `0.770`) | `+0.0%` | — |
+| | `28M head_only` | `0.2201 ± 0.0003` | `+4.5%` (`[+2.4%, +6.6%]` / `[-0.4%, +8.9%]`) | `3.92` (`−8.4%`) | `0.732 / 41.74` (`+6.8%`) / `69.86` (`−5.7%`) | `+20.8%` | `27.7 s` L4 |
+| | `28M lora_variate` | `0.2148 ± 0.0041` | `+2.0%` (`[-1.0%, +5.8%]` / `[-4.0%, +7.7%]`) | `3.83` (`−10.4%`) | `0.737 / 40.47` (`+3.6%`) / `68.71` (`−7.3%`) | `−0.3%` | `40.1 s` L4 |
+| | `28M lora_temporal` | `0.2145 ± 0.0003` | `+1.8%` (`[-0.1%, +3.7%]` / `[-4.8%, +10.5%]`) | `3.70` (`−13.4%`) | `0.739 / 41.49` (`+6.2%`) / `68.56` (`−7.5%`) | `+3.7%` | `54.7 s` L4 |
+| | **`28M full_ft`** | **`0.2104 ± 0.0013`** | **`−0.1%`** (`[-2.1%, +2.2%]` / `[-5.5%, +6.9%]`, `25/50`) | `3.63` (**`−15.0%`**) | `0.743 / 41.46` (`+6.1%`) / `66.91` (`−9.7%`; vs GBT `−4.4%`, `[-7.7%, -0.9%]`) | `+0.9%` | `46.0 s` L4 |
+| | `5M lora_variate` (vs `5M ZS 0.2338`) | `0.2147 ± 0.0009` | `+1.9%` (`[-0.3%, +4.1%]` / `[-2.1%, +6.7%]`) | `3.81` (`−13.5%`) | `0.729 / 39.86` (`+3.1%`) / `69.20` (`−8.3%`) | `+1.1%` | `27.5 s` L4 |
+| **`sl_marine_waves_daily`** (daily, `2026-10-28..11-16`, 16 sites × 5 blocks, m) | `seasonal_naive` (`s=7`) | `0.1924` | — | `0.0619` | `0.753 / 0.888 / 1.522` | — | `0.5 s` CPU |
+| | `classical_domain` (`raw, a=10`) | `0.0891` | — | `0.0454` | `0.856 / 0.632 / 0.716` | — | `9.5 s` CPU |
+| | `gbt_tuned` (`median_residual, l=15, ml=50, l2=1, it=40`) | `0.0798` | baseline (zero boundary hits) | `0.0381` | `0.944 / 0.596 / 0.642` | — | `128 s` fit / `1,005 s` tune CPU |
+| | `28M zero_shot` (+ CQR / ACI) | `0.0979` | `+22.7%` | `0.0436` | `0.878 / 0.640 / 0.738` (ACI `0.841`) | `+0.0%` | — |
+| | `28M head_only` | `0.0920 ± 0.0077` | `+15.3%` (`[+0.7%, +30.7%]` / `[+0.9%, +38.5%]`) | `0.0428` (`−2.0%`) | `0.909 / 0.642` (`+0.4%`) / `0.719` (`−2.5%`) | `+21.6%` | `18.3 s` L4 |
+| | `28M lora_variate` | `0.0862 ± 0.0018` | `+8.0%` (`[-0.3%, +17.0%]` / `[-0.8%, +18.6%]`) | `0.0386` (`−11.5%`) | `0.910 / 0.611` (`−4.4%`) / `0.688` (`−6.7%`) | `+0.4%` | `23.8 s` L4 |
+| | `28M lora_temporal` | `0.0804 ± 0.0010` | `+0.7%` (`[-8.2%, +8.1%]` / `[-16.1%, +15.6%]`) | `0.0351` (`−19.7%`) | `0.947 / 0.606` (`−5.3%`) / `0.673` (`−8.8%`) | `+4.1%` | `39.1 s` L4 |
+| | **`28M full_ft`** | **`0.0758 ± 0.0026`** | **`−5.1%`** (`[-13.3%, +2.9%]` / `[-20.5%, +10.5%]`, `10/16`) | `0.0348` (**`−20.3%`**) | `0.943 / 0.593` (`−7.2%`) / `0.661` (`−10.3%`; vs GBT `+3.0%`, `[-6.1%, +10.5%]`) | `+1.3%` | `35.8 s` L4 |
+| | `5M full_ft` (vs `5M ZS 0.1025`) | `0.0825 ± 0.0036` | `+3.3%` (`[-5.2%, +12.6%]` / `[-12.6%, +14.7%]`) | `0.0374` (`−18.9%`) | `0.926 / 0.601` (`−9.5%`) / `0.674` (`−13.2%`) | `+1.9%` | `25.1 s` L4 |
+
+*Notes on GBT target transform, cross-machine spread, `a69_da` look-ahead, wall times & practical conclusion:*
+`baselines.py` (Revision 3) selects `target_transform ∈ {"raw", "context_norm", "median_residual"}` strictly
+on `splits.val` (45 Stage-1 configs at `l2=0.0` to avoid scikit-learn's `loss="quantile"` split freeze on
+zero-inflated targets, plus Stage-2 refinement across `l2 ∈ {0, 1, 10, 50}` and leaf neighbours; `71–85` total
+configs). Running the same `HistGradientBoostingRegressor` code across CPU architectures (macOS arm64 vs Linux
+x86_64) exhibits up to `~0.4%` relative wQL spread from histogram/floating-point tie-breaking; all six committed
+Revision-3 baselines come from one uniform x86_64 machine (`g2-standard-32`). On `de_power_15m` (`10.2%` exact
+`0 MW` training targets; `19.6%` val, `23.9%` test), `median_residual` won validation cleanly (`val_wql_21q =
+0.0805`) and reached test `wQL = 0.0972` with zero boundary hits; on `sl_marine_waves_daily`, `median_residual`
+likewise won validation (`val_wql_21q = 0.0763`) and reached test `wQL = 0.0798` (zero boundary hits).
+Because fine-tuned Timestral (`28M` and `5M`) only ties or loses to tuned GBT across all four clean
+post-release slices (`de_power_15m`, `india_air_quality_daily`, `sl_marine_waves_daily`, and the 18-day
+post-release volatility tail — with `5M` trailing GBT significantly on three of the four by `+3.4%` to `+10.4%`),
+**gradient boosting is the better practical choice for those domains** under the pre-registered protocol.
+For `de_power_15m`, ENTSO-E `a69_da` day-ahead forecasts are published by 18:00 CET/CEST on D−1 for the German
+CET/CEST delivery day; under `00:00 UTC` origins, the final 4 winter (`23:00–23:45 UTC`) / 8 summer steps
+belong to day D+1's publication at 17:00/16:00 UTC on day D — meaning **for the last hour of each winter window
+(last two hours in summer), every method (Timestral and all baselines alike) sees a day-ahead forecast not yet
+published at the `00:00 UTC` forecast origin** (source parquets lack publication timestamps; all methods receive
+the exact same `da_mw` array). Timestral training times are single L4 GPU runs at previously swept defaults
+(`docs/BENCHMARKS.md` §2) whereas GBT fit and tune times are 4-thread CPU runs (`scikit-learn==1.6.1`), so wall
+times are reported directly without cross-hardware speed ratios.
+
+*Cross-size on WP3 (`5M full_ft` 3-seed vs released `28M`):* `5M full_ft` beats `28M zero_shot` on all three
+post-release domains by series: `−16.8%` on `de_power_15m` (`[-20.1%, -12.6%]`, `time CI [-20.8%, -12.5%]`, `10/10`),
+`−5.8%` on `india_air_quality_daily` (`[-8.3%, -3.0%]`, `time CI [-12.9%, +2.4%]`, `42/50`), and `−15.8%` on
+`sl_marine_waves_daily` (`[-23.2%, -10.3%]`, `time CI [-34.8%, +4.0%]`, `15/16`).
+
+---
+
+### 6.4 Retail covariate ablation (`docs/benchmarks/wp4_covariate_ablation.json`)
+
+Reproduce:
+
+```bash
+uv run python scripts/benchmarks/run_wp4_breadth_serving.py \
+  --run-ablation --device cuda --bf16 --sizes 5M 28M --seeds 0 1 2 \
+  --ablation-output docs/benchmarks/wp4_covariate_ablation.json
+```
+
+| Size | Mode | With covariates (3 past + 5 known) | No covariates (univariate) | `cov − uni` `ΔwQL` (3-seed series 95% CI, SKUs improved) |
+|---|---|---:|---:|---|
+| `5M` | `zero_shot` | `0.2210` | `0.2208` | `+0.1%` (`[-0.4%, +0.6%]`, `31/64`) |
+| `5M` | `head_only` | `0.2098 ± 0.0001` | `0.2122 ± 0.0001` | `−1.2%` (`[-1.5%, -0.8%]`, `51/64`) |
+| `5M` | `lora_variate` | `0.2027 ± 0.0009` | — *(T10 single-row guard)* | — |
+| `5M` | `lora_temporal` | `0.2036 ± 0.0012` | `0.2068 ± 0.0004` | `−1.5%` (`[-2.6%, -0.7%]`, `49/64`) |
+| `5M` | `full_ft` | `0.2015 ± 0.0005` | `0.2058 ± 0.0002` | **`−2.1%`** (`[-2.8%, -1.4%]`, `54/64`) |
+| `28M` | `zero_shot` | `0.2193` | `0.2185` | `+0.4%` (`[-0.0%, +0.8%]`, `19/64`) |
+| `28M` | `head_only` | `0.2071 ± 0.0000` | `0.2099 ± 0.0001` | `−1.3%` (`[-1.7%, -1.0%]`, `52/64`) |
+| `28M` | `lora_variate` | `0.1979 ± 0.0010` | — *(T10 single-row guard)* | — |
+| `28M` | `lora_temporal` | `0.1977 ± 0.0001` | `0.2026 ± 0.0007` | `−2.4%` (`[-3.2%, -1.6%]`, `58/64`) |
+| `28M` | `full_ft` | `0.1951 ± 0.0004` | `0.2003 ± 0.0005` | **`−2.6%`** (`[-3.3%, -1.8%]`, `56/64`) |
+
+*Finding:* As released, the 8 retail covariates add zero accuracy (`+0.1%` / `+0.4%`); fine-tuning delivers
+both a large univariate temporal adaptation (`−6.8%` on `5M`, `−8.3%` on `28M`) and unlocks an additional
+`−2.2%` to `−2.6%` (`55/64` SKUs) from the covariates.
+
+---
+
+### 6.5 Serving latency & throughput (`docs/benchmarks/wp4_inference_latency_{cuda_cpu,apple}.json`)
+
+Reproduce:
+
+```bash
+uv run python scripts/benchmarks/run_wp4_breadth_serving.py \
+  --run-latency --latency-devices cuda cpu --sizes 5M 28M 123M 209M \
+  --latency-output docs/benchmarks/wp4_inference_latency_cuda_cpu.json
+```
+
+All rows measure upstream `TimestralForecaster.forecast()` with its default `symmetric_averaging=True`
+(`symmetric_averaging=False` is roughly 2× faster and also recorded in the JSONs). Both CPU rows used
+PyTorch's unthrottled default `torch.get_num_threads()` (physical/performance core count: `2` threads on
+`g2-standard-4`'s 4 vCPUs / 2 Hyper-Threaded Intel Cascade Lake cores; `4` threads on Apple M4's 4
+performance cores).
+
+| Hardware & precision | Workload (`ctx=256, H=48, cov=8`) | `5M` (`p50 ms`, `ser/s`, `VRAM`) | `28M` (`speed-up of 5M`) | `123M` (`speed-up of 5M`) | `209M` (`speed-up of 5M`) |
+|---|---|---|---|---|---|
+| **NVIDIA L4 `bf16`** | `B=1` (interactive) | `44.1 ms` · `22.7/s` · `0.03 GiB` | `56.9 ms` (`1.3×`) · `0.12 GiB` | `81.5 ms` (`1.8×`) · `0.48 GiB` | `92.5 ms` (`2.1×`) · `0.81 GiB` |
+| **NVIDIA L4 `bf16`** | `B=16` | `44.1 ms` · `362.8/s` · `0.06 GiB` | `56.8 ms` (`1.3×`) · `0.18 GiB` | `103.2 ms` (`2.3×`) · `0.58 GiB` | `151.8 ms` (`3.4×`) · `0.92 GiB` |
+| **NVIDIA L4 `bf16`** | `B=64` (throughput) | `70.3 ms` · **`910.6/s`** · `0.30 GiB` | `179.1 ms` (**`2.5×`**) · `0.63 GiB` | `552.7 ms` (**`7.9×`**) · `1.32 GiB` | `837.7 ms` (**`11.9×`**) · `1.81 GiB` |
+| **NVIDIA L4 `fp32`** | `B=64` (upstream default) | `99.5 ms` · **`643.4/s`** · `0.30 GiB` | `333.0 ms` (**`3.3×`**) · `0.62 GiB` | `1,225.5 ms` (**`12.3×`**) · `1.29 GiB` | `1,877.4 ms` (**`18.9×`**) · `1.78 GiB` |
+| **x86 CPU `fp32`** (2 th) | `B=1` | `53.4 ms` · `18.7/s` | `152.4 ms` (`2.9×`) | `534.1 ms` (`10.0×`) | `869.4 ms` (`16.3×`) |
+| **x86 CPU `fp32`** (2 th) | `B=16` | `473.1 ms` · **`33.8/s`** | `1,818.1 ms` (**`3.8×`**) | `7,080.2 ms` (**`15.0×`**) | `11,549.5 ms` (**`24.4×`**) |
+| **Apple M4 CPU `fp32`** | `B=16` | `198.5 ms` · **`80.6/s`** | `717.6 ms` (**`3.6×`**) | `2,291.6 ms` (**`11.5×`**) | `3,482.2 ms` (**`17.5×`**) |
+| **Apple M4 MPS `fp32`** | `B=64` | `440.7 ms` · **`145.2/s`** · `1.13 GiB` | `1,318.3 ms` (**`3.0×`**) · `1.17 GiB` | `7,922.3 ms` (**`18.0×`**) · `2.63 GiB` | `11,069.1 ms` (**`25.1×`**) · `2.67 GiB` |
+
