@@ -3250,7 +3250,7 @@ def _t15j_cases() -> list[tuple[str, str, str, str, str]]:
     cases: list[tuple[str, str, str, str, str]] = []
     # Full 3x3x2 matrix on non-multiple wrapping replay with unequal M_r / W_r, zero-scored & empty domain ranks,
     # plus short replay (< N*b and < N: wraps every step, empty replay rank).
-    # `full_ft` + distillation in float32 is covered by `test_t15_j_full_ft_distill_float32` below: strict 1e-4
+    # `full_ft` + distillation in float32 is covered by `test_t15_j_full_ft_distill_float32` below: float32-tier
     # parity from a moved student (where one-process reproduces itself) plus cross-rank bitwise equality from an
     # identical student/teacher start (see `scripts/probes/linear_requires_grad_dispatch.py`).
     for dt in ("float64", "float32"):
@@ -3296,9 +3296,9 @@ def test_t15_j_replay_and_distillation_trajectory_parity(world_size: int, _t15_p
     """T15(j). Stage 2 multi-process `fit()` trajectory parity against one-process `fit()` at
     `(N * B, N * b)` across `replay_only`, `distill_only`, and `both`, across `head_only`, `full_ft`,
     and `lora_variate`, in `float64` (`1e-10`, including `full_ft` distillation from identical start)
-    and `float32` (`1e-4`), with unequal domain counts, zero-scored and empty domain ranks, wrapping
-    non-multiple replay (`len = N*b + N + 1` with unequal non-zero `M_r`), and short replay
-    (`len = N - 1 < N*b` with an empty replay rank).
+    and `float32` (`1e-4`; `1e-3` on `param_update`), with unequal domain counts, zero-scored and empty
+    domain ranks, wrapping non-multiple replay (`len = N*b + N + 1` with unequal non-zero `M_r`), and
+    short replay (`len = N - 1 < N*b` with an empty replay rank).
     """
     outcomes = _t15_pool("j", world_size)
 
@@ -3448,12 +3448,13 @@ def test_t15_j_full_ft_distill_float32(world_size: int, _t15_pool: Any) -> None:
             )
 
         # 2. Identical student/teacher start at float32: assert cross-rank bitwise equality and
-        #    identical TrainingResult/losses across ranks. The 1e-4 one-process parity tier is not
+        #    identical TrainingResult/losses across ranks. One-process float32 parity is not
         #    asserted here because one-process itself disagrees across cached vs live or split
         #    batch sizes at step 0 due to PyTorch's non-contiguous `F.linear` dispatch on
         #    `requires_grad=True` vs `False` weights (`scripts/probes/linear_requires_grad_dispatch.py`),
-        #    amplified by `1 / smooth_beta`; that kernel dispatch varies by PyTorch version and CPU
-        #    BLAS backend so identical-start parity is verified at float64 above instead.
+        #    amplified by `1 / smooth_beta`; that dispatch difference varies by PyTorch version and by
+        #    platform and CPU (`docs/VERIFICATION.md` §17.2), so identical-start parity is verified at
+        #    float64 above instead.
         ident_label = f"{label}_identical"
         ident_outs = unwrap_results(outcomes[ident_label])
         r0_i = ident_outs[0]
