@@ -1346,3 +1346,83 @@ def test_prepare_batch_helpers_and_fit_bookkeeper(tiny_forecaster):
     follower.apply_best_summary(0.49, 1)
     assert follower.restore_best_weights(2, [param], non_blocking=False) is False
     assert follower.build_result(2, restored_best=True).best_eval_loss == 0.49
+
+
+def test_run_fit_loop_drives_custom_non_primary_strategy(tiny_forecaster):
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    train, val = dataset.split_by_time(12 * tiny_forecaster.patch_size)
+    trainer = TimestralTrainer(
+        config_for(batch_size=4, max_steps=3, eval_every=2),
+        train,
+        val,
+        model=fresh_model(tiny_forecaster),
+    )
+
+    events: list[str] = []
+
+    class _FollowerStrategy:
+        is_primary = False
+
+        def prepare_fit(self) -> None:
+            events.append("prepare_fit")
+
+        def on_fit_start(self) -> None:
+            events.append("on_fit_start")
+
+        def iter_epoch_steps(self, epoch: int):
+            events.append(f"epoch:{epoch}")
+            if epoch == 0:
+                yield trainer_module._StepOutcome(skipped=True)
+                yield trainer_module._StepOutcome(skipped=False, loss=1.0, learning_rate=1e-3)
+                yield trainer_module._StepOutcome(skipped=False, loss=0.8, learning_rate=1e-3)
+            else:
+                yield trainer_module._StepOutcome(skipped=False, loss=0.6, learning_rate=1e-3)
+
+        def on_step_end(self, step: int, loss: float, learning_rate: float) -> float:
+            events.append(f"step_end:{step}")
+            # Simulate rank-0 broadcast returning an authoritative loss value.
+            return loss + 0.01
+
+        def evaluate_val(self) -> EvalResult:
+            events.append("evaluate_val")
+            return EvalResult(loss=0.5, scored_positions=10, batches=2)
+
+        def on_evaluate(self, step: int, result: EvalResult) -> float:
+            events.append(f"on_evaluate:{step}")
+            return 0.42 if step == 2 else 0.55
+
+        def finalize_best(self, bookkeeper, current_step: int) -> bool:
+            events.append(f"finalize_best:{current_step}")
+            # Non-primary bookkeeper must not have compared or snapshotted weights locally.
+            assert bookkeeper.best_eval_loss is None and bookkeeper._best_state is None
+            bookkeeper.apply_best_summary(0.42, 2)
+            return True
+
+        def on_fit_end(self, result) -> None:
+            events.append("on_fit_end")
+
+        def cleanup(self) -> None:
+            events.append("cleanup")
+
+    result = trainer._run_fit_loop(_FollowerStrategy())
+    assert result.steps == 3 and result.epochs == 2 and result.skipped_batches == 1
+    assert result.train_history == [(1, 1.01), (2, 0.81), (3, 0.61)]
+    assert result.eval_history == [(2, 0.42), (3, 0.55)]
+    assert result.best_eval_loss == 0.42 and result.best_step == 2 and result.restored_best is True
+    assert not result.stopped_early and not trainer.model.training
+    assert events == [
+        "prepare_fit",
+        "on_fit_start",
+        "epoch:0",
+        "step_end:1",
+        "step_end:2",
+        "evaluate_val",
+        "on_evaluate:2",
+        "epoch:1",
+        "step_end:3",
+        "evaluate_val",
+        "on_evaluate:3",
+        "cleanup",
+        "finalize_best:3",
+        "on_fit_end",
+    ]

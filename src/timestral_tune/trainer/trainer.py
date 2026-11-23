@@ -16,7 +16,7 @@ import math
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import torch
 from torch import Tensor
@@ -338,6 +338,153 @@ class _FitBookkeeper:
             train_history=self.train_history,
             eval_history=self.eval_history,
         )
+
+
+@dataclass(frozen=True)
+class _StepOutcome:
+    """Outcome of one loop iteration yielded by a `_FitStrategy`."""
+
+    skipped: bool
+    loss: float = 0.0
+    learning_rate: float = 0.0
+
+
+class _FitStrategy(Protocol):
+    """Execution strategy plugged into `TimestralTrainer._run_fit_loop`.
+
+    Separates execution mechanics (seeding, loaders, per-epoch step execution, validation,
+    callback dispatch and status/loss synchronisation, best-weight restore/broadcast, cleanup)
+    from the shared epoch, step, and evaluation loop skeleton.
+    """
+
+    @property
+    def is_primary(self) -> bool:
+        """Whether this process owns best-loss tracking and summary logging (True in 1-process and rank 0)."""
+        ...
+
+    def prepare_fit(self) -> None:
+        """Seed RNGs, attach per-fit flip generators, and construct training/replay loaders."""
+        ...
+
+    def on_fit_start(self) -> None:
+        """Run `on_fit_start` callbacks (and sync stop/error status across ranks)."""
+        ...
+
+    def iter_epoch_steps(self, epoch: int) -> Iterator[_StepOutcome]:
+        """Yield one `_StepOutcome` per loop iteration in 0-based `epoch`."""
+        ...
+
+    def on_step_end(self, step: int, loss: float, learning_rate: float) -> float:
+        """Run `on_step_end` callbacks (and broadcast `[status, loss]`); return authoritative `loss`."""
+        ...
+
+    def evaluate_val(self) -> EvalResult:
+        """Evaluate `val_dataset` for `fit()` (rank-local in 1-process, sharded in multi-process)."""
+        ...
+
+    def on_evaluate(self, step: int, result: EvalResult) -> float:
+        """Run `on_evaluate` callbacks (and sync status/loss); return authoritative `result.loss`."""
+        ...
+
+    def finalize_best(self, bookkeeper: _FitBookkeeper, current_step: int) -> bool:
+        """Restore best weights if warranted (and broadcast summary/weights); return `restored_best`."""
+        ...
+
+    def on_fit_end(self, result: TrainingResult) -> None:
+        """Run `on_fit_end` callbacks (rank 0 only in multi-process mode)."""
+        ...
+
+    def cleanup(self) -> None:
+        """Release per-fit state inside `fit()`'s `finally:` block."""
+        ...
+
+
+class _SingleProcessStrategy:
+    """Default one-process execution strategy for `TimestralTrainer._run_fit_loop`."""
+
+    def __init__(self, trainer: TimestralTrainer) -> None:
+        self._trainer = trainer
+        self._flip_generator: torch.Generator | None = None
+        self._replay_flip_generator: torch.Generator | None = None
+        self._loader: Iterable[TrainingBatch | CachedHeadBatch] | None = None
+        self._replay_iter: Iterator[Any] | None = None
+
+    @property
+    def is_primary(self) -> bool:
+        return True
+
+    def prepare_fit(self) -> None:
+        trainer = self._trainer
+        config = trainer.config
+        torch.manual_seed(config.seed)
+        self._flip_generator = torch.Generator().manual_seed(config.seed + 1_000_003) if config.sign_flip else None
+        trainer._fit_flip_generator = self._flip_generator
+        self._replay_flip_generator = (
+            torch.Generator().manual_seed(config.seed + 3_000_007) if trainer._replay_sign_flip else None
+        )
+        trainer._replay_flip_generator = self._replay_flip_generator
+        self._loader = trainer._loader(trainer.train_dataset, training=True)
+        self._replay_iter = _cycle_loader(trainer._replay_loader()) if trainer.replay_config is not None else None
+
+    def on_fit_start(self) -> None:
+        for callback in self._trainer.callbacks:
+            callback.on_fit_start(self._trainer)
+
+    def iter_epoch_steps(self, epoch: int) -> Iterator[_StepOutcome]:
+        del epoch
+        assert self._loader is not None
+        trainer = self._trainer
+        for batch in self._loader:
+            prepared = trainer._prepare_domain_batch(batch, self._flip_generator)
+            if prepared is None:
+                yield _StepOutcome(skipped=True)
+                continue
+            prepared_replay = (
+                trainer._prepare_replay_batch(next(self._replay_iter), self._replay_flip_generator)
+                if self._replay_iter is not None
+                else None
+            )
+            learning_rate = trainer.optimizer.param_groups[0]["lr"]
+            loss = trainer.training_step(
+                prepared.batch,
+                validate=False,
+                replay_batch=None if prepared_replay is None else prepared_replay.batch,
+                replay_real_series=None if prepared_replay is None else prepared_replay.real_series,
+                replay_teacher_quantiles=None if prepared_replay is None else prepared_replay.teacher_quantiles,
+            )
+            yield _StepOutcome(skipped=False, loss=loss, learning_rate=learning_rate)
+
+    def on_step_end(self, step: int, loss: float, learning_rate: float) -> float:
+        for callback in self._trainer.callbacks:
+            callback.on_step_end(self._trainer, step, loss, learning_rate)
+        return loss
+
+    def evaluate_val(self) -> EvalResult:
+        return self._trainer.evaluate()
+
+    def on_evaluate(self, step: int, result: EvalResult) -> float:
+        for callback in self._trainer.callbacks:
+            callback.on_evaluate(self._trainer, step, result)
+        return result.loss
+
+    def finalize_best(self, bookkeeper: _FitBookkeeper, current_step: int) -> bool:
+        return bookkeeper.restore_best_weights(
+            current_step,
+            self._trainer._trainable,
+            non_blocking=self._trainer.device.type == "cuda",
+        )
+
+    def on_fit_end(self, result: TrainingResult) -> None:
+        for callback in self._trainer.callbacks:
+            callback.on_fit_end(self._trainer, result)
+
+    def cleanup(self) -> None:
+        self._trainer._fit_flip_generator = None
+        self._trainer._replay_flip_generator = None
+        self._flip_generator = None
+        self._replay_flip_generator = None
+        self._loader = None
+        self._replay_iter = None
 
 
 def _learning_rate_factor(step: int, warmup_steps: int, total_steps: int, schedule: str) -> float:
@@ -1208,75 +1355,45 @@ class TimestralTrainer:
         self._apply_optimizer_step()
         return loss.item()
 
-    def fit(self) -> TrainingResult:
-        """Train for the configured number of steps and return a summary.
+    def _make_fit_strategy(self) -> _FitStrategy:
+        """Select the execution strategy for `fit()`."""
+        return _SingleProcessStrategy(self)
 
-        With a validation set, evaluation runs every `eval_every` steps (or at the end of each
-        epoch) and once more at the end if the last step was not evaluated.
-
-        Calling `fit` again continues from the current weights and optimiser state with a fresh
-        learning-rate schedule and the same batch order. It seeds PyTorch's global generator.
-        """
+    def _run_fit_loop(self, strategy: _FitStrategy) -> TrainingResult:
+        """Run the shared epoch, step, and evaluation loop skeleton driven by `strategy`."""
         config = self.config
-        torch.manual_seed(config.seed)
         self.scheduler = self._new_schedule()
-        flip_generator = torch.Generator().manual_seed(config.seed + 1_000_003) if config.sign_flip else None
-        self._fit_flip_generator = flip_generator
-        replay_flip_generator = (
-            torch.Generator().manual_seed(config.seed + 3_000_007) if self._replay_sign_flip else None
-        )
-        self._replay_flip_generator = replay_flip_generator
-        loader = self._loader(self.train_dataset, training=True)
-        replay_iter = _cycle_loader(self._replay_loader()) if self.replay_config is not None else None
         self.should_stop = False
         start_step = self.fit_start_step = self.global_step
         final_step = start_step + self.total_steps
         bookkeeper = _FitBookkeeper(
             start_step=start_step,
             final_step=final_step,
-            track_best=True,
-            restore_best=config.restore_best,
+            track_best=strategy.is_primary,
+            restore_best=config.restore_best and strategy.is_primary,
         )
 
         def evaluate_now() -> None:
-            result = self.evaluate()
+            result = strategy.evaluate_val()
             bookkeeper.record_eval(self.global_step, result.loss, self._trainable)
-            for callback in self.callbacks:
-                callback.on_evaluate(self, self.global_step, result)
+            loss = strategy.on_evaluate(self.global_step, result)
+            bookkeeper.set_last_eval_loss(loss)
 
-        non_blocking = self.device.type == "cuda"
-        for callback in self.callbacks:
-            callback.on_fit_start(self)
-        self.model.train()
         try:
+            strategy.prepare_fit()
+            strategy.on_fit_start()
+            self.model.train()
             while self.global_step < final_step and not self.should_stop:
                 bookkeeper.epochs += 1
                 steps_before_epoch = self.global_step
                 skipped_before_epoch = bookkeeper.skipped_batches
-                for batch in loader:
-                    prepared = self._prepare_domain_batch(batch, flip_generator)
-                    if prepared is None:
+                for outcome in strategy.iter_epoch_steps(bookkeeper.epochs - 1):
+                    if outcome.skipped:
                         bookkeeper.skipped_batches += 1
                         continue
-
-                    prepared_replay = (
-                        self._prepare_replay_batch(next(replay_iter), replay_flip_generator)
-                        if replay_iter is not None
-                        else None
-                    )
-
-                    learning_rate = self.optimizer.param_groups[0]["lr"]
-                    loss = self.training_step(
-                        prepared.batch,
-                        validate=False,
-                        replay_batch=None if prepared_replay is None else prepared_replay.batch,
-                        replay_real_series=None if prepared_replay is None else prepared_replay.real_series,
-                        replay_teacher_quantiles=None if prepared_replay is None else prepared_replay.teacher_quantiles,
-                    )
                     self.global_step += 1
+                    loss = strategy.on_step_end(self.global_step, outcome.loss, outcome.learning_rate)
                     bookkeeper.record_step(self.global_step, loss)
-                    for callback in self.callbacks:
-                        callback.on_step_end(self, self.global_step, loss, learning_rate)
                     due = config.eval_every is not None and (self.global_step - start_step) % config.eval_every == 0
                     if self.val_dataset is not None and due:
                         evaluate_now()
@@ -1292,18 +1409,27 @@ class TimestralTrainer:
             if self.val_dataset is not None and bookkeeper.last_evaluated_step != self.global_step:
                 evaluate_now()
         finally:
-            self._fit_flip_generator = None
-            self._replay_flip_generator = None
+            strategy.cleanup()
             self.model.eval()
 
-        restored = bookkeeper.restore_best_weights(self.global_step, self._trainable, non_blocking=non_blocking)
-        if bookkeeper.skipped_batches:
+        restored = strategy.finalize_best(bookkeeper, self.global_step)
+        if bookkeeper.skipped_batches and strategy.is_primary:
             logger.warning("skipped %d training batches that had no scored position", bookkeeper.skipped_batches)
 
         result = bookkeeper.build_result(self.global_step, restored_best=restored)
-        for callback in self.callbacks:
-            callback.on_fit_end(self, result)
+        strategy.on_fit_end(result)
         return result
+
+    def fit(self) -> TrainingResult:
+        """Train for the configured number of steps and return a summary.
+
+        With a validation set, evaluation runs every `eval_every` steps (or at the end of each
+        epoch) and once more at the end if the last step was not evaluated.
+
+        Calling `fit` again continues from the current weights and optimiser state with a fresh
+        learning-rate schedule and the same batch order. It seeds PyTorch's global generator.
+        """
+        return self._run_fit_loop(self._make_fit_strategy())
 
     @torch.no_grad()
     def evaluate(self, dataset: TimeSeriesDataset | None = None) -> EvalResult:
