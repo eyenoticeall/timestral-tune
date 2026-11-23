@@ -10,6 +10,7 @@ import copy
 import dataclasses
 import json
 import logging
+import os
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -1325,15 +1326,31 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
 # --------------------------------------------------------------------------- Persistent DataLoader workers with replay
 
 
+class _PidRecordingDataset(TimeSeriesDataset):
+    """Picklable `TimeSeriesDataset` recording `os.getpid()` for each `__getitem__` call in-process."""
+
+    def __init__(self, base: TimeSeriesDataset) -> None:
+        self.__dict__.update(base.__dict__)
+        self.pids: list[int] = []
+
+    def __getitem__(self, index: int):
+        self.pids.append(os.getpid())
+        return super().__getitem__(index)
+
+
 def _worker_fit_replay_persistent_workers(rank: int, world_size: int) -> dict[str, Any]:
     del rank
-    dom_ds = _make_single_window_dataset(2 * world_size * 2 + 1, seed=101, covariates=True, horizon=DOM_HORIZON)
-    rep_ds = _make_single_window_dataset(world_size * 2 + 1, seed=102, covariates=False, horizon=REP_HORIZON)
-    val_ds = _make_single_window_dataset(world_size * 2 + 1, seed=103, covariates=True, horizon=DOM_HORIZON)
+    main_pid = os.getpid()
+    dom_base = _make_single_window_dataset(2 * world_size * 2 + 1, seed=101, covariates=True, horizon=DOM_HORIZON)
+    rep_base = _make_single_window_dataset(world_size * 2 + 1, seed=102, covariates=False, horizon=REP_HORIZON)
+    val_base = _make_single_window_dataset(world_size * 2 + 1, seed=103, covariates=True, horizon=DOM_HORIZON)
     rcfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.3, batch_size=2, sign_flip=True)
 
-    outputs: dict[str, Any] = {}
+    outputs: dict[str, Any] = {"main_pid": main_pid}
     for workers in (0, 1):
+        dom_ds = _PidRecordingDataset(dom_base)
+        rep_ds = _PidRecordingDataset(rep_base)
+        val_ds = _PidRecordingDataset(val_base)
         cfg = _base_config(
             mode="head_only",
             batch_size=2,
@@ -1348,23 +1365,77 @@ def _worker_fit_replay_persistent_workers(rank: int, world_size: int) -> dict[st
         trainer = TimestralTrainer(
             cfg, dom_ds, val_ds, replay_config=rcfg, replay_dataset=rep_ds, model=_fresh_model(12)
         )
+
+        loader_info: dict[str, Any] = {}
+        real_make = trainer._make_fit_strategy
+
+        def _wrapped_make(info: dict[str, Any] = loader_info, make_fn: Any = real_make) -> Any:
+            strat = make_fn()
+            real_prepare = strat.prepare_fit
+            real_eval = strat.evaluate_val
+
+            def _wrapped_prepare() -> None:
+                real_prepare()
+                assert strat._train_loader is not None and strat._replay_loader is not None
+                info["train_num_workers"] = strat._train_loader.num_workers
+                info["train_persistent"] = strat._train_loader.persistent_workers
+                info["replay_num_workers"] = strat._replay_loader.num_workers
+                info["replay_persistent"] = strat._replay_loader.persistent_workers
+
+            def _wrapped_eval() -> Any:
+                res = real_eval()
+                assert strat._sharded_val_loader is not None
+                info["val_num_workers"] = strat._sharded_val_loader.num_workers
+                info["val_persistent"] = strat._sharded_val_loader.persistent_workers
+                return res
+
+            strat.prepare_fit = _wrapped_prepare  # type: ignore[method-assign]
+            strat.evaluate_val = _wrapped_eval  # type: ignore[method-assign]
+            return strat
+
+        trainer._make_fit_strategy = _wrapped_make  # type: ignore[method-assign]
+        dom_ds.pids.clear()
+        rep_ds.pids.clear()
+        val_ds.pids.clear()
         res = trainer.fit()
         outputs[f"result_w{workers}"] = res
         outputs[f"params_w{workers}"] = _flat_tensors(trainer._trainable)
         outputs[f"training_after_w{workers}"] = trainer.model.training
+        outputs[f"loaders_w{workers}"] = loader_info
+        outputs[f"dom_main_pids_w{workers}"] = list(dom_ds.pids)
+        outputs[f"val_main_pids_w{workers}"] = list(val_ds.pids)
+        outputs[f"rep_main_pids_w{workers}"] = list(rep_ds.pids)
     return outputs
 
 
 @pytest.mark.skipif(WORKERS_HANG_AT_EXIT, reason="PyTorch < 2.8 on macOS: DataLoader worker hangs at process exit")
 def test_distributed_fit_with_replay_and_persistent_workers() -> None:
-    """Multi-process `fit()` with `num_workers=1`, validation, and replay matches `num_workers=0` bitwise."""
+    """With `num_workers=1`, training and validation use workers while replay runs in the main process."""
     results = unwrap_results(
         run_distributed(_worker_fit_replay_persistent_workers, world_size=2, pg_timeout=20.0, wall_timeout=60.0)
     )
     for r in range(2):
+        main_pid = results[r]["main_pid"]
         assert results[r]["training_after_w0"] is False
         assert results[r]["training_after_w1"] is False
         assert results[r]["result_w1"] == results[r]["result_w0"]
         assert torch.equal(results[r]["params_w1"], results[r]["params_w0"])
+        assert results[r]["loaders_w1"] == {
+            "train_num_workers": 1,
+            "train_persistent": True,
+            "val_num_workers": 1,
+            "val_persistent": True,
+            "replay_num_workers": 0,
+            "replay_persistent": False,
+        }
+        # With num_workers=1, train/val __getitem__ ran in worker processes (so main-process lists stay empty),
+        # while replay ran in the main process (matching one-process _replay_loader).
+        assert results[r]["dom_main_pids_w1"] == []
+        assert results[r]["val_main_pids_w1"] == []
+        assert len(results[r]["rep_main_pids_w1"]) > 0
+        assert set(results[r]["rep_main_pids_w1"]) == {main_pid}
+        assert len(results[r]["dom_main_pids_w0"]) > 0 and set(results[r]["dom_main_pids_w0"]) == {main_pid}
+        assert len(results[r]["val_main_pids_w0"]) > 0 and set(results[r]["val_main_pids_w0"]) == {main_pid}
+        assert len(results[r]["rep_main_pids_w0"]) > 0 and set(results[r]["rep_main_pids_w0"]) == {main_pid}
     assert results[1]["result_w1"] == results[0]["result_w1"]
     assert torch.equal(results[1]["params_w1"], results[0]["params_w1"])

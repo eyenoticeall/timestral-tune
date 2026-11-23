@@ -771,23 +771,26 @@ class TimestralTrainer:
         batch_sampler: Sampler[list[int]] | None = None,
         indices: Sequence[int] | None = None,
         bucket_to_max: int | None = None,
+        num_workers: int | None = None,
     ) -> DataLoader:
         """Build a `DataLoader` over `dataset` (or an index `Subset`) with a model-matched `DHFDataCollator`.
 
-        When `config.num_workers > 0`, enables `persistent_workers=True`, so each distinct loader
-        constructed via this helper retains its own worker pool until released.
+        Defaults to `config.num_workers` (pass `num_workers=0` to keep iteration in the main
+        process). When the resolved worker count is positive, enables `persistent_workers=True`,
+        so each distinct loader constructed with workers retains its own pool until released.
         """
         if batch_sampler is not None and (batch_size is not None or shuffle or indices is not None):
             raise ValueError("batch_sampler cannot be combined with batch_size, shuffle, or indices")
         if batch_sampler is None and batch_size is None:
             raise ValueError("either batch_size or batch_sampler must be specified")
         config = self.config
+        resolved_workers = config.num_workers if num_workers is None else num_workers
         collator = DHFDataCollator.for_model(self.model.config, dataset.context_length, bucket_to_max=bucket_to_max)
         source: Dataset[Any] = dataset if indices is None else Subset(dataset, indices)
         common: dict[str, Any] = {
             "collate_fn": collator,
-            "num_workers": config.num_workers,
-            "persistent_workers": config.num_workers > 0,
+            "num_workers": resolved_workers,
+            "persistent_workers": resolved_workers > 0,
             "pin_memory": self.device.type == "cuda",
             "generator": generator,
         }

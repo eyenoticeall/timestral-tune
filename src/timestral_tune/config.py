@@ -263,11 +263,10 @@ class TrainingConfig:
         device: `"auto"`, `"cpu"`, `"cuda"` or `"mps"`.
         seed: Seeds weight-independent randomness: batch order and any sampling.
         num_workers: DataLoader worker processes per persistent pool. When `num_workers > 0`, each
-            process keeps a persistent worker pool per active loader during `fit()`: training plus
-            validation when `val_dataset` is given (up to two pools in one-process mode, where
-            replay uses `num_workers=0`), and a third pool for replay in multi-process mode (up to
-            three pools per rank). On macOS with PyTorch 2.4.0, any worker leaves the process
-            hanging at exit (a PyTorch issue; `docs/VERIFICATION.md` §10).
+            process (or rank in multi-process mode) keeps up to two persistent worker pools during
+            `fit()`: training, plus validation when `val_dataset` is given. The replay loader always
+            runs in the main process (`num_workers=0`). On macOS with PyTorch 2.4.0, any worker
+            leaves the process hanging at exit (a PyTorch issue; `docs/VERIFICATION.md` §10).
         eval_every: Evaluate on the validation set every this many steps. None evaluates at the
             end of each epoch.
         eval_batch_size: Batch size for evaluation. None uses `batch_size`.

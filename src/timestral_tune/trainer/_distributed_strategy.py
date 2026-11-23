@@ -174,9 +174,10 @@ class _DistributedStrategy:
     def prepare_fit(self) -> None:
         """Verify group liveness, seed rank-offset streams, and build samplers, loaders, and reducer.
 
-        When `config.num_workers > 0`, each rank keeps persistent worker pools for its active
-        loaders until `cleanup()`: training, validation (created lazily on first `evaluate_val()`,
-        up to two pools), and replay when `replay_config` is set (up to three pools per rank).
+        When `config.num_workers > 0`, each rank keeps persistent worker pools for training and
+        validation (created lazily on first `evaluate_val()`, up to two pools per rank) until
+        `cleanup()`. The replay loader always uses `num_workers=0` in the main process, matching
+        the one-process path.
 
         Ranks: all ranks must call in lockstep.
         Collectives: 0.
@@ -229,6 +230,7 @@ class _DistributedStrategy:
                 trainer.replay_dataset,
                 batch_sampler=self._replay_sampler,
                 generator=replay_loader_generator,
+                num_workers=0,
             )
             self._replay_cycle = DistributedBatchCycle(self._replay_sampler, self._replay_loader)
         else:
