@@ -96,7 +96,11 @@ baselines (`retail_demand`, `realised_volatility`, `realised_volatility_2026_10m
 paired comparisons were regenerated together in one single pass from the tip code on a short-lived
 OS-Login NVIDIA L4 VM (`g2-standard-32`, `OMP_NUM_THREADS=4` per baseline, `bf16` training on L4).
 All temporary VMs were deleted immediately afterward with verified empty GCP project metadata and
-zero leftover GPU VMs/disks; `README.md` and `assets/results.png` remain untouched.
+zero leftover GPU VMs/disks; `README.md` and `assets/results.png` were left untouched on the branch.
+
+*After the merge (2026-11-24):* the branch was squash-merged into `main`, and the README's Results
+section then gained the tuned-GBT comparison for `28M` and `5M` (`docs/DEVLOG.md`, 2026-11-24). The chart
+is unchanged.
 
 ### Methodological disclosures (including all three GBT search revisions)
 
