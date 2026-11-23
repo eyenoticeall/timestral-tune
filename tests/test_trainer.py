@@ -1228,3 +1228,61 @@ def test_local_checkpoint_of_an_unreleased_shape_trains_and_exports(mode, tmp_pa
     assert changed, "training left every exported weight equal to the base checkpoint"
     if mode == "head_only":
         assert all(name.startswith("head.") for name in changed)
+
+
+# ------------------------------------------------ internal step/eval seams
+
+
+def test_compute_loss_terms_mix_update_and_eval_totals(tiny_forecaster):
+    from timestral_tune import ReplayConfig
+    from timestral_tune.replay import SyntheticReplaySource
+
+    patch = tiny_forecaster.patch_size
+    dataset = make_toy_dataset(patch, series=4, covariates=True)
+    replay_ds = SyntheticReplaySource(num_series=3, context_length=dataset.context_length, forecast_horizon=6, seed=9)
+    replay_cfg = ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=False)
+    trainer = TimestralTrainer(
+        config_for(mode="full_ft", batch_size=2, max_steps=4, learning_rate=1e-3, warmup_steps=2, sign_flip=False),
+        dataset,
+        replay_config=replay_cfg,
+        replay_dataset=replay_ds,
+        model=fresh_model(tiny_forecaster),
+    )
+
+    dom_batch = dataset.collator(trainer.model.config)([dataset[0], dataset[1]])
+    rep_batch = replay_ds.collator(trainer.model.config)([replay_ds[0], replay_ds[1]])
+    prepared_replay = trainer_module._PreparedReplayBatch(
+        batch=rep_batch, real_series=2, num_scored=rep_batch.num_scored
+    )
+
+    # Unmixed terms expose domain, replay-pinball, and distillation losses with exact active counts.
+    trainer.model.train()
+    terms = trainer._compute_loss_terms(
+        dom_batch, domain_count=dom_batch.num_scored, validate=False, replay=prepared_replay
+    )
+    assert terms.domain is not None and terms.domain_count == dom_batch.num_scored
+    assert terms.replay is not None and terms.replay_count == rep_batch.num_scored
+    assert terms.distill is not None and terms.distill_count == 2 * replay_ds.forecast_horizon
+    expected_mixed = (0.75 * terms.domain + 0.25 * terms.replay) + 0.5 * terms.distill
+    assert torch.equal(trainer._mix_loss_terms(terms), expected_mixed)
+
+    # Empty / zero-scored domain shard skips domain forward while still computing replay terms.
+    empty_terms = trainer._compute_loss_terms(None, validate=False, replay=prepared_replay)
+    assert empty_terms.domain is None and empty_terms.domain_count == 0
+    assert empty_terms.replay is not None and empty_terms.distill is not None
+    with pytest.raises(ValueError, match="without a domain loss"):
+        trainer._mix_loss_terms(empty_terms)
+
+    # _apply_optimizer_step clips gradients, steps optimizer, and advances LR scheduler.
+    lr_before = trainer.optimizer.param_groups[0]["lr"]
+    trainer.optimizer.zero_grad(set_to_none=True)
+    expected_mixed.backward()
+    trainer._apply_optimizer_step()
+    assert trainer.optimizer.param_groups[0]["lr"] > lr_before
+
+    # _accumulate_eval_totals returns zeros on empty/unscored iterables without raising.
+    unscored = dataclasses.replace(dom_batch, loss_weight=torch.zeros_like(dom_batch.loss_weight))
+    assert trainer._accumulate_eval_totals([]) == (0.0, 0, 0)
+    assert trainer._accumulate_eval_totals([unscored]) == (0.0, 0, 1)
+    total, scored, count = trainer._accumulate_eval_totals([unscored, dom_batch])
+    assert scored == dom_batch.num_scored and count == 2 and total > 0.0

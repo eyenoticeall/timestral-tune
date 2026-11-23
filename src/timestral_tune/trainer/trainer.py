@@ -69,6 +69,41 @@ class _ReplayBatchItem:
         return _ReplayBatchItem(batch=self.batch.pin_memory(), indices=self.indices, real_series=self.real_series)
 
 
+@dataclass(frozen=True)
+class _PreparedDomainBatch:
+    """One domain batch prepared on the target device with its CPU-counted scored total."""
+
+    batch: TrainingBatch | CachedHeadBatch
+    num_scored: int
+
+
+@dataclass(frozen=True)
+class _PreparedReplayBatch:
+    """One replay micro-batch prepared on the target device for replay pinball and distillation."""
+
+    batch: TrainingBatch | CachedHeadBatch
+    real_series: int | None = None
+    teacher_quantiles: Tensor | None = None
+    num_scored: int | None = None
+
+
+@dataclass(frozen=True)
+class _LossTerms:
+    """Unmixed per-term training losses and active position counts from one forward pass.
+
+    `domain_count` is `0` when no domain batch was evaluated, the scored-position count when
+    supplied by the caller, or `None` when omitted to avoid an extra device-to-host sync on direct
+    `training_step()` calls.
+    """
+
+    domain: Tensor | None
+    domain_count: int | None = 0
+    replay: Tensor | None = None
+    replay_count: int = 0
+    distill: Tensor | None = None
+    distill_count: int = 0
+
+
 def _apply_series_flip(batch: TrainingBatch, flip_mask: Tensor, rows_per_series: int) -> TrainingBatch:
     """Negate every row of each real series `i` where `flip_mask[i]` is True; padded tail series stay +1."""
     real_series = int(flip_mask.numel())
@@ -816,20 +851,23 @@ class TimestralTrainer:
             generator=shuffle_gen,
         )
 
-    def _compute_replay_terms(
+    def _compute_replay_terms_with_counts(
         self,
         replay_batch: TrainingBatch | CachedHeadBatch,
         *,
         real_series: int | None,
         teacher_quantiles: Tensor | None,
         validate: bool,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Compute `(replay_pinball_loss, distill_loss)` on one replay micro-batch already on device."""
+        replay_scored: int | None = None,
+    ) -> tuple[Tensor | None, int, Tensor | None, int]:
+        """Compute `(replay_pinball, replay_count, distill_loss, distill_count)` on one device replay batch."""
         assert self.replay_config is not None and self.replay_dataset is not None
-        need_pinball = self.replay_config.replay_fraction > 0.0 and replay_batch.num_scored > 0
+        want_pinball = self.replay_config.replay_fraction > 0.0
+        w_r = (replay_batch.num_scored if replay_scored is None else replay_scored) if want_pinball else 0
+        need_pinball = want_pinball and w_r > 0
         need_distill = self.replay_config.distill_weight > 0.0
         if not need_pinball and not need_distill:
-            return None, None
+            return None, 0, None, 0
 
         need_hidden = need_distill and isinstance(replay_batch, TrainingBatch) and self._frozen_head is not None
         if need_pinball:
@@ -846,6 +884,7 @@ class TimestralTrainer:
             num_context_tokens = out.forward.num_context_tokens
         else:
             replay_pinball = None
+            w_r = 0
             if isinstance(replay_batch, CachedHeadBatch):
                 student_quantiles = self.model.head(replay_batch.horizon_hidden)
                 student_hidden = None
@@ -857,7 +896,7 @@ class TimestralTrainer:
                 num_context_tokens = fwd.num_context_tokens
 
         if not need_distill:
-            return replay_pinball, None
+            return replay_pinball, w_r, None, 0
 
         horizon_steps = student_quantiles.shape[1]
         requested_horizon = min(self.replay_dataset.forecast_horizon, horizon_steps)
@@ -869,8 +908,12 @@ class TimestralTrainer:
                 teacher_q = self._frozen_head(replay_batch.horizon_hidden)
             student_q = student_quantiles
             distill_mask = step_mask.unsqueeze(0).expand(student_q.shape[0], horizon_steps)
-            return replay_pinball, distillation_loss(
-                student_q, teacher_q, distill_mask, smooth_beta=self.replay_config.smooth_beta
+            distill_count = int(student_q.shape[0]) * requested_horizon
+            return (
+                replay_pinball,
+                w_r,
+                distillation_loss(student_q, teacher_q, distill_mask, smooth_beta=self.replay_config.smooth_beta),
+                distill_count,
             )
 
         rows_per_series = sum(self.replay_dataset.series[0].layout)
@@ -902,11 +945,104 @@ class TimestralTrainer:
                 self.model.train(was_training)
 
         distill_mask = step_mask.unsqueeze(0).expand(student_q.shape[0], horizon_steps)
-        return replay_pinball, distillation_loss(
-            student_q, teacher_q, distill_mask, smooth_beta=self.replay_config.smooth_beta
+        distill_count = int(student_q.shape[0]) * requested_horizon
+        return (
+            replay_pinball,
+            w_r,
+            distillation_loss(student_q, teacher_q, distill_mask, smooth_beta=self.replay_config.smooth_beta),
+            distill_count,
         )
 
+    def _compute_replay_terms(
+        self,
+        replay_batch: TrainingBatch | CachedHeadBatch,
+        *,
+        real_series: int | None,
+        teacher_quantiles: Tensor | None,
+        validate: bool,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Compute `(replay_pinball_loss, distill_loss)` on one replay micro-batch already on device."""
+        replay_pinball, _, distill_term, _ = self._compute_replay_terms_with_counts(
+            replay_batch,
+            real_series=real_series,
+            teacher_quantiles=teacher_quantiles,
+            validate=validate,
+        )
+        return replay_pinball, distill_term
+
     # ------------------------------------------------------------------ loop
+
+    def _mark_cudagraph_step_begin(self) -> None:
+        """Notify PyTorch CUDA graphs that a new compiled step is starting, when applicable."""
+        if (
+            self.config.compile_model
+            and self.config.compile_mode == "reduce-overhead"
+            and self.device.type == "cuda"
+            and hasattr(torch, "compiler")
+            and hasattr(torch.compiler, "cudagraph_mark_step_begin")
+        ):
+            torch.compiler.cudagraph_mark_step_begin()
+
+    def _compute_loss_terms(
+        self,
+        batch: TrainingBatch | CachedHeadBatch | None,
+        *,
+        domain_count: int | None = None,
+        validate: bool = True,
+        replay: _PreparedReplayBatch | None = None,
+    ) -> _LossTerms:
+        """Compute unmixed per-term losses and active counts under autocast on prepared device batches.
+
+        When `batch` is None or `domain_count == 0`, the domain forward is skipped (`domain=None`,
+        `domain_count=0`). Replay terms still run when `replay` and `self.replay_config` are set.
+        """
+        with self._autocast():
+            domain_loss: Tensor | None = None
+            w_d: int | None = 0
+            if batch is not None and domain_count != 0:
+                domain_loss = compute_loss(self.model, batch, self.config.target_frame, validate=validate).loss
+                w_d = domain_count
+
+            replay_loss: Tensor | None = None
+            w_r = 0
+            distill_term: Tensor | None = None
+            m_count = 0
+            if replay is not None and self.replay_config is not None:
+                replay_loss, w_r, distill_term, m_count = self._compute_replay_terms_with_counts(
+                    replay.batch,
+                    real_series=replay.real_series,
+                    teacher_quantiles=replay.teacher_quantiles,
+                    validate=validate,
+                    replay_scored=replay.num_scored,
+                )
+        return _LossTerms(
+            domain=domain_loss,
+            domain_count=w_d,
+            replay=replay_loss,
+            replay_count=w_r,
+            distill=distill_term,
+            distill_count=m_count,
+        )
+
+    def _mix_loss_terms(self, terms: _LossTerms) -> Tensor:
+        """Combine unmixed terms in exact one-process order: domain/replay mix, then distillation."""
+        if terms.domain is None:
+            raise ValueError("cannot mix loss terms without a domain loss")
+        loss = terms.domain
+        if self.replay_config is not None:
+            if terms.replay is not None:
+                frac = self.replay_config.replay_fraction
+                loss = (1.0 - frac) * terms.domain + frac * terms.replay
+            if terms.distill is not None:
+                loss = loss + self.replay_config.distill_weight * terms.distill
+        return loss
+
+    def _apply_optimizer_step(self) -> None:
+        """Clip trainable gradients (if configured) and advance the optimiser and LR scheduler."""
+        if self.config.gradient_clip_val is not None:
+            torch.nn.utils.clip_grad_norm_(self._trainable, self.config.gradient_clip_val)
+        self.optimizer.step()
+        self.scheduler.step()
 
     def training_step(
         self,
@@ -918,40 +1054,26 @@ class TimestralTrainer:
         replay_teacher_quantiles: Tensor | None = None,
     ) -> float:
         """One optimiser step on `batch` (already on the device), with optional replay micro-batch."""
-        if (
-            self.config.compile_model
-            and self.config.compile_mode == "reduce-overhead"
-            and self.device.type == "cuda"
-            and hasattr(torch, "compiler")
-            and hasattr(torch.compiler, "cudagraph_mark_step_begin")
-        ):
-            torch.compiler.cudagraph_mark_step_begin()
+        self._mark_cudagraph_step_begin()
         self.optimizer.zero_grad(set_to_none=True)
-        with self._autocast():
-            domain_loss = compute_loss(self.model, batch, self.config.target_frame, validate=validate).loss
-            loss = domain_loss
-            if replay_batch is not None and self.replay_config is not None:
-                replay_pinball, distill_term = self._compute_replay_terms(
-                    replay_batch,
-                    real_series=replay_real_series,
-                    teacher_quantiles=replay_teacher_quantiles,
-                    validate=validate,
-                )
-                if replay_pinball is not None:
-                    frac = self.replay_config.replay_fraction
-                    loss = (1.0 - frac) * domain_loss + frac * replay_pinball
-                if distill_term is not None:
-                    loss = loss + self.replay_config.distill_weight * distill_term
+        replay = (
+            None
+            if replay_batch is None
+            else _PreparedReplayBatch(
+                batch=replay_batch,
+                real_series=replay_real_series,
+                teacher_quantiles=replay_teacher_quantiles,
+            )
+        )
+        terms = self._compute_loss_terms(batch, validate=validate, replay=replay)
+        loss = self._mix_loss_terms(terms)
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError(
                 f"the training loss became {loss.item()} at step {self.global_step + 1}. Lower the learning rate, "
                 "or check the data for extreme values"
             )
         loss.backward()
-        if self.config.gradient_clip_val is not None:
-            torch.nn.utils.clip_grad_norm_(self._trainable, self.config.gradient_clip_val)
-        self.optimizer.step()
-        self.scheduler.step()
+        self._apply_optimizer_step()
         return loss.item()
 
     def fit(self) -> TrainingResult:
@@ -1123,7 +1245,9 @@ class TimestralTrainer:
         finally:
             self.model.train(was_training)
 
-    def _evaluate(self, batches: Iterable[TrainingBatch | CachedHeadBatch]) -> EvalResult:
+    @torch.no_grad()
+    def _accumulate_eval_totals(self, batches: Iterable[TrainingBatch | CachedHeadBatch]) -> tuple[float, int, int]:
+        """Accumulate `(loss_sum, scored_positions, batches)` over `batches` in float64."""
         patch = self.model.config.patch_size
         non_blocking = self.device.type == "cuda"
         total = 0.0
@@ -1145,6 +1269,10 @@ class TimestralTrainer:
             # Weight each batch by its scored positions, so the result is the mean over the dataset.
             total += loss.item() * positions  # .item() is a Python float, so the sum accumulates in float64
             scored += positions
+        return total, scored, count
+
+    def _evaluate(self, batches: Iterable[TrainingBatch | CachedHeadBatch]) -> EvalResult:
+        total, scored, count = self._accumulate_eval_totals(batches)
         if scored == 0:
             raise ValueError("the dataset has no scored position to evaluate")
         return EvalResult(loss=total / scored, scored_positions=scored, batches=count)
