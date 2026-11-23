@@ -22,14 +22,19 @@
 # by killing the active stage tree and writing an interrupted summary, and re-collects confirmed-live
 # stage PIDs immediately before every signal so reaped/reused PIDs are never signalled.
 #
-# Limitation (A1): a process that double-forks, calls `setsid()`, and clears its environment (or runs
-# on a system with neither `/proc` nor `ps`) can escape tree termination; neither `torchrun` nor
-# PyTorch `DataLoader` workers do this.
+# Limitation (A1): a descendant that clears its environment (`_TIMESTRAL_STAGE_TOKEN`) and outlives
+# its parent (so it is reparented out of the tracked PPID tree — even without double-forking or
+# calling `setsid()`, because a PGID is signalled only when every live member is a known target), or
+# runs on a system with neither `/proc` nor `ps`, can escape tree termination; neither `torchrun`
+# nor PyTorch `DataLoader` workers do this.
 #
-# Resume markers (`<stage>.done`) are content-addressed over git tree state (HEAD + tracked diffs +
-# untracked code under scripts/ and src/), resolved Python/torch/CUDA runtime identity, all
-# `NCCL_*`/`TORCH_*`/`CUDA_*`/`CUBLAS_*`/`OMP_*` environment variables, exact stage arguments, and
-# the verified SHA-256 content digest of any reference archive produced or consumed by the stage.
+# Resume markers (`<stage>.done`) are content-addressed over tree state (git HEAD + tracked diffs +
+# untracked code under scripts/ and src/, or deterministic content hashing of scripts/, src/,
+# pyproject.toml, and uv.lock excluding LOG_DIR and bytecode caches when git is unavailable or outside
+# a git work tree), resolved Python/torch/CUDA runtime identity, exact stage arguments, a domain
+# separator, all `NCCL_*`/`GLOO_*`/`TORCH_*`/`PYTORCH_*`/`CUDA_*`/`CUDNN_*`/`CUBLAS_*`/`OMP_*`/
+# `MKL_*`/`OPENBLAS_*` environment variables, and the verified SHA-256 content digest of any reference
+# archive produced or consumed by the stage.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -304,56 +309,176 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 '
 }
 
-# Digest of actual checkout state: HEAD commit + tracked git status/diff + untracked code files under
-# scripts/ and src/ (excluding LOG_DIR so writing logs inside the checkout never invalidates resume).
+# Digest of actual tree state. Uses git when `git` is available and cwd is the top-level of a git
+# work tree; otherwise deterministically hashes the contents of `scripts/`, `src/`, `pyproject.toml`,
+# and `uv.lock` (excluding LOG_DIR and Python bytecode caches). Prints `<method> <64-hex-sha256>`
+# and exits non-zero on failure so the script never proceeds with an empty or constant signature.
 compute_tree_state_sig() {
     "${HELPER_PY[@]}" -c '
-import hashlib, os, subprocess, sys
+import hashlib, os, shutil, subprocess, sys
 from pathlib import Path
 
+cwd_resolved = Path.cwd().resolve()
 log_dir_resolved = Path(sys.argv[1]).resolve()
-h = hashlib.sha256()
 
-def _run(args):
-    p = subprocess.run(args, check=False, capture_output=True)
-    return p.returncode, p.stdout
 
-rc, head = _run(["git", "rev-parse", "HEAD"])
-h.update(b"head=")
-h.update(head.strip() if rc == 0 else b"unknown")
-h.update(b"\0")
+def _is_inside_log_dir(p):
+    try:
+        rp = p.resolve()
+    except OSError:
+        return False
+    return rp == log_dir_resolved or log_dir_resolved in rp.parents
 
-rc, status = _run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=no"])
-h.update(b"status=")
-h.update(status if rc == 0 else b"unknown")
-h.update(b"\0")
 
-rc, diff = _run(["git", "diff", "HEAD"])
-h.update(b"diff=")
-h.update(diff if rc == 0 else b"unknown")
-h.update(b"\0")
+def _is_bytecode_cache(name):
+    return name == "__pycache__" or name.endswith((".pyc", ".pyo"))
 
-rc, untracked = _run(["git", "ls-files", "--others", "--exclude-standard", "-z", "scripts", "src"])
-if rc == 0 and untracked:
-    for rel_b in sorted(x for x in untracked.split(b"\0") if x):
-        p = Path(rel_b.decode("utf-8", errors="surrogateescape"))
+
+def _try_git_sig():
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        return None
+
+    def _run(args):
         try:
-            resolved = p.resolve()
+            p = subprocess.run([git_bin, *args], check=False, capture_output=True)
         except OSError:
-            continue
-        if resolved == log_dir_resolved or log_dir_resolved in resolved.parents:
-            continue
-        h.update(b"untracked=")
-        h.update(rel_b)
-        h.update(b"\0")
-        if p.is_file():
-            try:
-                h.update(p.read_bytes())
-            except OSError:
-                pass
-        h.update(b"\0")
+            return 1, b""
+        return p.returncode, p.stdout
 
-print(h.hexdigest())
+    rc_wt, out_wt = _run(["rev-parse", "--is-inside-work-tree"])
+    if rc_wt != 0 or out_wt.strip() != b"true":
+        return None
+    rc_top, out_top = _run(["rev-parse", "--show-toplevel"])
+    if rc_top != 0:
+        return None
+    try:
+        top_resolved = Path(os.fsdecode(out_top.strip())).resolve()
+    except OSError:
+        return None
+    if top_resolved != cwd_resolved:
+        return None
+
+    rc_head, head = _run(["rev-parse", "HEAD"])
+    rc_status, status = _run(["status", "--porcelain=v1", "-z", "--untracked-files=no"])
+    rc_diff, diff = _run(["diff", "HEAD"])
+    rc_untracked, untracked = _run(["ls-files", "--others", "--exclude-standard", "-z", "scripts", "src"])
+    if rc_head != 0 or not head.strip() or rc_status != 0 or rc_diff != 0 or rc_untracked != 0:
+        return None
+
+    h = hashlib.sha256()
+    h.update(b"method=git\0")
+    h.update(b"head=")
+    h.update(head.strip())
+    h.update(b"\0")
+    h.update(b"status=")
+    h.update(status)
+    h.update(b"\0")
+    h.update(b"diff=")
+    h.update(diff)
+    h.update(b"\0")
+
+    if untracked:
+        for rel_b in sorted(x for x in untracked.split(b"\0") if x):
+            p = Path(os.fsdecode(rel_b))
+            if any(_is_bytecode_cache(part) for part in p.parts):
+                continue
+            if _is_inside_log_dir(p):
+                continue
+            h.update(b"untracked=")
+            h.update(rel_b)
+            h.update(b"\0")
+            if p.is_symlink():
+                h.update(b"symlink=")
+                h.update(os.fsencode(os.readlink(p)))
+            elif p.is_file():
+                with open(p, "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+            h.update(b"\0")
+    return "git", h.hexdigest()
+
+
+def _content_hash_sig():
+    h = hashlib.sha256()
+    h.update(b"method=content_hash\0")
+    hashed_files = 0
+
+    def _hash_file(rel_posix, fp):
+        nonlocal hashed_files
+        h.update(b"file=")
+        h.update(rel_posix.encode("utf-8", errors="surrogateescape"))
+        h.update(b"\0")
+        size = fp.stat().st_size
+        h.update(f"{size}:".encode("ascii"))
+        with open(fp, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        h.update(b"\0")
+        hashed_files += 1
+
+    for root_name in ("scripts", "src"):
+        root_p = Path(root_name)
+        if not root_p.is_dir():
+            h.update(b"missing_dir=")
+            h.update(root_name.encode("ascii"))
+            h.update(b"\0")
+            continue
+        for dirpath, dirnames, filenames in os.walk(root_p, topdown=True, followlinks=False):
+            dp = Path(dirpath)
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if not _is_bytecode_cache(d) and not _is_inside_log_dir(dp / d)
+            )
+            for fn in sorted(filenames):
+                if _is_bytecode_cache(fn):
+                    continue
+                fp = dp / fn
+                if _is_inside_log_dir(fp):
+                    continue
+                rel_posix = fp.as_posix()
+                if fp.is_symlink():
+                    h.update(b"symlink=")
+                    h.update(rel_posix.encode("utf-8", errors="surrogateescape"))
+                    h.update(b"\0")
+                    h.update(os.fsencode(os.readlink(fp)))
+                    h.update(b"\0")
+                    hashed_files += 1
+                elif fp.is_file():
+                    _hash_file(rel_posix, fp)
+
+    for top_file in ("pyproject.toml", "uv.lock"):
+        fp = Path(top_file)
+        if fp.is_symlink():
+            h.update(b"symlink=")
+            h.update(top_file.encode("ascii"))
+            h.update(b"\0")
+            h.update(os.fsencode(os.readlink(fp)))
+            h.update(b"\0")
+            hashed_files += 1
+        elif fp.is_file():
+            _hash_file(top_file, fp)
+        else:
+            h.update(b"missing_file=")
+            h.update(top_file.encode("ascii"))
+            h.update(b"\0")
+
+    if hashed_files == 0:
+        print("error: content_hash found no source files under scripts/, src/, pyproject.toml, or uv.lock", file=sys.stderr)
+        sys.exit(1)
+    return "content_hash", h.hexdigest()
+
+
+res = _try_git_sig()
+if res is None:
+    res = _content_hash_sig()
+print(f"{res[0]} {res[1]}")
 ' "$LOG_DIR"
 }
 
@@ -375,25 +500,57 @@ print(h.hexdigest())
 ' 2>/dev/null || echo "uninitialized"
 }
 
-TREE_STATE_SIG="$(compute_tree_state_sig)"
+TREE_STATE_METHOD=""
+TREE_STATE_SIG=""
+if ! TREE_STATE_PAIR="$(compute_tree_state_sig)" || [[ -z "$TREE_STATE_PAIR" ]]; then
+    echo "error: failed to compute tree-state signature" >&2
+    exit 2
+fi
+read -r TREE_STATE_METHOD TREE_STATE_SIG <<< "$TREE_STATE_PAIR"
+if [[ ( "$TREE_STATE_METHOD" != "git" && "$TREE_STATE_METHOD" != "content_hash" ) || "${#TREE_STATE_SIG}" -ne 64 || ! "$TREE_STATE_SIG" =~ ^[0-9a-f]+$ ]]; then
+    echo "error: invalid tree-state signature '${TREE_STATE_PAIR}'" >&2
+    exit 2
+fi
 RUNTIME_ENV_SIG="$(compute_runtime_env_sig)"
 
-# Content-addressed signature for a stage: tree state + resolved runtime identity + stage name +
-# exact canonical arguments + every environment variable matching NCCL_*, TORCH_*, CUDA_*, CUBLAS_*, OMP_*.
+# Content-addressed signature for a stage: tree state (method + digest) + resolved runtime identity +
+# stage name + exact canonical arguments + explicit domain separator + every environment variable
+# matching NCCL_*, GLOO_*, TORCH_*, PYTORCH_*, CUDA_*, CUDNN_*, CUBLAS_*, OMP_*, MKL_*, OPENBLAS_*.
 stage_signature() {
     "${HELPER_PY[@]}" -c '
 import hashlib, os, sys
 h = hashlib.sha256()
+h.update(b"args\0")
 for part in sys.argv[1:]:
-    h.update(part.encode("utf-8"))
+    b = part.encode("utf-8")
+    h.update(f"{len(b)}:".encode("ascii"))
+    h.update(b)
     h.update(b"\0")
-prefixes = ("NCCL_", "TORCH_", "CUDA_", "CUBLAS_", "OMP_")
+h.update(b"--env--\0")
+prefixes = (
+    "NCCL_",
+    "GLOO_",
+    "TORCH_",
+    "PYTORCH_",
+    "CUDA_",
+    "CUDNN_",
+    "CUBLAS_",
+    "OMP_",
+    "MKL_",
+    "OPENBLAS_",
+)
 for env_k in sorted(os.environ):
     if env_k.startswith(prefixes):
-        h.update(f"{env_k}={os.environ[env_k]}".encode("utf-8"))
+        kb = env_k.encode("utf-8")
+        vb = os.environ[env_k].encode("utf-8")
+        h.update(f"{len(kb)}:".encode("ascii"))
+        h.update(kb)
+        h.update(b"=")
+        h.update(f"{len(vb)}:".encode("ascii"))
+        h.update(vb)
         h.update(b"\0")
 print(h.hexdigest())
-' "$TREE_STATE_SIG" "$RUNTIME_ENV_SIG" "$@"
+' "$TREE_STATE_METHOD" "$TREE_STATE_SIG" "$RUNTIME_ENV_SIG" "$@"
 }
 
 # Verify a reference zip archive is non-empty, passes full zip CRC integrity (`testzip()`), has valid
@@ -462,7 +619,132 @@ ACTIVE_STAGE_NAME=""
 ACTIVE_STAGE_LOG=""
 ACTIVE_REQUIRED_ARTIFACT=""
 STAGE_RUNNER_PID=""
+ACTIVE_STAGE_TOKEN=""
+STAGE_SEQ=0
 INT_MARKER="${LOG_DIR}/.stage_interrupted"
+PS_BIN="$(command -v ps 2>/dev/null || true)"
+if [[ -z "$PS_BIN" && -x /bin/ps ]]; then
+    PS_BIN="/bin/ps"
+fi
+
+# Non-blocking liveness check that treats zombie children ('Z') as exited so polling never spins
+# waiting for bash to reap a terminated background runner inside a signal trap.
+runner_is_live() {
+    local pid="$1"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+    if [[ -r "/proc/${pid}/stat" ]]; then
+        local st
+        st="$(cat "/proc/${pid}/stat" 2>/dev/null || true)"
+        st="${st##*) }"
+        [[ -n "$st" && "${st:0:1}" != "Z" ]]
+        return
+    fi
+    if [[ -n "$PS_BIN" ]]; then
+        local st
+        st="$("$PS_BIN" -o stat= -p "$pid" 2>/dev/null || true)"
+        st="${st#"${st%%[![:space:]]*}"}"
+        [[ -n "$st" && "${st:0:1}" != "Z" ]]
+        return
+    fi
+    return 0
+}
+
+# Fallback process-tree sweep used only if the Python stage runner itself had to be SIGKILLed.
+sweep_stage_token_pids() {
+    local token_val="$1"
+    if [[ -z "$token_val" ]]; then
+        return
+    fi
+    "${HELPER_PY[@]}" -c '
+import os, shutil, signal, subprocess, sys
+
+token_needle = f"_TIMESTRAL_STAGE_TOKEN={sys.argv[1]}"
+self_pid = os.getpid()
+self_pgid = os.getpgrp()
+ps_bin = shutil.which("ps") or ("/bin/ps" if os.path.isfile("/bin/ps") else None)
+
+children, pgids = {}, {}
+if os.path.isdir("/proc"):
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            stat = open(f"/proc/{pid}/stat", "rb").read()
+            rparen = stat.rfind(b")")
+            if rparen < 0:
+                continue
+            fields = stat[rparen + 2 :].split()
+            if len(fields) < 3 or fields[0] == b"Z":
+                continue
+            ppid, pgid = int(fields[1]), int(fields[2])
+            children.setdefault(ppid, []).append(pid)
+            pgids[pid] = pgid
+        except OSError:
+            continue
+elif ps_bin is not None:
+    out = subprocess.run([ps_bin, "-axo", "pid=,ppid=,pgid=,stat="], check=False, capture_output=True, text=True, timeout=5.0)
+    if out.returncode == 0:
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and all(p.isdigit() for p in parts[:3]) and not parts[3].startswith("Z"):
+                pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
+                children.setdefault(ppid, []).append(pid)
+                pgids[pid] = pgid
+
+seeds = set()
+if os.path.isdir("/proc"):
+    needle_b = token_needle.encode("utf-8")
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == self_pid:
+            continue
+        try:
+            if needle_b in open(f"/proc/{pid}/environ", "rb").read():
+                seeds.add(pid)
+        except OSError:
+            continue
+elif ps_bin is not None:
+    out = subprocess.run([ps_bin, "eww", "-axo", "pid=,command="], check=False, capture_output=True, text=True, timeout=5.0)
+    if out.returncode == 0:
+        for line in out.stdout.splitlines():
+            if token_needle in line:
+                parts = line.strip().split(None, 1)
+                if parts and parts[0].isdigit() and int(parts[0]) != self_pid:
+                    seeds.add(int(parts[0]))
+
+targets = set()
+stack = [p for p in seeds if not pgids or p in pgids]
+while stack:
+    cur = stack.pop()
+    if cur in targets or cur == self_pid:
+        continue
+    if pgids and cur not in pgids:
+        continue
+    targets.add(cur)
+    stack.extend(children.get(cur, ()))
+
+members_by_pgid = {}
+for pid, pg in pgids.items():
+    members_by_pgid.setdefault(pg, set()).add(pid)
+for pid in targets:
+    pg = pgids.get(pid)
+    if pg is not None and pg > 0 and pg != self_pgid and members_by_pgid.get(pg, set()).issubset(targets):
+        try:
+            os.killpg(pg, signal.SIGKILL)
+        except OSError:
+            pass
+for pid in targets:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+' "$token_val" 2>/dev/null || true
+}
 
 record_stage() {
     STAGE_NAMES+=("$1")
@@ -511,28 +793,34 @@ on_interrupt() {
     ANY_FAILED=1
 
     if [[ -n "$STAGE_RUNNER_PID" ]]; then
-        # Forward the signal to the Python stage runner (idempotent if delivered via PGID) and wait
-        # for it to drain output and terminate the entire stage tree.
-        kill "-${sig_name}" "$STAGE_RUNNER_PID" 2>/dev/null || true
-        local waited=0
-        while kill -0 "$STAGE_RUNNER_PID" 2>/dev/null; do
-            wait "$STAGE_RUNNER_PID" 2>/dev/null || true
-            if ! kill -0 "$STAGE_RUNNER_PID" 2>/dev/null; then
-                break
-            fi
-            waited=$((waited + 1))
-            if [[ "$waited" -eq 2 ]]; then
-                # Re-signal once in case the runner was mid-startup before installing its handler.
-                kill "-${sig_name}" "$STAGE_RUNNER_PID" 2>/dev/null || true
-            elif [[ "$waited" -ge 120 ]]; then
+        # Forward SIGTERM (never ignored for background `&` jobs, unlike SIGINT in non-interactive
+        # shells) and poll non-blockingly — never call blocking `wait` while the runner is alive,
+        # so re-signal and SIGKILL fallbacks always execute on schedule.
+        kill -TERM "$STAGE_RUNNER_PID" 2>/dev/null || true
+        local polls=0
+        local start_sec="$SECONDS"
+        local max_wait_s=7    # covers runner 3s SIGTERM grace + 2s SIGKILL reap + 1s wait
+        local max_polls=140   # secondary cap (~7s at 0.05s/poll)
+        local escalated_kill=0
+        while runner_is_live "$STAGE_RUNNER_PID"; do
+            sleep 0.05
+            polls=$((polls + 1))
+            if [[ "$polls" -eq 4 || "$polls" -eq 12 || "$polls" -eq 24 ]]; then
+                # Re-send SIGTERM at ~0.2s, ~0.6s, ~1.2s in case the runner was mid-startup or exec'ing.
+                kill -TERM "$STAGE_RUNNER_PID" 2>/dev/null || true
+            elif [[ $((SECONDS - start_sec)) -ge "$max_wait_s" || "$polls" -ge "$max_polls" ]]; then
                 kill -KILL "$STAGE_RUNNER_PID" 2>/dev/null || true
-                wait "$STAGE_RUNNER_PID" 2>/dev/null || true
+                escalated_kill=1
                 break
             fi
-            sleep 0.1
         done
+        if [[ "$escalated_kill" -eq 1 ]]; then
+            sweep_stage_token_pids "$ACTIVE_STAGE_TOKEN"
+        fi
+        wait "$STAGE_RUNNER_PID" 2>/dev/null || true
         STAGE_RUNNER_PID=""
     fi
+    ACTIVE_STAGE_TOKEN=""
 
     if [[ -n "$ACTIVE_STAGE_NAME" ]]; then
         rm -f "${LOG_DIR}/${ACTIVE_STAGE_NAME}.done" "$INT_MARKER"
@@ -565,22 +853,23 @@ run_stage_with_timeout() {
     local log_file="$3"
     shift 3
     rm -f "$INT_MARKER"
+    STAGE_SEQ=$((STAGE_SEQ + 1))
+    ACTIVE_STAGE_TOKEN="tt_$$_${STAGE_SEQ}_${RANDOM}_${RANDOM}"
 
     "${HELPER_PY[@]}" -c '
-import errno, os, selectors, shutil, signal, subprocess, sys, time, uuid
+# Install signal handlers first before any other imports or setup to close the startup window.
+import os, signal, sys
 
-limit = float(sys.argv[1])
-stage_name = sys.argv[2]
-log_path = sys.argv[3]
-int_marker_path = sys.argv[4]
-cmd = sys.argv[5:]
-
-self_pid = os.getpid()
-self_pgid = os.getpgrp()
-token_key = "_TIMESTRAL_STAGE_TOKEN"
-token_val = f"tt_{self_pid}_{uuid.uuid4().hex}"
-token_needle = f"{token_key}={token_val}"
-ps_bin = shutil.which("ps") or ("/bin/ps" if os.path.isfile("/bin/ps") else None)
+# Test hook (inert unless set): deterministically hold the pre-handler startup window for R1 checks.
+_pre_ready = os.environ.get("_TIMESTRAL_TEST_RUNNER_PRE_HANDLER_READY_FILE")
+_pre_delay = os.environ.get("_TIMESTRAL_TEST_RUNNER_PRE_HANDLER_DELAY_S")
+if _pre_ready or _pre_delay:
+    import time as _pre_time
+    if _pre_ready:
+        with open(_pre_ready, "w", encoding="utf-8") as _rf:
+            _rf.write(f"{os.getpid()}\n")
+    if _pre_delay:
+        _pre_time.sleep(float(_pre_delay))
 
 interrupted_sig = [None]
 
@@ -593,6 +882,31 @@ def _on_signal(signum, _frame):
 
 for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
     signal.signal(_sig, _on_signal)
+
+import errno, selectors, shutil, subprocess, time
+
+limit = float(sys.argv[1])
+stage_name = sys.argv[2]
+log_path = sys.argv[3]
+int_marker_path = sys.argv[4]
+token_val = sys.argv[5]
+tree_state_desc = sys.argv[6]
+cmd = sys.argv[7:]
+
+self_pid = os.getpid()
+self_pgid = os.getpgrp()
+token_key = "_TIMESTRAL_STAGE_TOKEN"
+token_needle = f"{token_key}={token_val}"
+ps_bin = shutil.which("ps") or ("/bin/ps" if os.path.isfile("/bin/ps") else None)
+
+
+def _sig_names(sig_num):
+    try:
+        sig_label = signal.Signals(sig_num).name
+    except ValueError:
+        sig_label = f"SIG{sig_num}"
+    short_sig = sig_label[3:] if sig_label.startswith("SIG") else sig_label
+    return sig_label, short_sig
 
 
 def _read_proc_table():
@@ -764,11 +1078,42 @@ def _write_stderr(data):
         pass
 
 
+def _finish_interrupted(log_f, killed_n=0, context=""):
+    sig_num = interrupted_sig[0]
+    sig_label, short_sig = _sig_names(sig_num)
+    suffix = f" ({context})" if context else ""
+    msg = (
+        f"ERROR: stage {stage_name} interrupted by {sig_label}{suffix} "
+        f"and killed (signalled {killed_n} pid(s))\n"
+    ).encode("utf-8")
+    if log_f is not None:
+        try:
+            log_f.write(msg)
+            log_f.flush()
+        except OSError:
+            pass
+    _write_stderr(msg)
+    try:
+        with open(int_marker_path, "w", encoding="utf-8") as mf:
+            mf.write(f"{short_sig} {128 + sig_num}\n")
+    except OSError:
+        pass
+    sys.exit(128 + sig_num)
+
+
 with open(log_path, "wb") as log_f:
-    header = f"== stage: {stage_name} ==\n".encode("utf-8")
+    header = f"== stage: {stage_name} (tree_state={tree_state_desc}) ==\n".encode("utf-8")
     log_f.write(header)
     log_f.flush()
     _write_stdout(header)
+
+    if interrupted_sig[0] is not None:
+        try:
+            os.close(r_fd)
+            os.close(w_fd)
+        except OSError:
+            pass
+        _finish_interrupted(log_f, 0, context="during startup before launch")
 
     proc = subprocess.Popen(cmd, stdout=w_fd, stderr=w_fd, start_new_session=True, env=child_env)
     os.close(w_fd)
@@ -816,7 +1161,7 @@ with open(log_path, "wb") as log_f:
             if events:
                 _drain_available()
 
-    def _kill_stage_tree():
+    def _kill_stage_tree(teardown_ready_path=None):
         ever_signalled = set()
         _drain_available()
 
@@ -824,6 +1169,14 @@ with open(log_path, "wb") as log_f:
         if live_pids or live_pgids:
             ever_signalled |= live_pids
             _signal_live(live_pids, live_pgids, signal.SIGTERM)
+
+        # Test hook (inert unless set): announce entry into timeout teardown for deterministic R2 checks.
+        if teardown_ready_path:
+            try:
+                with open(teardown_ready_path, "w", encoding="utf-8") as _tf:
+                    _tf.write(f"{self_pid}\n")
+            except OSError:
+                pass
 
         # Drain continuously through the 3s SIGTERM grace window so dumping children never block on the pipe.
         grace_end = time.monotonic() + 3.0
@@ -894,49 +1247,44 @@ with open(log_path, "wb") as log_f:
             if events:
                 _drain_available()
 
+        def _final_exit(code, already_killed=None, context=""):
+            # Every exit path checks interrupted_sig first so a signal arriving during timeout
+            # teardown or normal stage completion is never swallowed.
+            if interrupted_sig[0] is not None:
+                kn = _kill_stage_tree() if already_killed is None else already_killed
+                _finish_interrupted(log_f, kn, context=context)
+            sys.exit(code)
+
         if interrupted_sig[0] is not None:
-            sig_num = interrupted_sig[0]
-            try:
-                sig_label = signal.Signals(sig_num).name
-            except ValueError:
-                sig_label = f"SIG{sig_num}"
-            short_sig = sig_label[3:] if sig_label.startswith("SIG") else sig_label
             killed_n = _kill_stage_tree()
-            msg = f"ERROR: stage {stage_name} interrupted by {sig_label} and killed (signalled {killed_n} pid(s))\n".encode("utf-8")
-            log_f.write(msg)
-            log_f.flush()
-            _write_stderr(msg)
-            try:
-                with open(int_marker_path, "w", encoding="utf-8") as mf:
-                    mf.write(f"{short_sig} {128 + sig_num}\n")
-            except OSError:
-                pass
-            sys.exit(128 + sig_num)
+            _finish_interrupted(log_f, killed_n)
 
         if timed_out:
-            killed_n = _kill_stage_tree()
+            killed_n = _kill_stage_tree(
+                teardown_ready_path=os.environ.get("_TIMESTRAL_TEST_TIMEOUT_TEARDOWN_READY_FILE")
+            )
             msg = f"ERROR: stage {stage_name} timed out after {limit:.0f}s and was killed (signalled {killed_n} pid(s))\n".encode("utf-8")
             log_f.write(msg)
             log_f.flush()
             _write_stderr(msg)
-            sys.exit(124)
+            _final_exit(124, already_killed=killed_n, context="during timeout teardown")
 
         rc = proc.wait()
         _drain_available()
-        if rc < 0:
-            sys.exit(128 + (-rc))
-        sys.exit(rc)
+        exit_code = 128 + (-rc) if rc < 0 else rc
+        _final_exit(exit_code, context="at stage exit")
     finally:
         sel.close()
         try:
             os.close(r_fd)
         except OSError:
             pass
-' "$limit_s" "$stage_name" "$log_file" "$INT_MARKER" "$@" &
+' "$limit_s" "$stage_name" "$log_file" "$INT_MARKER" "$ACTIVE_STAGE_TOKEN" "${TREE_STATE_METHOD}:${TREE_STATE_SIG:0:12}" "$@" &
     STAGE_RUNNER_PID=$!
     local rc=0
     wait "$STAGE_RUNNER_PID" || rc=$?
     STAGE_RUNNER_PID=""
+    ACTIVE_STAGE_TOKEN=""
     return "$rc"
 }
 
@@ -1112,13 +1460,16 @@ ENV_STAGE_CMD=(
     bash -c '
 set -euo pipefail
 backend="$1"
-shift
+tree_method="$2"
+tree_sig_short="$3"
+shift 3
 uv sync --locked --quiet "$@"
 uv run --no-sync "$@" python -c '\''
 import os, platform, shutil, subprocess, sys, sysconfig, torch
 
-backend = sys.argv[1]
+backend, tree_method, tree_sig_short = sys.argv[1], sys.argv[2], sys.argv[3]
 print(f"os={platform.system()} arch={platform.machine()} python={platform.python_version()}")
+print(f"tree_state_method={tree_method} tree_state_sig={tree_sig_short}")
 print(f"torch={torch.__version__} cuda_available={torch.cuda.is_available()} cuda_runtime={torch.version.cuda}")
 cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "unset")
 print(f"cuda_visible_devices={cvd}")
@@ -1144,23 +1495,28 @@ print(f"nccl_multi_rank_gpu_enable={nccl_shared}")
 if backend == "nccl" and not torch.cuda.is_available():
     print("error: --backend nccl requested, but this PyTorch build cannot use CUDA", file=sys.stderr)
     sys.exit(3)
-'\'' "$backend"
-' _ "$BACKEND" ${UV_PY_ARGS[@]+"${UV_PY_ARGS[@]}"}
+'\'' "$backend" "$tree_method" "$tree_sig_short"
+' _ "$BACKEND" "$TREE_STATE_METHOD" "${TREE_STATE_SIG:0:12}" ${UV_PY_ARGS[@]+"${UV_PY_ARGS[@]}"}
 )
 run_stage "01_env" "" "${ENV_STAGE_CMD[@]}"
 ENV_OK="$LAST_STAGE_OK"
 ENV_RC="$LAST_STAGE_RC"
 
+if [[ "$ENV_OK" -ne 1 ]]; then
+    echo "error: stage 01_env failed (exit ${ENV_RC}); aborting ${BACKEND} session (see 01_env.log)" >&2
+    ANY_FAILED=1
+    write_summary
+    exit "$ENV_RC"
+fi
+
 # Refresh resolved runtime identity after uv sync; if 01_env just ran and synced a new venv, bind
 # 01_env.done to the post-sync runtime identity so the next identical invocation resumes cleanly.
-if [[ "$ENV_OK" -eq 1 ]]; then
-    POST_ENV_RUNTIME_SIG="$(compute_runtime_env_sig)"
-    if [[ "$POST_ENV_RUNTIME_SIG" != "$RUNTIME_ENV_SIG" ]]; then
-        RUNTIME_ENV_SIG="$POST_ENV_RUNTIME_SIG"
-        if [[ "$LAST_STAGE_RESUMED" -eq 0 ]]; then
-            POST_ENV_SIG="$(stage_signature "01_env" "${ENV_STAGE_CMD[@]}")"
-            write_done_marker "${LOG_DIR}/01_env.done" "$POST_ENV_SIG" ""
-        fi
+POST_ENV_RUNTIME_SIG="$(compute_runtime_env_sig)"
+if [[ "$POST_ENV_RUNTIME_SIG" != "$RUNTIME_ENV_SIG" ]]; then
+    RUNTIME_ENV_SIG="$POST_ENV_RUNTIME_SIG"
+    if [[ "$LAST_STAGE_RESUMED" -eq 0 ]]; then
+        POST_ENV_SIG="$(stage_signature "01_env" "${ENV_STAGE_CMD[@]}")"
+        write_done_marker "${LOG_DIR}/01_env.done" "$POST_ENV_SIG" ""
     fi
 fi
 
@@ -1168,12 +1524,6 @@ fi
 # works inside containers without `nvidia-smi`).
 GPU_COUNT=0
 if [[ "$BACKEND" == "nccl" ]]; then
-    if [[ "$ENV_OK" -ne 1 ]]; then
-        echo "error: stage 01_env failed (exit ${ENV_RC}); aborting NCCL session (see 01_env.log)" >&2
-        ANY_FAILED=1
-        write_summary
-        exit "$ENV_RC"
-    fi
     GPU_COUNT_RAW="$(uv run --no-sync ${UV_PY_ARGS[@]+"${UV_PY_ARGS[@]}"} python -c 'import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)' 2>/dev/null || echo 0)"
     if [[ "$GPU_COUNT_RAW" =~ ^[0-9]+$ ]]; then
         GPU_COUNT="$GPU_COUNT_RAW"
@@ -1199,6 +1549,8 @@ if [[ "$RANKS_SPECIFIED" -eq 0 ]]; then
         fi
         if [[ "${#RANKS[@]}" -eq 0 ]]; then
             echo "error: only $GPU_COUNT visible GPU detected; pass --shared-gpu to run N=2 and N=4 on one GPU" >&2
+            ANY_FAILED=1
+            write_summary
             exit 2
         fi
     fi
@@ -1211,6 +1563,8 @@ for n in "${RANKS[@]}"; do
     fi
     if [[ "$BACKEND" == "nccl" && "$SHARED_GPU" -eq 0 && "$n" -gt "$GPU_COUNT" ]]; then
         echo "error: requested --ranks $n with per-rank NCCL, but only $GPU_COUNT visible GPU(s) detected (pass --shared-gpu to share 1 GPU)" >&2
+        ANY_FAILED=1
+        write_summary
         exit 2
     fi
 done
