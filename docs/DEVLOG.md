@@ -1043,3 +1043,17 @@ the new panel from `docs/benchmarks/wp3_unfamiliar_domains.json`; the retail pan
   model does poorly on it. A fourth bar for it is an open option for the maintainer.
 
 **Not done / open.** `main` is not pushed.
+
+## 2026-11-24 — README: Memory and speed moved above Results
+
+**Done.** At the maintainer's request the README's Memory and speed section now comes before Results.
+`main` at `e989a50` (benchmark merge, shortened Results, new chart) was pushed earlier the same day and
+CI passed on it.
+
+**Decisions.** The section's opening sentence said its table covered "every fine-tuning run behind the
+results above". With German power in the chart that was no longer true: `28M full_ft` on `de_power_15m`
+ran 400 steps at a 384-step context in `39.5 s` (`1.48 GiB`), outside the table's "under 30 s" for 28M.
+The sentence now names the retail demand and stock volatility benchmarks, and the German power run is
+quoted as an example of how time scales with context length and steps.
+
+**Not done / open.** This change is not pushed.
