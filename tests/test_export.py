@@ -331,18 +331,18 @@ def test_export_multiprocess_metadata_keys_only_when_world_size_gt_one(tiny_fore
     assert meta_four["effective_batch_size"] == 32
     assert meta_four["hyperparameters"]["batch_size"] == 8
 
-    # When effective_batch_size is omitted with training_config, it defaults to world_size * batch_size.
-    out_inferred = export_checkpoint(tiny_forecaster.model, tmp_path / "ws-2", training_config=cfg, world_size=2)
-    meta_inferred = json.loads((out_inferred / "tune_metadata.json").read_text(encoding="utf-8"))
-    assert meta_inferred["world_size"] == 2
-    assert meta_inferred["effective_batch_size"] == 16
-
-    # Invalid world_size / effective_batch_size fail before creating output_dir.
+    # Passing only one of world_size / effective_batch_size is rejected (no implicit fallback).
     bad_dir = tmp_path / "bad-ws"
+    with pytest.raises(ValueError, match="passed together"):
+        export_checkpoint(tiny_forecaster.model, bad_dir, training_config=cfg, world_size=2)
+    with pytest.raises(ValueError, match="passed together"):
+        export_checkpoint(tiny_forecaster.model, bad_dir, training_config=cfg, effective_batch_size=16)
+
+    # Invalid world_size / effective_batch_size values fail before creating output_dir.
     with pytest.raises(ValueError, match="world_size"):
-        export_checkpoint(tiny_forecaster.model, bad_dir, world_size=0)
+        export_checkpoint(tiny_forecaster.model, bad_dir, world_size=0, effective_batch_size=8)
     with pytest.raises(ValueError, match="world_size"):
-        export_checkpoint(tiny_forecaster.model, bad_dir, world_size=True)  # type: ignore[arg-type]
+        export_checkpoint(tiny_forecaster.model, bad_dir, world_size=True, effective_batch_size=8)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="effective_batch_size"):
         export_checkpoint(tiny_forecaster.model, bad_dir, world_size=2, effective_batch_size=0)
     assert not bad_dir.exists()

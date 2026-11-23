@@ -37,6 +37,7 @@ from timestral_tune.data.batch import flip_batch_signs
 from timestral_tune.models import TuneTimestralModel
 from timestral_tune.trainer import Callback, RankFailureError
 from timestral_tune.trainer import __all__ as trainer_all
+from timestral_tune.trainer import trainer as trainer_module
 from timestral_tune.trainer.distributed import DistributedContext, steps_per_epoch
 from timestral_tune.trainer.step import compute_loss
 
@@ -425,18 +426,20 @@ def _sc_guards_logs_and_export(rank: int, world_size: int) -> dict[str, Any]:
 
         assert not export_target.exists()
 
-        # On non-zero ranks, verify export() never touches Hub, weight merges, or disk.
+        # On non-zero ranks, verify export() never hashes datasets, calls Hub, merges weights, or writes disk.
         orig_download = export_module.hf_hub_download
         orig_merge = export_module.merged_state_dict
         orig_save = export_module.save_file
+        orig_fp = trainer_module.dataset_fingerprint
 
         def _forbid(*_args: Any, **_kwargs: Any) -> Any:
-            raise AssertionError("non-zero rank export() must not call Hub, merge weights, or save files")
+            raise AssertionError("non-zero rank export() must not hash datasets, call Hub, merge weights, or write")
 
         if rank != 0:
             export_module.hf_hub_download = _forbid
             export_module.merged_state_dict = _forbid
             export_module.save_file = _forbid
+            trainer_module.dataset_fingerprint = _forbid
 
         tlog, handler, prev = _capture_trainer_logs()
         try:
@@ -446,6 +449,7 @@ def _sc_guards_logs_and_export(rank: int, world_size: int) -> dict[str, Any]:
             export_module.hf_hub_download = orig_download
             export_module.merged_state_dict = orig_merge
             export_module.save_file = orig_save
+            trainer_module.dataset_fingerprint = orig_fp
 
         out["export_returned_matches"] = returned == export_target
         out["export_dir_exists"] = export_target.exists()

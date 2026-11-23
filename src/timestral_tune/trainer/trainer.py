@@ -1754,6 +1754,28 @@ class TimestralTrainer:
         target = output_dir if output_dir is not None else self.config.output_dir
         if target is None:
             raise ValueError("no output directory: pass output_dir to export() or set TrainingConfig.output_dir")
+        world_size = None if self._dist is None else self._dist.world_size
+        effective_batch_size = None if self._dist is None else self._dist.world_size * self.config.batch_size
+        if self._dist is not None and not self._dist.is_rank_zero:
+            # Skip dataset_fingerprint() hashing on non-zero ranks; validate only caller-supplied inputs.
+            _validate_export_inputs(
+                self.model,
+                lora_config=self.lora_config,
+                calibrator=calibrator,
+                metrics=metrics,
+                license_path=license_path,
+                data_fingerprint=data_fingerprint,
+                world_size=world_size,
+                effective_batch_size=effective_batch_size,
+            )
+            logger.info(
+                "skipping checkpoint write on rank %d/%d; rank 0 writes %s",
+                self._dist.rank,
+                self._dist.world_size,
+                Path(target),
+            )
+            return Path(target)
+
         fingerprint = data_fingerprint if data_fingerprint is not None else dataset_fingerprint(self.train_dataset)
         replay_source: dict[str, Any] | None = None
         if self.replay_dataset is not None:
@@ -1769,27 +1791,6 @@ class TimestralTrainer:
                 replay_source["seed"] = self.replay_dataset.seed
                 replay_source["families"] = list(self.replay_dataset.families)
                 replay_source["missing_rate"] = self.replay_dataset.missing_rate
-        world_size = None if self._dist is None else self._dist.world_size
-        effective_batch_size = None if self._dist is None else self._dist.world_size * self.config.batch_size
-        if self._dist is not None and not self._dist.is_rank_zero:
-            _validate_export_inputs(
-                self.model,
-                lora_config=self.lora_config,
-                calibrator=calibrator,
-                metrics=metrics,
-                license_path=license_path,
-                replay_source=replay_source,
-                data_fingerprint=fingerprint,
-                world_size=world_size,
-                effective_batch_size=effective_batch_size,
-            )
-            logger.info(
-                "skipping checkpoint write on rank %d/%d; rank 0 writes %s",
-                self._dist.rank,
-                self._dist.world_size,
-                Path(target),
-            )
-            return Path(target)
 
         return export_checkpoint(
             self.model,

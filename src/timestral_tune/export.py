@@ -269,7 +269,8 @@ def _validate_export_inputs(
     Checks, in the same order as `export_checkpoint`: fitted `ConformalCalibrator`, LoRA config
     match and presence when the model has adapters, strict (`allow_nan=False`) JSON serialisability
     of adapter config, calibrator, `replay_source`, `data_fingerprint`, and `metrics`, existence
-    of an explicit `license_path`, and optional multi-process metadata arguments.
+    of an explicit `license_path`, and optional multi-process metadata arguments (`world_size` and
+    `effective_batch_size`, which must be passed together or both omitted).
     """
     if isinstance(calibrator, ConformalCalibrator) and not calibrator.is_fitted:
         raise ValueError("cannot export an unfitted ConformalCalibrator; call fit() first")
@@ -303,6 +304,8 @@ def _validate_export_inputs(
         if not src.is_file():
             raise FileNotFoundError(f"license_path {str(src)!r} does not exist")
 
+    if (world_size is None) != (effective_batch_size is None):
+        raise ValueError("world_size and effective_batch_size must be passed together or both omitted")
     if world_size is not None and (isinstance(world_size, bool) or not isinstance(world_size, int) or world_size < 1):
         raise ValueError(f"world_size must be a positive integer or None, got {world_size!r}")
     if effective_batch_size is not None and (
@@ -345,9 +348,9 @@ def export_checkpoint(
     unmerged adapter matrices are written to `adapter.safetensors`. All metadata, JSON payloads,
     and licence files are validated and serialised before writing anything to disk, so errors
     never leave a partial export without `LICENSE` or `NOTICE`. Stale conditional files from a
-    previous export in `output_dir` are removed when not part of this export. When `world_size` is
-    greater than 1, top-level `world_size` and `effective_batch_size` keys are added to
-    `tune_metadata.json`; one-process exports omit them.
+    previous export in `output_dir` are removed when not part of this export. `world_size` and
+    `effective_batch_size` must be passed together or both omitted; when `world_size > 1`, both
+    are added as top-level keys in `tune_metadata.json`, while one-process exports omit them.
     """
     validated = _validate_export_inputs(
         model,
@@ -393,12 +396,9 @@ def export_checkpoint(
         "vendored_upstream_commit": _vendored_upstream_commit(),
     }
     if world_size is not None and world_size > 1:
+        assert effective_batch_size is not None
         metadata["world_size"] = world_size
-        metadata["effective_batch_size"] = (
-            effective_batch_size
-            if effective_batch_size is not None
-            else (None if training_config is None else world_size * training_config.batch_size)
-        )
+        metadata["effective_batch_size"] = effective_batch_size
     metadata_json = _dumps_json(metadata)
     license_bytes, is_verbatim = _resolve_license_bytes(resolved_base, resolved_revision, license_path)
     notice_text = _notice_text(
