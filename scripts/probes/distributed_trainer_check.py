@@ -1004,14 +1004,15 @@ def _validate_exported_dir(
         max_abs = float((reloaded_raw.double() - live_raw.double()).abs().max().item())
         scale = max(float(live_raw.double().abs().max().item()), 1e-12)
         rel_err = max_abs / scale
-        # `load_model(..., dtype=torch.float64)` (src/timestral_tune/models/loader.py:119-121)
-        # builds `TuneTimestralModel(config)` in float32, loads `model.safetensors` into those
-        # float32 parameters (truncating float64 weights to float32), and only then casts via
-        # `.to(device=target, dtype=dtype)`. Until the loader preserves float64 precision on load,
-        # a reloaded float64 export can only match the live float64 model to float32 precision
-        # (~1e-8-1e-7 on tiny_random), not float64 round-trip precision (~1e-10). Compare both
-        # dtypes at the float32 parity tolerance the loader can actually deliver.
-        tol = 1e-4
+        # `timestral_tune.models.loader.load_model` builds `TuneTimestralModel(config)` in float32,
+        # loads `model.safetensors` into those float32 parameters (truncating float64 weights to
+        # float32), and only then casts via `.to(device=target, dtype=dtype)`. Until `load_model`
+        # preserves float64 precision on load, a reloaded float64 export matches the live float64
+        # model only to float32 precision (~2.5e-9 to 1.65e-8 measured across `tiny_random`
+        # adaptation modes), not float64 round-trip precision (~1e-10). Use 1e-6 for float64
+        # (~60x margin over measured tiny_random truncation error, 100x tighter than float32's
+        # 1e-4 so silent corruption or drift is still caught).
+        tol = 1e-6 if model_dtype == torch.float64 else 1e-4
         if not math.isfinite(rel_err) or rel_err > tol:
             return False, f"export forecast parity mismatch: rel_err={rel_err:.2e} > tol={tol:.1e}"
     finally:
