@@ -9,7 +9,7 @@ All parity tests compare against the shipped one-process `TimestralTrainer` at `
 with `shuffle=False`, `sign_flip=False`, and LoRA `dropout=0`, using the exact tolerance tiers from
 spec §9:
 
-- Trajectory parity (a): `1e-10` relative (`float64` under `float64_reference()`) / `1e-4` (`float32`).
+- Trajectory parity (a, j): `1e-10` relative (`float64` under `float64_reference()`) / `1e-4` (`float32`).
 - Step-level gradients and loss (b): `1e-12` (`float64`) / `1e-5` (`float32`), bitwise `0.0` cross-rank.
 - Internal sharded validation (g): `1e-12` (`float64`) / `1e-5` (`float32`).
 """
@@ -3132,6 +3132,28 @@ def _replay_cfg_for(kind: str, *, batch_size: int, cache_base_outputs: bool) -> 
     raise ValueError(f"unknown replay kind: {kind}")
 
 
+def _t15j_warmed_full_ft_state(world_size: int, dtype_name: str) -> dict[str, Tensor]:
+    """Run 3 deterministic domain-only `full_ft` steps on one process so student != step-0 teacher."""
+    dtype = torch.float64 if dtype_name == "float64" else torch.float32
+    domain_ds = _make_uneven_dataset(_t15j_domain_counts(world_size), seed=1001, covariates=True)
+    cfg = _base_config(
+        mode="full_ft",
+        batch_size=world_size * 2,
+        max_steps=3,
+        warmup_steps=0,
+        lr_schedule="constant",
+        learning_rate=5e-3,
+        weight_decay=0.0,
+        gradient_clip_val=1.0,
+        seed=107,
+    )
+    ctx_mgr = float64_reference() if dtype == torch.float64 else torch.enable_grad()
+    with ctx_mgr:
+        trainer = TimestralTrainer(cfg, domain_ds, model=_fresh_tiny_model(seed=0, dtype=dtype))
+        trainer.fit()
+        return {k: v.detach().cpu().clone() for k, v in trainer.model.state_dict().items()}
+
+
 def _run_t15j_one(
     world_size: int,
     mode: str,
@@ -3142,6 +3164,7 @@ def _run_t15j_one(
     per_rank_batch: int,
     per_rank_replay_batch: int,
     cache_base_outputs: bool = True,
+    student_state: dict[str, Tensor] | None = None,
 ) -> dict[str, Any]:
     dtype = torch.float64 if dtype_name == "float64" else torch.float32
     domain_ds = _make_uneven_dataset(_t15j_domain_counts(world_size), seed=1001, covariates=True)
@@ -3173,6 +3196,9 @@ def _run_t15j_one(
             replay_dataset=replay_ds,
             model=model,
         )
+        if student_state is not None:
+            # Load pre-warmed student weights after teacher setup so `_frozen_base` / cached teacher stay at base.
+            trainer.model.load_state_dict(student_state)
         init_trainable = _flat_trainable(trainer).clone()
         res = trainer.fit()
         final_trainable = _flat_trainable(trainer).clone()
@@ -3185,7 +3211,15 @@ def _run_t15j_one(
     }
 
 
-def _sc_t15j_parity(rank: int, world_size: int, mode: str, kind: str, layout: str, dtype_name: str) -> dict[str, Any]:
+def _sc_t15j_parity(
+    rank: int,
+    world_size: int,
+    mode: str,
+    kind: str,
+    layout: str,
+    dtype_name: str,
+    student_state: dict[str, Tensor] | None = None,
+) -> dict[str, Any]:
     del rank
     return _run_t15j_one(
         world_size,
@@ -3196,6 +3230,7 @@ def _sc_t15j_parity(rank: int, world_size: int, mode: str, kind: str, layout: st
         per_rank_batch=2,
         per_rank_replay_batch=2,
         cache_base_outputs=True,
+        student_state=student_state,
     )
 
 
@@ -3203,10 +3238,9 @@ def _t15j_cases() -> list[tuple[str, str, str, str, str]]:
     cases: list[tuple[str, str, str, str, str]] = []
     # Full 3x3x2 matrix on non-multiple wrapping replay with unequal M_r / W_r, zero-scored & empty domain ranks,
     # plus short replay (< N*b and < N: wraps every step, empty replay rank).
-    # (`full_ft` + distillation in float32 is asserted in its own xfail test below because `_frozen_base`'s
-    # `requires_grad=False` triggers a different PyTorch F.linear dispatch from student's `requires_grad=True`
-    # at step 0—for batch > 1 on PyTorch 2.15 and even batch == 1 on PyTorch 2.4—amplified 1000x by
-    # `1 / smooth_beta` and AdamW sign flips into ~4e-4..2e-3 `param_update` divergence vs 1e-4.)
+    # `full_ft` + distillation in float32 is covered by `test_t15_j_full_ft_distill_float32` below: strict 1e-4
+    # parity from a moved student (where one-process reproduces itself) plus cross-rank bitwise equality from an
+    # identical student/teacher start (see `scripts/probes/linear_requires_grad_dispatch.py`).
     for dt in ("float64", "float32"):
         for mode in REPLAY_TEACHER_MODES:
             for kind in ("replay_only", "distill_only", "both"):
@@ -3233,12 +3267,14 @@ _T15J_FULL_FT_DISTILL_F32_CASES: tuple[tuple[str, str, str], ...] = (
 
 
 def _scenarios_t15j(world_size: int, base_dir: str) -> dict[str, Any]:
-    del world_size, base_dir
+    del base_dir
     scenarios: dict[str, Any] = {
         label: (_sc_t15j_parity, (mode, kind, layout, dt)) for label, mode, kind, layout, dt in _t15j_cases()
     }
+    warmed_f32 = _t15j_warmed_full_ft_state(world_size, "float32")
     for label, kind, layout in _T15J_FULL_FT_DISTILL_F32_CASES:
-        scenarios[label] = (_sc_t15j_parity, ("full_ft", kind, layout, "float32"))
+        scenarios[f"{label}_moved"] = (_sc_t15j_parity, ("full_ft", kind, layout, "float32", warmed_f32))
+        scenarios[f"{label}_identical"] = (_sc_t15j_parity, ("full_ft", kind, layout, "float32"))
     return scenarios
 
 
@@ -3247,9 +3283,10 @@ def _scenarios_t15j(world_size: int, base_dir: str) -> dict[str, Any]:
 def test_t15_j_replay_and_distillation_trajectory_parity(world_size: int, _t15_pool: Any) -> None:
     """T15(j). Stage 2 multi-process `fit()` trajectory parity against one-process `fit()` at
     `(N * B, N * b)` across `replay_only`, `distill_only`, and `both`, across `head_only`, `full_ft`,
-    and `lora_variate`, in `float64` (`1e-10`) and `float32` (`1e-4`), with unequal domain counts,
-    zero-scored and empty domain ranks, wrapping non-multiple replay (`len = N*b + N + 1` with unequal
-    non-zero `M_r`), and short replay (`len = N - 1 < N*b` with an empty replay rank).
+    and `lora_variate`, in `float64` (`1e-10`, including `full_ft` distillation from identical start)
+    and `float32` (`1e-4`), with unequal domain counts, zero-scored and empty domain ranks, wrapping
+    non-multiple replay (`len = N*b + N + 1` with unequal non-zero `M_r`), and short replay
+    (`len = N - 1 < N*b` with an empty replay rank).
     """
     outcomes = _t15_pool("j", world_size)
 
@@ -3323,24 +3360,39 @@ def test_t15_j_replay_and_distillation_trajectory_parity(world_size: int, _t15_p
 
 
 @pytest.mark.acceptance
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "full_ft distillation at float32 with smooth_beta=1e-3: _frozen_base has requires_grad=False "
-        "which dispatches F.linear differently from student's requires_grad=True (~2e-7..4e-7 at step 0), "
-        "amplified 1000x by 1/smooth_beta and AdamW sign flips into ~4e-4..2e-3 param_update error (> 1e-4)"
-    ),
-)
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_t15_j_full_ft_distill_float32_parity(world_size: int, _t15_pool: Any) -> None:
-    """T15(j) float32 tier probe for `full_ft` distillation (`distill_only` and `both`, wrapping
-    and short replay). Cross-rank bitwise equality holds; the `1e-4` float32 `param_update` tier
-    is not loosened and is tracked as strict xfail until `_frozen_base` matches student's `F.linear`
-    dispatch.
+def test_t15_j_full_ft_distill_float32(world_size: int, _t15_pool: Any) -> None:
+    """T15(j) float32 `full_ft` distillation (`distill_only` and `both`, wrapping and short replay):
+    strict `1e-4` parity (losses, `final_params`, `param_update`) from a legitimately warmed student
+    (moved away from the step-0 frozen teacher), plus cross-rank bitwise parameter and `TrainingResult`
+    equality from an identical student/teacher start.
     """
     outcomes = _t15_pool("j", world_size)
     tol = TRAJ_TOL["float32"]
+    warmed_f32 = _t15j_warmed_full_ft_state(world_size, "float32")
+
+    # Non-vacuous check for the moved-student regime: distillation must shift weights vs no-replay.
+    domain_ds = _make_uneven_dataset(_t15j_domain_counts(world_size), seed=1001, covariates=True)
+    plain_cfg = _base_config(
+        mode="full_ft",
+        batch_size=world_size * 2,
+        epochs=2,
+        max_steps=None,
+        warmup_steps=1,
+        lr_schedule="cosine",
+        learning_rate=1e-3,
+        weight_decay=0.01,
+        gradient_clip_val=1.0,
+        seed=107,
+    )
+    t_plain_moved = TimestralTrainer(plain_cfg, domain_ds, model=_fresh_tiny_model(0))
+    t_plain_moved.model.load_state_dict(warmed_f32)
+    t_plain_moved.fit()
+    plain_moved_params = _flat_trainable(t_plain_moved).clone()
+
     for label, kind, layout in _T15J_FULL_FT_DISTILL_F32_CASES:
+        # 1. Moved student: strict 1e-4 parity against default 1-process (cache_base_outputs=True).
+        moved_label = f"{label}_moved"
         ref = _run_t15j_one(
             world_size,
             "full_ft",
@@ -3350,17 +3402,53 @@ def test_t15_j_full_ft_distill_float32_parity(world_size: int, _t15_pool: Any) -
             per_rank_batch=world_size * 2,
             per_rank_replay_batch=world_size * 2,
             cache_base_outputs=True,
+            student_state=warmed_f32,
         )
+        ref_res: TrainingResult = ref["result"]
+        assert ref_res.steps == 6 and ref_res.epochs == 2 and ref_res.skipped_batches == 0
         ref_update = ref["final_trainable"] - ref["init_trainable"]
-        rank_outs = unwrap_results(outcomes[label])
-        r0 = rank_outs[0]
-        for r, out in enumerate(rank_outs):
-            assert out["result"] == r0["result"]
-            assert torch.equal(out["final_all"], r0["final_all"])
+        assert float(ref_update.norm()) > 1e-4, f"{moved_label}: reference update is trivial"
+        shift = l2_rel(ref["final_trainable"], plain_moved_params)
+        assert shift > 1e-4, f"{moved_label}: distillation had negligible effect vs no-replay ({shift:.2e})"
+
+        moved_outs = unwrap_results(outcomes[moved_label])
+        r0_m = moved_outs[0]
+        for r, out in enumerate(moved_outs):
+            res: TrainingResult = out["result"]
+            assert res.steps == ref_res.steps and res.epochs == ref_res.epochs and res.skipped_batches == 0
+            assert res == r0_m["result"], f"{moved_label} r{r}: TrainingResult differs from rank 0"
+            assert torch.equal(out["final_all"], r0_m["final_all"]), (
+                f"{moved_label} r{r}: cross-rank parameters not bitwise identical"
+            )
+            for (step, loss), (ref_step, ref_loss) in zip(res.train_history, ref_res.train_history, strict=True):
+                assert step == ref_step
+                assert _scalar_rel(loss, ref_loss) <= tol, (
+                    f"{moved_label} r{r} step {step}: loss {loss} vs ref {ref_loss} "
+                    f"(rel {_scalar_rel(loss, ref_loss):.2e} > {tol:.1e})"
+                )
             param_err = l2_rel(out["final_trainable"], ref["final_trainable"])
             update_err = l2_rel(out["final_trainable"] - out["init_trainable"], ref_update)
-            assert param_err <= tol, f"{label} r{r}: final_params rel L2 {param_err:.2e} > {tol:.1e}"
-            assert update_err <= tol, f"{label} r{r}: param_update rel L2 {update_err:.2e} > {tol:.1e}"
+            assert param_err <= tol, f"{moved_label} r{r}: final_params rel L2 {param_err:.2e} > {tol:.1e}"
+            assert update_err <= tol, f"{moved_label} r{r}: param_update rel L2 {update_err:.2e} > {tol:.1e}"
+
+        # 2. Identical student/teacher start at float32: assert cross-rank bitwise equality and
+        #    identical TrainingResult/losses across ranks. The 1e-4 one-process parity tier is not
+        #    asserted here because one-process itself disagrees across cached vs live or split
+        #    batch sizes at step 0 due to PyTorch's non-contiguous `F.linear` dispatch on
+        #    `requires_grad=True` vs `False` weights (`scripts/probes/linear_requires_grad_dispatch.py`),
+        #    amplified by `1 / smooth_beta`; that kernel dispatch varies by PyTorch version and CPU
+        #    BLAS backend so identical-start parity is verified at float64 above instead.
+        ident_label = f"{label}_identical"
+        ident_outs = unwrap_results(outcomes[ident_label])
+        r0_i = ident_outs[0]
+        for r, out in enumerate(ident_outs):
+            res = out["result"]
+            assert res.steps == 6 and res.epochs == 2 and res.skipped_batches == 0
+            assert res == r0_i["result"], f"{ident_label} r{r}: TrainingResult differs from rank 0"
+            assert torch.equal(out["final_all"], r0_i["final_all"]), (
+                f"{ident_label} r{r}: cross-rank parameters not bitwise identical"
+            )
+            assert float((out["final_trainable"] - out["init_trainable"]).norm()) > 1e-4
 
 
 # ------------------------------------------------------------------ T15 (k): skip, unscored/partial, repeated fit
@@ -4693,6 +4781,99 @@ def test_t15_l_replay_flips_teachers_startup_failures_and_export(world_size: int
             assert out["export_info_logs"] >= 1
 
 
+def _worker_t15l_compile_default_replay_distill(rank: int, world_size: int, base_dir: str) -> dict[str, Any]:
+    del world_size
+    # 8 domain windows and 8 replay windows (B=2, b=2, max_steps=3): both ranks compile identical
+    # per-rank shapes in parallel across distinct domain/replay sequence layouts and wrap replay on step 2.
+    domain_ds = _make_uneven_dataset([8, 4, 6, 2, 7, 3, 5, 1], seed=1230, covariates=True)
+    replay_ds = _make_uneven_dataset([8, 6, 4, 2, 7, 3, 5, 1], seed=1231, covariates=False, context_patches=3)
+    cfg = _base_config(
+        mode="lora_variate",
+        batch_size=2,
+        max_steps=3,
+        learning_rate=2e-2,
+        lr_schedule="constant",
+        compile_model=True,
+        compile_mode="default",
+        seed=82,
+    )
+    rcfg = ReplayConfig(
+        replay_fraction=0.25,
+        distill_weight=0.5,
+        batch_size=2,
+        sign_flip=False,
+        cache_base_outputs=True,
+    )
+    trainer = TimestralTrainer(
+        cfg,
+        domain_ds,
+        lora_config=_lora_for("lora_variate", dropout=0.0),
+        replay_config=rcfg,
+        replay_dataset=replay_ds,
+        model=_fresh_tiny_model(seed=36),
+    )
+    init_params = _flat_params(trainer.model).clone()
+    res = trainer.fit()
+    state = merged_state_dict(trainer.model)
+    has_orig_mod = any("_orig_mod" in k for k in state)
+    reloaded = TimestralModel(trainer.model.config)
+    reloaded.load_state_dict(state, strict=True)
+    export_dir = Path(base_dir) / f"compile_replay_export_r{rank}"
+    returned = trainer.export(export_dir)
+    return {
+        "result": res,
+        "init_params": init_params,
+        "params": _flat_params(trainer.model),
+        "replay_base_pos_is_none": trainer._replay_base_pos is None,
+        "replay_base_neg_is_none": trainer._replay_base_neg is None,
+        "has_orig_mod": has_orig_mod,
+        "rcfg_dict": rcfg.to_dict(),
+        "replay_fp": dataset_fingerprint(replay_ds),
+        "returned": str(returned),
+        "export_dir": str(export_dir),
+        "exists": export_dir.exists(),
+    }
+
+
+@pytest.mark.acceptance
+def test_t15_l_compile_default_replay_distill_smoke(tmp_path: Path) -> None:
+    """T15(l). `compile_model=True` with `compile_mode="default"` trains cleanly across 2 ranks
+    with LoRA replay and live `disable_lora` distillation across distinct domain/replay layouts,
+    produces bitwise identical weights, merges without `_orig_mod` keys, and exports replay +
+    multi-process metadata on rank 0 only.
+    """
+    if shutil.which("g++") is None and shutil.which("clang++") is None:
+        pytest.skip("CPU torch.compile requires a C++ compiler (g++ or clang++)")
+    outs = unwrap_results(
+        run_distributed(
+            _worker_t15l_compile_default_replay_distill,
+            world_size=2,
+            args=(str(tmp_path),),
+            pg_timeout=60.0,
+            wall_timeout=180.0,
+        )
+    )
+    for r, out in enumerate(outs):
+        assert out["result"].steps == 3
+        assert out["result"] == outs[0]["result"]
+        assert torch.equal(out["params"], outs[0]["params"]), f"compile_replay r{r}: cross-rank params differ"
+        assert not torch.equal(out["params"], out["init_params"]), f"compile_replay r{r}: weights did not move"
+        assert out["replay_base_pos_is_none"] and out["replay_base_neg_is_none"], (
+            f"compile_replay r{r}: teacher cache was built instead of live disable_lora path"
+        )
+        assert out["has_orig_mod"] is False
+        assert out["returned"] == out["export_dir"]
+    assert outs[0]["exists"] is True
+    meta = json.loads((Path(outs[0]["export_dir"]) / "tune_metadata.json").read_text(encoding="utf-8"))
+    assert meta["world_size"] == 2 and meta["effective_batch_size"] == 4
+    assert meta["replay_config"] == outs[0]["rcfg_dict"]
+    src = meta["replay_source"]
+    assert src["type"] == "TimeSeriesDataset"
+    assert src["num_windows"] == 8
+    assert src["data_fingerprint"] == outs[0]["replay_fp"]
+    assert outs[1]["exists"] is False
+
+
 # --------------------------------------------------------------------------- collection-aware scenario pool
 
 _SCENARIO_GROUPS: dict[str, Callable[[int, str], dict[str, Any]]] = {
@@ -4723,7 +4904,7 @@ _TEST_TO_GROUP: dict[str, str] = {
     "test_t15_i_single_rank_failure_propagation": "i",
     "test_t15_i_startup_digest_failure_propagation": "i",
     "test_t15_j_replay_and_distillation_trajectory_parity": "j",
-    "test_t15_j_full_ft_distill_float32_parity": "j",
+    "test_t15_j_full_ft_distill_float32": "j",
     "test_t15_k_replay_skip_unscored_and_repeated_fit": "k",
     "test_t15_l_replay_flips_teachers_startup_failures_and_export": "l",
 }
