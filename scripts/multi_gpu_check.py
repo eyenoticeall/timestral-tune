@@ -1147,6 +1147,351 @@ def _prepare_session_env(base_env: Mapping[str, str], *, shared_gpu: bool) -> di
     return env
 
 
+# --------------------------------------------------------------------------- stage process runner
+
+
+class StageProcess:
+    """Execute one stage command with non-blocking pipe draining, timeout, and confirmed-live tree cleanup."""
+
+    def __init__(
+        self,
+        *,
+        stage_name: str,
+        log_file: Path,
+        cmd: Sequence[str],
+        repo_root: Path,
+        env: Mapping[str, str],
+        ps_bin: str | None,
+        stage_timeout: float,
+        teardown_grace_s: float,
+        teardown_reap_s: float,
+        tree_method: TreeStateMethod,
+        tree_sig: str,
+        get_interrupted_sig: Callable[[], int | None],
+        write_stdout: Callable[[bytes], None],
+        write_stderr: Callable[[bytes], None],
+        on_before_spawn: Callable[[str], None] | None = None,
+        on_timeout_teardown: Callable[[str], None] | None = None,
+    ) -> None:
+        self.stage_name = stage_name
+        self.log_file = log_file
+        self.cmd = list(cmd)
+        self.repo_root = repo_root
+        self.env = env
+        self.ps_bin = ps_bin
+        self.stage_timeout = stage_timeout
+        self.teardown_grace_s = teardown_grace_s
+        self.teardown_reap_s = teardown_reap_s
+        self.tree_method = tree_method
+        self.tree_sig = tree_sig
+        self._get_interrupted_sig = get_interrupted_sig
+        self._write_stdout = write_stdout
+        self._write_stderr = write_stderr
+        self._on_before_spawn = on_before_spawn
+        self._on_timeout_teardown = on_timeout_teardown
+
+        self.status_note: str = ""
+        self._self_pid = os.getpid()
+        self._self_pgid = os.getpgrp()
+        self._token_val = f"tt_{self._self_pid}_{uuid.uuid4().hex}"
+        self._token_needle = f"{_STAGE_TOKEN_ENV_KEY}={self._token_val}"
+        self._r_fd: int = -1
+        self._w_fd: int = -1
+        self._sel: selectors.BaseSelector | None = None
+        self._fd_registered: bool = False
+        self._eof: bool = False
+        self._proc: subprocess.Popen[Any] | None = None
+        self._log_f: Any = None
+        self._log_write_enabled: bool = True
+
+    def _mark_eof(self) -> None:
+        self._eof = True
+        if self._fd_registered and self._sel is not None:
+            try:
+                self._sel.unregister(self._r_fd)
+            except (KeyError, ValueError, OSError):
+                pass
+            self._fd_registered = False
+
+    def _safe_write_log(self, data: bytes) -> None:
+        if self._log_f is not None and self._log_write_enabled:
+            try:
+                self._log_f.write(data)
+                self._log_f.flush()
+            except OSError:
+                self._log_write_enabled = False
+
+    def _drain_available(self, *, raise_on_log_error: bool = True) -> None:
+        while not self._eof:
+            try:
+                chunk = os.read(self._r_fd, 65536)
+            except BlockingIOError:
+                return
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    return
+                self._mark_eof()
+                return
+            if not chunk:
+                self._mark_eof()
+                return
+            if self._log_f is not None and self._log_write_enabled:
+                if raise_on_log_error:
+                    self._log_f.write(chunk)
+                    self._log_f.flush()
+                else:
+                    self._safe_write_log(chunk)
+            self._write_stdout(chunk)
+
+    def _wait_and_drain(self, duration: float, *, raise_on_log_error: bool = True) -> None:
+        end = time.monotonic() + duration
+        while True:
+            self._drain_available(raise_on_log_error=raise_on_log_error)
+            rem = end - time.monotonic()
+            if rem <= 0:
+                return
+            if self._eof or not self._fd_registered or self._sel is None:
+                time.sleep(min(0.05, rem))
+                return
+            try:
+                events = self._sel.select(timeout=min(0.05, rem))
+            except InterruptedError:
+                continue
+            if events:
+                self._drain_available(raise_on_log_error=raise_on_log_error)
+
+    def _collect_targets(self) -> tuple[set[int], set[int]]:
+        assert self._proc is not None
+        return collect_live_targets(
+            self._proc,
+            self._token_needle,
+            self_pid=self._self_pid,
+            self_pgid=self._self_pgid,
+            ps_bin=self.ps_bin,
+        )
+
+    def _kill_tree(self, *, notify_timeout_teardown: bool = False, raise_on_log_error: bool = True) -> int:
+        assert self._proc is not None
+        ever_signalled: set[int] = set()
+        self._drain_available(raise_on_log_error=raise_on_log_error)
+
+        live_pids, live_pgids = self._collect_targets()
+        if live_pids or live_pgids:
+            ever_signalled |= live_pids
+            signal_live(live_pids, live_pgids, signal.SIGTERM)
+
+        if notify_timeout_teardown and self._on_timeout_teardown is not None:
+            self._on_timeout_teardown(self.stage_name)
+
+        grace_end = time.monotonic() + self.teardown_grace_s
+        while time.monotonic() < grace_end:
+            self._wait_and_drain(0.05, raise_on_log_error=raise_on_log_error)
+            live_pids, live_pgids = self._collect_targets()
+            if not live_pids and self._proc.poll() is not None:
+                self._wait_and_drain(0.1, raise_on_log_error=raise_on_log_error)
+                break
+            newly_seen = live_pids - ever_signalled
+            if newly_seen:
+                ever_signalled |= newly_seen
+                signal_live(newly_seen, set(), signal.SIGTERM)
+
+        live_pids, live_pgids = self._collect_targets()
+        if live_pids or live_pgids:
+            ever_signalled |= live_pids
+            signal_live(live_pids, live_pgids, signal.SIGKILL)
+
+            reap_end = time.monotonic() + self.teardown_reap_s
+            while time.monotonic() < reap_end:
+                self._wait_and_drain(0.05, raise_on_log_error=raise_on_log_error)
+                live_pids, live_pgids = self._collect_targets()
+                if not live_pids and self._proc.poll() is not None:
+                    break
+                if live_pids or live_pgids:
+                    ever_signalled |= live_pids
+                    signal_live(live_pids, live_pgids, signal.SIGKILL)
+
+        try:
+            self._proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        self._wait_and_drain(0.1, raise_on_log_error=raise_on_log_error)
+        self._drain_available(raise_on_log_error=raise_on_log_error)
+        return len(ever_signalled)
+
+    def _log_interrupted(self, killed_n: int, context: str = "") -> tuple[int, int]:
+        sig_num = self._get_interrupted_sig()
+        assert sig_num is not None
+        sig_label, _ = signal_names(sig_num)
+        suffix = f" ({context})" if context else ""
+        msg = (
+            f"ERROR: stage {self.stage_name} interrupted by {sig_label}{suffix} "
+            f"and killed (signalled {killed_n} pid(s))\n"
+        ).encode()
+        self._safe_write_log(msg)
+        self._write_stderr(msg)
+        return 128 + sig_num, sig_num
+
+    def _wait_until_exit_or_deadline(self, deadline: float) -> bool:
+        assert self._proc is not None and self._sel is not None
+        while True:
+            if self._get_interrupted_sig() is not None:
+                return False
+            rc = self._proc.poll()
+            remaining = deadline - time.monotonic()
+            if rc is not None:
+                self._drain_available()
+                if self._eof:
+                    return False
+                if remaining <= 0:
+                    return True
+                try:
+                    events = self._sel.select(timeout=min(0.05, remaining))
+                except InterruptedError:
+                    continue
+                if events:
+                    self._drain_available()
+                continue
+
+            if remaining <= 0:
+                return True
+            if self._eof or not self._fd_registered:
+                time.sleep(min(0.05, remaining))
+                continue
+            try:
+                events = self._sel.select(timeout=min(0.05, remaining))
+            except InterruptedError:
+                continue
+            if events:
+                self._drain_available()
+
+    def _close_resources(self) -> None:
+        if self._log_f is not None:
+            try:
+                self._log_f.close()
+            except OSError:
+                pass
+            self._log_f = None
+        if self._sel is not None:
+            self._sel.close()
+            self._sel = None
+            self._fd_registered = False
+        if self._w_fd >= 0:
+            try:
+                os.close(self._w_fd)
+            except OSError:
+                pass
+            self._w_fd = -1
+        if self._r_fd >= 0:
+            try:
+                os.close(self._r_fd)
+            except OSError:
+                pass
+            self._r_fd = -1
+
+    def run(self) -> tuple[int, int | None]:
+        """Spawn the stage, stream its output until completion/timeout/interrupt, and return `(rc, interrupted_sig)`."""
+        child_env = dict(self.env)
+        child_env[_STAGE_TOKEN_ENV_KEY] = self._token_val
+
+        self._r_fd, self._w_fd = os.pipe()
+        os.set_blocking(self._r_fd, False)
+        self._sel = selectors.DefaultSelector()
+        self._sel.register(self._r_fd, selectors.EVENT_READ)
+        self._fd_registered = True
+
+        try:
+            self._log_f = open(self.log_file, "wb")
+            header = f"== stage: {self.stage_name} (tree_state={self.tree_method}:{self.tree_sig[:12]}) ==\n".encode()
+            self._log_f.write(header)
+            self._log_f.flush()
+            self._write_stdout(header)
+
+            if self._on_before_spawn is not None:
+                self._on_before_spawn(self.stage_name)
+
+            if self._get_interrupted_sig() is not None:
+                return self._log_interrupted(0, context="during startup before launch")
+
+            try:
+                self._proc = subprocess.Popen(
+                    self.cmd,
+                    cwd=str(self.repo_root),
+                    stdout=self._w_fd,
+                    stderr=self._w_fd,
+                    start_new_session=True,
+                    env=child_env,
+                )
+            except OSError as exc:
+                msg = f"ERROR: failed to launch stage {self.stage_name}: {exc}\n".encode()
+                self._safe_write_log(msg)
+                self._write_stderr(msg)
+                return 127, None
+            os.close(self._w_fd)
+            self._w_fd = -1
+
+            timed_out = self._wait_until_exit_or_deadline(time.monotonic() + self.stage_timeout)
+
+            if self._get_interrupted_sig() is not None:
+                killed_n = self._kill_tree()
+                return self._log_interrupted(killed_n)
+
+            if timed_out:
+                killed_n = self._kill_tree(notify_timeout_teardown=True)
+                msg = (
+                    f"ERROR: stage {self.stage_name} timed out after {self.stage_timeout:.0f}s "
+                    f"and was killed (signalled {killed_n} pid(s))\n"
+                ).encode()
+                self._safe_write_log(msg)
+                self._write_stderr(msg)
+                if self._get_interrupted_sig() is not None:
+                    return self._log_interrupted(killed_n, context="during timeout teardown")
+                return 124, None
+
+            rc = self._proc.wait()
+            self._drain_available()
+            if self._get_interrupted_sig() is not None:
+                killed_n = self._kill_tree()
+                return self._log_interrupted(killed_n, context="at stage exit")
+
+            exit_code = 128 + (-rc) if rc < 0 else rc
+            # Sweep any surviving token-carrying descendants (for example backgrounded workers
+            # with closed/redirected stdio) so finished stages never leak processes or GPU memory.
+            survivor_pids, survivor_pgids = self._collect_targets()
+            if survivor_pids or survivor_pgids:
+                killed_n = self._kill_tree()
+                if self._get_interrupted_sig() is not None:
+                    return self._log_interrupted(killed_n, context="during post-exit cleanup")
+                warn_msg = (
+                    f"WARNING: stage {self.stage_name} exited ({exit_code}) with surviving descendants; "
+                    f"killed stage tree (signalled {killed_n} pid(s))\n"
+                ).encode()
+                self._safe_write_log(warn_msg)
+                self._write_stderr(warn_msg)
+            return exit_code, None
+        except BaseException as exc:
+            if isinstance(exc, OSError):
+                self._log_write_enabled = False
+            killed_n = 0
+            if self._proc is not None:
+                killed_n = self._kill_tree(raise_on_log_error=False)
+            if not isinstance(exc, Exception):
+                raise
+            err_msg = (
+                f"ERROR: stage {self.stage_name} aborted due to {type(exc).__name__}: {exc} "
+                f"(killed {killed_n} pid(s))\n"
+            ).encode()
+            self._safe_write_log(err_msg)
+            self._write_stderr(err_msg)
+            if self._get_interrupted_sig() is not None:
+                return self._log_interrupted(killed_n, context=f"after {type(exc).__name__}")
+            self.status_note = type(exc).__name__
+            return 1, None
+        finally:
+            self._close_resources()
+
+
 # --------------------------------------------------------------------------- session runner
 
 
@@ -1166,7 +1511,7 @@ class SessionRunner:
 
     stages: list[StageRecord] = field(default_factory=list, init=False)
     ranks: list[int] = field(default_factory=list, init=False)
-    any_failed: int = field(default=0, init=False)
+    any_failed: bool = field(default=False, init=False)
     tree_method: TreeStateMethod = field(default="git", init=False)
     tree_sig: str = field(default="", init=False)
     runtime_env_sig: str = field(default="uninitialized", init=False)
@@ -1307,9 +1652,16 @@ class SessionRunner:
         _, short_sig = signal_names(self.interrupted_sig_num)
         self.interrupted_short_sig = short_sig
         self.interrupted_exit_code = 128 + self.interrupted_sig_num
-        self.any_failed = 1
+        self.any_failed = True
         self.write_summary()
         return self.interrupted_exit_code
+
+    def _abort_with_error(self, message: str, *, exit_code: int = 2, write_summary: bool = True) -> int:
+        self._write_stderr_bytes((message + "\n").encode("utf-8"))
+        if write_summary:
+            self.any_failed = True
+            self.write_summary()
+        return exit_code
 
     def _run_interruptible_capture(
         self,
@@ -1416,299 +1768,27 @@ class SessionRunner:
         after spawn kills the stage tree before returning non-zero so descendants never survive.
         """
         self._last_stage_status_note = ""
-        self_pid = os.getpid()
-        self_pgid = os.getpgrp()
-        token_val = f"tt_{self_pid}_{uuid.uuid4().hex}"
-        token_needle = f"{_STAGE_TOKEN_ENV_KEY}={token_val}"
-        child_env = dict(self.env)
-        child_env[_STAGE_TOKEN_ENV_KEY] = token_val
-
-        r_fd, w_fd = os.pipe()
-        os.set_blocking(r_fd, False)
-        sel = selectors.DefaultSelector()
-        sel.register(r_fd, selectors.EVENT_READ)
-        fd_registered = True
-        eof = False
-        proc: subprocess.Popen[Any] | None = None
-        log_f: Any = None
-        log_write_enabled = True
-
-        def _mark_eof() -> None:
-            nonlocal eof, fd_registered
-            eof = True
-            if fd_registered:
-                try:
-                    sel.unregister(r_fd)
-                except (KeyError, ValueError, OSError):
-                    pass
-                fd_registered = False
-
-        def _safe_write_log(data: bytes) -> None:
-            nonlocal log_write_enabled
-            if log_f is not None and log_write_enabled:
-                try:
-                    log_f.write(data)
-                    log_f.flush()
-                except OSError:
-                    log_write_enabled = False
-
-        def _drain_available(*, raise_on_log_error: bool = True) -> None:
-            nonlocal log_write_enabled
-            while not eof:
-                try:
-                    chunk = os.read(r_fd, 65536)
-                except BlockingIOError:
-                    return
-                except InterruptedError:
-                    continue
-                except OSError as exc:
-                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                        return
-                    _mark_eof()
-                    return
-                if not chunk:
-                    _mark_eof()
-                    return
-                if log_f is not None and log_write_enabled:
-                    if raise_on_log_error:
-                        log_f.write(chunk)
-                        log_f.flush()
-                    else:
-                        _safe_write_log(chunk)
-                self._write_stdout_bytes(chunk)
-
-        def _wait_and_drain(duration: float, *, raise_on_log_error: bool = True) -> None:
-            end = time.monotonic() + duration
-            while True:
-                _drain_available(raise_on_log_error=raise_on_log_error)
-                rem = end - time.monotonic()
-                if rem <= 0:
-                    return
-                if eof or not fd_registered:
-                    time.sleep(min(0.05, rem))
-                    return
-                try:
-                    events = sel.select(timeout=min(0.05, rem))
-                except InterruptedError:
-                    continue
-                if events:
-                    _drain_available(raise_on_log_error=raise_on_log_error)
-
-        def _kill_stage_tree(*, notify_timeout_teardown: bool = False, raise_on_log_error: bool = True) -> int:
-            assert proc is not None
-            ever_signalled: set[int] = set()
-            _drain_available(raise_on_log_error=raise_on_log_error)
-
-            live_pids, live_pgids = collect_live_targets(
-                proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-            )
-            if live_pids or live_pgids:
-                ever_signalled |= live_pids
-                signal_live(live_pids, live_pgids, signal.SIGTERM)
-
-            if notify_timeout_teardown and self.on_timeout_teardown is not None:
-                self.on_timeout_teardown(stage_name)
-
-            grace_end = time.monotonic() + self.teardown_grace_s
-            while time.monotonic() < grace_end:
-                _wait_and_drain(0.05, raise_on_log_error=raise_on_log_error)
-                live_pids, live_pgids = collect_live_targets(
-                    proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-                )
-                if not live_pids and proc.poll() is not None:
-                    _wait_and_drain(0.1, raise_on_log_error=raise_on_log_error)
-                    break
-                newly_seen = live_pids - ever_signalled
-                if newly_seen:
-                    ever_signalled |= newly_seen
-                    signal_live(newly_seen, set(), signal.SIGTERM)
-
-            live_pids, live_pgids = collect_live_targets(
-                proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-            )
-            if live_pids or live_pgids:
-                ever_signalled |= live_pids
-                signal_live(live_pids, live_pgids, signal.SIGKILL)
-
-                reap_end = time.monotonic() + self.teardown_reap_s
-                while time.monotonic() < reap_end:
-                    _wait_and_drain(0.05, raise_on_log_error=raise_on_log_error)
-                    live_pids, live_pgids = collect_live_targets(
-                        proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-                    )
-                    if not live_pids and proc.poll() is not None:
-                        break
-                    if live_pids or live_pgids:
-                        ever_signalled |= live_pids
-                        signal_live(live_pids, live_pgids, signal.SIGKILL)
-
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                pass
-            _wait_and_drain(0.1, raise_on_log_error=raise_on_log_error)
-            _drain_available(raise_on_log_error=raise_on_log_error)
-            return len(ever_signalled)
-
-        def _log_interrupted(killed_n: int, context: str = "") -> tuple[int, int]:
-            assert self.interrupted_sig_num is not None
-            sig_num = self.interrupted_sig_num
-            sig_label, _ = signal_names(sig_num)
-            suffix = f" ({context})" if context else ""
-            msg = (
-                f"ERROR: stage {stage_name} interrupted by {sig_label}{suffix} "
-                f"and killed (signalled {killed_n} pid(s))\n"
-            ).encode()
-            _safe_write_log(msg)
-            self._write_stderr_bytes(msg)
-            return 128 + sig_num, sig_num
-
-        try:
-            log_f = open(log_file, "wb")
-            header = f"== stage: {stage_name} (tree_state={self.tree_method}:{self.tree_sig[:12]}) ==\n".encode()
-            log_f.write(header)
-            log_f.flush()
-            self._write_stdout_bytes(header)
-
-            if self.on_before_stage_spawn is not None:
-                self.on_before_stage_spawn(stage_name)
-
-            if self.interrupted_sig_num is not None:
-                sig_num = self.interrupted_sig_num
-                sig_label, _ = signal_names(sig_num)
-                msg = (
-                    f"ERROR: stage {stage_name} interrupted by {sig_label} "
-                    "(during startup before launch) and killed (signalled 0 pid(s))\n"
-                ).encode()
-                _safe_write_log(msg)
-                self._write_stderr_bytes(msg)
-                return 128 + sig_num, sig_num
-
-            try:
-                proc = subprocess.Popen(
-                    list(cmd),
-                    cwd=str(self.repo_root),
-                    stdout=w_fd,
-                    stderr=w_fd,
-                    start_new_session=True,
-                    env=child_env,
-                )
-            except OSError as exc:
-                msg = f"ERROR: failed to launch stage {stage_name}: {exc}\n".encode()
-                _safe_write_log(msg)
-                self._write_stderr_bytes(msg)
-                return 127, None
-            os.close(w_fd)
-            w_fd = -1
-
-            deadline = time.monotonic() + self.config.stage_timeout
-            timed_out = False
-
-            while True:
-                if self.interrupted_sig_num is not None:
-                    break
-                rc = proc.poll()
-                remaining = deadline - time.monotonic()
-                if rc is not None:
-                    _drain_available()
-                    if eof:
-                        break
-                    if remaining <= 0:
-                        timed_out = True
-                        break
-                    try:
-                        events = sel.select(timeout=min(0.05, remaining))
-                    except InterruptedError:
-                        continue
-                    if events:
-                        _drain_available()
-                    continue
-
-                if remaining <= 0:
-                    timed_out = True
-                    break
-                if eof or not fd_registered:
-                    time.sleep(min(0.05, remaining))
-                    continue
-                try:
-                    events = sel.select(timeout=min(0.05, remaining))
-                except InterruptedError:
-                    continue
-                if events:
-                    _drain_available()
-
-            if self.interrupted_sig_num is not None:
-                killed_n = _kill_stage_tree()
-                return _log_interrupted(killed_n)
-
-            if timed_out:
-                killed_n = _kill_stage_tree(notify_timeout_teardown=True)
-                msg = (
-                    f"ERROR: stage {stage_name} timed out after {self.config.stage_timeout:.0f}s "
-                    f"and was killed (signalled {killed_n} pid(s))\n"
-                ).encode()
-                _safe_write_log(msg)
-                self._write_stderr_bytes(msg)
-                if self.interrupted_sig_num is not None:
-                    return _log_interrupted(killed_n, context="during timeout teardown")
-                return 124, None
-
-            rc = proc.wait()
-            _drain_available()
-            if self.interrupted_sig_num is not None:
-                killed_n = _kill_stage_tree()
-                return _log_interrupted(killed_n, context="at stage exit")
-
-            exit_code = 128 + (-rc) if rc < 0 else rc
-            # Sweep any surviving token-carrying descendants (for example backgrounded workers
-            # with closed/redirected stdio) so finished stages never leak processes or GPU memory.
-            survivor_pids, survivor_pgids = collect_live_targets(
-                proc, token_needle, self_pid=self_pid, self_pgid=self_pgid, ps_bin=self._ps_bin
-            )
-            if survivor_pids or survivor_pgids:
-                killed_n = _kill_stage_tree()
-                if self.interrupted_sig_num is not None:
-                    return _log_interrupted(killed_n, context="during post-exit cleanup")
-                warn_msg = (
-                    f"WARNING: stage {stage_name} exited ({exit_code}) with surviving descendants; "
-                    f"killed stage tree (signalled {killed_n} pid(s))\n"
-                ).encode()
-                _safe_write_log(warn_msg)
-                self._write_stderr_bytes(warn_msg)
-            return exit_code, None
-        except BaseException as exc:
-            if isinstance(exc, OSError):
-                log_write_enabled = False
-            killed_n = 0
-            if proc is not None:
-                killed_n = _kill_stage_tree(raise_on_log_error=False)
-            if not isinstance(exc, Exception):
-                raise
-            err_msg = (
-                f"ERROR: stage {stage_name} aborted due to {type(exc).__name__}: {exc} (killed {killed_n} pid(s))\n"
-            ).encode()
-            _safe_write_log(err_msg)
-            self._write_stderr_bytes(err_msg)
-            if self.interrupted_sig_num is not None:
-                return _log_interrupted(killed_n, context=f"after {type(exc).__name__}")
-            self._last_stage_status_note = type(exc).__name__
-            return 1, None
-        finally:
-            if log_f is not None:
-                try:
-                    log_f.close()
-                except OSError:
-                    pass
-            sel.close()
-            if w_fd >= 0:
-                try:
-                    os.close(w_fd)
-                except OSError:
-                    pass
-            try:
-                os.close(r_fd)
-            except OSError:
-                pass
+        stage_proc = StageProcess(
+            stage_name=stage_name,
+            log_file=log_file,
+            cmd=cmd,
+            repo_root=self.repo_root,
+            env=self.env,
+            ps_bin=self._ps_bin,
+            stage_timeout=self.config.stage_timeout,
+            teardown_grace_s=self.teardown_grace_s,
+            teardown_reap_s=self.teardown_reap_s,
+            tree_method=self.tree_method,
+            tree_sig=self.tree_sig,
+            get_interrupted_sig=lambda: self.interrupted_sig_num,
+            write_stdout=self._write_stdout_bytes,
+            write_stderr=self._write_stderr_bytes,
+            on_before_spawn=self.on_before_stage_spawn,
+            on_timeout_teardown=self.on_timeout_teardown,
+        )
+        rc, int_sig = stage_proc.run()
+        self._last_stage_status_note = stage_proc.status_note
+        return rc, int_sig
 
     def run_stage_with_sig(
         self,
@@ -1747,7 +1827,7 @@ class SessionRunner:
             self._unlink_artifact(required_artifact)
             _, short_sig = signal_names(int_sig)
             self.record_stage(name, f"{128 + int_sig} (interrupted:SIG{short_sig})", shown_log)
-            self.any_failed = 1
+            self.any_failed = True
             return StageOutcome(ok=False, returncode=128 + int_sig, interrupted_sig=int_sig)
 
         if rc == 0:
@@ -1764,7 +1844,7 @@ class SessionRunner:
                 )
                 done_file.unlink(missing_ok=True)
                 self._unlink_artifact(required_artifact)
-                self.any_failed = 1
+                self.any_failed = True
                 self.record_stage(name, "1 (corrupt artifact)", shown_log)
                 return StageOutcome(ok=False, returncode=1)
             write_done_marker(done_file, sig)
@@ -1773,7 +1853,7 @@ class SessionRunner:
 
         done_file.unlink(missing_ok=True)
         self._unlink_artifact(required_artifact)
-        self.any_failed = 1
+        self.any_failed = True
         status_str = f"{rc} ({self._last_stage_status_note})" if self._last_stage_status_note else str(rc)
         self.record_stage(name, status_str, shown_log)
         return StageOutcome(ok=False, returncode=rc)
@@ -1812,7 +1892,7 @@ class SessionRunner:
             port = pick_free_port()
         except OSError:
             self._write_stderr_bytes(f"error: failed to allocate a free TCP port for {name}\n".encode())
-            self.any_failed = 1
+            self.any_failed = True
             self.record_stage(name, "1 (no port)", shown_log)
             return StageOutcome(ok=False, returncode=1)
         if self.interrupted_sig_num is not None:
@@ -1902,278 +1982,292 @@ class SessionRunner:
         else:
             self._print_line(f"== [SKIP] {dist_stage_name} (reference stage failed) ==")
             self.record_stage(dist_stage_name, "SKIPPED (ref failed)", "-")
-            self.any_failed = 1
+            self.any_failed = True
         return True
+
+    def _run_rank_failure_stages(
+        self,
+        *,
+        prefix: str,
+        backend: Backend,
+        device_map_args: Sequence[str],
+    ) -> bool:
+        """Run rank-failure timeout probes across configured ranks. Returns False if interrupted."""
+        for n in self.ranks:
+            self.run_stage(
+                f"{prefix}_rank_failure_{backend}_n{n}",
+                None,
+                [
+                    self.uv_bin,
+                    "run",
+                    "--no-sync",
+                    *self.config.uv_py_args,
+                    "python",
+                    "scripts/probes/distributed_rank_failure_check.py",
+                    "--backend",
+                    backend,
+                    *device_map_args,
+                    "--world-size",
+                    str(n),
+                    "--pg-timeout",
+                    self.config.pg_timeout,
+                ],
+            )
+            if self.interrupted_sig_num is not None:
+                return False
+        return True
+
+    def _prepare_tree_and_runtime(self) -> int | None:
+        """Verify prerequisites, create output directories, and compute initial tree/runtime signatures."""
+        if self.interrupted_sig_num is not None:
+            return self._finalize_interrupted()
+
+        if self.uv_bin == "uv" and _which_in_env("uv", self.env) is None:
+            return self._abort_with_error(
+                "error: 'uv' not found on PATH; install uv before running this script",
+                write_summary=False,
+            )
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.refs_dir.mkdir(parents=True, exist_ok=True)
+        if self.interrupted_sig_num is not None:
+            return self._finalize_interrupted()
+
+        try:
+            self.tree_method, self.tree_sig = compute_tree_state_sig(
+                self.repo_root,
+                self.log_dir,
+                env=self.env,
+                is_interrupted=lambda: self.interrupted_sig_num is not None,
+                git_timeout_s=self.helper_timeout_s,
+            )
+        except _SessionInterrupted:
+            return self._finalize_interrupted()
+        except Exception as exc:
+            return self._abort_with_error(
+                f"error: failed to compute tree-state signature: {exc}",
+                write_summary=False,
+            )
+
+        if self.interrupted_sig_num is not None:
+            return self._finalize_interrupted()
+
+        try:
+            self.runtime_env_sig = self.compute_runtime_env_sig(allow_uninitialized=True)
+        except HelperError as exc:
+            return self._abort_with_error(f"error: {exc}")
+        if self.interrupted_sig_num is not None:
+            return self._finalize_interrupted()
+        return None
+
+    def _run_env_phase(self) -> int | None:
+        """Stage 1: sync the project environment, record runtime facts, and refresh post-sync identity."""
+        env_cmd = self._build_env_stage_cmd()
+        env_sig_parts = [
+            "01_env",
+            self.config.backend,
+            self.tree_method,
+            self.tree_sig[:12],
+            *self.config.uv_py_args,
+        ]
+        env_sig = stage_signature(self.tree_method, self.tree_sig, self.runtime_env_sig, env_sig_parts, env=self.env)
+        env_out = self.run_stage_with_sig("01_env", env_sig, None, env_cmd)
+        if self.interrupted_sig_num is not None:
+            return self._finalize_interrupted()
+
+        if not env_out.ok:
+            return self._abort_with_error(
+                f"error: stage 01_env failed (exit {env_out.returncode}); "
+                f"aborting {self.config.backend} session (see 01_env.log)",
+                exit_code=env_out.returncode,
+            )
+
+        # Refresh resolved runtime identity after uv sync; if 01_env just synced a new venv,
+        # rebind 01_env.done to the post-sync runtime identity so identical re-runs resume cleanly.
+        try:
+            post_env_runtime_sig = self.compute_runtime_env_sig(allow_uninitialized=False)
+        except HelperError as exc:
+            return self._abort_with_error(f"error: {exc}")
+        if self.interrupted_sig_num is not None:
+            return self._finalize_interrupted()
+        if post_env_runtime_sig != self.runtime_env_sig:
+            self.runtime_env_sig = post_env_runtime_sig
+            if not env_out.resumed:
+                post_env_sig = stage_signature(
+                    self.tree_method, self.tree_sig, self.runtime_env_sig, env_sig_parts, env=self.env
+                )
+                write_done_marker(self.log_dir / "01_env.done", post_env_sig)
+        return None
+
+    def _resolve_ranks_and_gpus(self) -> tuple[int, int | None]:
+        """Query visible CUDA GPUs (when nccl), resolve default ranks, and validate per-rank GPU counts."""
+        gpu_count = 0
+        if self.config.backend == "nccl":
+            try:
+                gpu_count = self.query_gpu_count()
+            except HelperError as exc:
+                return 0, self._abort_with_error(f"error: {exc}")
+            if self.interrupted_sig_num is not None:
+                return 0, self._finalize_interrupted()
+            if gpu_count < 1:
+                return 0, self._abort_with_error(
+                    "error: --backend nccl requested, but PyTorch reported 0 visible CUDA GPUs (see 01_env.log)"
+                )
+
+        if not self.config.ranks_specified:
+            if self.config.backend == "gloo" or self.config.shared_gpu:
+                self.ranks = [2, 4]
+            else:
+                self.ranks = []
+                if gpu_count >= 2:
+                    self.ranks.append(2)
+                if gpu_count >= 4:
+                    self.ranks.append(4)
+                if not self.ranks:
+                    return gpu_count, self._abort_with_error(
+                        f"error: only {gpu_count} visible GPU detected; pass --shared-gpu to run N=2 and N=4 on one GPU"
+                    )
+
+        for n in self.ranks:
+            if self.config.backend == "nccl" and not self.config.shared_gpu and n > gpu_count:
+                return gpu_count, self._abort_with_error(
+                    f"error: requested --ranks {n} with per-rank NCCL, "
+                    f"but only {gpu_count} visible GPU(s) detected "
+                    "(pass --shared-gpu to share 1 GPU)"
+                )
+
+        if self.interrupted_sig_num is not None:
+            return gpu_count, self._finalize_interrupted()
+        return gpu_count, None
+
+    def _run_prototype_phase(self, gpu_count: int) -> bool:
+        """Stage 2: 4-GPU prototype parity probe (or record skip reason). Returns False if interrupted."""
+        if self.config.backend == "nccl" and not self.config.shared_gpu and gpu_count >= 4 and (4 in self.ranks):
+            proto_size_args = ["--sizes", *self.config.sizes] if self.config.sizes else []
+            self.run_stage(
+                "02_prototype_parity_cuda",
+                None,
+                [
+                    self.uv_bin,
+                    "run",
+                    "--no-sync",
+                    *self.config.uv_py_args,
+                    "python",
+                    "scripts/probes/distributed_parity.py",
+                    "--device",
+                    "cuda",
+                    *proto_size_args,
+                ],
+            )
+            return self.interrupted_sig_num is None
+
+        if self.config.backend != "nccl":
+            proto_skip_reason = "gloo backend"
+        elif self.config.shared_gpu:
+            proto_skip_reason = "shared GPU"
+        elif gpu_count < 4:
+            proto_skip_reason = "needs 4 GPUs"
+        else:
+            proto_skip_reason = "rank 4 not requested"
+        self._print_line(f"== [SKIP] 02_prototype_parity_cuda ({proto_skip_reason}) ==")
+        self.record_stage("02_prototype_parity_cuda", f"SKIPPED ({proto_skip_reason})", "-")
+        return True
+
+    def _run_tiny_pairs_phase(self, ref_device: str, device_map_args: Sequence[str]) -> bool:
+        """Stages 3-4: tiny_random reference + torchrun on the selected backend."""
+        for n in self.ranks:
+            if not self._run_ref_and_torchrun_pair(
+                ref_stage_name=f"03_ref_{self.config.backend}_tiny_n{n}",
+                dist_stage_name=f"04_{self.config.backend}_tiny_n{n}",
+                ref_file=self.refs_dir / f"ref_{self.config.backend}_tiny_n{n}.zip",
+                world_size=n,
+                ref_device=ref_device,
+                dist_backend=self.config.backend,
+                device_map_args=device_map_args,
+                extra_model_args=(),
+            ):
+                return False
+        return True
+
+    def _run_released_pairs_phase(self, ref_device: str, device_map_args: Sequence[str]) -> bool:
+        """Stages 5-6: released checkpoints when requested."""
+        if not self.config.sizes:
+            return True
+        released_args = ("--no-tiny", "--sizes", *self.config.sizes)
+        for n in self.ranks:
+            if not self._run_ref_and_torchrun_pair(
+                ref_stage_name=f"05_ref_{self.config.backend}_released_n{n}",
+                dist_stage_name=f"06_{self.config.backend}_released_n{n}",
+                ref_file=self.refs_dir / f"ref_{self.config.backend}_released_n{n}.zip",
+                world_size=n,
+                ref_device=ref_device,
+                dist_backend=self.config.backend,
+                device_map_args=device_map_args,
+                extra_model_args=released_args,
+            ):
+                return False
+        return True
+
+    def _run_gloo_comparison_phase(self) -> bool:
+        """Stages 7-9: CPU gloo comparison and gloo rank-failure checks when primary backend is nccl."""
+        if self.config.backend != "nccl":
+            return True
+        for n in self.ranks:
+            if not self._run_ref_and_torchrun_pair(
+                ref_stage_name=f"07_ref_gloo_tiny_n{n}",
+                dist_stage_name=f"08_gloo_tiny_n{n}",
+                ref_file=self.refs_dir / f"ref_gloo_tiny_n{n}.zip",
+                world_size=n,
+                ref_device="cpu",
+                dist_backend="gloo",
+                device_map_args=(),
+                extra_model_args=(),
+            ):
+                return False
+        return self._run_rank_failure_stages(prefix="09", backend="gloo", device_map_args=())
+
+    def _run_primary_rank_failure_phase(self, device_map_args: Sequence[str]) -> bool:
+        """Stage 9 (gloo) or 10 (nccl): rank-failure timeout checks for the primary backend."""
+        rf_prefix = "10" if self.config.backend == "nccl" else "09"
+        return self._run_rank_failure_stages(
+            prefix=rf_prefix,
+            backend=self.config.backend,
+            device_map_args=device_map_args,
+        )
 
     def run(self) -> int:
         """Execute the full Stage 3 verification session and return the POSIX exit code."""
         with self._managed_signals():
-            if self.interrupted_sig_num is not None:
+            abort_rc = self._prepare_tree_and_runtime()
+            if abort_rc is not None:
+                return abort_rc
+
+            abort_rc = self._run_env_phase()
+            if abort_rc is not None:
+                return abort_rc
+
+            gpu_count, abort_rc = self._resolve_ranks_and_gpus()
+            if abort_rc is not None:
+                return abort_rc
+
+            if not self._run_prototype_phase(gpu_count):
                 return self._finalize_interrupted()
 
-            if self.uv_bin == "uv" and _which_in_env("uv", self.env) is None:
-                self._write_stderr_bytes(b"error: 'uv' not found on PATH; install uv before running this script\n")
-                return 2
-
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            self.refs_dir.mkdir(parents=True, exist_ok=True)
-            if self.interrupted_sig_num is not None:
-                return self._finalize_interrupted()
-
-            try:
-                self.tree_method, self.tree_sig = compute_tree_state_sig(
-                    self.repo_root,
-                    self.log_dir,
-                    env=self.env,
-                    is_interrupted=lambda: self.interrupted_sig_num is not None,
-                    git_timeout_s=self.helper_timeout_s,
-                )
-            except _SessionInterrupted:
-                return self._finalize_interrupted()
-            except Exception as exc:
-                self._write_stderr_bytes(f"error: failed to compute tree-state signature: {exc}\n".encode())
-                return 2
-
-            if self.interrupted_sig_num is not None:
-                return self._finalize_interrupted()
-
-            try:
-                self.runtime_env_sig = self.compute_runtime_env_sig(allow_uninitialized=True)
-            except HelperError as exc:
-                self._write_stderr_bytes(f"error: {exc}\n".encode())
-                self.any_failed = 1
-                self.write_summary()
-                return 2
-            if self.interrupted_sig_num is not None:
-                return self._finalize_interrupted()
-
-            # Stage 1: environment sync and runtime facts.
-            env_cmd = self._build_env_stage_cmd()
-            env_sig_parts = [
-                "01_env",
-                self.config.backend,
-                self.tree_method,
-                self.tree_sig[:12],
-                *self.config.uv_py_args,
-            ]
-            env_sig = stage_signature(
-                self.tree_method, self.tree_sig, self.runtime_env_sig, env_sig_parts, env=self.env
-            )
-            env_out = self.run_stage_with_sig("01_env", env_sig, None, env_cmd)
-            if self.interrupted_sig_num is not None:
-                return self._finalize_interrupted()
-
-            if not env_out.ok:
-                self._write_stderr_bytes(
-                    f"error: stage 01_env failed (exit {env_out.returncode}); "
-                    f"aborting {self.config.backend} session (see 01_env.log)\n".encode()
-                )
-                self.any_failed = 1
-                self.write_summary()
-                return env_out.returncode
-
-            # Refresh resolved runtime identity after uv sync; if 01_env just synced a new venv,
-            # rebind 01_env.done to the post-sync runtime identity so identical re-runs resume cleanly.
-            try:
-                post_env_runtime_sig = self.compute_runtime_env_sig(allow_uninitialized=False)
-            except HelperError as exc:
-                self._write_stderr_bytes(f"error: {exc}\n".encode())
-                self.any_failed = 1
-                self.write_summary()
-                return 2
-            if self.interrupted_sig_num is not None:
-                return self._finalize_interrupted()
-            if post_env_runtime_sig != self.runtime_env_sig:
-                self.runtime_env_sig = post_env_runtime_sig
-                if not env_out.resumed:
-                    post_env_sig = stage_signature(
-                        self.tree_method, self.tree_sig, self.runtime_env_sig, env_sig_parts, env=self.env
-                    )
-                    write_done_marker(self.log_dir / "01_env.done", post_env_sig)
-
-            # Query visible GPU count via PyTorch in the synced project environment.
-            gpu_count = 0
-            if self.config.backend == "nccl":
-                try:
-                    gpu_count = self.query_gpu_count()
-                except HelperError as exc:
-                    self._write_stderr_bytes(f"error: {exc}\n".encode())
-                    self.any_failed = 1
-                    self.write_summary()
-                    return 2
-                if self.interrupted_sig_num is not None:
-                    return self._finalize_interrupted()
-                if gpu_count < 1:
-                    self._write_stderr_bytes(
-                        b"error: --backend nccl requested, but PyTorch reported 0 visible CUDA GPUs (see 01_env.log)\n"
-                    )
-                    self.any_failed = 1
-                    self.write_summary()
-                    return 2
-
-            # Resolve default ranks and validate per-rank GPU count.
-            if not self.config.ranks_specified:
-                if self.config.backend == "gloo" or self.config.shared_gpu:
-                    self.ranks = [2, 4]
-                else:
-                    self.ranks = []
-                    if gpu_count >= 2:
-                        self.ranks.append(2)
-                    if gpu_count >= 4:
-                        self.ranks.append(4)
-                    if not self.ranks:
-                        self._write_stderr_bytes(
-                            f"error: only {gpu_count} visible GPU detected; "
-                            "pass --shared-gpu to run N=2 and N=4 on one GPU\n".encode()
-                        )
-                        self.any_failed = 1
-                        self.write_summary()
-                        return 2
-
-            has_rank_4 = 4 in self.ranks
-            for n in self.ranks:
-                if self.config.backend == "nccl" and not self.config.shared_gpu and n > gpu_count:
-                    self._write_stderr_bytes(
-                        f"error: requested --ranks {n} with per-rank NCCL, "
-                        f"but only {gpu_count} visible GPU(s) detected "
-                        "(pass --shared-gpu to share 1 GPU)\n".encode()
-                    )
-                    self.any_failed = 1
-                    self.write_summary()
-                    return 2
-
-            if self.interrupted_sig_num is not None:
-                return self._finalize_interrupted()
-
-            # Stage 2: 4-GPU prototype parity probe.
-            if self.config.backend == "nccl" and not self.config.shared_gpu and gpu_count >= 4 and has_rank_4:
-                proto_size_args = ["--sizes", *self.config.sizes] if self.config.sizes else []
-                self.run_stage(
-                    "02_prototype_parity_cuda",
-                    None,
-                    [
-                        self.uv_bin,
-                        "run",
-                        "--no-sync",
-                        *self.config.uv_py_args,
-                        "python",
-                        "scripts/probes/distributed_parity.py",
-                        "--device",
-                        "cuda",
-                        *proto_size_args,
-                    ],
-                )
-                if self.interrupted_sig_num is not None:
-                    return self._finalize_interrupted()
-            else:
-                if self.config.backend != "nccl":
-                    proto_skip_reason = "gloo backend"
-                elif self.config.shared_gpu:
-                    proto_skip_reason = "shared GPU"
-                elif gpu_count < 4:
-                    proto_skip_reason = "needs 4 GPUs"
-                else:
-                    proto_skip_reason = "rank 4 not requested"
-                self._print_line(f"== [SKIP] 02_prototype_parity_cuda ({proto_skip_reason}) ==")
-                self.record_stage("02_prototype_parity_cuda", f"SKIPPED ({proto_skip_reason})", "-")
-
-            # Stages 3-4: tiny_random reference + torchrun on the selected backend.
             ref_device = "cuda:0" if self.config.backend == "nccl" else "cpu"
             device_map_args: tuple[str, ...] = (
                 ("--device-map", self.config.device_map) if self.config.backend == "nccl" else ()
             )
-            for n in self.ranks:
-                if not self._run_ref_and_torchrun_pair(
-                    ref_stage_name=f"03_ref_{self.config.backend}_tiny_n{n}",
-                    dist_stage_name=f"04_{self.config.backend}_tiny_n{n}",
-                    ref_file=self.refs_dir / f"ref_{self.config.backend}_tiny_n{n}.zip",
-                    world_size=n,
-                    ref_device=ref_device,
-                    dist_backend=self.config.backend,
-                    device_map_args=device_map_args,
-                    extra_model_args=(),
-                ):
-                    return self._finalize_interrupted()
-
-            # Stages 5-6: released checkpoints when requested.
-            if self.config.sizes:
-                released_args = ("--no-tiny", "--sizes", *self.config.sizes)
-                for n in self.ranks:
-                    if not self._run_ref_and_torchrun_pair(
-                        ref_stage_name=f"05_ref_{self.config.backend}_released_n{n}",
-                        dist_stage_name=f"06_{self.config.backend}_released_n{n}",
-                        ref_file=self.refs_dir / f"ref_{self.config.backend}_released_n{n}.zip",
-                        world_size=n,
-                        ref_device=ref_device,
-                        dist_backend=self.config.backend,
-                        device_map_args=device_map_args,
-                        extra_model_args=released_args,
-                    ):
-                        return self._finalize_interrupted()
-
-            # Stages 7-9: CPU gloo comparison (including gloo rank-failure check) when primary backend is nccl.
-            if self.config.backend == "nccl":
-                for n in self.ranks:
-                    if not self._run_ref_and_torchrun_pair(
-                        ref_stage_name=f"07_ref_gloo_tiny_n{n}",
-                        dist_stage_name=f"08_gloo_tiny_n{n}",
-                        ref_file=self.refs_dir / f"ref_gloo_tiny_n{n}.zip",
-                        world_size=n,
-                        ref_device="cpu",
-                        dist_backend="gloo",
-                        device_map_args=(),
-                        extra_model_args=(),
-                    ):
-                        return self._finalize_interrupted()
-                for n in self.ranks:
-                    self.run_stage(
-                        f"09_rank_failure_gloo_n{n}",
-                        None,
-                        [
-                            self.uv_bin,
-                            "run",
-                            "--no-sync",
-                            *self.config.uv_py_args,
-                            "python",
-                            "scripts/probes/distributed_rank_failure_check.py",
-                            "--backend",
-                            "gloo",
-                            "--world-size",
-                            str(n),
-                            "--pg-timeout",
-                            self.config.pg_timeout,
-                        ],
-                    )
-                    if self.interrupted_sig_num is not None:
-                        return self._finalize_interrupted()
-
-            # Rank-failure timeout check for the primary backend.
-            rf_prefix = "10" if self.config.backend == "nccl" else "09"
-            for n in self.ranks:
-                self.run_stage(
-                    f"{rf_prefix}_rank_failure_{self.config.backend}_n{n}",
-                    None,
-                    [
-                        self.uv_bin,
-                        "run",
-                        "--no-sync",
-                        *self.config.uv_py_args,
-                        "python",
-                        "scripts/probes/distributed_rank_failure_check.py",
-                        "--backend",
-                        self.config.backend,
-                        *device_map_args,
-                        "--world-size",
-                        str(n),
-                        "--pg-timeout",
-                        self.config.pg_timeout,
-                    ],
-                )
-                if self.interrupted_sig_num is not None:
-                    return self._finalize_interrupted()
+            if not self._run_tiny_pairs_phase(ref_device, device_map_args):
+                return self._finalize_interrupted()
+            if not self._run_released_pairs_phase(ref_device, device_map_args):
+                return self._finalize_interrupted()
+            if not self._run_gloo_comparison_phase():
+                return self._finalize_interrupted()
+            if not self._run_primary_rank_failure_phase(device_map_args):
+                return self._finalize_interrupted()
 
             self.write_summary()
-            return self.any_failed
+            return 1 if self.any_failed else 0
 
 
 def _write_stream_safe(stream: Any, text: str) -> None:
