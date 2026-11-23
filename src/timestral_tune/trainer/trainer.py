@@ -271,6 +271,75 @@ class TrainingResult:
     eval_history: list[tuple[int, float]] = field(repr=False)
 
 
+class _FitBookkeeper:
+    """Tracks histories, best-validation snapshot, and constructs `TrainingResult` for one `fit()`.
+
+    When `track_best` is False (non-zero ranks in multi-process mode), validation losses are
+    recorded in `eval_history` without comparing losses or snapshotting weights; the authoritative
+    `(best_eval_loss, best_step)` summary is supplied via `apply_best_summary()` at the end of fit.
+    """
+
+    def __init__(self, *, start_step: int, final_step: int, track_best: bool, restore_best: bool) -> None:
+        self.start_step = start_step
+        self.final_step = final_step
+        self.track_best = track_best
+        self.restore_best = restore_best
+        self.train_history: list[tuple[int, float]] = []
+        self.eval_history: list[tuple[int, float]] = []
+        self.best_eval_loss: float | None = None
+        self.best_step: int | None = None
+        self._best_state: list[Tensor] | None = None
+        self.skipped_batches = 0
+        self.epochs = 0
+        self.last_evaluated_step = -1
+
+    def record_step(self, step: int, loss: float) -> None:
+        self.train_history.append((step, loss))
+
+    def record_eval(self, step: int, loss: float, trainable: Sequence[Tensor]) -> None:
+        self.last_evaluated_step = step
+        self.eval_history.append((step, loss))
+        if self.track_best and (self.best_eval_loss is None or loss < self.best_eval_loss):
+            self.best_eval_loss = loss
+            self.best_step = step
+            if self.restore_best:
+                # Keep best-state snapshot on CPU so `full_ft` does not double GPU VRAM.
+                self._best_state = [parameter.detach().cpu().clone() for parameter in trainable]
+
+    def set_last_eval_loss(self, loss: float) -> None:
+        """Overwrite the most recent `eval_history` loss with an authoritative value (e.g. rank 0)."""
+        step, _ = self.eval_history[-1]
+        self.eval_history[-1] = (step, loss)
+
+    def restore_best_weights(self, current_step: int, trainable: Sequence[Tensor], *, non_blocking: bool) -> bool:
+        """Copy the best CPU weight snapshot into `trainable` if an earlier step had lower loss."""
+        if self._best_state is None or self.best_step == current_step:
+            return False
+        with torch.no_grad():
+            for parameter, saved in zip(trainable, self._best_state, strict=True):
+                parameter.copy_(saved, non_blocking=non_blocking)
+        return True
+
+    def apply_best_summary(self, best_eval_loss: float | None, best_step: int | None) -> None:
+        """Set `(best_eval_loss, best_step)` from an authoritative source (e.g. rank 0 broadcast)."""
+        self.best_eval_loss = best_eval_loss
+        self.best_step = best_step
+
+    def build_result(self, current_step: int, *, restored_best: bool) -> TrainingResult:
+        return TrainingResult(
+            steps=current_step - self.start_step,
+            epochs=self.epochs,
+            final_train_loss=self.train_history[-1][1] if self.train_history else None,
+            best_eval_loss=self.best_eval_loss,
+            best_step=self.best_step,
+            stopped_early=current_step < self.final_step,
+            skipped_batches=self.skipped_batches,
+            restored_best=restored_best,
+            train_history=self.train_history,
+            eval_history=self.eval_history,
+        )
+
+
 def _learning_rate_factor(step: int, warmup_steps: int, total_steps: int, schedule: str) -> float:
     """Multiplier on the peak learning rate for the optimiser step with 0-based index `step`."""
     if step < warmup_steps:
@@ -972,6 +1041,69 @@ class TimestralTrainer:
 
     # ------------------------------------------------------------------ loop
 
+    def _prepare_domain_batch(
+        self,
+        batch: TrainingBatch | CachedHeadBatch,
+        flip_generator: torch.Generator | None,
+    ) -> _PreparedDomainBatch | None:
+        """Sign-flip, validate on CPU, and transfer a scored domain batch to `self.device`.
+
+        Returns None when `batch` has no scored position, leaving `flip_generator` untouched and
+        skipping validation and device transfer.
+        """
+        scored = batch.num_scored
+        if scored == 0:
+            return None
+        if isinstance(batch, TrainingBatch):
+            if flip_generator is not None:
+                batch = flip_batch_signs(batch, flip_generator)
+            batch.validate(self.model.config.patch_size)
+        return _PreparedDomainBatch(
+            batch=batch.to(self.device, non_blocking=self.device.type == "cuda"),
+            num_scored=scored,
+        )
+
+    def _prepare_replay_batch(
+        self,
+        replay_item: _ReplayBatchItem | CachedHeadBatch,
+        flip_generator: torch.Generator | None,
+    ) -> _PreparedReplayBatch:
+        """Sign-flip, validate on CPU, resolve cached teacher quantiles, and transfer a replay batch."""
+        non_blocking = self.device.type == "cuda"
+        if isinstance(replay_item, CachedHeadBatch):
+            return _PreparedReplayBatch(
+                batch=replay_item.to(self.device, non_blocking=non_blocking),
+                num_scored=replay_item.num_scored,
+            )
+        assert isinstance(replay_item, _ReplayBatchItem)
+        assert self.replay_dataset is not None
+        r_batch = replay_item.batch
+        real_series = replay_item.real_series
+        flip_mask: Tensor | None = None
+        if flip_generator is not None:
+            rows_per_series = sum(self.replay_dataset.series[0].layout)
+            flip_mask = torch.rand((real_series,), generator=flip_generator) < 0.5
+            r_batch = _apply_series_flip(r_batch, flip_mask, rows_per_series)
+        r_batch.validate(self.model.config.patch_size)
+        scored = r_batch.num_scored
+        replay_dev = r_batch.to(self.device, non_blocking=non_blocking)
+        teacher_dev: Tensor | None = None
+        if self._replay_base_pos is not None:
+            pos_q = self._replay_base_pos[replay_item.indices]
+            if flip_mask is not None and self._replay_base_neg is not None:
+                neg_q = self._replay_base_neg[replay_item.indices]
+                sel = flip_mask.view(-1, 1, 1, 1)
+                teacher_cpu = torch.where(sel, neg_q, pos_q).flatten(0, 1)
+            else:
+                teacher_cpu = pos_q.flatten(0, 1)
+            teacher_dev = teacher_cpu.to(self.device, non_blocking=non_blocking)
+        return _PreparedReplayBatch(
+            batch=replay_dev,
+            real_series=real_series,
+            teacher_quantiles=teacher_dev,
+            num_scored=scored,
+        )
+
     def _mark_cudagraph_step_begin(self) -> None:
         """Notify PyTorch CUDA graphs that a new compiled step is starting, when applicable."""
         if (
@@ -1096,87 +1228,53 @@ class TimestralTrainer:
         self._replay_flip_generator = replay_flip_generator
         loader = self._loader(self.train_dataset, training=True)
         replay_iter = _cycle_loader(self._replay_loader()) if self.replay_config is not None else None
-        replay_rows_per_series = sum(self.replay_dataset.series[0].layout) if self.replay_dataset is not None else 0
-        train_history: list[tuple[int, float]] = []
-        eval_history: list[tuple[int, float]] = []
-        best_loss: float | None = None
-        best_step: int | None = None
-        best_state: list[Tensor] | None = None
-        skipped = epochs = 0
-        last_evaluated_step = -1
         self.should_stop = False
         start_step = self.fit_start_step = self.global_step
         final_step = start_step + self.total_steps
+        bookkeeper = _FitBookkeeper(
+            start_step=start_step,
+            final_step=final_step,
+            track_best=True,
+            restore_best=config.restore_best,
+        )
 
         def evaluate_now() -> None:
-            nonlocal best_loss, best_step, best_state, last_evaluated_step
             result = self.evaluate()
-            last_evaluated_step = self.global_step
-            eval_history.append((self.global_step, result.loss))
-            if best_loss is None or result.loss < best_loss:
-                best_loss, best_step = result.loss, self.global_step
-                if config.restore_best:
-                    # Keep best-state snapshot on CPU so `full_ft` does not double GPU VRAM.
-                    best_state = [parameter.detach().cpu().clone() for parameter in self._trainable]
+            bookkeeper.record_eval(self.global_step, result.loss, self._trainable)
             for callback in self.callbacks:
                 callback.on_evaluate(self, self.global_step, result)
 
-        patch = self.model.config.patch_size
         non_blocking = self.device.type == "cuda"
         for callback in self.callbacks:
             callback.on_fit_start(self)
         self.model.train()
         try:
             while self.global_step < final_step and not self.should_stop:
-                epochs += 1
+                bookkeeper.epochs += 1
                 steps_before_epoch = self.global_step
-                skipped_before_epoch = skipped
+                skipped_before_epoch = bookkeeper.skipped_batches
                 for batch in loader:
-                    if batch.num_scored == 0:
-                        skipped += 1
+                    prepared = self._prepare_domain_batch(batch, flip_generator)
+                    if prepared is None:
+                        bookkeeper.skipped_batches += 1
                         continue
-                    if isinstance(batch, TrainingBatch):
-                        if flip_generator is not None:
-                            batch = flip_batch_signs(batch, flip_generator)
-                        batch.validate(patch)
 
-                    replay_dev: TrainingBatch | CachedHeadBatch | None = None
-                    replay_real_series: int | None = None
-                    replay_teacher_dev: Tensor | None = None
-                    if replay_iter is not None:
-                        replay_item = next(replay_iter)
-                        if isinstance(replay_item, CachedHeadBatch):
-                            replay_dev = replay_item.to(self.device, non_blocking=non_blocking)
-                        else:
-                            assert isinstance(replay_item, _ReplayBatchItem)
-                            r_batch = replay_item.batch
-                            replay_real_series = replay_item.real_series
-                            flip_mask: Tensor | None = None
-                            if replay_flip_generator is not None:
-                                flip_mask = torch.rand((replay_real_series,), generator=replay_flip_generator) < 0.5
-                                r_batch = _apply_series_flip(r_batch, flip_mask, replay_rows_per_series)
-                            r_batch.validate(patch)
-                            replay_dev = r_batch.to(self.device, non_blocking=non_blocking)
-                            if self._replay_base_pos is not None:
-                                pos_q = self._replay_base_pos[replay_item.indices]
-                                if flip_mask is not None and self._replay_base_neg is not None:
-                                    neg_q = self._replay_base_neg[replay_item.indices]
-                                    sel = flip_mask.view(-1, 1, 1, 1)
-                                    teacher_cpu = torch.where(sel, neg_q, pos_q).flatten(0, 1)
-                                else:
-                                    teacher_cpu = pos_q.flatten(0, 1)
-                                replay_teacher_dev = teacher_cpu.to(self.device, non_blocking=non_blocking)
+                    prepared_replay = (
+                        self._prepare_replay_batch(next(replay_iter), replay_flip_generator)
+                        if replay_iter is not None
+                        else None
+                    )
 
                     learning_rate = self.optimizer.param_groups[0]["lr"]
                     loss = self.training_step(
-                        batch.to(self.device, non_blocking=non_blocking),
+                        prepared.batch,
                         validate=False,
-                        replay_batch=replay_dev,
-                        replay_real_series=replay_real_series,
-                        replay_teacher_quantiles=replay_teacher_dev,
+                        replay_batch=None if prepared_replay is None else prepared_replay.batch,
+                        replay_real_series=None if prepared_replay is None else prepared_replay.real_series,
+                        replay_teacher_quantiles=None if prepared_replay is None else prepared_replay.teacher_quantiles,
                     )
                     self.global_step += 1
-                    train_history.append((self.global_step, loss))
+                    bookkeeper.record_step(self.global_step, loss)
                     for callback in self.callbacks:
                         callback.on_step_end(self, self.global_step, loss, learning_rate)
                     due = config.eval_every is not None and (self.global_step - start_step) % config.eval_every == 0
@@ -1185,40 +1283,24 @@ class TimestralTrainer:
                     if self.global_step >= final_step or self.should_stop:
                         break
                 if self.global_step == steps_before_epoch:
-                    epoch_skipped = skipped - skipped_before_epoch
+                    epoch_skipped = bookkeeper.skipped_batches - skipped_before_epoch
                     raise RuntimeError(
                         f"an epoch produced no optimiser step: all {epoch_skipped} batches had no scored position"
                     )
                 if self.val_dataset is not None and config.eval_every is None and not self.should_stop:
                     evaluate_now()
-            if self.val_dataset is not None and last_evaluated_step != self.global_step:
+            if self.val_dataset is not None and bookkeeper.last_evaluated_step != self.global_step:
                 evaluate_now()
         finally:
             self._fit_flip_generator = None
             self._replay_flip_generator = None
             self.model.eval()
 
-        restored = False
-        if best_state is not None and best_step != self.global_step:
-            with torch.no_grad():
-                for parameter, saved in zip(self._trainable, best_state, strict=True):
-                    parameter.copy_(saved, non_blocking=non_blocking)
-            restored = True
-        if skipped:
-            logger.warning("skipped %d training batches that had no scored position", skipped)
+        restored = bookkeeper.restore_best_weights(self.global_step, self._trainable, non_blocking=non_blocking)
+        if bookkeeper.skipped_batches:
+            logger.warning("skipped %d training batches that had no scored position", bookkeeper.skipped_batches)
 
-        result = TrainingResult(
-            steps=self.global_step - start_step,
-            epochs=epochs,
-            final_train_loss=train_history[-1][1] if train_history else None,
-            best_eval_loss=best_loss,
-            best_step=best_step,
-            stopped_early=self.global_step < final_step,
-            skipped_batches=skipped,
-            restored_best=restored,
-            train_history=train_history,
-            eval_history=eval_history,
-        )
+        result = bookkeeper.build_result(self.global_step, restored_best=restored)
         for callback in self.callbacks:
             callback.on_fit_end(self, result)
         return result

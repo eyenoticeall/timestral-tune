@@ -1286,3 +1286,63 @@ def test_compute_loss_terms_mix_update_and_eval_totals(tiny_forecaster):
     assert trainer._accumulate_eval_totals([unscored]) == (0.0, 0, 1)
     total, scored, count = trainer._accumulate_eval_totals([unscored, dom_batch])
     assert scored == dom_batch.num_scored and count == 2 and total > 0.0
+
+
+def test_prepare_batch_helpers_and_fit_bookkeeper(tiny_forecaster):
+    from timestral_tune import ReplayConfig
+    from timestral_tune.replay import SyntheticReplaySource
+
+    patch = tiny_forecaster.patch_size
+    dataset = make_toy_dataset(patch, series=4, covariates=True)
+    replay_ds = SyntheticReplaySource(num_series=3, context_length=dataset.context_length, forecast_horizon=6, seed=13)
+    trainer = TimestralTrainer(
+        config_for(mode="full_ft", batch_size=2, max_steps=2, sign_flip=True),
+        dataset,
+        replay_config=ReplayConfig(replay_fraction=0.25, distill_weight=0.5, batch_size=2, cache_base_outputs=True),
+        replay_dataset=replay_ds,
+        model=fresh_model(tiny_forecaster),
+    )
+
+    # Zero-scored domain batch returns None without consuming flip_generator RNG.
+    dom_batch = dataset.collator(trainer.model.config)([dataset[0], dataset[1]])
+    unscored = dataclasses.replace(dom_batch, loss_weight=torch.zeros_like(dom_batch.loss_weight))
+    gen = torch.Generator().manual_seed(17)
+    rng_before = gen.get_state()
+    assert trainer._prepare_domain_batch(unscored, gen) is None
+    assert torch.equal(gen.get_state(), rng_before)
+
+    # Scored domain batch flips, validates, transfers, and reports exact scored count.
+    prepared_dom = trainer._prepare_domain_batch(dom_batch, gen)
+    assert prepared_dom is not None and prepared_dom.num_scored == dom_batch.num_scored
+    assert not torch.equal(gen.get_state(), rng_before)
+
+    # Replay preparation selects cached +x/-x teacher quantiles matching the drawn flip mask.
+    replay_item = next(iter(trainer._replay_loader()))
+    prepared_rep = trainer._prepare_replay_batch(replay_item, torch.Generator().manual_seed(23))
+    assert prepared_rep.real_series == replay_item.real_series
+    assert prepared_rep.num_scored == replay_item.batch.num_scored
+    assert prepared_rep.teacher_quantiles is not None
+
+    # _FitBookkeeper tracks best weights when primary, restores earlier best, and skips tracking when non-primary.
+    param = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    primary = trainer_module._FitBookkeeper(start_step=0, final_step=4, track_best=True, restore_best=True)
+    primary.epochs = 1
+    primary.record_step(1, 0.9)
+    primary.record_eval(1, 0.5, [param])
+    with torch.no_grad():
+        param.fill_(9.0)
+    primary.record_step(2, 0.8)
+    primary.record_eval(2, 0.7, [param])
+    assert primary.restore_best_weights(2, [param], non_blocking=False) is True
+    assert torch.equal(param.detach(), torch.tensor([1.0, 2.0]))
+    res = primary.build_result(2, restored_best=True)
+    assert res.steps == 2 and res.best_step == 1 and res.best_eval_loss == 0.5 and res.stopped_early
+
+    follower = trainer_module._FitBookkeeper(start_step=0, final_step=4, track_best=False, restore_best=False)
+    follower.record_eval(1, 0.5, [param])
+    assert follower.best_eval_loss is None and follower.best_step is None and follower._best_state is None
+    follower.set_last_eval_loss(0.49)
+    assert follower.eval_history == [(1, 0.49)]
+    follower.apply_best_summary(0.49, 1)
+    assert follower.restore_best_weights(2, [param], non_blocking=False) is False
+    assert follower.build_result(2, restored_best=True).best_eval_loss == 0.49
