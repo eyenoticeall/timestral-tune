@@ -7,7 +7,8 @@ failures, and replay export) live in `tests/acceptance/test_distributed.py` (T15
 This module keeps only checks that are white-box or complementary to T15:
 - White-box `_DistributedStrategy._run_step` parity on a warmed-up student with a non-patch-multiple
   replay horizon (`REP_HORIZON = 6`, `PATCH = 4`, exercising distillation mask padding), at strict
-  `1e-12` (float64) and `1e-5` (float32).
+  `1e-12` (float64) and `1e-5` (float32) for loss and gradients (`1e-4` float32 for post-AdamW
+  parameters).
 - Complementary trajectory parity combining replay with periodic validation + `restore_best=True`,
   with `lora_temporal`, and with moved-student `full_ft` + distillation, all at strict `1e-10`
   (float64) and `1e-4` (float32).
@@ -43,7 +44,14 @@ from timestral_tune.replay import SyntheticReplaySource
 from timestral_tune.trainer import compute_loss
 from timestral_tune.trainer.distributed import rank_seed
 
-from .distributed_harness import run_distributed, run_scenarios, unwrap_results
+from .distributed_harness import (
+    STEP_PARAM_TOL,
+    STEP_TOL,
+    TRAJ_TOL,
+    run_distributed,
+    run_scenarios,
+    unwrap_results,
+)
 from .helpers import as_double, float64_reference, l2_rel, make_tiny_forecaster
 
 # PyTorch < 2.8 on macOS hangs at process exit after DataLoader worker processes run (docs/VERIFICATION.md §10).
@@ -54,9 +62,6 @@ CTX_STEPS = 4 * PATCH  # 16
 DOM_HORIZON = 2 * PATCH  # 8
 REP_HORIZON = 6  # deliberately not a multiple of PATCH (exercises distillation mask padding)
 COV_ROWS = 3
-
-STEP_TOL = {"float64": 1e-12, "float32": 1e-5}
-TRAJ_TOL = {"float64": 1e-10, "float32": 1e-4}
 
 
 # --------------------------------------------------------------------------- helpers
@@ -582,6 +587,7 @@ def test_distributed_replay_whitebox_scenarios(world_size: int) -> None:
 
     for dtype_name, dtype in (("float64", torch.float64), ("float32", torch.float32)):
         tol = STEP_TOL[dtype_name]
+        param_tol = STEP_PARAM_TOL[dtype_name]
         ctx_mgr = float64_reference() if dtype == torch.float64 else contextlib.nullcontext()
         with ctx_mgr:
             for mode in ("head_only", "lora_variate", "full_ft"):
@@ -636,7 +642,7 @@ def test_distributed_replay_whitebox_scenarios(world_size: int) -> None:
                     assert l2_rel(r0["grads"], ref_grads) <= tol, (
                         f"{key}: grad rel L2 = {l2_rel(r0['grads'], ref_grads)}"
                     )
-                    assert l2_rel(r0["params"], ref_params) <= tol, (
+                    assert l2_rel(r0["params"], ref_params) <= param_tol, (
                         f"{key}: param rel L2 = {l2_rel(r0['params'], ref_params)}"
                     )
                     for r in range(1, world_size):

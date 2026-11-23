@@ -39,8 +39,10 @@ from timestral_tune.trainer.distributed import (
 )
 
 from .distributed_harness import (
+    F32_TOL_SCALE_ENV,
     DistributedTimeoutError,
     RankResult,
+    f32_tol_scale,
     run_distributed,
     run_scenarios,
     unwrap_results,
@@ -1424,6 +1426,21 @@ def test_harness_does_not_kill_siblings_when_one_rank_raises() -> None:
     assert results[1].error.exc_type is ValueError
     assert "rank1_immediate_error" in results[1].error.message
     assert "ValueError" in results[1].error.traceback
+
+
+def test_f32_tol_scale_env_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`TIMESTRAL_TEST_F32_TOL_SCALE` defaults to 1.0, accepts finite positive floats, and rejects garbage."""
+    monkeypatch.delenv(F32_TOL_SCALE_ENV, raising=False)
+    assert f32_tol_scale() == 1.0
+
+    for raw, expected in (("0.1", 0.1), ("0.2", 0.2), ("1.0", 1.0), (" 2.5 ", 2.5)):
+        monkeypatch.setenv(F32_TOL_SCALE_ENV, raw)
+        assert f32_tol_scale() == pytest.approx(expected)
+
+    for bad in ("", "   ", "abc", "0", "-0.1", "nan", "inf", "-inf", "1e400", "1e-400"):
+        monkeypatch.setenv(F32_TOL_SCALE_ENV, bad)
+        with pytest.raises(ValueError, match=F32_TOL_SCALE_ENV):
+            f32_tol_scale()
 
 
 def test_public_all_and_docstrings_complete() -> None:
