@@ -579,19 +579,21 @@ Training entries run **one optimiser step** and assert `torch.isfinite(loss)` (n
 
 Also covered in pytest by `tests/test_loader_device.py::test_mps_long_context_and_large_checkpoint_parity` (`@pytest.mark.network`).
 
-## 16. Distributed training-step parity prototype (proposed, §5.6)
+## 16. Distributed training-step parity prototype (§5.6, approved 2026-11-23, not yet implemented)
 
-Backs the `[V]` claims in spec §5.6 (proposed) and §9 T15 (proposed) (referenced by D22, D24, and D26). Every number below
+Backs the `[V]` claims in spec §5.6 and §9 T15 (referenced by D22, D24, and D26). Every number below
 measures a **standalone prototype outside `src/`** (`scripts/probes/distributed_parity.py`) run with
 `torch.multiprocessing.spawn` on loopback (`127.0.0.1`), CPU, `gloo` backend, on `2026-11-23` (macOS
-arm64). Nothing in `src/` or `tests/` implements multi-process training.
+arm64). Nothing in `src/` or `tests/` implements multi-process training yet.
 
 The prototype checks distributed steps against two single-process references: `probe_ref` (a union-batch
 `_local_step`, run for every case and model) and independent `shipped_trainer` (a one-process
 `TimestralTrainer`, run on `tiny_random` only: `training_step()` for `[2] unequal`, `[3] head_only`,
 `lora_variate_step1`, `lora_temporal_step1`, and all four `[4]` replay/distillation regimes in `float64`
 and `float32`; `fit()` with `cache_frozen_features=True` for `[3] head_only_cached` in `float32`, while
-`float64` `head_only_cached` is reported `n/a` because `TimeSeriesDataset` enforces `np.float32`).
+`float64` `head_only_cached` is reported `n/a` because `TimeSeriesDataset` stores `np.float32` inputs—a
+`float64` model works with the shipped head cache in `fit()`, but `float64` input values cannot be fed
+through `TimeSeriesDataset`).
 
 Commands run:
 
