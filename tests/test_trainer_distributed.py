@@ -150,6 +150,8 @@ def _sc_consistency_mismatches(rank: int, world_size: int) -> dict[str, Any]:
             "raised": True,
             "exc_type": type(exc),
             "message": str(exc),
+            "failing_ranks": getattr(exc, "failing_ranks", None),
+            "stage": getattr(exc, "stage", None),
             "followup": _followup_sum(ctx),
         }
 
@@ -163,6 +165,8 @@ def _sc_consistency_mismatches(rank: int, world_size: int) -> dict[str, Any]:
             "raised": True,
             "exc_type": type(exc),
             "message": str(exc),
+            "failing_ranks": getattr(exc, "failing_ranks", None),
+            "stage": getattr(exc, "stage", None),
             "followup": _followup_sum(ctx),
         }
 
@@ -179,6 +183,8 @@ def _sc_consistency_mismatches(rank: int, world_size: int) -> dict[str, Any]:
             "raised": True,
             "exc_type": type(exc),
             "message": str(exc),
+            "failing_ranks": getattr(exc, "failing_ranks", None),
+            "stage": getattr(exc, "stage", None),
             "followup": _followup_sum(ctx),
         }
 
@@ -192,6 +198,8 @@ def _sc_consistency_mismatches(rank: int, world_size: int) -> dict[str, Any]:
             "raised": True,
             "exc_type": type(exc),
             "message": str(exc),
+            "failing_ranks": getattr(exc, "failing_ranks", None),
+            "stage": getattr(exc, "stage", None),
             "followup": _followup_sum(ctx),
         }
 
@@ -512,14 +520,25 @@ def test_trainer_distributed_startup_guards_and_export(world_size: int) -> None:
             assert sb[r][mode]["buffers"] == r0["buffers"]
             assert sb[r][mode]["total_steps"] == r0["total_steps"]
 
-    # 2. Consistency mismatches raise ValueError on EVERY rank and keep group clean.
+    # 2. Consistency mismatches: mismatched ranks raise ValueError; matching peers raise RankFailureError.
     cm = unwrap_results(outcomes["consistency_mismatches"])
-    for key in ("dataset_len", "config_seed", "model_shape", "val_presence"):
+    mismatch_expected: dict[str, tuple[int, ...]] = {
+        "dataset_len": (1,),
+        "config_seed": (world_size - 1,),
+        "model_shape": (1,),
+        "val_presence": tuple(range(1, world_size)),
+    }
+    for key, mismatched_ranks in mismatch_expected.items():
         for r in range(world_size):
             entry = cm[r][key]
             assert entry["raised"] is True
-            assert entry["exc_type"] is ValueError
             assert entry["followup"] == world_size
+            if r in mismatched_ranks:
+                assert entry["exc_type"] is ValueError
+            else:
+                assert entry["exc_type"] is RankFailureError
+                assert entry["failing_ranks"] == mismatched_ranks
+                assert entry["stage"] == "startup_consistency"
 
     # 3. Startup single-rank and two-rank failure propagation.
     sf = unwrap_results(outcomes["startup_failures"])

@@ -39,7 +39,6 @@ from ..replay import SyntheticReplaySource, distillation_loss
 from .callbacks import Callback, EarlyStopping, ProgressLogger
 from .distributed import (
     DistributedContext,
-    RankFailureError,
     broadcast_module_state,
     is_oom_error,
     steps_per_epoch,
@@ -795,15 +794,8 @@ class TimestralTrainer:
         # Step (b): startup failure collective.
         dist_ctx.propagate_failure(local_error, stage="startup")
 
-        # Step (c): consistency digest check across ranks (raises ValueError on every rank on mismatch).
-        try:
-            dist_ctx.check_consistency(self._startup_consistency_digest(), stage="startup_consistency")
-        except RankFailureError as exc:
-            ranks = ", ".join(str(r) for r in exc.failing_ranks)
-            raise ValueError(
-                f"startup consistency check failed: ranks [{ranks}] differed from rank 0 "
-                "in model, configuration, or datasets"
-            ) from exc
+        # Step (c): consistency digest check (mismatched ranks raise ValueError; matching peers raise RankFailureError).
+        dist_ctx.check_consistency(self._startup_consistency_digest(), stage="startup_consistency")
 
         # Step (d): broadcast all parameters and all buffers from rank 0.
         broadcast_module_state(dist_ctx, self.model)
