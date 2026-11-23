@@ -3125,3 +3125,260 @@ sys.exit(0)
         _kill_process_group_quiet(proc)
         _cleanup_tagged_processes(tag)
     assert "INTERRUPTED by SIGTERM (exit 143)" in (ld_int / "summary.txt").read_text(encoding="utf-8")
+
+
+def test_unwritable_and_invalid_log_dir_exits_2_cleanly(tmp_path: Path) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    _write_stub_uv(bin_dir, _standard_stub_uv_body())
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+
+    def _run_cli(log_dir_arg: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "/bin/bash",
+                str(repo / "scripts" / "multi_gpu_check.sh"),
+                "--backend",
+                "gloo",
+                "--ranks",
+                "2",
+                "--log-dir",
+                log_dir_arg,
+            ],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def _assert_clean_exit_2(
+        res: subprocess.CompletedProcess[str],
+        *,
+        expected_path: str,
+        forbid_repo_leak: bool,
+        expected_reasons: tuple[str, ...],
+    ) -> None:
+        assert res.returncode == 2, (res.returncode, res.stdout, res.stderr)
+        assert res.stdout == "", res.stdout
+        assert "Traceback" not in res.stderr, res.stderr
+        err_lines = [ln for ln in res.stderr.splitlines() if ln.strip()]
+        assert len(err_lines) == 1, err_lines
+        line = err_lines[0]
+        assert line.startswith("error:"), line
+        assert expected_path in line, line
+        if forbid_repo_leak:
+            assert str(repo) not in line, line
+        assert any(r in line for r in expected_reasons), line
+
+    # 1. Existing regular file at relative --log-dir (preserving user-given './' prefix).
+    not_a_dir = repo / "not_a_dir"
+    not_a_dir.write_text("plain file\n", encoding="utf-8")
+    _assert_clean_exit_2(
+        _run_cli("./not_a_dir"),
+        expected_path="./not_a_dir",
+        forbid_repo_leak=True,
+        expected_reasons=("File exists", "Not a directory"),
+    )
+
+    # 2. Existing regular file as a parent component of relative --log-dir.
+    _assert_clean_exit_2(
+        _run_cli("not_a_dir/sub"),
+        expected_path="not_a_dir/sub",
+        forbid_repo_leak=True,
+        expected_reasons=("File exists", "Not a directory"),
+    )
+
+    # 3. Existing regular file at <log-dir>/refs.
+    bad_refs_dir = repo / "rel_bad_refs"
+    bad_refs_dir.mkdir()
+    (bad_refs_dir / "refs").write_text("file blocking refs dir\n", encoding="utf-8")
+    _assert_clean_exit_2(
+        _run_cli("rel_bad_refs"),
+        expected_path="rel_bad_refs/refs",
+        forbid_repo_leak=True,
+        expected_reasons=("File exists", "Not a directory"),
+    )
+
+    # 4. Real filesystem permission failures (when running non-root, where chmod 0555 is enforced).
+    if os.geteuid() != 0:
+        ro_parent = repo / "ro_parent"
+        ro_parent.mkdir()
+        ro_dir = repo / "ro_dir"
+        ro_dir.mkdir()
+        ro_dir_with_refs = repo / "ro_dir_with_refs"
+        (ro_dir_with_refs / "refs").mkdir(parents=True)
+        dir_ro_refs = repo / "dir_ro_refs"
+        (dir_ro_refs / "refs").mkdir(parents=True)
+
+        ro_parent.chmod(0o555)
+        ro_dir.chmod(0o555)
+        ro_dir_with_refs.chmod(0o555)
+        (dir_ro_refs / "refs").chmod(0o555)
+        try:
+            # 4a. Unwritable parent (relative and absolute).
+            _assert_clean_exit_2(
+                _run_cli("ro_parent/logs"),
+                expected_path="ro_parent/logs",
+                forbid_repo_leak=True,
+                expected_reasons=("Permission denied",),
+            )
+            abs_unwritable = str(ro_parent / "abs_logs")
+            _assert_clean_exit_2(
+                _run_cli(abs_unwritable),
+                expected_path=abs_unwritable,
+                forbid_repo_leak=False,
+                expected_reasons=("Permission denied",),
+            )
+            # 4b. Existing read-only --log-dir without refs/.
+            _assert_clean_exit_2(
+                _run_cli("ro_dir"),
+                expected_path="ro_dir",
+                forbid_repo_leak=True,
+                expected_reasons=("Permission denied",),
+            )
+            # 4c. Existing read-only --log-dir WITH existing refs/ (fails before 01_env starts).
+            _assert_clean_exit_2(
+                _run_cli("ro_dir_with_refs"),
+                expected_path="ro_dir_with_refs",
+                forbid_repo_leak=True,
+                expected_reasons=("Permission denied",),
+            )
+            # 4d. Writable --log-dir with read-only existing refs/.
+            _assert_clean_exit_2(
+                _run_cli("dir_ro_refs"),
+                expected_path="dir_ro_refs/refs",
+                forbid_repo_leak=True,
+                expected_reasons=("Permission denied",),
+            )
+        finally:
+            ro_parent.chmod(0o755)
+            ro_dir.chmod(0o755)
+            ro_dir_with_refs.chmod(0o755)
+            (dir_ro_refs / "refs").chmod(0o755)
+
+
+def test_pre_stage_and_stage_oserrors_fail_cleanly_without_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = _make_stub_repo(tmp_path, with_git=False)
+    bin_dir = tmp_path / "bin"
+    _symlink_python_dir(bin_dir)
+    call_log = tmp_path / "uv_calls.log"
+    _write_stub_uv(bin_dir, _standard_stub_uv_body(call_log=call_log))
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+
+    # 1. os.chdir(REPO_ROOT) OSError in main() exits 2 cleanly with one error line and no traceback.
+    with (
+        mock.patch.object(DRIVER, "REPO_ROOT", repo),
+        mock.patch.object(os, "chdir", side_effect=PermissionError(13, "Permission denied", str(repo))),
+    ):
+        rc_chdir = DRIVER.main(["--backend", "gloo", "--ranks", "2", "--log-dir", "unused_logs"])
+    cap_chdir = capsys.readouterr()
+    assert rc_chdir == 2
+    assert cap_chdir.out == ""
+    assert "Traceback" not in cap_chdir.err
+    assert cap_chdir.err.strip().startswith("error:")
+    assert str(repo) in cap_chdir.err and "Permission denied" in cap_chdir.err
+    assert not (repo / "unused_logs").exists()
+
+    # 2. mkdir PermissionError on relative --log-dir (deterministic even under root): preserves relative path.
+    cfg_ro = DRIVER.parse_args(["--backend", "gloo", "--ranks", "2", "--log-dir", "./rel_ro"])
+    runner_ro = DRIVER.SessionRunner(config=cfg_ro, repo_root=repo, env=env)
+    real_mkdir = Path.mkdir
+
+    def _fail_log_mkdir(self_p: Path, *args: Any, **kwargs: Any) -> None:
+        if self_p == runner_ro.log_dir:
+            raise PermissionError(13, "Permission denied", str(self_p))
+        real_mkdir(self_p, *args, **kwargs)
+
+    with mock.patch.object(Path, "mkdir", autospec=True, side_effect=_fail_log_mkdir):
+        rc_mkdir = runner_ro.run()
+    cap_mkdir = capsys.readouterr()
+    assert rc_mkdir == 2
+    assert cap_mkdir.out == ""
+    assert cap_mkdir.err.strip() == "error: cannot create log directory './rel_ro': Permission denied"
+    assert str(repo) not in cap_mkdir.err
+    assert not call_log.exists()
+
+    # 2b. mkdir PermissionError on <log-dir>/refs preserves relative path as '<log-dir>/refs'.
+    cfg_refs = DRIVER.parse_args(["--backend", "gloo", "--ranks", "2", "--log-dir", "./rel_refs_ro"])
+    runner_refs = DRIVER.SessionRunner(config=cfg_refs, repo_root=repo, env=env)
+
+    def _fail_refs_mkdir(self_p: Path, *args: Any, **kwargs: Any) -> None:
+        if self_p == runner_refs.refs_dir:
+            raise PermissionError(13, "Permission denied", str(self_p))
+        real_mkdir(self_p, *args, **kwargs)
+
+    with mock.patch.object(Path, "mkdir", autospec=True, side_effect=_fail_refs_mkdir):
+        rc_refs = runner_refs.run()
+    cap_refs = capsys.readouterr()
+    assert rc_refs == 2
+    assert cap_refs.out == ""
+    assert cap_refs.err.strip() == "error: cannot create log directory './rel_refs_ro/refs': Permission denied"
+    assert str(repo) not in cap_refs.err
+    assert not call_log.exists()
+
+    # 3. Read-only existing --log-dir with existing refs/ caught by writability probe before any stage runs.
+    (repo / "rel_existing" / "refs").mkdir(parents=True)
+    cfg_ex = DRIVER.parse_args(["--backend", "gloo", "--ranks", "2", "--log-dir", "rel_existing"])
+    runner_ex = DRIVER.SessionRunner(config=cfg_ex, repo_root=repo, env=env)
+    with mock.patch.object(
+        DRIVER,
+        "_verify_dir_writable",
+        side_effect=PermissionError(13, "Permission denied", str(runner_ex.log_dir)),
+    ):
+        rc_ex = runner_ex.run()
+    cap_ex = capsys.readouterr()
+    assert rc_ex == 2
+    assert cap_ex.out == ""
+    assert cap_ex.err.strip() == "error: log directory 'rel_existing' is not writable: Permission denied"
+    assert str(repo) not in cap_ex.err
+    assert not call_log.exists()
+
+    # 4. Mid-session OSError: pre-stage unlink failure & write_done_marker ENOSPC fail cleanly without traceback.
+    cfg_mid = DRIVER.parse_args(["--backend", "gloo", "--ranks", "2", "--log-dir", "rel_mid"])
+    runner_mid = DRIVER.SessionRunner(config=cfg_mid, repo_root=repo, env=env)
+    runner_mid.log_dir.mkdir(parents=True, exist_ok=True)
+    runner_mid.refs_dir.mkdir(parents=True, exist_ok=True)
+    runner_mid.tree_method, runner_mid.tree_sig = "content_hash", "0" * 64
+
+    # Block unlink by placing a directory at the .done path.
+    (runner_mid.log_dir / "blocked_unlink.done").mkdir()
+    out_unlink = runner_mid.run_stage_with_sig(
+        "blocked_unlink", "sig_u", None, [sys.executable, "-c", "print('should not run')"]
+    )
+    cap_unlink = capsys.readouterr()
+    assert not out_unlink.ok and out_unlink.returncode == 1
+    assert "rel_mid" in cap_unlink.err and str(repo) not in cap_unlink.err
+    assert "Traceback" not in cap_unlink.err
+
+    # Simulate ENOSPC when writing completion marker after a passing stage.
+    with mock.patch.object(
+        DRIVER,
+        "write_done_marker",
+        side_effect=OSError(28, "No space left on device", str(runner_mid.log_dir / "enospc_done.done")),
+    ):
+        out_done = runner_mid.run_stage_with_sig("enospc_done", "sig_d", None, [sys.executable, "-c", "pass"])
+    cap_done = capsys.readouterr()
+    assert not out_done.ok and out_done.returncode == 1
+    assert "rel_mid/enospc_done.done" in cap_done.err
+    assert "No space left on device" in cap_done.err
+    assert str(repo) not in cap_done.err
+
+    # 5. write_summary() on unwritable relative log_dir emits a clean warning without leaking repo path.
+    cfg_sum = DRIVER.parse_args(["--backend", "gloo", "--ranks", "2", "--log-dir", "rel_sum"])
+    runner_sum = DRIVER.SessionRunner(config=cfg_sum, repo_root=repo, env=env)
+    with mock.patch.object(
+        Path,
+        "mkdir",
+        autospec=True,
+        side_effect=PermissionError(13, "Permission denied", str(runner_sum.log_dir)),
+    ):
+        summary_text = runner_sum.write_summary()
+    cap_sum = capsys.readouterr()
+    assert "== multi_gpu_check summary" in summary_text
+    assert "== multi_gpu_check summary" in cap_sum.out
+    assert "warning: failed to write summary.txt (rel_sum/summary.txt): Permission denied" in cap_sum.err
+    assert str(repo) not in cap_sum.err

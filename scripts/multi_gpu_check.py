@@ -229,6 +229,34 @@ class _CaptureResult:
     interrupted: bool = False
 
 
+def _os_error_reason(exc: OSError) -> str:
+    """Return the concise OS reason for `exc` without leaking internal resolved paths."""
+    if exc.strerror:
+        return exc.strerror
+    return str(exc) or type(exc).__name__
+
+
+def _safe_is_file(path: Path) -> bool:
+    """Return True if `path` is a regular file, treating permission or lookup errors as False."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _verify_dir_writable(directory: Path) -> None:
+    """Confirm `directory` accepts file creation and removal via an atomic hidden probe file."""
+    probe = directory / f".timestral_write_probe_{os.getpid()}_{uuid.uuid4().hex}"
+    fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.close(fd)
+    finally:
+        try:
+            os.unlink(probe)
+        except FileNotFoundError:
+            pass
+
+
 def _which_in_env(cmd: str, env: Mapping[str, str] | None) -> str | None:
     """Look up `cmd` using `env['PATH']` without falling back to `os.environ` when `env` is empty."""
     source_env = os.environ if env is None else env
@@ -396,6 +424,7 @@ class SessionConfig:
     sizes: tuple[str, ...] = ("5M", "28M")
     python_version: str = ""
     log_dir: Path = Path("multi_gpu_check_logs")
+    log_dir_raw: str = ""
     force: bool = False
     reference_mode: ReferenceMode = "auto"
     pg_timeout: str = "20"
@@ -568,6 +597,7 @@ def parse_args(argv: Sequence[str]) -> SessionConfig:
         sizes=tuple(sizes),
         python_version=python_version,
         log_dir=Path(log_dir_raw),
+        log_dir_raw=log_dir_raw,
         force=force,
         reference_mode=reference_mode,
         pg_timeout=pg_timeout_raw,
@@ -1418,13 +1448,13 @@ class StageProcess:
         child_env = dict(self.env)
         child_env[_STAGE_TOKEN_ENV_KEY] = self._token_val
 
-        self._r_fd, self._w_fd = os.pipe()
-        os.set_blocking(self._r_fd, False)
-        self._sel = selectors.DefaultSelector()
-        self._sel.register(self._r_fd, selectors.EVENT_READ)
-        self._fd_registered = True
-
         try:
+            self._r_fd, self._w_fd = os.pipe()
+            os.set_blocking(self._r_fd, False)
+            self._sel = selectors.DefaultSelector()
+            self._sel.register(self._r_fd, selectors.EVENT_READ)
+            self._fd_registered = True
+
             self._log_f = open(self.log_file, "wb")
             header = f"== stage: {self.stage_name} (tree_state={self.tree_method}:{self.tree_sig[:12]}) ==\n".encode()
             self._log_f.write(header)
@@ -1571,6 +1601,22 @@ class SessionRunner:
     def refs_dir(self) -> Path:
         return self.log_dir / "refs"
 
+    @property
+    def _display_log_dir(self) -> str:
+        """Return `--log-dir` as supplied by the caller so relative paths stay relative in diagnostics."""
+        return self.config.log_dir_raw or str(self.config.log_dir)
+
+    def _display_in_log_dir(self, child: str) -> str:
+        base = self._display_log_dir
+        if not base:
+            return child
+        trimmed = base.rstrip("/")
+        return f"{trimmed}/{child}" if trimmed else f"/{child}"
+
+    @property
+    def _display_refs_dir(self) -> str:
+        return self._display_in_log_dir("refs")
+
     def _stage_arg_path(self, path: Path) -> str:
         """Keep stage paths relative to `repo_root` when `--log-dir` is relative so machine paths never leak."""
         if not self.config.log_dir.is_absolute():
@@ -1586,6 +1632,21 @@ class SessionRunner:
             return
         artifact.unlink(missing_ok=True)
         Path(f"{artifact}.tmp").unlink(missing_ok=True)
+
+    def _best_effort_cleanup_stage_files(self, done_file: Path, required_artifact: Path | None) -> None:
+        """Best-effort removal of stale/partial markers and artifacts without crashing teardown."""
+        try:
+            done_file.unlink(missing_ok=True)
+        except OSError as exc:
+            self._write_stderr_bytes(
+                f"warning: failed to remove '{self._display_in_log_dir(done_file.name)}': "
+                f"{_os_error_reason(exc)}\n".encode()
+            )
+        try:
+            self._unlink_artifact(required_artifact)
+        except OSError as exc:
+            display_art = self._stage_arg_path(required_artifact) if required_artifact is not None else "artifact"
+            self._write_stderr_bytes(f"warning: failed to remove '{display_art}': {_os_error_reason(exc)}\n".encode())
 
     def _on_signal(self, signum: int, _frame: Any) -> None:
         # Record first signal only; ignore duplicates so teardown cannot be aborted mid-cleanup.
@@ -1682,7 +1743,10 @@ class SessionRunner:
             summary_file = self.log_dir / "summary.txt"
             summary_file.write_text(text, encoding="utf-8")
         except OSError as exc:
-            self._write_stderr_bytes(f"warning: failed to write summary.txt: {exc}\n".encode())
+            self._write_stderr_bytes(
+                f"warning: failed to write summary.txt ({self._display_in_log_dir('summary.txt')}): "
+                f"{_os_error_reason(exc)}\n".encode()
+            )
         self._write_stdout_bytes(text.encode("utf-8"))
         return text
 
@@ -1785,7 +1849,7 @@ class SessionRunner:
     def is_stage_resumed(self, name: str, expected_sig: str, required_artifact: Path | None) -> tuple[bool, str]:
         """Return `(resumed, artifact_sha)` when `<name>.done` matches `expected_sig` and artifact integrity."""
         done_file = self.log_dir / f"{name}.done"
-        if self.config.force or not done_file.is_file():
+        if self.config.force or not _safe_is_file(done_file):
             return False, ""
         saved_sig, saved_sha = read_done_marker(done_file)
         if not saved_sig or saved_sig != expected_sig:
@@ -1857,14 +1921,22 @@ class SessionRunner:
             self.record_stage(name, "0 (resumed)", shown_log)
             return StageOutcome(ok=True, returncode=0, resumed=True, artifact_sha256=artifact_sha)
 
-        done_file.unlink(missing_ok=True)
-        self._unlink_artifact(required_artifact)
+        try:
+            done_file.unlink(missing_ok=True)
+            self._unlink_artifact(required_artifact)
+        except OSError as exc:
+            self._write_stderr_bytes(
+                f"error: stage {name} failed to clear stale files in '{self._display_log_dir}': "
+                f"{_os_error_reason(exc)}\n".encode()
+            )
+            self.any_failed = True
+            self.record_stage(name, f"1 ({type(exc).__name__})", shown_log)
+            return StageOutcome(ok=False, returncode=1)
 
         self._print_line(f"== [RUN] {name} ==")
         rc, int_sig = self.run_stage_process(name, log_file, cmd)
         if int_sig is not None:
-            done_file.unlink(missing_ok=True)
-            self._unlink_artifact(required_artifact)
+            self._best_effort_cleanup_stage_files(done_file, required_artifact)
             _, short_sig = signal_names(int_sig)
             self.record_stage(name, f"{128 + int_sig} (interrupted:SIG{short_sig})", shown_log)
             self.any_failed = True
@@ -1874,7 +1946,17 @@ class SessionRunner:
             if required_artifact is not None:
                 produced_sha = verify_and_hash_ref_archive(required_artifact)
                 if produced_sha is not None:
-                    write_done_marker(done_file, sig, produced_sha)
+                    try:
+                        write_done_marker(done_file, sig, produced_sha)
+                    except OSError as exc:
+                        self._write_stderr_bytes(
+                            f"error: failed to write completion marker "
+                            f"'{self._display_in_log_dir(done_file.name)}': {_os_error_reason(exc)}\n".encode()
+                        )
+                        self._best_effort_cleanup_stage_files(done_file, None)
+                        self.any_failed = True
+                        self.record_stage(name, "1 (marker write error)", shown_log)
+                        return StageOutcome(ok=False, returncode=1)
                     self.record_stage(name, "0", shown_log)
                     return StageOutcome(ok=True, returncode=0, artifact_sha256=produced_sha)
                 display_artifact = self._stage_arg_path(required_artifact)
@@ -1882,17 +1964,25 @@ class SessionRunner:
                     f"error: stage {name} exited 0, but artifact {display_artifact} "
                     "failed integrity verification\n".encode()
                 )
-                done_file.unlink(missing_ok=True)
-                self._unlink_artifact(required_artifact)
+                self._best_effort_cleanup_stage_files(done_file, required_artifact)
                 self.any_failed = True
                 self.record_stage(name, "1 (corrupt artifact)", shown_log)
                 return StageOutcome(ok=False, returncode=1)
-            write_done_marker(done_file, sig)
+            try:
+                write_done_marker(done_file, sig)
+            except OSError as exc:
+                self._write_stderr_bytes(
+                    f"error: failed to write completion marker "
+                    f"'{self._display_in_log_dir(done_file.name)}': {_os_error_reason(exc)}\n".encode()
+                )
+                self._best_effort_cleanup_stage_files(done_file, None)
+                self.any_failed = True
+                self.record_stage(name, "1 (marker write error)", shown_log)
+                return StageOutcome(ok=False, returncode=1)
             self.record_stage(name, "0", shown_log)
             return StageOutcome(ok=True, returncode=0)
 
-        done_file.unlink(missing_ok=True)
-        self._unlink_artifact(required_artifact)
+        self._best_effort_cleanup_stage_files(done_file, required_artifact)
         self.any_failed = True
         status_str = f"{rc} ({self._last_stage_status_note})" if self._last_stage_status_note else str(rc)
         self.record_stage(name, status_str, shown_log)
@@ -2003,7 +2093,7 @@ class SessionRunner:
         if self.interrupted_sig_num is not None:
             return False
 
-        if ref_out.ok and ref_out.artifact_sha256 and ref_file.is_file():
+        if ref_out.ok and ref_out.artifact_sha256 and _safe_is_file(ref_file):
             driver_args = [
                 "scripts/probes/distributed_trainer_check.py",
                 "--backend",
@@ -2057,6 +2147,44 @@ class SessionRunner:
                 return False
         return True
 
+    def _prepare_log_dirs(self) -> int | None:
+        """Create and verify writability of `--log-dir` and `<log-dir>/refs` before any stage starts."""
+        for target_dir, display_dir in (
+            (self.log_dir, self._display_log_dir),
+            (self.refs_dir, self._display_refs_dir),
+        ):
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return self._abort_with_error(
+                    f"error: cannot create log directory '{display_dir}': {_os_error_reason(exc)}",
+                    exit_code=2,
+                    write_summary=False,
+                )
+            try:
+                is_dir = target_dir.is_dir()
+            except OSError as exc:
+                return self._abort_with_error(
+                    f"error: cannot access log directory '{display_dir}': {_os_error_reason(exc)}",
+                    exit_code=2,
+                    write_summary=False,
+                )
+            if not is_dir:
+                return self._abort_with_error(
+                    f"error: log directory '{display_dir}' is not a directory",
+                    exit_code=2,
+                    write_summary=False,
+                )
+            try:
+                _verify_dir_writable(target_dir)
+            except OSError as exc:
+                return self._abort_with_error(
+                    f"error: log directory '{display_dir}' is not writable: {_os_error_reason(exc)}",
+                    exit_code=2,
+                    write_summary=False,
+                )
+        return None
+
     def _prepare_tree_and_runtime(self) -> int | None:
         """Verify prerequisites, create output directories, and compute initial tree/runtime signatures."""
         if self.interrupted_sig_num is not None:
@@ -2068,8 +2196,9 @@ class SessionRunner:
                 write_summary=False,
             )
 
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.refs_dir.mkdir(parents=True, exist_ok=True)
+        dir_err = self._prepare_log_dirs()
+        if dir_err is not None:
+            return dir_err
         if self.interrupted_sig_num is not None:
             return self._finalize_interrupted()
 
@@ -2136,7 +2265,14 @@ class SessionRunner:
                 post_env_sig = stage_signature(
                     self.tree_method, self.tree_sig, self.runtime_env_sig, env_sig_parts, env=self.env
                 )
-                write_done_marker(self.log_dir / "01_env.done", post_env_sig)
+                try:
+                    write_done_marker(self.log_dir / "01_env.done", post_env_sig)
+                except OSError as exc:
+                    return self._abort_with_error(
+                        f"error: failed to write completion marker '{self._display_in_log_dir('01_env.done')}': "
+                        f"{_os_error_reason(exc)}",
+                        exit_code=1,
+                    )
         return None
 
     def _resolve_ranks_and_gpus(self) -> tuple[int, int | None]:
@@ -2380,7 +2516,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         with runner._managed_signals():
             if runner.interrupted_sig_num is not None:
                 return runner._finalize_interrupted()
-            os.chdir(REPO_ROOT)
+            try:
+                os.chdir(REPO_ROOT)
+            except OSError as exc:
+                return runner._abort_with_error(
+                    f"error: cannot change directory to repository root '{REPO_ROOT}': {_os_error_reason(exc)}",
+                    exit_code=2,
+                    write_summary=False,
+                )
             try:
                 return runner.run()
             except KeyboardInterrupt:
