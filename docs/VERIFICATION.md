@@ -586,7 +586,7 @@ Also covered in pytest by `tests/test_loader_device.py::test_mps_long_context_an
 Backs the prototype `[V]` claims in spec §5.6 and §9 T15 (referenced by D22, D24, and D26). Every number in
 this section measures the **standalone prototype outside `src/`** (`scripts/probes/distributed_parity.py`)
 run with `torch.multiprocessing.spawn` on loopback (`127.0.0.1`), CPU, `gloo` backend, on `2026-11-23`
-(macOS arm64). Implemented Stage 1 trainer tests (T15) are recorded separately in §17.
+(macOS arm64). Implemented Stages 1–2 trainer tests (T15) are recorded separately in §17.
 
 The prototype checks distributed steps against two single-process references: `probe_ref` (a union-batch
 `_local_step`, run for every case and model) and independent `shipped_trainer` (a one-process
@@ -652,30 +652,62 @@ LoRA step-0/1 invariants, and `[5]` clipping-parity and skipped-step no-op invar
 `ReduceOp.AVG` vs `ReduceOp.SUM` check on CPU `gloo` across PyTorch 2.4.0 and 2.15.0 is recorded as a
 one-off result in §11 (not covered by this probe).
 
-## 17. Phase 5 Stage 1: Implemented multi-process training (CPU/`gloo`)
+## 17. Phase 5 Stages 1–2: Implemented multi-process training (CPU/`gloo`)
 
-Measured on `2026-11-23` at commit `e4fdeb4` on Apple M4 (macOS arm64, Python `3.12.13`), exercising the
-implemented multi-process trainer (`src/timestral_tune/trainer/distributed.py`, `_distributed_strategy.py`,
-`_types.py`, `trainer.py`, and `export.py`) on CPU/`gloo` via `tests/distributed_harness.py` (`spawn`,
-file-based rendezvous, 1 intra-op CPU thread per worker, hard wall-clock deadlines). T15 was hardened by a
-mutation campaign of deliberate breakages during Stage 1 verification.
+### 17.1 Multi-process trainer and acceptance test runs (CPU/`gloo`)
+
+Measured on `2026-11-23` at commit `3347f70` on Apple M4 (macOS arm64, Python `3.12.13`), exercising the
+implemented Stages 1–2 multi-process trainer (`src/timestral_tune/trainer/distributed.py`,
+`_distributed_strategy.py`, `_types.py`, `trainer.py`, and `export.py`) on CPU/`gloo` via
+`tests/distributed_harness.py` (`spawn`, file-based rendezvous, 1 intra-op CPU thread per worker, hard
+wall-clock deadlines; tiny random model).
 
 Commands run:
 
 ```bash
-TMPDIR=/tmp uv run pytest tests/acceptance/test_distributed.py -v
-TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/acceptance/test_distributed.py tests/test_distributed.py -v
+uv run pytest tests/acceptance/test_distributed.py --collect-only -q
+TMPDIR=/tmp uv run pytest -m "not network" -q -p no:cacheprovider
+TMPDIR=/tmp uv run pytest tests/acceptance/test_distributed.py -q -p no:cacheprovider
+TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py -q -p no:cacheprovider
 ```
 
-| Suite | PyTorch `2.15.0` (`CPU`/`gloo`, Python `3.12.13`) | PyTorch `2.4.0` (`CPU`/`gloo`, Python `3.12.13`) |
+| Suite | PyTorch `2.15.0` (`CPU`/`gloo`, Python `3.12.13`) | PyTorch `2.4.0` (`CPU`/`gloo`, Python `3.12`) |
 |---|---|---|
-| Acceptance test T15 (`tests/acceptance/test_distributed.py`, cases `(a)–(i)`, `N = 2` and `N = 4`, tiny random model) | **`25 passed`** in `80.22 s` (`0` skipped, `0` failed; includes `test_t15_f_dataloader_workers` at `N = 4` and 2-rank CPU `test_t15_h_compile_default_smoke`) | **`24 passed, 1 skipped`** (`test_t15_f_dataloader_workers` skipped on macOS PyTorch `< 2.8` per §10; `test_t15_h_compile_default_smoke` passed) |
-| Primitives & harness (`tests/test_distributed.py`, `N = 2` and `N = 4`) | **`87 passed`** (`0` skipped, run in `pytest -m "not network"`: `483 passed, 15 skipped`, excluding the known failing `test_distributed_trainer_whitebox_internals` at `e4fdeb4`) | **`86 passed, 1 skipped`** (`test_batch_sampler_with_persistent_workers` skipped on macOS PyTorch `< 2.8` per §10); combined run `110 passed, 2 skipped` in `39.52 s` |
+| Full network-free suite (`-m "not network"`) | **`510 passed, 15 skipped, 213 deselected`** (`0` failed; skips: 1 optional `lacuna`, 14 CUDA `bf16`) | Not run in full here (four distributed files below) |
+| Acceptance test T15 (`tests/acceptance/test_distributed.py`, cases `(a)–(l)`, 19 test functions / 34 collected items, `N = 2` and `N = 4`, tiny random model) | **`34 passed`** (`0` skipped, `0` failed; includes `test_t15_f_dataloader_workers` at `N = 4`, `test_t15_h_compile_default_smoke`, and `test_t15_l_compile_default_replay_distill_smoke`) | **`33 passed, 1 skipped`** within the 4-file run below (`test_t15_f_dataloader_workers` skipped on macOS PyTorch `< 2.8` per §10; both compiled smoke tests passed) |
+| All four multi-process test files (`tests/test_distributed.py`, `tests/test_trainer_distributed.py`, `tests/test_trainer_distributed_replay.py`, `tests/acceptance/test_distributed.py`; `141` items collected) | **`141 passed`** (`0` skipped, run inside `-m "not network"` above) | **`137 passed, 4 skipped`** (all 4 skips are `num_workers > 0` on macOS PyTorch `< 2.8` per §10: 2 in `tests/test_distributed.py`, 1 in `tests/test_trainer_distributed_replay.py`, 1 in `tests/acceptance/test_distributed.py`) |
 
-**Not verified anywhere (Stage 2 & Stage 3, spec §10 & §12):** CUDA/NCCL hardware, real
-`torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests only), `bf16` autocast and CUDA
-`compile_mode="default"` (including trailing-shape recompilation) across ranks, `torchrun` on Linux and
-Linux `DataLoader` worker teardown timing, Stage 2 multi-process `ReplayConfig` / distillation, live
-concurrent `huggingface_hub==0.23.0` downloads (source reading only, §12), released-weights T15 bounds,
-multi-GPU throughput/VRAM/scaling (including per-parameter pack/unpack, three collectives per step, and
-keeping the flat gradient buffer allocated across validation), and NCCL rank-failure behaviour.
+### 17.2 PyTorch `F.linear` `requires_grad` dispatch probe (`scripts/probes/linear_requires_grad_dispatch.py`)
+
+Backs the `[V]` claims in spec §9 T15(j) and §12. Measured on `2026-11-23` at commit `3347f70` on macOS arm64
+CPU (`threads=4`, `seed=0`). **Only macOS arm64 CPU has been measured**; other BLAS backends and GPUs are
+unmeasured.
+
+Commands run:
+
+```bash
+uv run python scripts/probes/linear_requires_grad_dispatch.py
+uv run --isolated --python 3.12 --with "torch==2.4.0" python scripts/probes/linear_requires_grad_dispatch.py
+```
+
+| Probe section & case | PyTorch `2.15.0` (macOS arm64 CPU) | PyTorch `2.4.0` (macOS arm64 CPU) |
+|---|---|---|
+| `[a]` Standalone `F.linear`, `float32` contiguous (all 7 shapes) | `0.00e+00` across all four columns (`grad:T-F`, `nograd:T-F`, `rgT:g-ng`, `rgF:g-ng`) | Identical (`0.00e+00` everywhere) |
+| `[a]` Standalone `F.linear`, `float32` permuted `(1, 0, 2)` non-contiguous (7 shapes) | `grad:T-F == nograd:T-F`: `(8,5,32)->32`: `3.81e-06`; `(2,6,64)->64`: `1.34e-05`; `(4,6,64)->64`: `9.54e-06`; `(2,6,64)->192`: `7.63e-06`; `(1,6,64)->64`, `(8,6,64)->64`, `(8,6,64)->192`: `0.00e+00`. `rgT:g-ng` and `rgF:g-ng`: `0.00e+00` for every shape | Identical in every cell |
+| `[a]` Standalone `F.linear`, `float64` (contiguous & permuted, all 7 shapes) | `0.00e+00` in every cell | Identical (`0.00e+00` everywhere) |
+| `[b]` Tiny random model, `student(train, rg=T)` vs `teacher(eval, no_grad, rg=T)` | `0.00e+00` (`max_abs` & `rel_l2`) across all `float32`/`float64`, univariate/covariates, `bs=1,2,4,8` | Identical (`0.00e+00` everywhere) |
+| `[b]` Tiny random model, `student(train, rg=T)` vs `frozen(rg=F)` teacher, `float32` | Uni `bs=1`: `0.00e+00`; `bs=2`: `max_abs 4.77e-07` (`rel_l2 1.94e-07`); `bs=4`: `8.34e-07` (`2.23e-07`); `bs=8`: `5.96e-07` (`2.06e-07`). Cov `bs=1`: `3.58e-07` (`2.14e-07`); `bs=2`: `7.15e-07` (`2.03e-07`); `bs=4,8`: `0.00e+00` | **Differs from 2.15.0:** Uni `bs=1`: `4.77e-07` (`1.64e-07`); `bs=2`: `5.96e-07` (`2.32e-07`); `bs=4`: `5.96e-07` (`2.15e-07`); `bs=8`: `5.96e-07` (`2.16e-07`). Cov `bs=1`: `4.77e-07` (`1.80e-07`); `bs=2`: `5.96e-07` (`2.10e-07`); `bs=4,8`: `0.00e+00` |
+| `[b]` Tiny random model, `student(train, rg=T)` vs `frozen(rg=F)` teacher, `float64` | `0.00e+00` across all 8 cells (`uni`/`cov`, `bs=1,2,4,8`) | **Differs from 2.15.0:** Uni `bs=1`: `max_abs 8.88e-16` (`rel_l2 3.76e-16`); all other 7 cells `0.00e+00` |
+| `[c]` Step-0 `distillation_loss` & `grad_l2` at identical weights, `unfrozen(rg=T)` teacher | `0.00e+00` / `0.00e+00` in every cell (`float32` & `float64`, `beta=1e-3` & `0.0`) | Identical (`0.00e+00` / `0.00e+00` everywhere) |
+| `[c]` Step-0 `distillation_loss` & `grad_l2`, `frozen(rg=F)` teacher, `float32` | Non-zero on uni `bs=2,4,8` and cov `bs=1,2` (zero on uni `bs=1`, cov `bs=4,8`): `beta=1e-3` loss `9.11e-12`–`1.25e-11`, `grad_l2` `8.82e-05`–`3.04e-04` (peak cov `bs=1`); `beta=0.0` loss `1.05e-07`–`1.21e-07`, `grad_l2` `5.69e-01`–`1.76e+00` | **Differs from 2.15.0:** Non-zero on uni `bs=1,2,4,8` and cov `bs=1,2` (zero on cov `bs=4,8`): `beta=1e-3` loss `6.73e-12`–`1.31e-11`, `grad_l2` `8.58e-05`–`2.55e-04` (peak uni `bs=2`); `beta=0.0` loss `8.88e-08`–`1.20e-07`, `grad_l2` `5.41e-01`–`1.47e+00` |
+| `[c]` Step-0 `distillation_loss` & `grad_l2`, `frozen(rg=F)` teacher, `float64` | `0.00e+00` / `0.00e+00` in every cell | **Differs from 2.15.0:** Uni `bs=1`: `beta=1e-3` loss `3.53e-29`, `grad_l2` `5.07e-13`; `beta=0.0` loss `2.17e-16`, `grad_l2` `1.76e+00`; all other 7 cells `0.00e+00` / `0.00e+00` |
+
+**Not verified anywhere (Stage 3, spec §10 & §12):** Stage 2 multi-process replay and distillation are now
+verified on CPU/`gloo` on macOS arm64 only; **multi-rank NCCL has never executed**. Unverified: CUDA/NCCL
+hardware, real `torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests only), `bf16`
+autocast and CUDA `compile_mode="default"` (including trailing-shape recompilation and replay) across ranks,
+`torchrun` on Linux and Linux `DataLoader` worker teardown timing, live concurrent `huggingface_hub==0.23.0`
+downloads (source reading only, §12), released-weights T15 bounds (with or without replay), multi-GPU
+throughput/VRAM/scaling (including per-parameter pack/unpack, 3–4 collectives per step, flat gradient buffer
+live through validation, and per-rank `_frozen_base` VRAM in `full_ft` distillation), `F.linear`
+`requires_grad` dispatch on other BLAS backends or GPUs, and NCCL rank-failure behaviour.

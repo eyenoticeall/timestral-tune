@@ -1013,7 +1013,7 @@ one message string in `scripts/probes/distributed_parity.py`:
 **Done.** Implemented Phase 5 Stage 1 single-node multi-process training (domain loss across all four
 adaptation modes: `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), verified it network-free on
 CPU/`gloo` for `N = 2` and `N = 4` across PyTorch `2.4.0` and `2.15.0`, and updated documentation to match
-the as-built code (`e4fdeb4`).
+the as-built Stage 1 code.
 
 - **Modules & architecture:**
   - `src/timestral_tune/trainer/_types.py`: shared dataclasses (`EvalResult`, `TrainingResult`, `_StepOutcome`,
@@ -1094,7 +1094,7 @@ the as-built code (`e4fdeb4`).
    `on_fit_end()`'s broadcast. Fixed by running `model.eval()` in the inner `finally` before end-of-fit
    collectives and `strategy.cleanup()` in an outer `finally` after `on_fit_end()`.
 
-**Evidence (`e4fdeb4`, macOS arm64, Python `3.12.13`, CPU/`gloo`):**
+**Evidence (Stage 1 completion, macOS arm64, Python `3.12.13`, CPU/`gloo`):**
 
 - `TMPDIR=/tmp uv run pytest tests/acceptance/test_distributed.py -v` on PyTorch `2.15.0`: **`25 passed`** in
   `80.22 s` (`docs/VERIFICATION.md` §17).
@@ -1118,6 +1118,104 @@ the as-built code (`e4fdeb4`).
   validation-time flat-buffer VRAM measurements, rank-failure timeout check, and released-weights T15 bounds).
 - Live concurrent multi-process Hub download check at `huggingface_hub==0.23.0`.
 - Parallel fix in progress for `tests/test_trainer_distributed.py::test_distributed_trainer_whitebox_internals`,
-  which at `e4fdeb4` calls the removed `strategy.after_train_loop()` method and reads the removed
-  `trainer._fit_flip_generator` attribute (remaining `-m "not network"` suite at `e4fdeb4` on PyTorch `2.15.0`:
+  which then called the removed `strategy.after_train_loop()` method and read the removed
+  `trainer._fit_flip_generator` attribute (remaining `-m "not network"` suite at Stage 1 completion on PyTorch `2.15.0`:
   `483 passed, 15 skipped`).
+
+---
+
+## 2026-11-23 — Implement Phase 5 Stage 2 multi-process replay and distillation
+
+**Done.** Implemented Phase 5 Stage 2 single-node multi-process `ReplayConfig` replay mixing and uncached
+frozen-base distillation across all four adaptation modes (`head_only`, `lora_variate`, `lora_temporal`,
+`full_ft`), extended acceptance test T15 to cases `(a)–(l)`, added the `F.linear` `requires_grad` dispatch
+probe, verified the full network-free and multi-process suites on CPU/`gloo` on macOS arm64 across PyTorch
+`2.4.0` and `2.15.0` at `3347f70`, and reconciled all tracked documentation with the as-built code.
+
+- **Modules & implementation:**
+  - `src/timestral_tune/trainer/distributed.py`: added `DistributedBatchCycle` wrapping a replay
+    `DistributedBatchSampler` and `DataLoader` to cycle global replay epochs disjointly across ranks,
+    wrapping independently of domain epochs and handling `len(replay_dataset) < N * b` and `< N` without
+    invoking `DHFDataCollator` empty.
+  - `src/timestral_tune/trainer/_distributed_strategy.py`: structured `_DistributedStrategy._run_step` into
+    six named stages (`_precheck_domain_for_replay`, `_run_local_stage`, `_reduce_step_stats`,
+    `_decide_step`, `_backward_local_terms`, `_reduce_gradients_and_update`); wired the replay-only
+    2-element `float64` `[w_d, failed]` pre-check collective (failure taking precedence over skip before
+    advancing replay), shared replay epoch seed (`config.seed + 2_000_009`) with rank-seeded replay loader
+    generator (`rank_seed(config.seed + 2_000_009, rank)`) and main-process execution (`num_workers=0`,
+    `persistent_workers=False`), rank-offset replay sign flips (`rank_seed(config.seed + 3_000_007, rank)`),
+    count-weighted `[W_r, sum_r, M, sum_m]` terms in the 8-scalar stats collective and backward (including
+    empty/zero-scored domain ranks contributing replay), and cleanup of replay cycle/loader/generator state.
+  - `src/timestral_tune/trainer/trainer.py` & `src/timestral_tune/config.py`: removed Stage 1's
+    `ReplayConfig` `NotImplementedError`, validated `replay_config`/`replay_dataset` (constructing default
+    `SyntheticReplaySource` with shared seed `config.seed + 2_000_003`) and included them in
+    `_startup_consistency_digest()`, moved `_setup_replay_teacher()` into step (e) after rank-0 weight
+    broadcast (building no teacher caches in multi-process mode; using `_frozen_head`, live `disable_lora`,
+    or live `_frozen_base`, with a one-time rank-0 bypass log), logged `per_rank_replay_batch_size` and
+    `effective_replay_batch_size` on rank 0 at startup, skipped `dataset_fingerprint(self.replay_dataset)`
+    on non-zero ranks in `export()`, and updated `TrainingConfig.num_workers` and `ReplayConfig.batch_size`
+    docstrings.
+- **Tests & probes:**
+  - `tests/acceptance/test_distributed.py`: extended T15 to cases `(a)–(l)` (19 test functions, 34 collected
+    items), adding `test_t15_j_replay_and_distillation_trajectory_parity`,
+    `test_t15_j_full_ft_distill_float32` (replacing an earlier xfail with moved-student `1e-4` parity and
+    identical-start cross-rank bitwise checks), `test_t15_k_replay_skip_unscored_and_repeated_fit`,
+    `test_t15_l_replay_flips_teachers_startup_failures_and_export`, and 2-rank CPU compiled replay smoke
+    `test_t15_l_compile_default_replay_distill_smoke`.
+  - `tests/test_trainer_distributed_replay.py`, `tests/test_trainer_distributed.py`, and
+    `tests/test_distributed.py`: added dedicated Stage 2 unit/integration replay tests (including
+    `lora_temporal`, non-patch-multiple replay horizon, periodic validation + `restore_best=True`, and
+    cleanup), `DistributedBatchCycle` tests, and updated white-box trainer tests.
+  - `scripts/probes/linear_requires_grad_dispatch.py`: added standalone probe measuring PyTorch's
+    `F.linear` `weight.requires_grad` dispatch difference on non-contiguous `float32` inputs and its step-0
+    effect on `full_ft` distillation (`docs/VERIFICATION.md` §17.2).
+- **Documentation:** updated `docs/SPEC.md` (§5.3, §5.6, §6, §7.4, §7.6, §9 T15, §10 Phase 5, §11 D22–D37,
+  §12 including the `F.linear` finding and ten verified pre-existing one-process observations),
+  `docs/VERIFICATION.md` (§16–§17), `docs/STATUS.md`, `docs/phases/phase-5-multi-gpu.md`,
+  `docs/DEVELOPMENT.md`, `README.md`, `CHANGELOG.md`, and `AGENTS.md` §1.
+
+**Decisions (spec §11):**
+
+- **2-element `[w_d, failed]` replay pre-check collective (D23):** expanded Stage 1's planned 1-element
+  domain-count collective to `[float(pre_w_d), failed]` so single-rank domain-fetch failures propagate via
+  `raise_propagated_failure(..., stage="training_step")` with failure taking precedence over skipping before
+  any rank advances replay.
+- **Main-process replay loader (D36):** the multi-process replay `DataLoader` runs with `num_workers=0` and
+  `persistent_workers=False` regardless of `config.num_workers`, matching one-process `_replay_loader` and
+  capping persistent worker pools at two per rank during `fit()`.
+- **Shared replay epoch seed with `DistributedBatchCycle` (D37):** replaced Stage 1's planned rank-offset
+  replay shuffling with a shared replay epoch seed (`config.seed + 2_000_009`) partitioned by
+  `DistributedBatchSampler` and cycled by `DistributedBatchCycle`, giving disjoint rank slices, exact
+  once-per-replay-epoch union coverage, and clean short-dataset handling; only the replay loader generator
+  and replay sign-flip stream (`+3_000_007`) are rank-offset (D33).
+
+**Development history (not `[V]` claims):**
+
+- Acceptance tests T15(j)–(l) were written by a different engineer from the Stage 2 implementation.
+- The distributed tests were hardened with mutation campaigns: engineers reported 56 seeded implementation
+  mutations killed across three rounds. Because those mutation runs are not reproducible from the repository,
+  they are noted here as reported development history only and excluded from `docs/VERIFICATION.md`.
+- Investigating the `float32` `full_ft` identical-start distillation gap initially produced a wrong
+  explanation ("grad vs no-grad" mode difference); the standalone probe
+  `scripts/probes/linear_requires_grad_dispatch.py` disproved that explanation (`0.00e+00` between
+  `enable_grad` and `no_grad` for the same flag) and established the measured `weight.requires_grad`
+  dispatch cause on non-contiguous `float32` inputs (`docs/VERIFICATION.md` §17.2, spec §12).
+
+**Evidence (`3347f70`, macOS arm64, Python `3.12.13`, CPU/`gloo`; full commands and tables in
+`docs/VERIFICATION.md` §17):**
+
+- Full network-free suite (`-m "not network"`, PyTorch `2.15.0`) and acceptance test T15 (`tests/acceptance/test_distributed.py`, cases `(a)–(l)`) pass on CPU/`gloo` with zero failures; the four distributed test files pass on PyTorch `2.4.0` with only the four expected macOS `< 2.8` `num_workers > 0` skips.
+- `scripts/probes/linear_requires_grad_dispatch.py` ran on both PyTorch `2.15.0` and `2.4.0` on macOS arm64
+  CPU (`docs/VERIFICATION.md` §17.2), confirming identical standalone `F.linear` diffs and documenting the
+  tiny-model differences between `2.4.0` and `2.15.0`.
+- `uv run ruff check .` and `uv run ruff format --check .` clean.
+
+**Not done / open:**
+
+- **Stage 3 (CUDA/NCCL hardware verification):** multi-rank NCCL has never executed; all multi-process runs
+  remain CPU/`gloo` on macOS arm64 only (`docs/phases/phase-5-multi-gpu.md` §3, spec §10 & §12).
+- Live concurrent multi-process Hub download check at `huggingface_hub==0.23.0` (source reading only,
+  `docs/VERIFICATION.md` §12).
+- Maintainer decisions on the two candidate remedies for PyTorch's `F.linear` `requires_grad` dispatch in
+  `full_ft` distillation and on the ten pre-existing one-process observations recorded in spec §12.
+- Optional gradient accumulation (unticked, unscheduled).

@@ -6,7 +6,9 @@ Guide for anyone, human or coding agent, picking up work in this repository.
 
 `timestral-tune` is an adaptation toolkit (fine-tuning, LoRA, conformal calibration) for Mistral's
 Timestral time-series models. It is **alpha** (v0.1): Phases 0–4 (rescoped: replay/distillation and
-Apple GPU 123M/209M/long-context coverage) are built; tiled DHF training is deferred as exploratory.
+Apple GPU 123M/209M/long-context coverage) and Phase 5 Stages 1–2 (single-node multi-process training
+including replay/distillation, verified on CPU/`gloo` only; Stage 3 CUDA/NCCL open) are built; tiled
+DHF training is deferred as exploratory.
 
 Read in this order before changing anything:
 

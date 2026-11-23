@@ -8,14 +8,17 @@ minor releases, and such changes are called out under **Changed**.
 
 ### Added
 
-- **Experimental multi-process training (Phase 5 Stage 1):** `TimestralTrainer` activates single-node
+- **Experimental multi-process training (Phase 5 Stages 1–2):** `TimestralTrainer` activates single-node
   data-parallel training automatically when a caller-owned `torch.distributed` process group (`"gloo"` or
   `"nccl"`, `world_size > 1`) is active, across `head_only`, `lora_variate`, `lora_temporal`, and `full_ft`,
-  with count-weighted gradient reduction (`ReduceOp.SUM`), startup consistency checks and rank-0
-  weight/buffer broadcast, sharded validation inside `fit()`, rank-0 callbacks/early-stopping/restore with
-  identical `TrainingResult` fields across ranks, and best-effort single-rank failure propagation
-  (`docs/SPEC.md` §5.6). Verified on CPU/`gloo` (`N = 2` and `N = 4`, acceptance test T15); not yet verified
-  on GPUs/NCCL, and `ReplayConfig` is not yet supported in multi-process mode.
+  including `ReplayConfig` replay mixing and uncached frozen-base distillation (`DistributedBatchCycle` with
+  shared replay epoch seed, main-process `num_workers=0` replay loader, per-rank `ReplayConfig.batch_size`
+  resolution and rank-0 startup logging, and replay-only pre-check collective), count-weighted gradient
+  reduction (`ReduceOp.SUM`), startup consistency checks and rank-0 weight/buffer broadcast, sharded
+  validation inside `fit()`, rank-0 callbacks/early-stopping/restore with identical `TrainingResult` fields
+  across ranks, and best-effort single-rank failure propagation (`docs/SPEC.md` §5.6). Verified on
+  CPU/`gloo` on macOS arm64 (`N = 2` and `N = 4`, acceptance test T15 cases `(a)–(l)`); multi-rank NCCL has
+  never executed and GPU hardware verification remains open (Stage 3).
 - **`RankFailureError`** exported from `timestral_tune.trainer` (`RuntimeError` subclass raised on healthy
   peers when another rank fails during multi-process setup, training, validation, or rank-0 callbacks).
 - **Multi-process export metadata:** optional paired `world_size` and `effective_batch_size` arguments on
