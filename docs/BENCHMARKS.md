@@ -1,5 +1,61 @@
 # Phase 3 Benchmarks & Hyperparameter Sweeps
 
+## Summary
+
+Fine-tuning cut forecast error by about 11% on retail demand and 6% on stock volatility, in under a
+minute on a single GPU.
+
+![Forecast error of a classical statistical model, Timestral-28M as released, and Timestral-28M fine-tuned, on retail demand and stock volatility](../assets/results.png)
+
+We fine-tuned Timestral-28M on two real datasets and scored it on later data it had never seen. The
+bars show how far the forecasts were from what happened, so shorter is better. The dashed line marks
+the model exactly as Mistral AI released it.
+
+These gains are not noise:
+
+- **Nearly every series improved.** Fine-tuning made the forecasts better on all 64 retail series and
+  on 50 of the 51 stocks.
+- **It held up over time.** Splitting the test data into consecutive periods, the fine-tuned model was
+  ahead in 6 of 6 periods on retail demand and in 46 of 49 on stock volatility.
+- **The uncertainty is small next to the gain.** The 95% confidence interval is 10% to 13% less error
+  on retail demand and 5% to 7% less on stock volatility.
+- **Repeating the training changes little.** Three fine-tuning runs on retail demand with different
+  random seeds landed within 0.4% of each other.
+
+What else we found:
+
+- **Every model size improved**, from 5M to 209M.
+- **A small fine-tuned model can beat a larger one as released.** On retail demand the fine-tuned 5M
+  model made 7% to 10% less error than every model size as released, the 209M included.
+- **Little was forgotten.** On three unrelated datasets, the error of the fully fine-tuned models moved
+  by less than 3% either way.
+- **Against a tuned gradient-boosted model the result is mixed.** Gradient boosting is a stronger
+  baseline than the classical models in the chart. Fine-tuned Timestral-28M made 8% less error than it
+  on retail demand and 6% less on stock volatility, the two datasets in the chart, whose test periods
+  mostly predate the models' release. On four test sets taken entirely from after the release (18 days
+  of stock volatility, German wind and solar power, air pollution in Indian cities and wave heights off
+  Sri Lanka) the two were level: no difference was larger than its margin of error. The fine-tuned 5M
+  model did not beat gradient boosting on any of the four, and was clearly behind on German power.
+
+The fine print:
+
+- The chart uses full fine-tuning at default settings. Error is the weighted quantile loss, which
+  scores the whole predicted range and not just a single best guess. The classical models are a
+  seasonal ridge regression for retail demand and a HAR model for stock volatility.
+- The gradient-boosted model is scikit-learn's `HistGradientBoostingRegressor`. It predicts the same
+  range of outcomes, trains on a CPU, and has its settings chosen on validation data.
+- The stock volatility test covers January to November 2026. Most of that is before the models'
+  release in late October, so the released model may have seen some of it in its own training. On the
+  18 days after the release the gain is the same 6%, but that is too short a period to confirm on its
+  own (95% interval: 1.5% to 10%).
+- The retail data is from 2024 and may also have been part of the models' training data.
+
+The sections below hold the numbers behind this summary, with the commands to reproduce them: §1 and §3
+for the four model sizes, §4 for the chart, its confidence intervals and the repeated runs, and §6.1 and
+§6.3 for the comparison with gradient boosting.
+
+## Measurement setup
+
 All numbers below were measured on an NVIDIA L4 GPU (`g2-standard-4`, PyTorch 2.15.0+cu132,
 Python 3.12, `bf16` autocast) on `2026-11-22`, evaluating every mode in raw space through the
 vendored upstream `TimestralForecaster.forecast()` with its defaults (`symmetric_averaging=True`,
