@@ -63,7 +63,7 @@ include = ["src", "tests", "scripts", "docs", "README.md", "CHANGELOG.md", "NOTI
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
-    "acceptance: one of the acceptance tests T1-T14 from spec §9",
+    "acceptance: one of the acceptance tests T1-T15 from spec §9",
     "network: needs to download released checkpoints from the Hugging Face Hub",
 ]
 
