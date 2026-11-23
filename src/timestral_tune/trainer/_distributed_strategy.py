@@ -89,7 +89,12 @@ class _DistributedStrategy:
             seed=config.seed,
             epoch=0,
         )
-        self._train_loader = trainer._build_data_loader(trainer.train_dataset, batch_sampler=self._sampler)
+        train_loader_generator = torch.Generator().manual_seed(rank_seed(config.seed, rank))
+        self._train_loader = trainer._build_data_loader(
+            trainer.train_dataset,
+            batch_sampler=self._sampler,
+            generator=train_loader_generator,
+        )
         self._sharded_val_loader = None
         self._val_loader_ready = False
         self._reducer = GradientReducer(self._ctx, trainer._trainable)
@@ -292,7 +297,13 @@ class _DistributedStrategy:
             self._val_loader_ready = True
             return None
         batch_size = trainer.config.eval_batch_size or trainer.config.batch_size
-        self._sharded_val_loader = trainer._build_data_loader(val_dataset, batch_size=batch_size, indices=indices)
+        val_loader_generator = torch.Generator().manual_seed(rank_seed(trainer.config.seed, self._ctx.rank))
+        self._sharded_val_loader = trainer._build_data_loader(
+            val_dataset,
+            batch_size=batch_size,
+            indices=indices,
+            generator=val_loader_generator,
+        )
         self._val_loader_ready = True
         return self._sharded_val_loader
 

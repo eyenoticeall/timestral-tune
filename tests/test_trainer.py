@@ -1524,3 +1524,54 @@ def test_validate_export_inputs_integer_normalisation_and_effective_batch_bound(
                 effective_batch_size=bad_eff,  # type: ignore[arg-type]
             )
         assert not bad_dir.exists()
+
+
+def test_distributed_loaders_do_not_consume_global_rng(tiny_forecaster, monkeypatch):
+    from timestral_tune.trainer import _distributed_strategy as strat_mod
+    from timestral_tune.trainer.distributed import DistributedBatchSampler, DistributedContext, rank_seed
+
+    dataset = make_toy_dataset(tiny_forecaster.patch_size)
+    train, val = dataset.split_by_time(12 * tiny_forecaster.patch_size)
+    cfg = config_for(batch_size=2, max_steps=2, seed=17)
+    trainer = TimestralTrainer(cfg, train, val, model=fresh_model(tiny_forecaster))
+    ctx = DistributedContext(rank=1, world_size=2, backend="gloo", device=torch.device("cpu"))
+    monkeypatch.setattr(DistributedContext, "check_active", lambda _self: None)
+
+    strategy = strat_mod._DistributedStrategy(trainer, ctx)
+    strategy.prepare_fit()
+    try:
+        expected_seed = rank_seed(cfg.seed, ctx.rank)
+        assert strategy._train_loader is not None
+        assert strategy._train_loader.generator is not None
+        assert strategy._train_loader.generator.initial_seed() == expected_seed
+
+        # Iterating the multi-process training loader across epochs must never draw from the global RNG.
+        rng_before = torch.get_rng_state()
+        assert strategy._sampler is not None
+        for epoch in (0, 1):
+            strategy._sampler.set_epoch(epoch)
+            assert len(list(strategy._train_loader)) == len(strategy._sampler)
+        assert torch.equal(torch.get_rng_state(), rng_before)
+
+        # Iterating the multi-process sharded validation loader must also leave the global RNG untouched,
+        # using its own distinct rank-seeded generator.
+        val_loader = strategy._get_sharded_val_loader()
+        assert val_loader is not None
+        assert val_loader.generator is not None
+        assert val_loader.generator is not strategy._train_loader.generator
+        assert val_loader.generator.initial_seed() == expected_seed
+        rng_before_val = torch.get_rng_state()
+        assert len(list(val_loader)) > 0
+        assert len(list(val_loader)) > 0
+        assert torch.equal(torch.get_rng_state(), rng_before_val)
+
+        # _build_data_loader still rejects batch_sampler combined with batch_size, shuffle, or indices.
+        sampler = DistributedBatchSampler(len(train), world_size=2, rank=1, batch_size=2)
+        with pytest.raises(ValueError, match="batch_sampler"):
+            trainer._build_data_loader(train, batch_sampler=sampler, batch_size=2)
+        with pytest.raises(ValueError, match="batch_sampler"):
+            trainer._build_data_loader(train, batch_sampler=sampler, shuffle=True)
+        with pytest.raises(ValueError, match="batch_sampler"):
+            trainer._build_data_loader(train, batch_sampler=sampler, indices=[0, 1])
+    finally:
+        strategy.cleanup()

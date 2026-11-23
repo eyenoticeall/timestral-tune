@@ -766,10 +766,8 @@ class TimestralTrainer:
         bucket_to_max: int | None = None,
     ) -> DataLoader:
         """Build a `DataLoader` over `dataset` (or an index `Subset`) with a model-matched `DHFDataCollator`."""
-        if batch_sampler is not None and (
-            batch_size is not None or shuffle or generator is not None or indices is not None
-        ):
-            raise ValueError("batch_sampler cannot be combined with batch_size, shuffle, generator, or indices")
+        if batch_sampler is not None and (batch_size is not None or shuffle or indices is not None):
+            raise ValueError("batch_sampler cannot be combined with batch_size, shuffle, or indices")
         if batch_sampler is None and batch_size is None:
             raise ValueError("either batch_size or batch_sampler must be specified")
         config = self.config
@@ -780,10 +778,11 @@ class TimestralTrainer:
             "num_workers": config.num_workers,
             "persistent_workers": config.num_workers > 0,
             "pin_memory": self.device.type == "cuda",
+            "generator": generator,
         }
         if batch_sampler is not None:
             return DataLoader(source, batch_sampler=batch_sampler, **common)
-        return DataLoader(source, batch_size=batch_size, shuffle=shuffle, generator=generator, **common)
+        return DataLoader(source, batch_size=batch_size, shuffle=shuffle, **common)
 
     def _raw_loader(self, dataset: TimeSeriesDataset, *, training: bool) -> DataLoader:
         config = self.config
