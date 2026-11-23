@@ -230,9 +230,11 @@ def _warmed_student_state(
     mode: str,
     dtype: torch.dtype,
     dom_ds: TimeSeriesDataset,
+    *,
+    model_seed: int = 0,
 ) -> dict[str, Tensor]:
-    """Take 1 deterministic step from `_fresh_model(0, dtype)` so student != base (and LoRA B != 0)."""
-    model = _fresh_model(0, dtype=dtype)
+    """Take 1 deterministic step from `_fresh_model(model_seed, dtype)` so student != base (and LoRA B != 0)."""
+    model = _fresh_model(model_seed, dtype=dtype)
     if mode == "full_ft":
         trainable = list(model.parameters())
     else:
@@ -419,6 +421,16 @@ def _trajectory_cases(world_size: int) -> list[dict[str, Any]]:
             "steps": 5,
         },
         {
+            "name": "both_short_full_ft_moved",
+            "mode": "full_ft",
+            "dom_len": dom_len,
+            "rep_len": short_rep,
+            "rf": 0.25,
+            "dw": 0.5,
+            "steps": 5,
+            "moved_student": True,
+        },
+        {
             "name": "both_non_mult_head_only_with_val",
             "mode": "head_only",
             "dom_len": dom_len,
@@ -468,6 +480,10 @@ def _run_trajectory_case(case: dict[str, Any], *, batch_size: int, replay_batch_
         replay_dataset=rep_ds,
         model=_fresh_model(3),
     )
+    if case.get("moved_student"):
+        # Move student away from the step-0 frozen teacher so |student_q - teacher_q| >> smooth_beta.
+        moved_state = _warmed_student_state(mode, torch.float32, dom_ds, model_seed=3)
+        trainer.model.load_state_dict(moved_state)
     res = trainer.fit()
     return {
         "result": res,
@@ -1089,10 +1105,16 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
         r0 = tp[0][name]
         assert r0["result"].steps == ref["result"].steps == case["steps"]
         assert len(r0["result"].train_history) == len(ref["result"].train_history)
-        # For `full_ft` starting at student == frozen_base with distillation, PyTorch CPU `bs=2` grad vs
-        # `no_grad` differs by ~3.6e-7 in fp32, which `smooth_l1_loss(beta=1e-3)` scales by 1/beta (~3.6e-4)
-        # on step 1 (verified 6.5e-14 in float64); all other regimes stay well inside 1e-4.
-        loss_tol = 5e-4 if (case["mode"] == "full_ft" and case["dw"] > 0.0) else 1e-4
+        # Only `full_ft` with distillation starting at student == _frozen_base needs 5e-4 on fp32 loss:
+        # PyTorch CPU `grad` vs `no_grad` differs by ~3.6e-7 at batch_size>=2 vs 0 at batch_size=1, which
+        # `smooth_l1_loss(beta=1e-3)` amplifies by 1/beta into ~1.5e-4 step-1 grad / 3.38e-4 max loss diff
+        # in a pure 1-process union-vs-split comparison (drops to 2.18e-7 loss / 2.07e-7 param from a
+        # moved student and 3.08e-13 in float64). Every other case, including `both_short_full_ft_moved`,
+        # holds strict 1e-4 on both loss and parameters.
+        is_step0_full_ft_distill = (
+            case["mode"] == "full_ft" and case["dw"] > 0.0 and not case.get("moved_student", False)
+        )
+        loss_tol = 5e-4 if is_step0_full_ft_distill else 1e-4
         for (s_got, l_got), (s_ref, l_ref) in zip(r0["result"].train_history, ref["result"].train_history, strict=True):
             assert s_got == s_ref
             assert abs(l_got - l_ref) <= loss_tol * max(1.0, abs(l_ref)), f"{name} step {s_got}: {l_got} vs {l_ref}"
@@ -1136,9 +1158,12 @@ def test_distributed_replay_and_distillation_scenarios(world_size: int) -> None:
     assert r0_sk["result"].skipped_batches == 2  # 2 epochs over 3 global batches (1 skipped per epoch)
     # Every active step 0..3 consumed replay steps 0, 1, 2, 3 (never advanced on skipped middle batches!).
     assert r0_sk["recorded_replay_steps"] == [(0, 0), (1, 1), (2, 2), (3, 3)]
+    # `skipped_domain` runs `full_ft` + distillation from student == _frozen_base; the same step-0
+    # 1/smooth_beta fp32 sensitivity gives 1.27e-4 param L2 in pure 1-process union-vs-split
+    # (2.14e-7 from a moved student, 9.64e-14 in float64), while loss stays inside 1e-4 (6.68e-5).
     assert l2_rel(r0_sk["params"], ref_skip_params) <= 5e-4
     for (s_got, l_got), (s_ref, l_ref) in zip(r0_sk["result"].train_history, ref_skip_res.train_history, strict=True):
-        assert s_got == s_ref and abs(l_got - l_ref) <= 5e-4 * max(1.0, abs(l_ref))
+        assert s_got == s_ref and abs(l_got - l_ref) <= 1e-4 * max(1.0, abs(l_ref))
     for r in range(world_size):
         assert sk[r]["stoch_skip_ok"] is True
         assert sk[r]["recorded_replay_steps"] == [(0, 0), (1, 1), (2, 2), (3, 3)]
