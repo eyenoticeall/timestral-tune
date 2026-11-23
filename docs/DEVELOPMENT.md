@@ -61,7 +61,7 @@ src/timestral_tune/
 tests/
   conftest.py, helpers.py   Fixtures, global PyTorch state leak guard, and builders shared by all tests
   distributed_harness.py    Multi-process CPU/gloo spawn harness, shared parity tiers, and headroom knob
-  test_*.py                 Unit tests per module (including test_distributed.py, test_trainer_distributed.py, test_trainer_distributed_replay.py)
+  test_*.py                 Unit tests per module (including test_distributed.py, test_trainer_distributed.py, test_trainer_distributed_replay.py, test_multi_gpu_check.py)
   acceptance/               T1–T15 from spec §9 (all 15 implemented and passing; T15 on CPU/gloo)
 scripts/
   vendor_upstream.py     Regenerates _vendor/timestral
@@ -70,7 +70,8 @@ scripts/
   benchmarks/            Benchmark, sweep and significance runs behind docs/BENCHMARKS.md
   make_banner.py, make_results_chart.py   Draw the README images in assets/
   cuda_check.sh          Runs the device tests and the whole suite on a CUDA machine
-  multi_gpu_check.sh     Staged Stage 3 multi-process/multi-GPU verification session runner
+  multi_gpu_check.sh     Thin bash 3.2+ wrapper that execs multi_gpu_check.py
+  multi_gpu_check.py     Stdlib-only Stage 3 multi-process/multi-GPU verification session driver
 ```
 
 No stub modules remain. Every module's docstring names the spec section it implements; start there when
@@ -172,46 +173,139 @@ lines, pin revisions through `_common.load`, and record the result in `docs/VERI
 
 ### Multi-process / Stage 3 verification scripts
 
-Three tracked scripts support Stage 3 hardware measurement (they are measuring instruments, separate from T15,
-which runs on CPU/`gloo` through `tests/distributed_harness.py`):
+Tracked scripts under `scripts/` drive Stage 3 hardware measurement on CPU/`gloo`, a single shared GPU, or a
+multi-GPU host (they are ungraded measuring instruments, separate from T15, which runs on CPU/`gloo` through
+`tests/distributed_harness.py`):
 
+- **`scripts/multi_gpu_check.sh` and `scripts/multi_gpu_check.py`** — `multi_gpu_check.sh` is a thin bash
+  3.2+ wrapper that locates any Python `>= 3.10` and `exec`s `scripts/multi_gpu_check.py`, a single
+  standard-library-only Python program (never imports `torch` or third-party packages) that owns CLI parsing,
+  stage sequencing, content-bound resume signatures, signal handling, per-stage timeouts, and process-tree
+  teardown.
 - **`scripts/probes/distributed_trainer_check.py`** — runs the real `TimestralTrainer` across ranks under
-  `torchrun` (`--backend gloo|nccl`, `--device-map per-rank|shared`), compares against a one-process reference
-  archive written beforehand on the same device (`--write-reference PATH`, then `torchrun ... --reference PATH`),
-  and prints ungraded numbers across 41 scenarios in groups `g1`–`g8` (`--list` prints all scenarios;
-  `--only` / `--skip` filters by scenario name; `--sizes 5M 28M` adds released checkpoints). Reference archives
-  default to `--reference-mode sketch` (SHA-256 hashes, exact norms, exact deltas for parameter sets up to
-  8,192 elements, and a CountSketch of dimension 8,192 for larger sets), with `--reference-mode exact`
-  available for full tensor snapshots.
-- **`scripts/probes/distributed_rank_failure_check.py`** — spawns `N` ranks (`--backend gloo|nccl`,
-  `--world-size N`, `--device-map per-rank|shared`, `--pg-timeout S`, `--wall-timeout S`), kills `--kill-rank`
-  (default `1`) mid-`fit()` via `os._exit(1)` at `--kill-step` (default `2`), and reports each rank's exit
-  status, exception type (if any), and elapsed seconds.
-- **`scripts/multi_gpu_check.sh`** — staged session runner that automates environment logging, optional
-  4-GPU `distributed_parity.py --device cuda`, reference generation, `torchrun` driver runs, and
-  rank-failure checks in numbered stages (`01_env` through `09_rank_failure_*`). Automatically exports
-  `TMPDIR=/tmp` whenever `TMPDIR` is unset or longer than 60 characters.
+  `torchrun` (`--backend gloo|nccl`, `--device-map per-rank|shared`), compares against a one-process
+  reference archive written beforehand on the same device (`--write-reference PATH`, then
+  `torchrun ... --reference PATH`), and prints ungraded parity/timing/VRAM metrics across 41 scenarios in
+  groups `g1`–`g8` (`--list`, `--only`, `--skip`, `--sizes 5M 28M`). Checks cross-rank equality over all
+  parameters **and** buffers (`xr_eq`, `xr_max`). Defaults to `--reference-mode auto` (exact `float64` deltas
+  when `dtype=float64` and `numel <= 1,000,000` or any dtype with `numel <= 8,192`; `k = 8,192` CountSketch
+  otherwise; schema v5 archive with pre-flight CRC and digest validation), with `sketch` and `exact` also
+  available.
+- **`scripts/probes/distributed_rank_failure_check.py`** — spawns `N` independent ranks via
+  `torch.multiprocessing` (`--backend gloo|nccl`, `--world-size N`, `--device-map per-rank|shared`,
+  `--pg-timeout S`, separate `--startup-timeout` and post-kill `--wall-timeout`), lets `--kill-rank` (default
+  `1`) call `os._exit(1)` mid-`fit()` at `--kill-step` (default `2`), and grades surviving ranks against a
+  strict allow-list of distributed transport/collective exceptions or in-`fit()` `SIGABRT`.
+- **`scripts/probes/_dist_common.py`** — shared constants, synthetic dataset builders, device-map validation,
+  and `TMPDIR` socket-length checks shared by both probes.
+
+**Which Python runs what:** the wrapper picks the interpreter that runs `multi_gpu_check.py` itself—first
+`python3` on `PATH` if it is `>= 3.10`, then an installed interpreter found by
+`uv python find --no-project --resolve-links ">=3.10"` (or without `--resolve-links`), falling back to
+`uv run --no-project --python ">=3.10" python`—without inspecting CLI flags, and `exec`s `multi_gpu_check.py`
+so Python owns its PID, signal dispositions, and exit code. Passing **`--python VERSION`** (for example
+`--python 3.12`) selects the **project virtual environment's** Python passed to `uv sync --locked --quiet`
+and `uv run --no-sync` inside every stage (where PyTorch, CUDA, and `Python.h` live; use a `uv`-managed
+Python on Ubuntu hosts whose system Python lacks `Python.h`).
 
 ```bash
-# CPU/gloo dry run (macOS or Linux; tiny model only)
-bash scripts/multi_gpu_check.sh --backend gloo --ranks 2 4 --pg-timeout 10
+# 1. CPU/gloo dry run (macOS or Linux; tiny model only)
+bash scripts/multi_gpu_check.sh --backend gloo --ranks 2 4 --pg-timeout 10 --log-dir multi_gpu_dry
 
-# Single-GPU shared NCCL (testing convenience; sets NCCL_MULTI_RANK_GPU_ENABLE=1 and --device-map shared)
-bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12
+# 2. Single-GPU shared NCCL (testing convenience; sets NCCL_MULTI_RANK_GPU_ENABLE=1 and --device-map shared)
+bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12 --log-dir multi_gpu_shared
 
-# Multi-GPU host (2 or 4 separate GPUs; --device-map per-rank, real LOCAL_RANK binding)
-bash scripts/multi_gpu_check.sh --python 3.12            # pass --ranks 2 on a 2-GPU host
+# 3. Multi-GPU host (4 separate GPUs; --device-map per-rank, real LOCAL_RANK binding; pass --ranks 2 on 2 GPUs)
+bash scripts/multi_gpu_check.sh --python 3.12 --log-dir multi_gpu_4gpu
 ```
 
-**Logs, resume markers, and timeout caveats (`82a21ca`):** logs, `.done` markers, `summary.txt`, and
-reference archives (`refs/`) are written under `--log-dir`, which defaults to `multi_gpu_check_logs`
-(untracked; do not commit, or pass `--log-dir /tmp/<name>` and delete afterwards). Today at `82a21ca`, each
-passing stage writes `<stage>.done` and re-running with the same `--log-dir` skips stages whose `.done` file
-exists (`--force` re-runs them), **without checking whether CLI flags changed** or guarding against a stale
-reference archive after a failed `--write-reference` re-run; use a fresh `--log-dir` when changing flags.
-Likewise, the script's `--stage-timeout` wrapper does not reliably kill `torchrun`'s rank processes on a real
-hang because `torchrun` puts workers in separate sessions. Fixes for both are pending
-(`docs/VERIFICATION.md` §17.4). Full options: `bash scripts/multi_gpu_check.sh --help`.
+**Stages executed:** `01_env` (syncs the locked venv and records OS/arch/Python/tree-state/PyTorch/CUDA/NCCL/GPU
+facts); `02_prototype_parity_cuda` (`distributed_parity.py --device cuda`, forwarding `--sizes`; runs only for
+`--backend nccl` without `--shared-gpu` when `>= 4` GPUs are visible and `4` is in `--ranks`, skipped
+otherwise); `03_ref_<backend>_tiny_n<N>` / `04_<backend>_tiny_n<N>`; `05_ref_<backend>_released_n<N>` /
+`06_<backend>_released_n<N>` (default `--sizes 5M 28M` for `nccl`, empty for `gloo`; pass `--sizes ""` to
+skip); when `--backend nccl`, Linux CPU/`gloo` comparison stages `07_ref_gloo_tiny_n<N>` / `08_gloo_tiny_n<N>`
+and `09_rank_failure_gloo_n<N>`; and primary rank-failure checks `09_rank_failure_gloo_n<N>` (for `gloo`) or
+`10_rank_failure_nccl_n<N>` (for `nccl`). Full CLI options: `bash scripts/multi_gpu_check.sh --help`.
+
+**Logs, markers, reference archives, and relative `--log-dir`:** per-stage logs (`<stage>.log`), completion
+markers (`<stage>.done`), `summary.txt`, and reference archives (`refs/ref_*.zip`) are written under
+`--log-dir` (default `multi_gpu_check_logs`; untracked, do not commit). Passing a **relative** `--log-dir`
+(such as the default or `--log-dir mgc_logs`) keeps stage arguments, `.done` signatures, and `summary.txt`
+relative to the repository root so machine and home paths do not leak into those files (note that Python
+itself may still print absolute paths inside stage logs for warnings or `faulthandler` tracebacks).
+
+**Content-bound resume and `--force`:** every passing stage writes `<stage>.done` containing a SHA-256 `sig=`
+(plus `artifact_sha256=` for reference stages) bound to:
+1. Tree state: `git` (`HEAD`, tracked `status`, `diff HEAD`, and untracked files under `scripts/` and `src/`
+   excluding bytecode caches and `--log-dir`), automatically falling back to deterministic `content_hash`
+   over `scripts/`, `src/`, `pyproject.toml`, and `uv.lock` when `git` is absent or the directory is not a
+   git work-tree top-level (for example an exported archive).
+2. Resolved project runtime identity (interpreter executable/version, `torch.__version__`,
+   `torch.version.cuda`).
+3. Exact stage arguments (omitting the ephemeral `--master-port` on `torchrun` stages and binding `ref_sha=`
+   to the verified reference archive SHA-256 instead), separated by a domain boundary from tracked
+   environment variables (`NCCL_*`, `GLOO_*`, `TORCH_*`, `PYTORCH_*`, `CUDA_*`, `CUDNN_*`, `CUBLAS_*`,
+   `OMP_*`, `MKL_*`, `OPENBLAS_*`).
+4. For reference stages, full zip CRC, metadata JSON, tensor member byte-size verification, and SHA-256
+   equality of the archive on disk.
+
+Re-running with the same `--log-dir` skips any stage whose `.done` signature and verified artifact still
+match (`0 (resumed)`); changing code, CLI flags, tracked environment variables, runtime versions, or a
+reference archive automatically invalidates and re-runs affected stages. Pass `--force` to ignore `.done`
+markers and re-run every stage. Whenever a reference stage fails, times out, or is interrupted, any partial
+`.zip` / `.zip.tmp` archive is deleted and its dependent `torchrun` stage is recorded as
+`SKIPPED (ref failed)`.
+
+**Signals (`SIGINT` / Ctrl-C, `SIGTERM`, `SIGHUP`) and `nohup`:** on entry, `multi_gpu_check.py` inspects the
+inherited disposition of `SIGINT`, `SIGTERM`, and `SIGHUP`:
+- Any signal already set to `SIG_IGN` on entry—such as `SIGHUP` under `nohup bash scripts/multi_gpu_check.sh ... &`
+  over SSH—stays ignored for the entire session (child stages start in their own session via
+  `start_new_session=True` and inherit `SIG_IGN` across `exec`), so disconnecting SSH does not abort the run.
+- Any signal not ignored on entry interrupts cleanly at any point (start-up, mid-stage, timeout teardown, or
+  stage boundaries): kills the active stage's process tree, removes incomplete `.done` markers and partial
+  reference archives, writes an interrupted `summary.txt`, skips remaining stages, and exits `128 + signum`.
+
+**Stage timeout and process-tree handling:** each stage runs in its own session tagged with a per-stage
+environment variable (`_TIMESTRAL_STAGE_TOKEN`), streaming combined stdout/stderr through a non-blocking pipe
+(no shell `| tee` pipeline). If a stage exceeds `--stage-timeout` (default `900` s), the driver collects
+confirmed-live non-zombie PIDs carrying the stage token (via `/proc` on Linux, `ps` fallback elsewhere),
+their live descendants, and safe stage-only PGIDs, sends `SIGTERM` with a `3 s` pipe-draining grace period,
+then `SIGKILL` with a `2 s` reap loop, deletes any partial artifact, records `124`, and continues to
+independent remaining stages. If a stage leader exits while descendants still hold stdio open or stay alive,
+the driver drains for up to a `2 s` post-exit grace period and then kills and logs a warning for any
+surviving descendants without waiting out `--stage-timeout`. Runtime/GPU helper probe failures or timeouts
+(`180 s` helper limit) are reported explicitly with stderr snippets (never silently as "0 GPUs"), and broken
+stdout/stderr pipes are redirected to `/dev/null` so interpreter shutdown never overwrites the real exit code
+with `120`.
+
+**Exit codes:**
+- `0`: all runnable stages passed (or `-h`/`--help`).
+- `1`: at least one stage failed or timed out (`124` in `summary.txt`, corrupt archive, port allocation
+  failure, or stage exception).
+- `2`: invalid CLI arguments, missing Python `>= 3.10` or `uv`, failed tree-state/runtime/GPU helper probe,
+  `0` visible CUDA GPUs for `--backend nccl`, or `--ranks` exceeding visible GPUs without `--shared-gpu`.
+- `3` (or `01_env`'s exit code): `01_env` failed (`3` when `--backend nccl` is requested on a non-CUDA
+  PyTorch build, or `uv sync`'s non-zero exit code).
+- `129` / `130` / `143`: interrupted by `SIGHUP` / `SIGINT` / `SIGTERM` (when not ignored on entry).
+
+**Known process-escape limitation:** a descendant that strips `_TIMESTRAL_STAGE_TOKEN` from its environment
+and outlives its parent (being reparented outside the tracked PPID tree), or runs on a system with neither
+`/proc` nor `ps`, can escape tree termination; neither `torchrun` nor PyTorch `DataLoader` workers do this.
+
+**macOS `TMPDIR` handling:** `multi_gpu_check.py` automatically exports `TMPDIR=/tmp` whenever `TMPDIR` is
+unset or longer than 60 characters (and `distributed_trainer_check.py` fails fast via
+`check_tmpdir_for_workers()` before spawning workers if `TMPDIR` would overflow macOS's 103-byte `sun_path`
+limit; see "Testing strategy" above).
+
+**Driver unit tests (`tests/test_multi_gpu_check.py`):** 103 stub-stage tests covering CLI parsing, wrapper
+selection, resume signatures, `git` and `content_hash` tree hashing, signal dispositions, timeouts,
+process-tree cleanup, partial-artifact removal, relative log paths, and closed stdio streams (included in
+`uv run pytest -m "not network"`):
+
+```bash
+env -u PYTHONUNBUFFERED TMPDIR=/tmp uv run pytest tests/test_multi_gpu_check.py
+```
 
 ## Style
 
