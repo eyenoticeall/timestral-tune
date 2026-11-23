@@ -84,3 +84,24 @@ def available_accelerators() -> list[str]:
     if mps_is_usable():
         devices.append("mps")
     return devices
+
+
+@pytest.fixture(autouse=True)
+def _guard_torch_global_state():
+    """Fail loudly if any test leaks process-global PyTorch state to later tests."""
+    threads_before = torch.get_num_threads()
+    grad_before = torch.is_grad_enabled()
+    dtype_before = torch.get_default_dtype()
+    yield
+    leaks: list[str] = []
+    if torch.get_num_threads() != threads_before:
+        leaks.append(f"num_threads {threads_before} -> {torch.get_num_threads()}")
+        torch.set_num_threads(threads_before)
+    if torch.is_grad_enabled() != grad_before:
+        leaks.append(f"grad_enabled {grad_before} -> {torch.is_grad_enabled()}")
+        torch.set_grad_enabled(grad_before)
+    if torch.get_default_dtype() != dtype_before:
+        leaks.append(f"default_dtype {dtype_before} -> {torch.get_default_dtype()}")
+        torch.set_default_dtype(dtype_before)
+    if leaks:
+        pytest.fail("test leaked process-global PyTorch state: " + ", ".join(leaks))

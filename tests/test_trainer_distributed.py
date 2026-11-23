@@ -107,7 +107,7 @@ def test_rank_failure_error_exported_from_trainer_package() -> None:
 def test_harness_preserves_scenario_error_when_destroy_process_group_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If `dist.destroy_process_group()` raises in `_worker_main`'s `finally:`, keep the scenario error."""
+    """`_worker_main` keeps the scenario error if `destroy_process_group()` raises and restores thread count."""
     monkeypatch.setattr(dist, "init_process_group", lambda **_kw: None)
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
 
@@ -116,28 +116,41 @@ def test_harness_preserves_scenario_error_when_destroy_process_group_raises(
 
     monkeypatch.setattr(dist, "destroy_process_group", _boom_destroy)
 
+    orig_threads = torch.get_num_threads()
+    caller_threads = max(2, orig_threads)
+    observed_threads: list[int] = []
+
     def _failing_fn(rank: int, world_size: int) -> None:
         del rank, world_size
+        observed_threads.append(torch.get_num_threads())
         raise ValueError("original_scenario_error")
 
-    res_fail_path = tmp_path / "fail.pkl"
-    harness._worker_main(0, 2, str(tmp_path / "store"), str(res_fail_path), 5.0, "gloo", _failing_fn, ())
-    res_fail = pickle.loads(res_fail_path.read_bytes())
-    assert not res_fail.ok and res_fail.error is not None
-    assert res_fail.error.exc_type is ValueError
-    assert "original_scenario_error" in res_fail.error.message
-
-    # When the scenario itself succeeds, a cleanup error from destroy_process_group() is still surfaced.
     def _ok_fn(rank: int, world_size: int) -> str:
         del rank, world_size
+        observed_threads.append(torch.get_num_threads())
         return "ok"
 
-    res_ok_path = tmp_path / "ok.pkl"
-    harness._worker_main(0, 2, str(tmp_path / "store"), str(res_ok_path), 5.0, "gloo", _ok_fn, ())
-    res_ok = pickle.loads(res_ok_path.read_bytes())
-    assert not res_ok.ok and res_ok.error is not None
-    assert res_ok.error.exc_type is RuntimeError
-    assert "destroy_pg_boom" in res_ok.error.message
+    torch.set_num_threads(caller_threads)
+    try:
+        res_fail_path = tmp_path / "fail.pkl"
+        harness._worker_main(0, 2, str(tmp_path / "store"), str(res_fail_path), 5.0, "gloo", _failing_fn, ())
+        assert torch.get_num_threads() == caller_threads
+        res_fail = pickle.loads(res_fail_path.read_bytes())
+        assert not res_fail.ok and res_fail.error is not None
+        assert res_fail.error.exc_type is ValueError
+        assert "original_scenario_error" in res_fail.error.message
+
+        # When the scenario itself succeeds, a cleanup error from destroy_process_group() is still surfaced.
+        res_ok_path = tmp_path / "ok.pkl"
+        harness._worker_main(0, 2, str(tmp_path / "store"), str(res_ok_path), 5.0, "gloo", _ok_fn, ())
+        assert torch.get_num_threads() == caller_threads
+        res_ok = pickle.loads(res_ok_path.read_bytes())
+        assert not res_ok.ok and res_ok.error is not None
+        assert res_ok.error.exc_type is RuntimeError
+        assert "destroy_pg_boom" in res_ok.error.message
+        assert observed_threads == [1, 1]
+    finally:
+        torch.set_num_threads(orig_threads)
 
 
 # --------------------------------------------------------------------------- white-box multi-process internals

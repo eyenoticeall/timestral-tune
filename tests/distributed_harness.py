@@ -136,33 +136,37 @@ def _worker_main(
     args: tuple[Any, ...],
 ) -> None:
     """Top-level worker entry point for `spawn`."""
+    prev_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     outcome: RankResult | None = None
     try:
-        dist.init_process_group(
-            backend=backend,
-            init_method=f"file://{store_path}",
-            rank=rank,
-            world_size=world_size,
-            timeout=datetime.timedelta(seconds=pg_timeout),
-        )
         try:
-            value = fn(rank, world_size, *args)
-            outcome = RankResult(rank=rank, value=value)
+            dist.init_process_group(
+                backend=backend,
+                init_method=f"file://{store_path}",
+                rank=rank,
+                world_size=world_size,
+                timeout=datetime.timedelta(seconds=pg_timeout),
+            )
+            try:
+                value = fn(rank, world_size, *args)
+                outcome = RankResult(rank=rank, value=value)
+            except BaseException as exc:
+                outcome = RankResult(rank=rank, error=_capture_error(exc))
+            finally:
+                if dist.is_initialized():
+                    try:
+                        dist.destroy_process_group()
+                    except BaseException as cleanup_exc:
+                        if outcome is None or outcome.ok:
+                            outcome = RankResult(rank=rank, error=_capture_error(cleanup_exc))
         except BaseException as exc:
-            outcome = RankResult(rank=rank, error=_capture_error(exc))
-        finally:
-            if dist.is_initialized():
-                try:
-                    dist.destroy_process_group()
-                except BaseException as cleanup_exc:
-                    if outcome is None or outcome.ok:
-                        outcome = RankResult(rank=rank, error=_capture_error(cleanup_exc))
-    except BaseException as exc:
-        if outcome is None or outcome.ok:
-            outcome = RankResult(rank=rank, error=_capture_error(exc))
-    assert outcome is not None
-    _write_result(Path(result_path), outcome)
+            if outcome is None or outcome.ok:
+                outcome = RankResult(rank=rank, error=_capture_error(exc))
+        assert outcome is not None
+        _write_result(Path(result_path), outcome)
+    finally:
+        torch.set_num_threads(prev_threads)
 
 
 def _signal_label(sig_num: int) -> str:
