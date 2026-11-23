@@ -12,6 +12,7 @@ import tempfile
 import time
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -191,6 +192,8 @@ def test_batch_sampler_matches_arithmetic_pickles_and_sets_epoch(
             num_items, world_size=world_size, rank=rank, batch_size=batch_size, shuffle=shuffle, seed=99
         )
         assert sampler.num_global_steps == n_steps
+        for step in range(n_steps):
+            assert sampler.slice_size(step) == rank_slice_size(num_items, world_size, batch_size, rank, step)
         for epoch in (0, 1, 2):
             sampler.set_epoch(epoch)
             assert sampler.epoch == epoch
@@ -301,6 +304,11 @@ def test_sampling_and_seed_validation_errors() -> None:
         rank_slice_size(4, 2, 2, 2, 0)
     with pytest.raises(ValueError):
         rank_slice_size(4, 2, 2, 0, 1)
+    sampler = DistributedBatchSampler(4, world_size=2, rank=0, batch_size=2)
+    with pytest.raises(ValueError):
+        sampler.slice_size(1)
+    with pytest.raises(ValueError):
+        sampler.slice_size(-1)
     with pytest.raises(ValueError):
         rank_step_indices(4, 2, 2, 0, 0, epoch=-1)
     with pytest.raises(ValueError):
@@ -464,6 +472,47 @@ def test_detect_nccl_device_rules_monkeypatched(monkeypatch: pytest.MonkeyPatch)
         assert selected == []
 
 
+def test_distributed_context_direct_construction_validation() -> None:
+    """Direct `DistributedContext(...)` normalises integer fields and enforces backend/device compatibility."""
+    ctx_gloo = DistributedContext(
+        rank=np.int64(1),  # type: ignore[arg-type]
+        world_size=np.int64(4),  # type: ignore[arg-type]
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+    assert type(ctx_gloo.rank) is int and ctx_gloo.rank == 1
+    assert type(ctx_gloo.world_size) is int and ctx_gloo.world_size == 4
+
+    ctx_nccl = DistributedContext(
+        rank=np.int32(0),  # type: ignore[arg-type]
+        world_size=np.int32(2),  # type: ignore[arg-type]
+        backend="nccl",
+        device=torch.device("cuda", 0),
+    )
+    assert type(ctx_nccl.rank) is int and ctx_nccl.rank == 0
+    assert type(ctx_nccl.world_size) is int and ctx_nccl.world_size == 2
+
+    # Impossible backend/device pairs rejected just as in detect().
+    for bad_gloo_dev in (torch.device("cuda", 0), torch.device("cuda"), torch.device("cpu", 0), torch.device("mps")):
+        with pytest.raises(ValueError, match="gloo"):
+            DistributedContext(rank=0, world_size=2, backend="gloo", device=bad_gloo_dev)
+
+    for bad_nccl_dev in (torch.device("cpu"), torch.device("cuda"), torch.device("mps")):
+        with pytest.raises(ValueError, match="nccl"):
+            DistributedContext(rank=0, world_size=2, backend="nccl", device=bad_nccl_dev)
+
+    with pytest.raises(TypeError, match="bool"):
+        DistributedContext(rank=False, world_size=2, backend="gloo", device=torch.device("cpu"))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="torch.device"):
+        DistributedContext(rank=0, world_size=2, backend="gloo", device="cpu")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="world_size"):
+        DistributedContext(rank=0, world_size=1, backend="gloo", device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="rank"):
+        DistributedContext(rank=2, world_size=2, backend="gloo", device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="backend"):
+        DistributedContext(rank=0, world_size=2, backend="cpu:gloo", device=torch.device("cpu"))  # type: ignore[arg-type]
+
+
 def test_stale_group_check_and_non_propagated_errors_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = DistributedContext(rank=0, world_size=2, backend="gloo", device=torch.device("cpu"))
 
@@ -553,6 +602,69 @@ def test_gradient_reducer_uses_single_collective_with_presence_flags(monkeypatch
     assert p_none.grad is None
     assert p_zero.grad is not None and p_zero.grad.tolist() == [0.0, 0.0]
     assert p_vals.grad is not None and p_vals.grad.tolist() == [2.0, 4.0, 6.0, 8.0]
+
+
+def test_gradient_reducer_all_present_skips_readback_and_all_absent_reuses_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All-present skips `_flags_slice.tolist()`; all-absent uses preallocated zeros and reads flags."""
+    ctx = DistributedContext(rank=0, world_size=2, backend="gloo", device=torch.device("cpu"))
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
+
+    p0 = nn.Parameter(torch.ones(2, dtype=torch.float32))
+    p1 = nn.Parameter(torch.ones(3, dtype=torch.float32))
+    reducer = GradientReducer(ctx, [p0, p1])
+
+    # 1. All local gradients present: single all_reduce carries [1.0, 1.0] flags, skips `.tolist()`.
+    calls: list[int] = []
+
+    def _double_all_reduce(tensor: torch.Tensor, op: Any = None) -> None:
+        assert op == dist.ReduceOp.SUM
+        calls.append(int(tensor.numel()))
+        tensor.mul_(2.0)
+
+    monkeypatch.setattr(dist, "all_reduce", _double_all_reduce)
+
+    real_flags = reducer._flags_slice
+
+    class _NoReadbackFlags:
+        def copy_(self, src: torch.Tensor) -> torch.Tensor:
+            return real_flags.copy_(src)
+
+        def tolist(self) -> list[float]:
+            raise AssertionError("all-present fast path must not read back presence flags")
+
+    reducer._flags_slice = _NoReadbackFlags()  # type: ignore[assignment]
+    p0.grad = torch.tensor([1.5, -2.5], dtype=torch.float32)
+    p1.grad = torch.tensor([0.0, 3.0, 4.0], dtype=torch.float32)
+    reducer.reduce()
+
+    assert calls == [2 + 3 + 2]
+    assert real_flags.tolist() == [2.0, 2.0]
+    assert p0.grad is not None and p0.grad.tolist() == [3.0, -5.0]
+    assert p1.grad is not None and p1.grad.tolist() == [0.0, 6.0, 8.0]
+
+    # 2. All local gradients None: uses preallocated zero flags and reads back peer presence.
+    reducer._flags_slice = real_flags
+
+    def _peer_populated_p1(tensor: torch.Tensor, op: Any = None) -> None:
+        assert op == dist.ReduceOp.SUM
+        # Verify caller wrote [0.0, 0.0] into flags before collective.
+        assert tensor[-2:].tolist() == [0.0, 0.0]
+        # Simulate peer rank contributing grad for p1 only (flag=1.0, values=[5, 6, 7]).
+        tensor[2:5].copy_(torch.tensor([5.0, 6.0, 7.0]))
+        tensor[-1].fill_(1.0)
+
+    monkeypatch.setattr(dist, "all_reduce", _peer_populated_p1)
+    p0.grad = None
+    p1.grad = None
+    reducer.reduce()
+    assert p0.grad is None
+    assert p1.grad is not None and p1.grad.tolist() == [5.0, 6.0, 7.0]
 
 
 # --------------------------------------------------------------------------- multi-process scenarios (N=2 and N=4)
@@ -781,6 +893,24 @@ def _sc_gradient_reducer(rank: int, world_size: int) -> dict[str, Any]:
     assert p3.grad.shape == ()
     r3 = {"p0": None, "p1": p1.grad.tolist(), "p2": None, "p3": p3.grad.item()}
 
+    # Round 4: asymmetric fast path — rank 0 has all grads present (skips flag read-back),
+    # while rank 1 has all grads None (reads back flags and allocates every param's .grad).
+    if rank == 0:
+        p0.grad = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
+        p1.grad = torch.full((2, 2), 4.0, dtype=torch.float64)
+        p2.grad = torch.zeros(4, dtype=torch.float64)
+        p3.grad = torch.tensor(5.0, dtype=torch.float64)
+    elif rank == 1:
+        p0.grad = p1.grad = p2.grad = p3.grad = None
+    else:
+        p0.grad = torch.full((3,), 0.5, dtype=torch.float64)
+        p1.grad = torch.full((2, 2), 1.0, dtype=torch.float64)
+        p2.grad = None
+        p3.grad = torch.tensor(2.0, dtype=torch.float64)
+    reducer.reduce()
+    assert p0.grad is not None and p1.grad is not None and p2.grad is not None and p3.grad is not None
+    r4 = {"p0": p0.grad.tolist(), "p1": p1.grad.tolist(), "p2": p2.grad.tolist(), "p3": p3.grad.item()}
+
     # AdamW weight-decay parity: all-None param skips decay; present all-zero param decays identically across ranks.
     p_unused = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64))
     p_zero = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64))
@@ -796,6 +926,7 @@ def _sc_gradient_reducer(rank: int, world_size: int) -> dict[str, Any]:
         "round1": r1,
         "round2": r2,
         "round3": r3,
+        "round4": r4,
         "wd_unused": p_unused.detach().tolist(),
         "wd_zero": p_zero.detach().tolist(),
     }
@@ -1003,6 +1134,11 @@ def test_distributed_primitives_multiprocess(world_size: int) -> None:
         assert res["round3"]["p1"] == [[2.5, 2.5], [2.5, 2.5]]
         assert res["round3"]["p2"] is None
         assert res["round3"]["p3"] == 0.0
+        extra_ranks = max(0, world_size - 2)
+        assert res["round4"]["p0"] == [1.0 + 0.5 * extra_ranks, 2.0 + 0.5 * extra_ranks, 3.0 + 0.5 * extra_ranks]
+        assert res["round4"]["p1"] == [[4.0 + extra_ranks] * 2, [4.0 + extra_ranks] * 2]
+        assert res["round4"]["p2"] == [0.0, 0.0, 0.0, 0.0]
+        assert res["round4"]["p3"] == 5.0 + 2.0 * extra_ranks
         assert res["wd_unused"] == [2.0, -4.0]
         assert res["wd_zero"] == ref_zero.detach().tolist()
         assert res["wd_zero"] != [2.0, -4.0]

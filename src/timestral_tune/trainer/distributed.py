@@ -246,12 +246,19 @@ class DistributedContext:
     device: torch.device
 
     def __post_init__(self) -> None:
-        _require_int("world_size", self.world_size, minimum=2)
-        _require_int("rank", self.rank, minimum=0, maximum=self.world_size - 1)
+        world_size = _require_int("world_size", self.world_size, minimum=2)
+        rank = _require_int("rank", self.rank, minimum=0, maximum=world_size - 1)
+        object.__setattr__(self, "world_size", world_size)
+        object.__setattr__(self, "rank", rank)
         if not isinstance(self.backend, str) or self.backend not in ("gloo", "nccl"):
             raise ValueError(f"unsupported backend {self.backend!r}; expected exactly 'gloo' or 'nccl'")
         if not isinstance(self.device, torch.device):
             raise TypeError(f"device must be a torch.device, got {type(self.device).__name__}")
+        if self.backend == "gloo":
+            if self.device.type != "cpu" or self.device.index is not None:
+                raise ValueError(f"backend 'gloo' requires device torch.device('cpu'); got {self.device!r}")
+        elif self.device.type != "cuda" or self.device.index is None or self.device.index < 0:
+            raise ValueError(f"backend 'nccl' requires an indexed CUDA device (cuda:<index>); got {self.device!r}")
 
     @property
     def is_rank_zero(self) -> bool:
@@ -452,6 +459,11 @@ def broadcast_module_state(ctx: DistributedContext, module: nn.Module) -> None:
     preserved unchanged. Non-contiguous tensors or tensors stored on a different device than
     `ctx.device` are staged through `ctx.device` and copied back in place.
 
+    Every parameter and buffer tensor must have a dtype supported by `ctx.backend`'s
+    `torch.distributed.broadcast` collective (standard real floating-point and integer dtypes;
+    unsupported dtypes such as `int16` or complex tensors are rejected by the backend). This
+    helper has been exercised with floating-point and integer tensors on `gloo`.
+
     A parameter or buffer name, shape, or dtype mismatch across ranks is a caller bug that
     `ctx.check_consistency` exists to catch before calling this function.
 
@@ -551,6 +563,8 @@ class GradientReducer:
         self._grad_numel = total_numel
         self._buffer = torch.empty(total_numel + len(params), dtype=dtype, device=device)
         self._flags_slice = self._buffer.narrow(0, total_numel, len(params))
+        self._all_present_flags = torch.ones(len(params), dtype=dtype, device=device)
+        self._all_absent_flags = torch.zeros(len(params), dtype=dtype, device=device)
 
         entries: list[tuple[Tensor, Tensor]] = []
         offset = 0
@@ -571,18 +585,25 @@ class GradientReducer:
         Parameters whose `.grad` is `None` on every rank remain `None` on every rank. Parameters
         with a non-`None` `.grad` on at least one rank (including all-zero tensors) receive the
         summed `.grad` tensor on every rank, allocating `.grad` where it was locally `None`.
+        When every local gradient is present, every global presence count is guaranteed >= 1, so
+        this rank copies preallocated device flags and skips the post-collective host read-back.
 
         Ranks: all ranks must call in lockstep on identically ordered, matching parameter lists.
         Collectives: 1 (`all_reduce(SUM)`).
         """
         self._ctx.check_active()
+        num_params = len(self._entries)
         with torch.no_grad():
-            local_flags: list[float] = []
-            for param, buf_slice in self._entries:
+            present_count = 0
+            local_flags: list[float] | None = None
+            for idx, (param, buf_slice) in enumerate(self._entries):
                 grad = param.grad
                 if grad is None:
                     buf_slice.zero_()
-                    local_flags.append(0.0)
+                    if local_flags is None and present_count > 0:
+                        local_flags = [1.0] * idx
+                    if local_flags is not None:
+                        local_flags.append(0.0)
                 else:
                     if grad.shape != param.shape or grad.dtype != self._dtype or grad.device != self._device:
                         raise ValueError(
@@ -591,14 +612,32 @@ class GradientReducer:
                             f"dtype={grad.dtype} device={grad.device}"
                         )
                     buf_slice.copy_(grad.detach().reshape(-1))
-                    local_flags.append(1.0)
-            self._flags_slice.copy_(torch.tensor(local_flags, dtype=self._dtype))
+                    present_count += 1
+                    if local_flags is None and present_count < idx + 1:
+                        local_flags = [0.0] * idx
+                    if local_flags is not None:
+                        local_flags.append(1.0)
+
+            all_local_present = present_count == num_params
+            if all_local_present:
+                self._flags_slice.copy_(self._all_present_flags)
+            elif present_count == 0:
+                self._flags_slice.copy_(self._all_absent_flags)
+            else:
+                assert local_flags is not None
+                self._flags_slice.copy_(torch.tensor(local_flags, dtype=self._dtype))
 
             dist.all_reduce(self._buffer, op=dist.ReduceOp.SUM)
 
+            if all_local_present:
+                for param, buf_slice in self._entries:
+                    assert param.grad is not None
+                    param.grad.copy_(buf_slice.view_as(param))
+                return
+
             present_counts = self._flags_slice.tolist()
-            for (param, buf_slice), present_count in zip(self._entries, present_counts, strict=True):
-                if present_count == 0.0:
+            for (param, buf_slice), global_present in zip(self._entries, present_counts, strict=True):
+                if global_present == 0.0:
                     param.grad = None
                     continue
                 if param.grad is None:
@@ -743,6 +782,10 @@ class DistributedBatchSampler(Sampler[list[int]]):
         """Total global steps in an epoch, including steps where this rank is empty."""
         return steps_per_epoch(self._num_items, self._world_size, self._batch_size)
 
+    def slice_size(self, step: int) -> int:
+        """Number of items assigned to this rank at global step `step` (`0 <= step < num_global_steps`)."""
+        return rank_slice_size(self._num_items, self._world_size, self._batch_size, self._rank, step)
+
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch index used for subsequent iterations."""
         self._epoch = _require_int("epoch", epoch, minimum=0)
@@ -752,8 +795,7 @@ class DistributedBatchSampler(Sampler[list[int]]):
         total_steps = self.num_global_steps
         if total_steps == 0:
             return 0
-        last_size = rank_slice_size(self._num_items, self._world_size, self._batch_size, self._rank, total_steps - 1)
-        return total_steps if last_size > 0 else total_steps - 1
+        return total_steps if self.slice_size(total_steps - 1) > 0 else total_steps - 1
 
     def __iter__(self) -> Iterator[list[int]]:
         total_steps = self.num_global_steps

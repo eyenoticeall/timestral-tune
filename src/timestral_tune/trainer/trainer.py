@@ -1393,14 +1393,15 @@ class TimestralTrainer:
         )
         terms = self._compute_loss_terms(batch, validate=validate, replay=replay)
         loss = self._mix_loss_terms(terms)
-        if not bool(torch.isfinite(loss)):
+        loss_value = loss.item()
+        if not math.isfinite(loss_value):
             raise FloatingPointError(
-                f"the training loss became {loss.item()} at step {self.global_step + 1}. Lower the learning rate, "
+                f"the training loss became {loss_value} at step {self.global_step + 1}. Lower the learning rate, "
                 "or check the data for extreme values"
             )
         loss.backward()
         self._apply_optimizer_step()
-        return loss.item()
+        return loss_value
 
     def _make_fit_strategy(self) -> _FitStrategy:
         """Select the execution strategy for `fit()`."""

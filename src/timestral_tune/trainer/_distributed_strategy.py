@@ -28,7 +28,6 @@ from .distributed import (
     broadcast_status,
     is_oom_error,
     rank_seed,
-    rank_slice_size,
     validation_shard_indices,
 )
 
@@ -160,6 +159,7 @@ class _DistributedStrategy:
         # Stage 1: protected local stage (lazy iterator creation, fetch, zero-scored skip, flip, validate, forward).
         local_error: Exception | None = None
         terms: _LossTerms | None = None
+        loss_val: float | None = None
         w_d = 0
         sum_d = 0.0
         non_finite = 0.0
@@ -175,8 +175,9 @@ class _DistributedStrategy:
                 )
                 assert terms.domain is not None
                 w_d = prepared.num_scored
-                if bool(torch.isfinite(terms.domain)):
-                    weighted_sum = terms.domain.item() * w_d
+                loss_val = terms.domain.item()
+                if math.isfinite(loss_val):
+                    weighted_sum = loss_val * w_d
                     if math.isfinite(weighted_sum):
                         sum_d = weighted_sum
                     else:
@@ -188,6 +189,7 @@ class _DistributedStrategy:
                 raise
             local_error = exc
             terms = None
+            loss_val = None
             w_d = 0
             sum_d = 0.0
             non_finite = 0.0
@@ -211,11 +213,7 @@ class _DistributedStrategy:
             self._ctx.raise_propagated_failure(local_error, stage="training_step")
 
         if non_finite_tot > 0.0:
-            bad_value: object = (
-                terms.domain.item()
-                if (terms is not None and terms.domain is not None and not bool(torch.isfinite(terms.domain)))
-                else "non-finite"
-            )
+            bad_value: object = loss_val if (loss_val is not None and not math.isfinite(loss_val)) else "non-finite"
             raise FloatingPointError(
                 f"the training loss became {bad_value} at step {trainer.global_step + 1}. "
                 "Lower the learning rate, or check the data for extreme values"
@@ -250,15 +248,11 @@ class _DistributedStrategy:
         """
         assert self._sampler is not None and self._train_loader is not None
         self._sampler.set_epoch(epoch)
-        num_items = len(self._trainer.train_dataset)
-        world_size = self._ctx.world_size
-        rank = self._ctx.rank
-        batch_size = self._trainer.config.batch_size
         total_epoch_steps = self._sampler.num_global_steps
         loader_iter: Iterator[TrainingBatch] | None = None
 
         for step_idx in range(total_epoch_steps):
-            slice_size = rank_slice_size(num_items, world_size, batch_size, rank, step_idx)
+            slice_size = self._sampler.slice_size(step_idx)
 
             def _fetch(size: int = slice_size) -> TrainingBatch | None:
                 nonlocal loader_iter
