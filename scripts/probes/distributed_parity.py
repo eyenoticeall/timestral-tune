@@ -652,7 +652,7 @@ def _run_shipped_trainer_ref(
     """Independent reference using the shipped 1-process `TimestralTrainer` (no `_local_losses`)."""
     dtype = DTYPE_MAP[dt]
     if case.cached_head and dtype == torch.float64:
-        return {"unsupported": "TimeSeriesDataset enforces np.float32; shipped head cache supports float32 only"}
+        return {"unsupported": "TimeSeriesDataset stores np.float32 inputs; cannot feed float64 input values"}
 
     # Start from base_state so TimestralTrainer itself injects LoRA and snapshots _frozen_base.
     base_model, _ = _load_model(payload["config"], payload["base_state"], dtype, device, mode="full_ft")
