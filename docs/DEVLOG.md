@@ -1094,3 +1094,18 @@ table with the former bar values and the retail demand result.
 `archive/` folder was then removed: it held only `timestral_tune_handoff_document.v0.md`, the first draft
 that `docs/SPEC.md` superseded on 2026-11-21. The spec's header now says the draft was removed and remains
 in git history. Earlier devlog entries that mention the archived file describe the tree as it was then.
+
+## 2026-11-24 — README results limited to released against fine-tuned
+
+**Done.** On the maintainer's instruction two things left the README's Results section: the clause
+calling the German power result "not a typical gain" (nothing here measures a typical gain), and the
+sentence comparing the fine-tuned model with the tuned gradient-boosted baseline. The README now states
+the 23% as against the released model and still says the dataset was picked because the released model
+does poorly on it.
+
+**Decisions.** The README is a released-against-fine-tuned comparison and makes no claim about other
+methods. The gradient-boosted comparison, including the registered conclusion that it is the better
+practical choice on the four post-release test sets, is unchanged in `docs/BENCHMARKS.md` (Summary and
+§6) and `docs/phases/practical-benchmarks.md`.
+
+**Not done / open.** These two changes are not pushed.
