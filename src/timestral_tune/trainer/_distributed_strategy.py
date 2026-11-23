@@ -15,10 +15,9 @@ from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from ..data.batch import TrainingBatch
-from ..data.collator import DHFDataCollator
 from .distributed import (
     ControlStatus,
     DistributedBatchSampler,
@@ -98,19 +97,7 @@ class _DistributedStrategy:
             seed=config.seed,
             epoch=0,
         )
-        collator = DHFDataCollator.for_model(
-            trainer.model.config,
-            trainer.train_dataset.context_length,
-            bucket_to_max=None,
-        )
-        self._train_loader = DataLoader(
-            trainer.train_dataset,
-            batch_sampler=self._sampler,
-            collate_fn=collator,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
-            pin_memory=trainer.device.type == "cuda",
-        )
+        self._train_loader = trainer._build_data_loader(trainer.train_dataset, batch_sampler=self._sampler)
         self._sharded_val_loader = None
         self._val_loader_ready = False
         self._reducer = GradientReducer(self._ctx, trainer._trainable)
@@ -321,18 +308,8 @@ class _DistributedStrategy:
             self._sharded_val_loader = None
             self._val_loader_ready = True
             return None
-        config = trainer.config
-        batch_size = config.eval_batch_size or config.batch_size
-        collator = DHFDataCollator.for_model(trainer.model.config, val_dataset.context_length, bucket_to_max=None)
-        self._sharded_val_loader = DataLoader(
-            Subset(val_dataset, indices),
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=collator,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
-            pin_memory=trainer.device.type == "cuda",
-        )
+        batch_size = trainer.config.eval_batch_size or trainer.config.batch_size
+        self._sharded_val_loader = trainer._build_data_loader(val_dataset, batch_size=batch_size, indices=indices)
         self._val_loader_ready = True
         return self._sharded_val_loader
 

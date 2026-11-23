@@ -23,7 +23,7 @@ from typing import Any, Literal, Protocol
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
 from ..config import LoraConfig, ReplayConfig, TrainingConfig
 from ..data.batch import TrainingBatch, flip_batch_signs
@@ -943,21 +943,48 @@ class TimestralTrainer:
     def num_trainable_parameters(self) -> int:
         return sum(parameter.numel() for parameter in self._trainable)
 
+    def _build_data_loader(
+        self,
+        dataset: TimeSeriesDataset,
+        *,
+        batch_size: int | None = None,
+        shuffle: bool = False,
+        generator: torch.Generator | None = None,
+        batch_sampler: Sampler[list[int]] | None = None,
+        indices: Sequence[int] | None = None,
+        bucket_to_max: int | None = None,
+    ) -> DataLoader:
+        """Build a `DataLoader` over `dataset` (or an index `Subset`) with a model-matched `DHFDataCollator`."""
+        if batch_sampler is not None and (
+            batch_size is not None or shuffle or generator is not None or indices is not None
+        ):
+            raise ValueError("batch_sampler cannot be combined with batch_size, shuffle, generator, or indices")
+        if batch_sampler is None and batch_size is None:
+            raise ValueError("either batch_size or batch_sampler must be specified")
+        config = self.config
+        collator = DHFDataCollator.for_model(self.model.config, dataset.context_length, bucket_to_max=bucket_to_max)
+        source: Dataset[Any] = dataset if indices is None else Subset(dataset, indices)
+        common: dict[str, Any] = {
+            "collate_fn": collator,
+            "num_workers": config.num_workers,
+            "persistent_workers": config.num_workers > 0,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if batch_sampler is not None:
+            return DataLoader(source, batch_sampler=batch_sampler, **common)
+        return DataLoader(source, batch_size=batch_size, shuffle=shuffle, generator=generator, **common)
+
     def _raw_loader(self, dataset: TimeSeriesDataset, *, training: bool) -> DataLoader:
         config = self.config
         generator = torch.Generator().manual_seed(config.seed) if training else None
         batch_size = config.batch_size if training else (config.eval_batch_size or config.batch_size)
         bucket_max = batch_size if (config.compile_model and config.compile_mode == "reduce-overhead") else None
-        collator = DHFDataCollator.for_model(self.model.config, dataset.context_length, bucket_to_max=bucket_max)
-        return DataLoader(
+        return self._build_data_loader(
             dataset,
             batch_size=batch_size,
             shuffle=training and config.shuffle,
-            collate_fn=collator,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
-            pin_memory=self.device.type == "cuda",
             generator=generator,
+            bucket_to_max=bucket_max,
         )
 
     def _estimate_head_cache_bytes(self, dataset: TimeSeriesDataset) -> int:
