@@ -920,6 +920,7 @@ def _sc_step_level_and_non_finite(rank: int, world_size: int) -> dict[str, Any]:
                             }
                         )
                 finally:
+                    strategy.after_train_loop()
                     strategy.cleanup()
                     assert strategy._reducer is None
                     trainer.model.eval()

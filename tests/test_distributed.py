@@ -495,6 +495,12 @@ def test_stale_group_check_and_non_propagated_errors_in_process(monkeypatch: pyt
         ctx.propagate_failure(KeyboardInterrupt(), stage="step")  # type: ignore[arg-type]
     assert not called_all_reduce
 
+    # raise_propagated_failure asserts if invoked when no rank actually supplied an error.
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, op=None: None)
+    with pytest.raises(AssertionError, match="no rank supplied a local_error"):
+        ctx.raise_propagated_failure(None, stage="training_step")
+
 
 def test_gradient_reducer_construction_validation() -> None:
     ctx = DistributedContext(rank=0, world_size=2, backend="gloo", device=torch.device("cpu"))

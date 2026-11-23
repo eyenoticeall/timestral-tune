@@ -1339,9 +1339,8 @@ def test_prepare_batch_helpers_and_fit_bookkeeper(tiny_forecaster):
     assert res.steps == 2 and res.best_step == 1 and res.best_eval_loss == 0.5 and res.stopped_early
 
     follower = trainer_module._FitBookkeeper(start_step=0, final_step=4, track_best=False, restore_best=False)
-    follower.record_eval(1, 0.5, [param])
+    follower.record_eval(1, 0.49, [param])
     assert follower.best_eval_loss is None and follower.best_step is None and follower._best_state is None
-    follower.set_last_eval_loss(0.49)
     assert follower.eval_history == [(1, 0.49)]
     follower.apply_best_summary(0.49, 1)
     assert follower.restore_best_weights(2, [param], non_blocking=False) is False
@@ -1401,6 +1400,9 @@ def test_run_fit_loop_drives_custom_non_primary_strategy(tiny_forecaster):
         def on_fit_end(self, result) -> None:
             events.append("on_fit_end")
 
+        def after_train_loop(self) -> None:
+            events.append("after_train_loop")
+
         def cleanup(self) -> None:
             events.append("cleanup")
 
@@ -1422,6 +1424,7 @@ def test_run_fit_loop_drives_custom_non_primary_strategy(tiny_forecaster):
         "step_end:3",
         "evaluate_val",
         "on_evaluate:3",
+        "after_train_loop",
         "finalize_best:3",
         "on_fit_end",
         "cleanup",

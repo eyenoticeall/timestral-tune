@@ -34,7 +34,7 @@ import struct
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Literal
+from typing import Literal, NoReturn
 
 import torch
 import torch.distributed as dist
@@ -398,6 +398,19 @@ class DistributedContext:
             raise local_error
         if failing_ranks:
             raise RankFailureError(failing_ranks, stage=stage)
+
+    def raise_propagated_failure(self, local_error: Exception | None, *, stage: str) -> NoReturn:
+        """Propagate a failure known from a prior reduction to have occurred on at least one rank.
+
+        Runs the same collective as `propagate_failure` and asserts that it does not return
+        normally (which would indicate a caller bug where the reduced failure flag was non-zero
+        but no rank passed a `local_error`).
+
+        Ranks: all ranks must call in lockstep after a reduced failure flag was non-zero.
+        Collectives: 1 (`all_reduce(SUM)` of an `int64` vector of length `world_size`).
+        """
+        self.propagate_failure(local_error, stage=stage)
+        raise AssertionError(f"raise_propagated_failure called at stage {stage!r}, but no rank supplied a local_error")
 
     def check_consistency(self, digest: bytes, *, stage: str = "consistency_check") -> None:
         """Verify that every rank computed the same `bytes` digest as rank 0.

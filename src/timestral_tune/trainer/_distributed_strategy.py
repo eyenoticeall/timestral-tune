@@ -218,8 +218,7 @@ class _DistributedStrategy:
 
         # Stage 3: globally decided control flow (failure -> non-finite -> global skip -> active step).
         if failed_tot > 0.0:
-            self._ctx.propagate_failure(local_error, stage="training_step")
-            raise RuntimeError("unreachable: failed_tot > 0 without any failing rank")
+            self._ctx.raise_propagated_failure(local_error, stage="training_step")
 
         if non_finite_tot > 0.0:
             bad_value: object = (
@@ -359,8 +358,7 @@ class _DistributedStrategy:
         total_loss_sum, total_scored_f, total_batches_f, failed_tot = totals.tolist()
 
         if failed_tot > 0.0:
-            self._ctx.propagate_failure(local_error, stage="validation")
-            raise RuntimeError("unreachable: validation failed_tot > 0 without any failing rank")
+            self._ctx.raise_propagated_failure(local_error, stage="validation")
 
         total_scored = int(round(total_scored_f))
         total_batches = int(round(total_batches_f))
@@ -448,12 +446,15 @@ class _DistributedStrategy:
 
         self._broadcast_rank0_hook("on_fit_end", _run)
 
-    def cleanup(self) -> None:
-        """Release the flat gradient buffer, loaders, sampler, and flip generators (0 collectives)."""
+    def after_train_loop(self) -> None:
+        """Detach per-fit flip generators once the training loop ends, before `finalize_best` / `on_fit_end`."""
         self._trainer._fit_flip_generator = None
         self._trainer._replay_flip_generator = None
         self._flip_generator = None
         self._replay_flip_generator = None
+
+    def cleanup(self) -> None:
+        """Release the flat gradient buffer, loaders, and sampler after all end-of-fit collectives (0 collectives)."""
         self._sampler = None
         self._train_loader = None
         self._sharded_val_loader = None

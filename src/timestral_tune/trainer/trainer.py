@@ -315,11 +315,6 @@ class _FitBookkeeper:
                 # Keep best-state snapshot on CPU so `full_ft` does not double GPU VRAM.
                 self._best_state = [parameter.detach().cpu().clone() for parameter in trainable]
 
-    def set_last_eval_loss(self, loss: float) -> None:
-        """Overwrite the most recent `eval_history` loss with an authoritative value (e.g. rank 0)."""
-        step, _ = self.eval_history[-1]
-        self.eval_history[-1] = (step, loss)
-
     def restore_best_weights(self, current_step: int, trainable: Sequence[Tensor], *, non_blocking: bool) -> bool:
         """Copy the best CPU weight snapshot into `trainable` if an earlier step had lower loss."""
         if self._best_state is None or self.best_step == current_step:
@@ -403,8 +398,12 @@ class _FitStrategy(Protocol):
         """Run `on_fit_end` callbacks (rank 0 only in multi-process mode)."""
         ...
 
+    def after_train_loop(self) -> None:
+        """Clear loop-scoped state (flip generators) once the loop exits, before `finalize_best` / `on_fit_end`."""
+        ...
+
     def cleanup(self) -> None:
-        """Release per-fit state inside `fit()`'s `finally:` block."""
+        """Release loaders, samplers, and buffers after end-of-fit collectives finish."""
         ...
 
 
@@ -487,11 +486,13 @@ class _SingleProcessStrategy:
         for callback in self._trainer.callbacks:
             callback.on_fit_end(self._trainer, result)
 
-    def cleanup(self) -> None:
+    def after_train_loop(self) -> None:
         self._trainer._fit_flip_generator = None
         self._trainer._replay_flip_generator = None
         self._flip_generator = None
         self._replay_flip_generator = None
+
+    def cleanup(self) -> None:
         self._loader = None
         self._replay_iter = None
 
@@ -1650,9 +1651,11 @@ class TimestralTrainer:
                 if self.val_dataset is not None and bookkeeper.last_evaluated_step != self.global_step:
                     evaluate_now()
             finally:
+                # Switch to eval and clear loop-scoped flip generators before `finalize_best()` /
+                # `on_fit_end()`, while keeping `strategy.cleanup()` in the outer `finally:` so
+                # potentially asymmetric DataLoader worker teardown never stalls end-of-fit collectives.
                 self.model.eval()
-                self._fit_flip_generator = None
-                self._replay_flip_generator = None
+                strategy.after_train_loop()
 
             restored = strategy.finalize_best(bookkeeper, self.global_step)
             if bookkeeper.skipped_batches and strategy.is_primary:
