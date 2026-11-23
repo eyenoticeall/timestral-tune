@@ -53,15 +53,16 @@ src/timestral_tune/
   data/                  Batch layout, dataset, collator, categorical encoders
   models/                Loader, device shims, training forward, slice LoRA adapter, conformal calibrators
   losses/                Pinball loss
-  trainer/               Loss step, training loop, callbacks
+  trainer/               Loss step, training loop, callbacks, multi-process primitives and strategy
   export.py              Upstream-loadable checkpoint export, adapters, conformal, sidecar, LICENSE/NOTICE
   utils/                 Verifiers and raw-space evaluation / forgetting metrics
   integrations/          Optional Lacuna integration (`timestral-tune[lacuna]`, Python 3.11+)
   replay/                Replay sources and distillation to the frozen base model
 tests/
   conftest.py, helpers.py   Fixtures and builders shared by all tests
-  test_*.py                 Unit tests per module
-  acceptance/               T1–T14 from spec §9 (all 14 implemented and passing)
+  distributed_harness.py    Multi-process CPU/gloo spawn harness (file rendezvous, hard timeouts)
+  test_*.py                 Unit tests per module (including test_distributed.py, test_trainer_distributed.py)
+  acceptance/               T1–T15 from spec §9 (all 15 implemented and passing; T15 on CPU/gloo)
 scripts/
   vendor_upstream.py     Regenerates _vendor/timestral
   check_upstream_drift.py
@@ -112,6 +113,17 @@ a batch with upstream's own input assembly as ground truth).
   floor without touching the project environment. Each such run downloads a PyTorch build of a few hundred
   megabytes into the uv cache; `uv cache prune` reclaims the space afterwards.
 - **Training tests** copy the model first (`copy.deepcopy`); the fixtures are shared across tests.
+- **Multi-process tests** (`tests/acceptance/test_distributed.py` for T15, `tests/test_distributed.py` for
+  primitives and the harness, and `tests/test_trainer_distributed.py` for white-box trainer internals)
+  spawn separate Python processes on CPU/`gloo` through `tests/distributed_harness.py`. The harness uses
+  the `spawn` start method, file-based rendezvous inside a fresh temporary directory (avoiding ephemeral
+  TCP port collisions), `torch.set_num_threads(1)` per worker, `run_scenarios` to amortise process startup
+  across balanced scenarios, and a hard wall-clock deadline that terminates/kills stuck workers
+  (`DistributedTimeoutError`) so collective hangs fail fast. Run them with:
+  `uv run pytest tests/acceptance/test_distributed.py tests/test_distributed.py` (set `TMPDIR=/tmp` if the
+  default temporary directory path is long or restricted), or on the floor with
+  `uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/acceptance/test_distributed.py tests/test_distributed.py`
+  (the two `num_workers > 0` tests skip on macOS below PyTorch 2.8; see `docs/VERIFICATION.md` §10).
 
 ## Devices
 

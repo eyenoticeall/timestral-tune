@@ -4,6 +4,25 @@ All notable changes to `timestral-tune` are listed here. The project follows
 [Semantic Versioning](https://semver.org/); while the version is 0.x, the public API may change between
 minor releases, and such changes are called out under **Changed**.
 
+## Unreleased
+
+### Added
+
+- **Experimental multi-process training (Phase 5 Stage 1):** `TimestralTrainer` activates single-node
+  data-parallel training automatically when a caller-owned `torch.distributed` process group (`"gloo"` or
+  `"nccl"`, `world_size > 1`) is active, across `head_only`, `lora_variate`, `lora_temporal`, and `full_ft`,
+  with count-weighted gradient reduction (`ReduceOp.SUM`), startup consistency checks and rank-0
+  weight/buffer broadcast, sharded validation inside `fit()`, rank-0 callbacks/early-stopping/restore with
+  identical `TrainingResult` fields across ranks, and best-effort single-rank failure propagation
+  (`docs/SPEC.md` §5.6). Verified on CPU/`gloo` (`N = 2` and `N = 4`, acceptance test T15); not yet verified
+  on GPUs/NCCL, and `ReplayConfig` is not yet supported in multi-process mode.
+- **`RankFailureError`** exported from `timestral_tune.trainer` (`RuntimeError` subclass raised on healthy
+  peers when another rank fails during multi-process setup, training, validation, or rank-0 callbacks).
+- **Multi-process export metadata:** optional paired `world_size` and `effective_batch_size` arguments on
+  `export_checkpoint`, writing top-level `world_size` and `effective_batch_size` keys to
+  `tune_metadata.json` when `world_size > 1` (`TimestralTrainer.export()` writes files on rank 0 only and
+  validates without writing on non-zero ranks).
+
 ## 0.1.0 — 2026-11-23
 
 First public release. It adapts the released Timestral checkpoints (5M, 28M, 123M and 209M) and vendors

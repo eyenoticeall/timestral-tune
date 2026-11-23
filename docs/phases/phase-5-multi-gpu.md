@@ -1,8 +1,8 @@
 # Phase 5 — Multi-Process / Multi-GPU Training
 
-**Status:** Approved by the maintainer on 2026-11-23; implementation in progress, nothing implemented yet in `src/` or `tests/`.
+**Status:** Stage 1 implemented and verified on CPU/`gloo` (2026-11-23); Stage 2 (replay/distillation) and Stage 3 (CUDA/NCCL hardware verification) are open; gradient accumulation remains unscheduled.
 **Goal:** Data-parallel multi-process training across `N` ranks on a single node (CUDA/NCCL and CPU/`gloo`) with exact step-level equivalence to single-process training on the union batch.
-**Spec sections:** `docs/SPEC.md` §5.6, §7.4, §9 (T15), §10 (Phase 5), §11 (D22–D35), §12; prototype evidence in `docs/VERIFICATION.md` §16.
+**Spec sections:** `docs/SPEC.md` §5.6, §6, §7.4, §7.6, §9 (T15), §10 (Phase 5), §11 (D22–D35), §12; prototype and Stage 1 evidence in `docs/VERIFICATION.md` §16–§17.
 
 The task checklist and exit criteria are in `docs/SPEC.md` §10.
 
@@ -43,32 +43,34 @@ An alternative raised while preparing this proposal is to defer multi-GPU and im
 - **Zero hardware risk:** fully testable on existing CPU, Apple GPU, and single-L4 setups with no NCCL unknowns or multi-GPU VM cost.
 - **Trade-off:** gradient accumulation does not cut wall-clock time on compute-bound large datasets; multi-GPU addresses throughput (subject to unmeasured NCCL scaling).
 
-**Status:** Phase 5 is approved (2026-11-23) and implementation is starting; gradient accumulation remains an unticked, unscheduled option (`docs/SPEC.md` §10).
+**Status:** Stage 1 of Phase 5 is implemented and verified on CPU/`gloo` (2026-11-23); gradient accumulation remains an unticked, unscheduled option (`docs/SPEC.md` §10).
 
 ---
 
 ## 2. Module and function map
 
-All behavioural rules live in `docs/SPEC.md` §5.6, §7.4, and D22–D35; this section maps those rules to modules and functions.
+All behavioural rules live in `docs/SPEC.md` §5.6, §7.4, §7.6, and D22–D35; this section maps the as-built Stage 1 implementation and planned Stage 2 touch points to modules and functions.
 
-### Stage 1 — Core multi-process training
+### Stage 1 — Core multi-process training (implemented)
 
-- **`models/loader.py`** — unchanged (`resolve_device`, `load_model`, `load_forecaster` stay pure and collective-free; Stage 1 checks `huggingface_hub==0.23` lock behaviour, §12).
-- **`trainer/__init__.py`** — export `RankFailureError` (`RuntimeError` subclass).
-- **`trainer/trainer.py`**
-  - `TimestralTrainer.__init__` — process-group detection & snapshot, exact backend string check, pre-collective device resolution/binding, startup sequence `(a)–(e)` (rank-local setup/validation + single trainable dtype check, startup `int64` failure collective, integer consistency digest + collective, all-parameter/all-buffer broadcast, post-broadcast setup & pre-allocated flat gradient buffer, one-time logs), and global `total_steps`.
-  - `TimestralTrainer._raw_loader` / `_loader` — main-process contiguous epoch batch sampler (balanced trailing split, non-empty slices only) and `head_only` cache bypass.
-  - `TimestralTrainer.training_step` + internal distributed step helper — public `training_step()` raises `RuntimeError`; internal helper implements stages 1–5 (local skip on empty/`num_scored == 0`, 8-scalar `ReduceOp.SUM`, conditional length-`N` `int64` rank vector, count-weighted backward, reused flat-buffer `ReduceOp.SUM`).
-  - `TimestralTrainer.fit` — process-group liveness/`world_size` check, global-iteration loop with lazy per-epoch iterator creation, rank-offset RNG streams, `on_fit_start` inside `try/finally`, rank-0 callbacks/best-loss/restore with fixed-size `float64` `[code, value]` and conditional `[has_best, best_eval_loss, best_step, restored]` broadcasts.
-  - Internal sharded validation helper (separate from `self._val_loader`) — `eval()`/`no_grad()` restoring `training`, cached stride loader skipped on empty shards, per-rank `eval_batch_size`, `[loss_sum, scored_positions, batches, failed]` reduction.
-  - `TimestralTrainer.evaluate` — unchanged (rank-local, collective-free).
-  - `TimestralTrainer.export` — uses snapshotted `rank`/`world_size`, calls shared validation helper on all ranks; rank 0 writes files with `world_size`/`effective_batch_size`, non-zero ranks log, no-op, and return `Path`.
-- **`export.py`** — extract input validation into a shared helper called by `export_checkpoint` and non-zero-rank `export()`; write top-level `world_size` and `effective_batch_size` to `tune_metadata.json` only when `world_size > 1`.
-- **`tests/acceptance/test_distributed.py`** — `test_t15_*` covering cases `(a)–(i)` and harness rules in `docs/SPEC.md` §9.
+- **`models/loader.py`** — unchanged (`resolve_device`, `load_model`, `load_forecaster` stay pure and collective-free; `huggingface_hub==0.23.0` `WeakFileLock` confirmed by source reading in `docs/VERIFICATION.md` §12, not a concurrent-download test).
+- **`trainer/__init__.py`** — exports `RankFailureError` (`RuntimeError` subclass) alongside `TimestralTrainer`, `TrainingResult`, `EvalResult`, and callbacks.
+- **`trainer/_types.py`** — shared dataclasses (`EvalResult`, `TrainingResult`, `_StepOutcome`, `_StepLoss`, `_FitBookkeeper`, etc.) and the `_FitStrategy` protocol, keeping `trainer.py` and `_distributed_strategy.py` acyclic.
+- **`trainer/distributed.py`** — sole importer of `torch.distributed`: `DistributedContext` (`detect`, `check_active` verifying liveness/`world_size`/`rank`/`backend`, `all_reduce_sum`, `broadcast`, `propagate_failure`, `raise_propagated_failure`, `check_consistency`), `RankFailureError`, `is_oom_error`, `ControlStatus`, `broadcast_status`, `broadcast_module_state`, `GradientReducer` (flat buffer with trailing presence flags and all-present read-back skip), `DistributedBatchSampler` (SHA-256 epoch permutation, `num_global_steps`, `slice_size`), `steps_per_epoch`, `rank_slice_size`, `rank_step_indices`, `validation_shard_indices`, and `rank_seed`.
+- **`trainer/_distributed_strategy.py`** — `_DistributedStrategy` implementing `_FitStrategy`:
+  - `prepare_fit` / `cleanup` — allocates `GradientReducer` per `fit()`, builds `DistributedBatchSampler` and rank-seeded train/val loaders, and releases them in `cleanup()` after end-of-fit collectives.
+  - `iter_epoch_steps` / `_run_step` — global-iteration stepping with lazy per-epoch iterator creation, local zero-scored skip, 8-scalar `float64` `ReduceOp.SUM` stats collective, failure-over-non-finite precedence, `float64` overflow checks, count-weighted backward, and `GradientReducer.reduce()`.
+  - `evaluate_val` — internal sharded validation (never touches `trainer._val_loader`), `eval()`/`no_grad()` restoring `training`, lazy cached stride loader skipped on empty shards, `[loss_sum, scored_positions, batches, failed]` reduction.
+  - `on_fit_start` / `on_step_end` / `on_evaluate` / `finalize_best` / `on_fit_end` — rank-0-only callbacks, best-loss tracking, early stopping, and restore; fixed-size `float64` `[code, value]` broadcasts mirroring `should_stop` (both sets and clears) and propagating rank-0 losses; `[has_best, best_eval_loss, best_step, restored]` plus per-parameter broadcast when `restored == 1`.
+- **`trainer/trainer.py`** — `_SingleProcessStrategy` and shared `_run_fit_loop` skeleton (`model.eval()` in inner `finally` before `finalize_best()`/`on_fit_end()`, `strategy.cleanup()` in outer `finally` after `on_fit_end()`); `_init_distributed` running five-step startup `(a)–(e)` (including protected `_startup_consistency_digest()` with `model.config.to_dict()`, uniform trainable non-emptiness/device/dtype checks, and `ValueError`/`RankFailureError` consistency check); rank-0-only startup logs; `head_only` cache bypass; public `training_step()` `RuntimeError`; unchanged collective-free `evaluate()`; snapshot-based `export()`.
+- **`export.py`** — shared `_validate_export_inputs` helper (called by `export_checkpoint` and non-zero-rank `TimestralTrainer.export()` without hashing datasets) and optional paired `world_size` / `effective_batch_size` arguments (positive `numbers.Integral` excluding `bool`, `effective_batch_size >= world_size`), writing top-level `world_size` and `effective_batch_size` keys to `tune_metadata.json` only when `world_size > 1`.
+- **`tests/distributed_harness.py`** — CPU/`gloo` `spawn` harness (file-based rendezvous, `torch.set_num_threads(1)`, hard wall-clock deadlines raising `DistributedTimeoutError`, `run_scenarios`).
+- **`tests/acceptance/test_distributed.py`** — T15 (`test_t15_*`, cases `(a)–(i)`, plus `should_stop`-clear and startup-digest regressions and CPU `compile_mode="default"` smoke test).
+- **`tests/test_distributed.py`**, **`tests/test_trainer_distributed.py`**, **`tests/test_trainer.py`**, **`tests/test_export.py`** — unit, multi-process primitive/harness, white-box trainer, and export-metadata tests.
 
-### Stage 2 — Replay and distillation
+### Stage 2 — Replay and distillation (planned)
 
-- **`trainer/trainer.py`** — `_setup_replay_teacher` (uncached paths only, logged once), `_replay_loader` (per-rank cycling loader with rank-offset shuffle seed and per-rank `ReplayConfig.batch_size`), internal distributed step (replay-only 1-element pre-forward domain count collective + `[W_r, sum_r, M, sum_m]` terms), and Stage 2 T15 coverage.
+- **`trainer/trainer.py`** & **`trainer/_distributed_strategy.py`** — remove Stage 1 `NotImplementedError`, run uncached `_setup_replay_teacher` after step (d) broadcast (logged once on rank 0), add per-rank cycling replay loader (`ReplayConfig.batch_size` per rank, rank-offset shuffle/flip seeds) and replay-only 1-element pre-forward domain count collective + `[W_r, sum_r, M, sum_m]` terms in `_DistributedStrategy._run_step`, and add Stage 2 T15 coverage.
 
 ### Optional (unscheduled): gradient accumulation
 
@@ -78,7 +80,7 @@ All behavioural rules live in `docs/SPEC.md` §5.6, §7.4, and D22–D35; this s
 
 ## 3. Hardware verification session plan (Stage 3: CUDA / NCCL)
 
-Nothing on CUDA or NCCL has been run yet. Before declaring multi-process training verified, run one focused verification session on Linux CUDA hardware with 2 GPUs and 4 GPUs (note: a single 4-GPU VM can run both `N = 2` and `N = 4` tests).
+Nothing on CUDA or NCCL has been run yet. Before declaring multi-process training verified on GPUs, run one focused verification session on Linux CUDA hardware with 2 GPUs and 4 GPUs (note: a single 4-GPU VM can run both `N = 2` and `N = 4` tests).
 
 ### What to run
 
@@ -86,20 +88,20 @@ Nothing on CUDA or NCCL has been run yet. Before declaring multi-process trainin
 2. **Prototype probe on NCCL:**
    - `uv run python scripts/probes/distributed_parity.py --device cuda` (`tiny_random`, `N = 2` and `N = 4`, NCCL).
    - `uv run python scripts/probes/distributed_parity.py --device cuda --sizes 5M 28M` (released weights on NCCL; measure cross-rank diffs and body-backprop diffs vs union reference).
-3. **Trainer acceptance & launcher checks (once Stage 1 lands):**
+3. **Trainer acceptance & launcher checks:**
    - `torchrun --nproc_per_node=2` and `torchrun --nproc_per_node=4` running `T15` (`test_t15_*`) on CUDA/NCCL.
-   - Smoke tests for `mixed_precision="bf16"`, `compile_mode="default"` (including epochs with empty trailing shards), and `num_workers > 0` on Linux.
+   - Smoke tests for `mixed_precision="bf16"`, `compile_mode="default"` (including epochs with shorter or empty trailing shards, measuring graph recompilation), and `num_workers > 0` on Linux (measuring worker shutdown time across uneven trailing shards vs macOS's ~5 s/worker `MP_STATUS_CHECK_INTERVAL` wait).
    - Rank-failure smoke test: launch with a short explicit `timeout` (e.g. `15 s`), terminate rank 1 mid-step, and verify surviving ranks abort cleanly at timeout rather than hanging indefinitely.
-4. **Throughput & scaling micro-benchmark:**
-   - Measure 1-GPU vs 2-GPU vs 4-GPU step time, samples/s, peak VRAM, and flat-buffer `all_reduce` wall-time share on `28M`, `123M`, and `209M` (`full_ft` and `lora_temporal`, `bf16`, eager and `compile_mode="default"`, at `ctx = 256` and `ctx = 1,024`–`4,096`).
+4. **Throughput, per-step cost breakdown, & scaling micro-benchmark:**
+   - Measure 1-GPU vs 2-GPU vs 4-GPU step time, samples/s, peak VRAM (including whether keeping `GradientReducer`'s flat gradient buffer allocated across validation inside `fit()` raises peak VRAM), and per-step overhead breakdown: Python per-parameter pack/unpack loops in `GradientReducer`, the three small collectives per active step (8-scalar stats `all_reduce`, `GradientReducer.reduce()`, and `on_step_end` `broadcast_status`), and flat-buffer `all_reduce` wall-time share on `28M`, `123M`, and `209M` (`full_ft` and `lora_temporal`, `bf16`, eager and `compile_mode="default"`, at `ctx = 256` and `ctx = 1,024`–`4,096`).
 
-### What to record (in `docs/VERIFICATION.md` §16)
+### What to record (in `docs/VERIFICATION.md` §17)
 
 - Exact VM type, GPU count, CUDA/NCCL/PyTorch/Python versions, and commands.
-- Probe pass/fail counts and `[INFO]` ranges on NCCL for `tiny_random`, `5M`, and `28M` (plus multi-seed and cosine-similarity measurements used to set released-weights T15 bounds).
+- Probe and T15 pass/fail counts and `[INFO]` ranges on NCCL for `tiny_random`, `5M`, and `28M` (plus multi-seed and cosine-similarity measurements used to set released-weights T15 bounds).
 - Whether NCCL cross-rank gradients and final parameters remain bitwise `0.0` or exhibit non-zero reduction variance.
-- `bf16` and `compile_mode="default"` pass/fail results, plus rank-failure timeout exit behaviour.
-- Measured 1 / 2 / 4 GPU step times, scaling efficiency, and `all_reduce` fraction of step time.
+- `bf16`, `compile_mode="default"` (including trailing-shape recompilation), Linux `num_workers > 0` teardown latency, and rank-failure timeout exit results.
+- Measured 1 / 2 / 4 GPU step times, scaling efficiency, peak VRAM (training vs validation with flat buffer live), and per-step pack/unpack + collective time shares.
 
 ### What findings would change the design
 
@@ -127,3 +129,4 @@ A single 1.5–2 hour session on `g2-standard-48` (which covers both `N = 2` and
 
 - **2026-11-23 (proposal & prototype probe):** wrote the documentation-only single-node multi-process design proposal across `docs/SPEC.md` (§5.6, §7.4, §9 T15 cases `(a)–(i)`, §10 Phase 5, §11 D22–D35, §12), `docs/VERIFICATION.md` (§11 one-off `ReduceOp.AVG` check and §16), `docs/STATUS.md`, and these notes, backed by the standalone CPU/`gloo` prototype probe `scripts/probes/distributed_parity.py` (`326/326` passed on `tiny_random` on PyTorch `2.15.0` and `2.4.0`; `516/516` passed + `68` `[INFO]` on `--sizes 5M`).
 - **2026-11-23 (approved & pre-implementation design revision):** maintainer approved Phase 5 (implementation starting; gradient accumulation stays unscheduled). Updated `docs/SPEC.md`, `docs/VERIFICATION.md`, `docs/STATUS.md`, and these notes to lock down exact backend checks, pre-collective device binding, `__init__` startup failure/consistency collectives and rank/world-size/backend snapshot, binary failure flags + conditional `int64` length-`N` vectors, `Exception`-only / OOM-excluded propagation and `RankFailureError`, fixed-size `float64` control broadcasts, contiguous slices, local zero-scored skip order, `(base + r * 1_000_000_007) mod 2^63` rank seeds, reused flat gradient buffer, sharded validation `eval()`/`no_grad()` & shared `export()` validation, Stage 2 decisions (per-rank cycling replay loaders, replay-only pre-forward count collective, no multi-process head/teacher caches), and tightened T15 cases `(a)–(i)`; trimmed repeated numbers and cut §2 to a module/function map.
+- **2026-11-23 (Stage 1 implemented & CPU/`gloo` verified at `e4fdeb4`):** implemented `trainer/_types.py`, `trainer/distributed.py`, `trainer/_distributed_strategy.py`, shared `_run_fit_loop` strategy dispatch in `trainer/trainer.py`, `RankFailureError` export, shared `_validate_export_inputs` and paired `world_size`/`effective_batch_size` on `export_checkpoint`, `tests/distributed_harness.py`, acceptance test T15 (`tests/acceptance/test_distributed.py`), and unit/white-box distributed tests. Fixed review-found hang paths (`should_stop` clearing sync and protected startup digest in `290cd6c`; `strategy.cleanup()` after end-of-fit collectives in `d181c7a`), preserved `RankFailureError` on matching ranks during consistency checks (`09de038`), packed gradient presence flags into `GradientReducer` (`ac9ab04`), and added rank-seeded loader generators (`e3a4f6e`). Verified T15 on CPU/`gloo`: `25 passed` on PyTorch `2.15.0`, `24 passed, 1 skipped` on PyTorch `2.4.0` (`docs/VERIFICATION.md` §17), plus `huggingface_hub==0.23.0` `WeakFileLock` source reading (`docs/VERIFICATION.md` §12). Stage 2 (replay/distillation) and Stage 3 (CUDA/NCCL hardware verification) remain open.

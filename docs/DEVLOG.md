@@ -1005,3 +1005,119 @@ one message string in `scripts/probes/distributed_parity.py`:
 
 **Not done / open.** Phase 5 Stages 1–3 implementation and CUDA/NCCL hardware verification (`docs/SPEC.md`
 §10, §12).
+
+---
+
+## 2026-11-23 — Implement Phase 5 Stage 1 multi-process training
+
+**Done.** Implemented Phase 5 Stage 1 single-node multi-process training (domain loss across all four
+adaptation modes: `head_only`, `lora_variate`, `lora_temporal`, `full_ft`), verified it network-free on
+CPU/`gloo` for `N = 2` and `N = 4` across PyTorch `2.4.0` and `2.15.0`, and updated documentation to match
+the as-built code (`e4fdeb4`).
+
+- **Modules & architecture:**
+  - `src/timestral_tune/trainer/_types.py`: shared dataclasses (`EvalResult`, `TrainingResult`, `_StepOutcome`,
+    `_StepLoss`, `_FitBookkeeper`, etc.) and `_FitStrategy` protocol, keeping `trainer.py` and
+    `_distributed_strategy.py` acyclic.
+  - `src/timestral_tune/trainer/distributed.py`: sole importer of `torch.distributed`, providing
+    `DistributedContext` (`detect`, `check_active`, `all_reduce_sum`, `broadcast`, `propagate_failure`,
+    `raise_propagated_failure`, `check_consistency`), `RankFailureError`, `is_oom_error`, `ControlStatus`,
+    `broadcast_status`, `broadcast_module_state`, `GradientReducer`, `DistributedBatchSampler`,
+    `steps_per_epoch`, `rank_slice_size`, `rank_step_indices`, `validation_shard_indices`, and `rank_seed`.
+  - `src/timestral_tune/trainer/_distributed_strategy.py`: `_DistributedStrategy` implementing per-`fit()`
+    `GradientReducer` lifecycle, global-iteration stepping with lazy rank-seeded train/val loaders, five-stage
+    count-weighted `_run_step`, internal sharded validation (`evaluate_val`), rank-0 callbacks/restore with
+    fixed-size `float64` `[code, value]` broadcasts, and `finalize_best()`.
+  - `src/timestral_tune/trainer/trainer.py` & `trainer/__init__.py`: extracted `_SingleProcessStrategy` and
+    unified `TimestralTrainer._run_fit_loop` across single- and multi-process strategies; implemented
+    five-step `__init__` startup `(a)–(e)`, rank-0-only startup logs, `head_only` cache bypass, public
+    `training_step()` `RuntimeError`, snapshot-based `export()`, and exported `RankFailureError` from
+    `timestral_tune.trainer`.
+  - `src/timestral_tune/export.py`: extracted `_validate_export_inputs` (shared with non-zero-rank
+    `TimestralTrainer.export()` without dataset hashing) and added optional paired `world_size` and
+    `effective_batch_size` keyword arguments on `export_checkpoint` (writing top-level keys to
+    `tune_metadata.json` only when `world_size > 1`).
+- **Tests:** added `tests/distributed_harness.py`, acceptance test T15 in `tests/acceptance/test_distributed.py`
+  (cases `(a)–(i)` plus regressions and 2-rank CPU `compile_mode="default"` smoke test),
+  `tests/test_distributed.py`, `tests/test_trainer_distributed.py`, and targeted unit tests in
+  `tests/test_trainer.py` and `tests/test_export.py`; updated the `acceptance` pytest marker in
+  `pyproject.toml` to T1–T15.
+- **Documentation:** updated `docs/SPEC.md` (§5.6, §6, §7.4, §7.6, §9, §10, D22–D35, §12),
+  `docs/VERIFICATION.md` (§12 source reading, §16 clarification, §17 Stage 1 measurements), `docs/STATUS.md`,
+  `docs/phases/phase-5-multi-gpu.md`, `docs/DEVELOPMENT.md`, `README.md`, and `CHANGELOG.md`.
+
+**Design adjustments made during implementation:**
+
+- **Consistency mismatch exceptions (D29, `09de038`):** `check_consistency` raises `ValueError` on mismatched
+  rank(s) and `RankFailureError(failing_ranks, stage="startup_consistency")` on matching peers (including rank
+  0 when another rank mismatches), matching every other failure stage rather than converting to `ValueError`
+  on every rank.
+- **`GradientReducer` lifecycle & presence flags (D22, `ac9ab04`, `1ae2dc3`):** allocated per `fit()` in
+  `prepare_fit()` and released in `cleanup()` rather than in `__init__` (trainable non-emptiness, uniform
+  device, and single dtype remain checked at construction). Packs one `0.0`/`1.0` presence flag per trainable
+  parameter into the tail of the single `all_reduce(ReduceOp.SUM)` buffer so all-`None` gradients stay `None`
+  (preserving one-process AdamW weight-decay semantics) while skipping post-collective `.tolist()` host
+  read-back when all local gradients are present.
+- **Process-group checks & `gloo` devices (D28, `1ae2dc3`):** `DistributedContext.check_active()` verifies
+  liveness, `world_size`, `rank`, and `backend` before every collective; `gloo` accepts `None`, `"auto"`,
+  `"cpu"`, or `torch.device("cpu")` (no index).
+- **Loader RNG isolation & epoch permutation (D26, `e3a4f6e`):** epoch shuffling hashes
+  `"timestral-tune:epoch:{seed}:{epoch}"` via SHA-256 (avoiding `seed + epoch` aliasing), and multi-process
+  train and sharded validation loaders receive explicit rank-seeded `torch.Generator`s so iterator creation
+  never consumes PyTorch's global RNG stream (LoRA dropout).
+- **Step overflow, failure precedence, and OOM scope (D23):** `failed` takes precedence over `non_finite` when
+  both occur in the same step; `loss_val * w_d` and `sum_d_tot / w_d_tot` are checked with `math.isfinite`;
+  `is_oom_error` matches `torch.OutOfMemoryError` and `torch.cuda.OutOfMemoryError` by type only.
+- **Export validation & metadata (D31, `ca07a6b`, `1c83a8d`):** non-zero-rank `export()` skips
+  `dataset_fingerprint()` (validating caller-supplied `data_fingerprint` only); `export_checkpoint()` requires
+  `world_size` and `effective_batch_size` to be passed together as positive `numbers.Integral` values
+  (excluding `bool`) with `effective_batch_size >= world_size`, writing the keys only when `world_size > 1`.
+- **Digest contents & rank-0 logs (D27, D29):** `_startup_consistency_digest()` includes
+  `model.config.to_dict()` alongside parameter/buffer schemas, config, and dataset fingerprints; startup
+  effective-batch and cache-bypass notices emit on rank 0 only.
+
+**Hang paths found in review and fixed (code facts):**
+
+1. **`should_stop` clearing (`290cd6c`):** `_DistributedStrategy._broadcast_rank0_hook` previously set
+   `trainer.should_stop = True` on `ControlStatus.STOP` without clearing it on `ControlStatus.CONTINUE`; a
+   callback setting `should_stop` in `on_step_end` and clearing it in `on_evaluate` left non-zero ranks
+   exiting the loop while rank 0 kept training, deadlocking the next collective. Fixed by unconditionally
+   assigning `self._trainer.should_stop = status is ControlStatus.STOP`; covered by
+   `test_t15_e_should_stop_cleared_after_set`.
+2. **Unprotected startup consistency digest (`290cd6c`):** `_startup_consistency_digest()` previously ran
+   after step (b)'s startup failure collective, so a single-rank serialisation error inside the digest left
+   peers blocked in step (c)'s broadcast. Moved inside step (a)'s protected `try/except` without adding a
+   collective; covered by `test_t15_i_startup_digest_failure_propagation`.
+3. **Cleanup before end-of-fit collectives (`d181c7a`):** calling `strategy.cleanup()` before
+   `finalize_best()` and `on_fit_end()` triggered PyTorch's macOS `DataLoader` worker shutdown (~5 s per
+   active worker under `MP_STATUS_CHECK_INTERVAL`) asymmetrically across uneven trailing shards, timing out
+   `on_fit_end()`'s broadcast. Fixed by running `model.eval()` in the inner `finally` before end-of-fit
+   collectives and `strategy.cleanup()` in an outer `finally` after `on_fit_end()`.
+
+**Evidence (`e4fdeb4`, macOS arm64, Python `3.12.13`, CPU/`gloo`):**
+
+- `TMPDIR=/tmp uv run pytest tests/acceptance/test_distributed.py -v` on PyTorch `2.15.0`: **`25 passed`** in
+  `80.22 s` (`docs/VERIFICATION.md` §17).
+- `TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/acceptance/test_distributed.py tests/test_distributed.py -v`:
+  **`110 passed, 2 skipped`** in `39.52 s` (`24 passed, 1 skipped` in T15; `86 passed, 1 skipped` in
+  `tests/test_distributed.py`; both skips are `num_workers > 0` on macOS PyTorch `< 2.8`,
+  `docs/VERIFICATION.md` §10 & §17).
+- T15 was hardened by a mutation campaign of deliberate breakages.
+- One-off pre-refactor 1-process bit-identity check (run via an out-of-repo script, not a repo test or probe):
+  confirmed bitwise identity across 12 scenarios (all four modes, replay and distillation, cached and streamed
+  `head_only`, sign flips, early stopping, and restore) against the pre-refactor one-process trainer.
+- Source reading of `huggingface_hub==0.23.0` (`docs/VERIFICATION.md` §12): `_snapshot_download.py:267-268`
+  delegates to `hf_hub_download` and `file_download.py:797, 1366, 1478, 1485` acquires `WeakFileLock` (source
+  reading only, not a concurrent-download test).
+
+**Not done / open:**
+
+- Stage 2 (multi-process `ReplayConfig` / distillation) and Stage 3 (CUDA/NCCL hardware verification: real
+  `torch.cuda.set_device` / `LOCAL_RANK` binding, `bf16`, CUDA `compile_mode="default"` + trailing-shape
+  recompilation, `torchrun` on Linux + worker shutdown latency, per-step pack/unpack & collective cost and
+  validation-time flat-buffer VRAM measurements, rank-failure timeout check, and released-weights T15 bounds).
+- Live concurrent multi-process Hub download check at `huggingface_hub==0.23.0`.
+- Parallel fix in progress for `tests/test_trainer_distributed.py::test_distributed_trainer_whitebox_internals`,
+  which at `e4fdeb4` calls the removed `strategy.after_train_loop()` method and reads the removed
+  `trainer._fit_flip_generator` attribute (remaining `-m "not network"` suite at `e4fdeb4` on PyTorch `2.15.0`:
+  `483 passed, 15 skipped`).

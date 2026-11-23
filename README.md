@@ -301,7 +301,7 @@ way: point `model_name_or_path` at a local directory holding `config.json` and `
 | NVIDIA GPU | PyTorch 2.4+ | float32 or `bf16` | One NVIDIA L4, PyTorch 2.15 |
 | Apple GPU | PyTorch 2.8+ | float32 | One Apple M4 (16 GB), all four sizes |
 
-Multi-GPU training is untested. Memory and timing figures are in [Memory and speed](#memory-and-speed).
+Experimental multi-process data-parallel training exists for single-node runs and is tested on CPU/`gloo`; it has not yet been verified on GPUs/NCCL, and `ReplayConfig` is not yet supported in that mode (see [docs/SPEC.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/SPEC.md) §5.6). Memory and timing figures are in [Memory and speed](#memory-and-speed).
 
 ## Limits
 
