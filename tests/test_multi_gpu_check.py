@@ -327,8 +327,9 @@ sys.exit(0)
 
 
 def _clean_tracked_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return a copy of `os.environ` stripped of tracked prefixes plus optional `extra` overrides."""
+    """Return a copy of `os.environ` stripped of tracked prefixes and `PYTHONUNBUFFERED`, plus `extra`."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(DRIVER.TRACKED_ENV_PREFIXES)}
+    env.pop("PYTHONUNBUFFERED", None)
     env["TMPDIR"] = "/tmp"
     if extra:
         env.update(extra)
@@ -2021,10 +2022,12 @@ def test_relative_log_dir_keeps_stage_args_signatures_and_errors_relative(
 
 
 def test_cli_help_and_error_survive_closed_stdout_and_stderr_pipes() -> None:
+    env = _clean_tracked_env()
     p_help = subprocess.Popen(
         [sys.executable, str(SCRIPT_PY), "--help"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     assert p_help.stdout is not None
     p_help.stdout.close()
@@ -2036,6 +2039,7 @@ def test_cli_help_and_error_survive_closed_stdout_and_stderr_pipes() -> None:
         [sys.executable, str(SCRIPT_PY), "--unknown-flag"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     assert p_err.stderr is not None
     p_err.stderr.close()
@@ -2049,6 +2053,7 @@ def test_cli_help_and_error_survive_closed_stdout_and_stderr_pipes() -> None:
         check=False,
         capture_output=True,
         text=True,
+        env=env,
         timeout=15,
     )
     assert r_uni.returncode == 2
@@ -2809,110 +2814,277 @@ sys.exit(0)
 
 
 def test_closed_stdout_mid_session_completes_cleanly(tmp_path: Path) -> None:
+    """Deterministically pin closed stdout/stderr handling under buffered stdio (PYTHONUNBUFFERED unset)."""
     repo = _make_stub_repo(tmp_path, with_git=False)
     bin_dir = tmp_path / "bin"
     _symlink_python_dir(bin_dir)
-    tag = f"tt_closed_stdout_{os.getpid()}"
-    stub_body = """\
-import json, pathlib, sys, uuid, zipfile
+    tag = f"tt_closed_stdio_{os.getpid()}"
+    ready_file = tmp_path / "stdio.ready"
+    go_file = tmp_path / "stdio.go"
+
+    def _write_uv(
+        *,
+        pause_at: str = "",
+        env_sync_rc: int = 0,
+        ref_mode: str = "ok",
+        large_output: bool = False,
+    ) -> None:
+        stub_body = f"""\
+import json, pathlib, sys, time, uuid, zipfile
 argv = sys.argv[1:]
 joined = " ".join(argv)
+ready = pathlib.Path({str(ready_file)!r})
+go = pathlib.Path({str(go_file)!r})
+large_output = {large_output!r}
+
+def _handshake():
+    ready.write_text("ready")
+    deadline = time.monotonic() + 20.0
+    while not go.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
 if argv and argv[0] == "sync":
-    sys.stdout.write("short line\\n")
-    sys.stdout.write(("Y" * 512 + "\\n") * 250)
+    if {pause_at!r} == "mid_sync":
+        _handshake()
+    sys.stdout.write("short sync line\\n")
+    if large_output:
+        sys.stdout.write(("Y" * 512 + "\\n") * 250)
     sys.stdout.flush()
+    sys.exit({env_sync_rc})
+if "sys.executable" in joined and "torch.version.cuda" in joined:
+    print("stub-rt")
     sys.exit(0)
-if "sys.executable" in joined and "torch.version.cuda" in joined: print("stub-rt"); sys.exit(0)
-if "tree_state_method=" in joined: print("tree_state_method=content_hash tree_state_sig=000000000000"); sys.exit(0)
+if "tree_state_method=" in joined:
+    print("tree_state_method=content_hash tree_state_sig=000000000000")
+    sys.exit(0)
 if "--write-reference" in argv:
-    sys.stdout.write("ref short line\\n")
-    sys.stdout.write(("R" * 512 + "\\n") * 250)
-    sys.stdout.flush()
+    if {pause_at!r} == "mid_ref":
+        _handshake()
+    if {ref_mode!r} == "timeout":
+        time.sleep(30)
+    if {ref_mode!r} == "fail":
+        print("simulated ref failure", file=sys.stderr, flush=True)
+        sys.exit(1)
     ref_path = pathlib.Path(argv[argv.index("--write-reference") + 1])
     ref_path.parent.mkdir(parents=True, exist_ok=True)
-    spec_doc = {"spec": {"schema_version": 5}, "environment": {"archive_id": uuid.uuid4().hex}}
-    entries_doc = {
-        "tiny_random:s": {"tensor_member": "tensors/0000.bin", "tensor_dtype": "float32", "tensor_shape": [4]}
-    }
+    if {ref_mode!r} == "corrupt":
+        ref_path.write_bytes(b"corrupt")
+        sys.exit(0)
+    sys.stdout.write("ref short line\\n")
+    if large_output:
+        sys.stdout.write(("R" * 512 + "\\n") * 250)
+    sys.stdout.flush()
+    spec_doc = {{"spec": {{"schema_version": 5}}, "environment": {{"archive_id": uuid.uuid4().hex}}}}
+    entries_doc = {{
+        "tiny_random:s": {{"tensor_member": "tensors/0000.bin", "tensor_dtype": "float32", "tensor_shape": [4]}}
+    }}
     with zipfile.ZipFile(ref_path, "w", compression=zipfile.ZIP_STORED) as zf:
         zf.writestr("tensors/0000.bin", b"\\x00" * 16)
         zf.writestr("spec.json", json.dumps(spec_doc).encode())
         zf.writestr("entries.json", json.dumps(entries_doc).encode())
     sys.exit(0)
 if "torchrun" in argv:
-    sys.stdout.write(("T" * 512 + "\\n") * 250)
+    if large_output:
+        sys.stdout.write(("T" * 512 + "\\n") * 250)
+    else:
+        sys.stdout.write("torchrun short line\\n")
     sys.stdout.flush()
     sys.exit(0)
-print("done")
+if "distributed_rank_failure_check.py" in joined:
+    if {pause_at!r} == "before_summary":
+        _handshake()
+    print("result: PASS (no hang)")
+    sys.exit(0)
 sys.exit(0)
 """
-    _write_stub_uv(bin_dir, stub_body)
-    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "_TT_TEST_LEFTOVER_TAG": tag})
-    log_dir = tmp_path / "logs"
+        _write_stub_uv(bin_dir, stub_body)
 
-    proc = subprocess.Popen(
-        [
-            "/bin/bash",
-            str(repo / "scripts" / "multi_gpu_check.sh"),
-            "--backend",
-            "gloo",
-            "--ranks",
-            "2",
-            "--log-dir",
-            str(log_dir),
-        ],
-        cwd=repo,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    env = _clean_tracked_env({"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "_TT_TEST_LEFTOVER_TAG": tag})
+    assert "PYTHONUNBUFFERED" not in env
+
+    def _launch(
+        log_dir: Path,
+        extra_args: list[str] | None = None,
+        *,
+        reset_sigs: bool = False,
+    ) -> subprocess.Popen[bytes]:
+        def _preexec() -> None:
+            os.setsid()
+            if reset_sigs:
+                for managed in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                    signal.signal(managed, signal.SIG_DFL)
+
+        return subprocess.Popen(
+            [
+                "/bin/bash",
+                str(repo / "scripts" / "multi_gpu_check.sh"),
+                "--backend",
+                "gloo",
+                "--ranks",
+                "2",
+                "--log-dir",
+                str(log_dir),
+                *(extra_args or []),
+            ],
+            cwd=repo,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=_preexec,
+        )
+
+    # 1. Deterministic mid-stage closed stdout right before a small (<8 KiB) write + large output.
+    _write_uv(pause_at="mid_sync", large_output=True)
+    ready_file.unlink(missing_ok=True)
+    go_file.unlink(missing_ok=True)
+    ld_mid = tmp_path / "logs_mid"
+    proc = _launch(ld_mid)
     try:
+        _wait_for_path(ready_file, proc, timeout=20.0)
         assert proc.stdout is not None
-        first_line = proc.stdout.readline()
-        assert first_line, "driver exited before emitting first stdout line"
         proc.stdout.close()
+        go_file.write_text("go", encoding="utf-8")
         _, err = proc.communicate(timeout=30.0)
         assert proc.returncode == 0, err
-        assert err == b"", f"unexpected stderr after closing stdout mid-session: {err!r}"
+        assert err == b"", f"unexpected stderr after mid-stage stdout close: {err!r}"
         assert _list_matching_pids(tag) == []
     finally:
         _kill_process_group_quiet(proc)
         _cleanup_tagged_processes(tag)
+    s_mid = (ld_mid / "summary.txt").read_text(encoding="utf-8")
+    assert "01_env                               0 " in s_mid
+    assert "09_rank_failure_gloo_n2              0 " in s_mid
+    assert len((ld_mid / "04_gloo_tiny_n2.log").read_bytes()) > 100_000
 
-    summary = (log_dir / "summary.txt").read_text(encoding="utf-8")
-    assert "01_env                               0 " in summary
-    assert "03_ref_gloo_tiny_n2                  0 " in summary
-    assert "04_gloo_tiny_n2                      0 " in summary
-    assert "09_rank_failure_gloo_n2              0 " in summary
-    assert len((log_dir / "04_gloo_tiny_n2.log").read_bytes()) > 100_000
-
-    # Also verify a short-output resumed session survives a closed stdout pipe with empty stderr.
-    proc2 = subprocess.Popen(
-        [
-            "/bin/bash",
-            str(repo / "scripts" / "multi_gpu_check.sh"),
-            "--backend",
-            "gloo",
-            "--ranks",
-            "2",
-            "--log-dir",
-            str(log_dir),
-        ],
-        cwd=repo,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    # 2. Closed stdout at start-up (before any stage emits output).
+    _write_uv(large_output=True)
+    ld_start = tmp_path / "logs_startup"
+    proc = _launch(ld_start)
     try:
-        assert proc2.stdout is not None
-        assert proc2.stdout.readline()
-        proc2.stdout.close()
-        _, err2 = proc2.communicate(timeout=30.0)
-        assert proc2.returncode == 0, err2
-        assert err2 == b"", f"unexpected stderr on resumed closed stdout: {err2!r}"
+        assert proc.stdout is not None
+        proc.stdout.close()
+        _, err = proc.communicate(timeout=30.0)
+        assert proc.returncode == 0, err
+        assert err == b"", err
         assert _list_matching_pids(tag) == []
     finally:
-        _kill_process_group_quiet(proc2)
+        _kill_process_group_quiet(proc)
         _cleanup_tagged_processes(tag)
+    assert "09_rank_failure_gloo_n2              0 " in (ld_start / "summary.txt").read_text(encoding="utf-8")
+
+    # 3. Closed stdout right before summary.txt is written (and also resumed run with closed stdout).
+    _write_uv(pause_at="before_summary")
+    ready_file.unlink(missing_ok=True)
+    go_file.unlink(missing_ok=True)
+    ld_sum = tmp_path / "logs_before_summary"
+    proc = _launch(ld_sum)
+    try:
+        _wait_for_path(ready_file, proc, timeout=20.0)
+        assert proc.stdout is not None
+        proc.stdout.close()
+        go_file.write_text("go", encoding="utf-8")
+        _, err = proc.communicate(timeout=30.0)
+        assert proc.returncode == 0, err
+        assert err == b"", err
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+    assert "09_rank_failure_gloo_n2              0 " in (ld_sum / "summary.txt").read_text(encoding="utf-8")
+
+    # 4. Closed stderr while driver writes stderr diagnostics (corrupt artifact -> exit 1, not 120).
+    _write_uv(ref_mode="corrupt")
+    ld_err = tmp_path / "logs_closed_stderr"
+    proc = _launch(ld_err)
+    try:
+        assert proc.stderr is not None
+        proc.stderr.close()
+        out, _ = proc.communicate(timeout=30.0)
+        assert proc.returncode == 1, out
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+    assert "03_ref_gloo_tiny_n2                  1 (corrupt artifact)" in (ld_err / "summary.txt").read_text(
+        encoding="utf-8"
+    )
+
+    # 5. Both stdout and stderr closed from start-up (success -> exit 0).
+    _write_uv()
+    ld_both = tmp_path / "logs_both_closed"
+    proc = _launch(ld_both)
+    try:
+        assert proc.stdout is not None and proc.stderr is not None
+        proc.stdout.close()
+        proc.stderr.close()
+        proc.wait(timeout=30.0)
+        assert proc.returncode == 0
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+    assert "09_rank_failure_gloo_n2              0 " in (ld_both / "summary.txt").read_text(encoding="utf-8")
+
+    # 6. Non-zero exit codes preserved verbatim when stdout is closed (failure 1, env code 7,
+    #    124-containing session -> 1, and interrupted 128+SIGTERM -> 143).
+    _write_uv(ref_mode="fail")
+    ld_fail = tmp_path / "logs_fail_rc1"
+    proc = _launch(ld_fail)
+    try:
+        assert proc.stdout is not None
+        proc.stdout.close()
+        _, err = proc.communicate(timeout=30.0)
+        assert proc.returncode == 1, err
+        assert err == b"", err
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+    assert "03_ref_gloo_tiny_n2                  1 " in (ld_fail / "summary.txt").read_text(encoding="utf-8")
+
+    _write_uv(env_sync_rc=7)
+    ld_env7 = tmp_path / "logs_env_rc7"
+    proc = _launch(ld_env7)
+    try:
+        assert proc.stdout is not None
+        proc.stdout.close()
+        _, err = proc.communicate(timeout=30.0)
+        assert proc.returncode == 7, err
+        assert b"BrokenPipeError" not in err and b"Exception ignored" not in err
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+    assert "01_env                               7 " in (ld_env7 / "summary.txt").read_text(encoding="utf-8")
+
+    _write_uv(ref_mode="timeout")
+    ld_to = tmp_path / "logs_timeout_rc1"
+    proc = _launch(ld_to, ["--stage-timeout", "0.3"])
+    try:
+        assert proc.stdout is not None
+        proc.stdout.close()
+        _, err = proc.communicate(timeout=30.0)
+        assert proc.returncode == 1, err
+        assert b"BrokenPipeError" not in err and b"Exception ignored" not in err
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+    assert "03_ref_gloo_tiny_n2                  124 " in (ld_to / "summary.txt").read_text(encoding="utf-8")
+
+    _write_uv(pause_at="mid_ref")
+    ready_file.unlink(missing_ok=True)
+    go_file.unlink(missing_ok=True)
+    ld_int = tmp_path / "logs_int_rc143"
+    proc = _launch(ld_int, reset_sigs=True)
+    try:
+        _wait_for_path(ready_file, proc, timeout=20.0)
+        assert proc.stdout is not None
+        proc.stdout.close()
+        os.killpg(proc.pid, signal.SIGTERM)
+        _, err = proc.communicate(timeout=30.0)
+        assert proc.returncode == 143, err
+        assert b"BrokenPipeError" not in err and b"Exception ignored" not in err
+        assert _list_matching_pids(tag) == []
+    finally:
+        _kill_process_group_quiet(proc)
+        _cleanup_tagged_processes(tag)
+    assert "INTERRUPTED by SIGTERM (exit 143)" in (ld_int / "summary.txt").read_text(encoding="utf-8")

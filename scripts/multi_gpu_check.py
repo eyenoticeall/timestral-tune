@@ -1536,6 +1536,7 @@ class SessionRunner:
     interrupted_short_sig: str = field(default="", init=False)
     interrupted_exit_code: int = field(default=0, init=False)
     _stdout_open: bool = field(default=True, init=False)
+    _stderr_open: bool = field(default=True, init=False)
     _ps_bin: str | None = field(default=None, init=False)
     _last_stage_status_note: str = field(default="", init=False)
     _handlers_installed: bool = field(default=False, init=False)
@@ -1615,7 +1616,8 @@ class SessionRunner:
             self._restore_signal_handlers(previous)
 
     def _write_stdout_bytes(self, data: bytes) -> None:
-        if not self._stdout_open:
+        if not self._stdout_open or sys.stdout is None:
+            self._stdout_open = False
             return
         try:
             buf = getattr(sys.stdout, "buffer", None)
@@ -1627,8 +1629,12 @@ class SessionRunner:
                 sys.stdout.flush()
         except OSError:
             self._stdout_open = False
+            _silence_broken_stream(sys.stdout)
 
     def _write_stderr_bytes(self, data: bytes) -> None:
+        if not self._stderr_open or sys.stderr is None:
+            self._stderr_open = False
+            return
         try:
             buf = getattr(sys.stderr, "buffer", None)
             if buf is not None:
@@ -1638,7 +1644,8 @@ class SessionRunner:
                 sys.stderr.write(data.decode("utf-8", errors="replace"))
                 sys.stderr.flush()
         except OSError:
-            pass
+            self._stderr_open = False
+            _silence_broken_stream(sys.stderr)
 
     def _print_line(self, text: str) -> None:
         self._write_stdout_bytes((text + "\n").encode("utf-8"))
@@ -2288,48 +2295,91 @@ class SessionRunner:
             return 1 if self.any_failed else 0
 
 
-def _write_stream_safe(stream: Any, text: str) -> None:
-    """Write CLI text to stdout/stderr without crashing or emitting finalizer errors on broken pipes."""
-    try:
-        stream.write(text)
-        stream.flush()
-    except OSError:
+def _silence_broken_stream(stream: Any) -> None:
+    """Redirect a broken stdio fd to `/dev/null` and drain its Python buffer so shutdown never exits 120."""
+    if stream is None:
+        return
+    if stream is sys.__stdout__ or stream is sys.__stderr__:
         try:
+            fd = stream.fileno()
             devnull = os.open(os.devnull, os.O_WRONLY)
             try:
-                os.dup2(devnull, stream.fileno())
+                os.dup2(devnull, fd)
             finally:
                 os.close(devnull)
         except Exception:
             pass
+    try:
+        buf = getattr(stream, "buffer", None)
+        if buf is not None:
+            buf.flush()
+        stream.flush()
+    except Exception:
+        pass
+
+
+def _flush_std_streams_safe() -> None:
+    """Flush stdout/stderr before exit, silencing broken pipes so interpreter shutdown preserves the exit code."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            buf = getattr(stream, "buffer", None)
+            if buf is not None:
+                buf.flush()
+            stream.flush()
+        except OSError:
+            _silence_broken_stream(stream)
+        except Exception:
+            pass
+
+
+def _write_stream_safe(stream: Any, text: str) -> None:
+    """Write CLI text to stdout/stderr without crashing or emitting finalizer errors on broken pipes."""
+    if stream is None:
+        return
+    try:
+        stream.write(text)
+        stream.flush()
+    except OSError:
+        _silence_broken_stream(stream)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint for `scripts/multi_gpu_check.py`."""
     try:
-        config = parse_args(sys.argv[1:] if argv is None else argv)
-    except HelpRequested:
-        _write_stream_safe(sys.stdout, USAGE + "\n")
-        return 0
-    except CliError as exc:
-        _write_stream_safe(sys.stderr, str(exc) + "\n")
-        if exc.show_usage:
-            _write_stream_safe(sys.stderr, USAGE + "\n")
-        return 2
-    except KeyboardInterrupt:
-        return 130
-
-    runner = SessionRunner(config=config, repo_root=REPO_ROOT)
-    with runner._managed_signals():
-        if runner.interrupted_sig_num is not None:
-            return runner._finalize_interrupted()
-        os.chdir(REPO_ROOT)
         try:
-            return runner.run()
+            config = parse_args(sys.argv[1:] if argv is None else argv)
+        except HelpRequested:
+            _write_stream_safe(sys.stdout, USAGE + "\n")
+            return 0
+        except CliError as exc:
+            _write_stream_safe(sys.stderr, str(exc) + "\n")
+            if exc.show_usage:
+                _write_stream_safe(sys.stderr, USAGE + "\n")
+            return 2
         except KeyboardInterrupt:
-            runner.interrupted_sig_num = int(signal.SIGINT)
-            return runner._finalize_interrupted()
+            return 130
+
+        runner = SessionRunner(config=config, repo_root=REPO_ROOT)
+        with runner._managed_signals():
+            if runner.interrupted_sig_num is not None:
+                return runner._finalize_interrupted()
+            os.chdir(REPO_ROOT)
+            try:
+                return runner.run()
+            except KeyboardInterrupt:
+                runner.interrupted_sig_num = int(signal.SIGINT)
+                return runner._finalize_interrupted()
+    finally:
+        _flush_std_streams_safe()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        _exit_code = main()
+    except KeyboardInterrupt:
+        _flush_std_streams_safe()
+        sys.exit(130)
+    _flush_std_streams_safe()
+    sys.exit(_exit_code)
