@@ -4,7 +4,7 @@
 train (`head_only`, `lora_variate`, `lora_temporal`, `full_ft`), and minimises the pinball loss
 of spec §4 over the windows of a `TimeSeriesDataset`.
 
-- Spec: `docs/SPEC.md` §4, §5, §5.1, §5.4, §7.1
+- Spec: `docs/SPEC.md` §4, §5, §5.1, §5.4, §5.6, §7.1
 """
 
 from __future__ import annotations
@@ -310,6 +310,13 @@ def _learning_rate_factor(step: int, warmup_steps: int, total_steps: int, schedu
 
 class TimestralTrainer:
     """Fine-tunes a Timestral checkpoint on a `TimeSeriesDataset`.
+
+    Multi-process training (spec §5.6) activates automatically when `torch.distributed` is
+    initialised with `world_size > 1` on the `"gloo"` or `"nccl"` backend; the library never
+    initialises or destroys process groups. All ranks must construct the trainer in lockstep with
+    matching config, datasets, and model layout. `config.batch_size` is per process (the global
+    effective batch size is `world_size * config.batch_size`), rank 0 broadcasts initial parameters
+    and buffers at construction, and callbacks run on rank 0 only.
 
     Args:
         config: Training settings.
@@ -1374,7 +1381,11 @@ class TimestralTrainer:
         replay_real_series: int | None = None,
         replay_teacher_quantiles: Tensor | None = None,
     ) -> float:
-        """One optimiser step on `batch` (already on the device), with optional replay micro-batch."""
+        """One optimiser step on `batch` (already on the device), with optional replay micro-batch.
+
+        Single-process only: raises `RuntimeError` on a multi-process trainer (call `fit()`
+        instead to run synchronised multi-process training; spec §5.6).
+        """
         if self._dist is not None:
             raise RuntimeError(
                 "training_step() is single-process only and cannot be called on a multi-process trainer; "
@@ -1481,6 +1492,11 @@ class TimestralTrainer:
 
         Calling `fit` again continues from the current weights and optimiser state with a fresh
         learning-rate schedule and the same batch order. It seeds PyTorch's global generator.
+
+        In multi-process mode (spec §5.6), all ranks must call `fit()` in lockstep: each process
+        trains on `config.batch_size` windows per global step, internal validation shards
+        `val_dataset` across ranks, callbacks and best-state tracking run on rank 0, and every
+        rank returns identical final weights and `TrainingResult` summaries.
         """
         if self._dist is not None:
             self._dist.check_active()
@@ -1488,7 +1504,11 @@ class TimestralTrainer:
 
     @torch.no_grad()
     def evaluate(self, dataset: TimeSeriesDataset | None = None) -> EvalResult:
-        """The loss over `dataset` (default: the validation set), in the configured target frame."""
+        """The loss over `dataset` (default: the validation set), in the configured target frame.
+
+        Always local to the calling process (executes no collectives, even on a multi-process
+        trainer; spec §5.6). Validation inside `fit()` shards `val_dataset` automatically.
+        """
         dataset = self.val_dataset if dataset is None else dataset
         if dataset is None:
             raise ValueError("no dataset to evaluate: pass one, or give the trainer a val_dataset")
@@ -1550,6 +1570,13 @@ class TimestralTrainer:
         license_path: str | Path | None = None,
     ) -> Path:
         """Write an upstream-loadable checkpoint directory (spec §7.4, acceptance test T11).
+
+        In multi-process mode (spec §5.6, §7.4), only rank 0 writes files to disk (recording
+        top-level `world_size` and `effective_batch_size` in `tune_metadata.json`). Non-zero
+        ranks validate arguments locally and return `Path(output_dir)` without writing or
+        synchronising, so another rank returning does not guarantee the exported files exist yet;
+        synchronise ranks externally (for example via `torch.distributed.barrier()`) before
+        reading the exported directory from non-zero ranks.
 
         Args:
             output_dir: Destination directory. Defaults to `config.output_dir`.
