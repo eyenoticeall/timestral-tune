@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import numbers
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -250,6 +251,8 @@ class _ValidatedExport:
     conformal_json: str | None
     replay_source_dict: dict[str, Any] | None
     metrics_dict: dict[str, Any] | None
+    world_size: int | None = None
+    effective_batch_size: int | None = None
 
 
 def _validate_export_inputs(
@@ -306,12 +309,28 @@ def _validate_export_inputs(
 
     if (world_size is None) != (effective_batch_size is None):
         raise ValueError("world_size and effective_batch_size must be passed together or both omitted")
-    if world_size is not None and (isinstance(world_size, bool) or not isinstance(world_size, int) or world_size < 1):
-        raise ValueError(f"world_size must be a positive integer or None, got {world_size!r}")
-    if effective_batch_size is not None and (
-        isinstance(effective_batch_size, bool) or not isinstance(effective_batch_size, int) or effective_batch_size < 1
+    validated_world_size: int | None = None
+    validated_effective_batch_size: int | None = None
+    if world_size is not None:
+        if not isinstance(world_size, numbers.Integral) or isinstance(world_size, bool) or world_size < 1:
+            raise ValueError(f"world_size must be a positive integer or None, got {world_size!r}")
+        validated_world_size = int(world_size)
+    if effective_batch_size is not None:
+        if (
+            not isinstance(effective_batch_size, numbers.Integral)
+            or isinstance(effective_batch_size, bool)
+            or effective_batch_size < 1
+        ):
+            raise ValueError(f"effective_batch_size must be a positive integer or None, got {effective_batch_size!r}")
+        validated_effective_batch_size = int(effective_batch_size)
+    if (
+        validated_world_size is not None
+        and validated_effective_batch_size is not None
+        and validated_effective_batch_size < validated_world_size
     ):
-        raise ValueError(f"effective_batch_size must be a positive integer or None, got {effective_batch_size!r}")
+        raise ValueError(
+            f"effective_batch_size ({validated_effective_batch_size}) must be >= world_size ({validated_world_size})"
+        )
 
     return _ValidatedExport(
         model_has_lora=model_has_lora,
@@ -320,6 +339,8 @@ def _validate_export_inputs(
         conformal_json=conformal_json,
         replay_source_dict=replay_source_dict,
         metrics_dict=metrics_dict,
+        world_size=validated_world_size,
+        effective_batch_size=validated_effective_batch_size,
     )
 
 
@@ -395,10 +416,10 @@ def export_checkpoint(
         "library_version": _library_version(),
         "vendored_upstream_commit": _vendored_upstream_commit(),
     }
-    if world_size is not None and world_size > 1:
-        assert effective_batch_size is not None
-        metadata["world_size"] = world_size
-        metadata["effective_batch_size"] = effective_batch_size
+    if validated.world_size is not None and validated.world_size > 1:
+        assert validated.effective_batch_size is not None
+        metadata["world_size"] = validated.world_size
+        metadata["effective_batch_size"] = validated.effective_batch_size
     metadata_json = _dumps_json(metadata)
     license_bytes, is_verbatim = _resolve_license_bytes(resolved_base, resolved_revision, license_path)
     notice_text = _notice_text(

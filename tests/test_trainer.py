@@ -1477,3 +1477,50 @@ def test_init_distributed_routes_digest_error_through_startup_failure(tiny_forec
     assert len(propagated) == 1
     assert isinstance(propagated[0][0], TypeError)
     assert propagated[0][1] == "startup"
+
+
+def test_validate_export_inputs_integer_normalisation_and_effective_batch_bound(tiny_forecaster, tmp_path):
+    import json
+
+    import numpy as np
+
+    from timestral_tune.export import _validate_export_inputs, export_checkpoint
+
+    model = tiny_forecaster.model
+
+    # NumPy integers are accepted (matching config.py) and normalised to Python ints.
+    validated = _validate_export_inputs(
+        model,
+        world_size=np.int64(4),  # type: ignore[arg-type]
+        effective_batch_size=np.int32(16),  # type: ignore[arg-type]
+    )
+    assert type(validated.world_size) is int and validated.world_size == 4
+    assert type(validated.effective_batch_size) is int and validated.effective_batch_size == 16
+
+    out = export_checkpoint(
+        model,
+        tmp_path / "np-meta",
+        world_size=np.int64(4),  # type: ignore[arg-type]
+        effective_batch_size=np.int32(16),  # type: ignore[arg-type]
+    )
+    meta = json.loads((out / "tune_metadata.json").read_text(encoding="utf-8"))
+    assert meta["world_size"] == 4 and meta["effective_batch_size"] == 16
+
+    # Python bool and NumPy bool are rejected, as are floats and effective_batch_size < world_size.
+    for bad_ws, bad_eff, pattern in [
+        (np.bool_(True), 4, "world_size"),
+        (2, np.bool_(True), "effective_batch_size"),
+        (2, True, "effective_batch_size"),
+        (2.0, 4, "world_size"),
+        (4, 2, "effective_batch_size"),
+        (np.int64(4), np.int64(3), "effective_batch_size"),
+    ]:
+        bad_dir = tmp_path / f"bad-{bad_ws}-{bad_eff}"
+        with pytest.raises(ValueError, match=pattern):
+            export_checkpoint(
+                model,
+                bad_dir,
+                world_size=bad_ws,  # type: ignore[arg-type]
+                effective_batch_size=bad_eff,  # type: ignore[arg-type]
+            )
+        assert not bad_dir.exists()
