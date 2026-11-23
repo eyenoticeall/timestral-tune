@@ -124,9 +124,10 @@ def _list_matching_pids(tag: str) -> list[str]:
 
     ps_bin = DRIVER._resolve_ps_bin()
     if ps_bin is not None:
-        # Pass 1: untruncated argv only (no unrelated env noise).
+        # Pass 1: untruncated argv only (no unrelated env noise). Pure BSD syntax (`axwwo`) works
+        # on pass 1 under both macOS/BSD `ps` and Linux `procps-ng`.
         out_cmd = subprocess.run(
-            [ps_bin, "-ww", "-axo", "pid=,stat=,command="],
+            [ps_bin, "axwwo", "pid=,stat=,command="],
             check=False,
             capture_output=True,
             text=True,
@@ -142,9 +143,10 @@ def _list_matching_pids(tag: str) -> list[str]:
                     continue
                 if tag in parts[2] and "pid=,stat=,command=" not in parts[2]:
                     hits_by_pid[pid] = f"{pid} {parts[2]}"
-        # Pass 2: environment tokens via `ps eww`, matching exact `_TT_TEST_LEFTOVER_TAG=<tag>` assignment.
+        # Pass 2: environment tokens via pure BSD `ps axewwo`, matching exact
+        # `_TT_TEST_LEFTOVER_TAG=<tag>` assignment on both macOS/BSD and Linux `procps-ng`.
         out_env = subprocess.run(
-            [ps_bin, "eww", "-axo", "pid=,stat=,command="],
+            [ps_bin, "axewwo", "pid=,stat=,command="],
             check=False,
             capture_output=True,
             text=True,
@@ -1458,6 +1460,7 @@ def test_post_exit_open_pipe_flushing_child_completes_without_warning_and_interr
 
 def test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order(tmp_path: Path) -> None:
     ps_bin = DRIVER._resolve_ps_bin()
+    assert ps_bin is not None
     base_token = f"tt_exact_{os.getpid()}"
     exact_ready = tmp_path / "exact.ready"
     ext_ready = tmp_path / "ext.ready"
@@ -1468,6 +1471,7 @@ def test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order(tmp_p
             f"import pathlib, time; pathlib.Path({str(exact_ready)!r}).write_text('ready'); time.sleep(15)",
         ],
         env=dict(os.environ, _TIMESTRAL_STAGE_TOKEN=base_token),
+        start_new_session=True,
     )
     p_extended = subprocess.Popen(
         [
@@ -1476,6 +1480,7 @@ def test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order(tmp_p
             f"import pathlib, time; pathlib.Path({str(ext_ready)!r}).write_text('ready'); time.sleep(15)",
         ],
         env=dict(os.environ, _TIMESTRAL_STAGE_TOKEN=f"{base_token}_suffix"),
+        start_new_session=True,
     )
     try:
         _wait_for_path(exact_ready, p_exact, timeout=10.0)
@@ -1485,16 +1490,37 @@ def test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order(tmp_p
         assert p_exact.pid in hits
         assert p_extended.pid not in hits
 
-        # Simulate an empty /proc directory and ensure fallback to ps still finds the exact token.
+        # Simulate an empty /proc directory and ensure the `ps` path finds the exact token and
+        # process table entries (including session leaders without a controlling tty) using pure BSD
+        # invocations accepted on pass 1 by both macOS/BSD `ps` and Linux `procps-ng`.
         real_isdir = os.path.isdir
         real_listdir = os.listdir
+        real_run = subprocess.run
+        recorded_ps_cmds: list[list[str]] = []
+
+        def _spy_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == ps_bin:
+                recorded_ps_cmds.append(list(cmd))
+            return real_run(cmd, *args, **kwargs)
+
         with (
             mock.patch.object(os.path, "isdir", side_effect=lambda p: True if str(p) == "/proc" else real_isdir(p)),
             mock.patch.object(os, "listdir", side_effect=lambda p: [] if str(p) == "/proc" else real_listdir(p)),
+            mock.patch.object(DRIVER.subprocess, "run", side_effect=_spy_run),
         ):
             fallback_hits = DRIVER.find_token_pids(needle, self_pid=os.getpid(), ps_bin=ps_bin)
             assert p_exact.pid in fallback_hits
             assert p_extended.pid not in fallback_hits
+
+            children, pgids = DRIVER.read_proc_table(ps_bin)
+            assert p_exact.pid in pgids
+            assert pgids[p_exact.pid] == p_exact.pid
+            assert p_exact.pid in children.get(os.getpid(), [])
+
+        assert recorded_ps_cmds == [
+            [ps_bin, "axewwo", "pid=,command="],
+            [ps_bin, "axo", "pid=,ppid=,pgid=,stat="],
+        ]
     finally:
         for p in (p_exact, p_extended):
             p.kill()
@@ -2301,6 +2327,17 @@ def test_leftover_detector_catches_env_only_process_and_cleanup_reaps_it(tmp_pat
         hits = _list_matching_pids(tag)
         assert any(entry.split()[0] == str(proc.pid) for entry in hits), hits
         assert _list_matching_pids(f"{tag}_other") == []
+
+        # Also exercise the `ps` fallback path on Linux where `/proc` is otherwise used first.
+        real_isdir = os.path.isdir
+        real_listdir = os.listdir
+        with (
+            mock.patch.object(os.path, "isdir", side_effect=lambda p: True if str(p) == "/proc" else real_isdir(p)),
+            mock.patch.object(os, "listdir", side_effect=lambda p: [] if str(p) == "/proc" else real_listdir(p)),
+        ):
+            ps_hits = _list_matching_pids(tag)
+            assert any(entry.split()[0] == str(proc.pid) for entry in ps_hits), ps_hits
+            assert _list_matching_pids(f"{tag}_other") == []
 
         _cleanup_tagged_processes(tag)
         proc.wait(timeout=5.0)

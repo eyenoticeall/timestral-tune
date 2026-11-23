@@ -30,12 +30,14 @@ Portability and process management:
   skips remaining stages, and exits `128 + signum`.
 - Runs each stage in its own session (`start_new_session=True`) tagged with an inherited per-stage
   environment token (`_TIMESTRAL_STAGE_TOKEN`), and re-collects confirmed-live non-zombie PIDs from
-  `/proc` or `ps` immediately before every signal so reaped/reused PIDs are never signalled.
+  `/proc` (primary on Linux) or pure-BSD `ps` (macOS/BSD, or fallback if Python cannot enumerate
+  `/proc`) immediately before every signal so reaped/reused PIDs are never signalled.
 - Limitation: a descendant that clears its environment (`_TIMESTRAL_STAGE_TOKEN`) and outlives its
   parent (so it is reparented out of the tracked PPID tree — even without double-forking or calling
   `setsid()`, because a PGID is signalled only when every live member is a known target), or runs on
-  a system with neither `/proc` nor `ps`, can escape tree termination; neither `torchrun` nor PyTorch
-  `DataLoader` workers do this.
+  a system where neither `/proc` nor `ps` can inspect processes (note that on Linux `procps-ng` `ps`
+  itself reads `/proc`, so an OS-level unmounted or inaccessible `/proc` cannot be worked around via
+  `ps`), can escape tree termination; neither `torchrun` nor PyTorch `DataLoader` workers do this.
 
 Resume markers (`<stage>.done`) are content-addressed over tree state (git HEAD + tracked status/diff
 + untracked files under `scripts/` and `src/`, or deterministic content hashing of `scripts/`, `src/`,
@@ -907,7 +909,11 @@ def _resolve_ps_bin(env: Mapping[str, str] | None = None) -> str | None:
 
 
 def read_proc_table(ps_bin: str | None) -> tuple[dict[int, list[int]], dict[int, int]]:
-    """Return `(children_by_ppid, pgid_by_pid)` of live (non-zombie) processes via `/proc` or `ps`."""
+    """Return `(children_by_ppid, pgid_by_pid)` of live (non-zombie) processes via `/proc` or `ps`.
+
+    Reads `/proc` directly on Linux (where `procps-ng` `ps` also depends on `/proc`), and uses pure
+    BSD `ps axo pid=,ppid=,pgid=,stat=` on macOS/BSD or when `/proc` yields no PIDs.
+    """
     children: dict[int, list[int]] = {}
     pgids: dict[int, int] = {}
     if os.path.isdir("/proc"):
@@ -937,8 +943,10 @@ def read_proc_table(ps_bin: str | None) -> tuple[dict[int, list[int]], dict[int,
             return children, pgids
     if ps_bin is not None:
         try:
+            # Pure BSD syntax (`axo`) parses cleanly on pass 1 on both macOS/BSD `ps` and Linux
+            # `procps-ng` without hitting `-x` personality errors or Unix98 `-o` header rules.
             out = subprocess.run(
-                [ps_bin, "-axo", "pid=,ppid=,pgid=,stat="],
+                [ps_bin, "axo", "pid=,ppid=,pgid=,stat="],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -959,7 +967,11 @@ def read_proc_table(ps_bin: str | None) -> tuple[dict[int, list[int]], dict[int,
 
 
 def find_token_pids(token_needle: str, *, self_pid: int, ps_bin: str | None) -> set[int]:
-    """Find live processes carrying our exact stage environment token (catches reparented/new-session workers)."""
+    """Find live processes carrying our exact stage environment token (catches reparented/new-session workers).
+
+    Reads `/proc/<pid>/environ` directly on Linux (where `procps-ng` `ps` itself reads `/proc`), and
+    uses pure BSD `ps axewwo pid=,command=` on macOS/BSD or when `/proc` yields no PIDs.
+    """
     found: set[int] = set()
     if os.path.isdir("/proc"):
         needle_b = token_needle.encode("utf-8")
@@ -985,8 +997,11 @@ def find_token_pids(token_needle: str, *, self_pid: int, ps_bin: str | None) -> 
             return found
     if ps_bin is not None:
         try:
+            # Pure BSD syntax (`axewwo`) parses cleanly on pass 1 on both macOS/BSD `ps` and Linux
+            # `procps-ng`: mixing BSD `eww` with SysV `-axo` fails under `procps-ng` (`-x` triggers
+            # `try_bsd`, which rejects dashless `eww` and exits 1).
             out = subprocess.run(
-                [ps_bin, "eww", "-axo", "pid=,command="],
+                [ps_bin, "axewwo", "pid=,command="],
                 check=False,
                 capture_output=True,
                 text=True,
