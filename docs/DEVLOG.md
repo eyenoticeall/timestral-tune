@@ -1087,3 +1087,10 @@ table with the former bar values and the retail demand result.
   figure footer, the JSON and the Summary's fine print.
 
 **Not done / open.** This change is not pushed.
+
+## 2026-11-24 — Remove `archive/`
+
+**Done.** `main` at `fa0df1c` (forecast figure in the README) was pushed. At the maintainer's request the
+`archive/` folder was then removed: it held only `timestral_tune_handoff_document.v0.md`, the first draft
+that `docs/SPEC.md` superseded on 2026-11-21. The spec's header now says the draft was removed and remains
+in git history. Earlier devlog entries that mention the archived file describe the tree as it was then.
