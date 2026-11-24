@@ -20,9 +20,10 @@ CUDA results (§13, §17.4) come from rented Linux x86_64 cloud VMs with one NVI
 2026-11-23 Phase 5 run (`71514a6`, §11, §13, §17.2) used driver `580.178.04`, CUDA runtime `13.2`, NCCL
 `2.30.7`, and `uv`-selected Python `3.15.2` (outside the CI matrix of Python `3.10–3.13`); and the
 2026-11-23/24 tracked Stage 3 shared-GPU sessions (`82a21ca`, `a20d386`, `866816a`, and the final-tip
-primary record at `8e8f490`, §13, §17.4) used rented 8-vCPU Linux x86_64 cloud VMs with one NVIDIA L4
-(`23034 MiB`, drivers `595.112.07` and `580.178.04`), CUDA runtime `13.2`, NCCL `2.30.7`, and project
-Python `3.12.16` (with the `8e8f490` Python session driver running on system Python `3.10.12`).
+primary record at `8e8f490`, §13, §17.4) used rented Linux x86_64 cloud VMs (8 vCPU per the sessions'
+provisioning records) with one NVIDIA L4 (`23034 MiB`, drivers `595.112.07` and `580.178.04`), CUDA runtime
+`13.2`, NCCL `2.30.7`, and project Python `3.12.16` (with `scripts/multi_gpu_check.py` at `8e8f490` running on
+`python3` `3.10.12` on `PATH`).
 Linux CPU results in §11, §16, and §17 come from 8-vCPU Linux x86_64 cloud VMs (Ubuntu 22.04, including an
 AMD EPYC 7B12 VM for post-fix runs) with `uv`-managed Python `3.12.16` (`torch 2.15.0+cu132`) and
 `3.10.22` (`torch 2.14.1+cu130`).
@@ -388,7 +389,7 @@ Re-measure before relying on them.
 | Pre-fix 10×-tightened float32 margin scans (2026-11-23, commit `3347f70`, out-of-repo edit dividing every float32 tier by 10; lower bounds on what was thin because each test stops at its first failing assert) | macOS arm64: `9 failed, 24 passed, 4 deselected` (`param_update` up to `4.82e-05` in `T15(l)[4]`, `3.32e-05` in `T15(j)[4]`, `2.97e-05` in `T15(a)[4]`; `T15(b)[4]` step-0 `param` `1.67e-05`). Linux x86_64 (8-vCPU VM, threads `1/2/4`): `12 failed / 21 passed` (`t=1`), `9 failed / 24 passed` (`t=2`), `12 failed / 21 passed` (`t=4`), `4 deselected` — `param_update` up to `1.94e-04` (`t=2`, `T15(l)[4]` `default_synth` before switching to `lora_temporal`), `1.71e-04` (`t=1`), `7.78e-05` (`t=4`, `T15(a)[4]`); single-step `param` up to `3.38e-06` (`t=2`, replay whitebox `lora_variate:b_replay_zero_one_rank`) and `1.07e-05` (`t=1`, `T15(b)[4]` step 1 at old `lr=1e-2`); single-step `grad` `1.03e-06` (`t=4`, `T15(b)[4]` step 1 at old `lr=1e-2`) |
 | Single-rank NCCL collective-dtype and primitive smoke (2026-11-23, commit `71514a6`, one NVIDIA L4, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`, out-of-repo script; kept as history — multi-rank NCCL collectives on `TimestralTrainer` are now exercised by the tracked Stage 3 driver in §17.4) | `19/19 passed`: `all_reduce_sum` (`float64` n=8, `int64` n=4, `float32` n=1,048,576, `bfloat16` n=1,024), `broadcast` (`float32`, `float64`, `bfloat16`, `float16`, `int64`, `int32`, `bool`), `propagate_failure` (no error), `check_consistency`, `broadcast_status`, `broadcast_module_state` (`tiny` 47 f32, `5M` 75 f32, `5M` 75 bf16), and `GradientReducer` (`tiny` 47 tensors / `490,624` elements, reduce `1.50 ms`; `5M` 75 tensors / `5,208,960` elements, reduce `2.15 ms`) |
 | Multi-rank NCCL trainer trial on one shared GPU (2026-11-23, commit `71514a6`, one NVIDIA L4, driver `580.178.04`, Python `3.15.2`, PyTorch `2.15.0+cu132`, NCCL `2.30.7`, out-of-repo script run with `NCCL_MULTI_RANK_GPU_ENABLE=1` because NCCL refuses multiple ranks on one GPU by default; 23 6-step scenarios each at `N = 2` and `N = 4` vs one-process CUDA on the same GPU; **kept as history — reproduced and superseded by the tracked Stage 3 driver session in §17.4**) | `N = 2` exit `[0, 0]`, `hung=[]`, wall `19 s`; `N = 4` exit `[0, 0, 0, 0]`, `hung=[]`, wall `35 s`; **`xrank_equal=True`** (bitwise cross-rank equality) across all 46 runs. **`float64`** (10 scenarios × 2: all 4 modes `none`, plus `head_only`/`lora_variate`/`full_ft` `replay_only` and `both`): `final_rel` `7.28e-17`–`1.43e-15`, `update_rel` `6.10e-16`–`2.99e-14`, `loss_rel` `1.33e-16`–`6.51e-16`. **`float32`** (`bf16=False`, same 10 scenarios × 2): `final_rel` `6.81e-08`–`9.86e-06`, `update_rel` `4.56e-07`–`1.80e-04` (peaks on `lora_variate`: `1.37e-04` at `N=2 none`, `1.80e-04` at `N=4 both`), `loss_rel` `7.76e-08`–`1.88e-05`. **`bf16`** (3 scenarios × 2: `lora_temporal none`, `full_ft none`, `full_ft both`; no parity tier set): `N = 2` `final_rel` `1.70e-04`–`8.14e-04`, `update_rel` `1.05e-02`–`1.89e-02`, `loss_rel` `1.96e-03`–`2.28e-03`; `N = 4` `final_rel` `1.77e-04`–`1.17e-03`, `update_rel` `1.03e-02`–`2.50e-02`, `loss_rel` `6.59e-04`–`2.85e-03` |
-| `load_model(..., dtype=torch.float64)` export-reload truncation on `tiny_random` (2026-11-24, commit `8e8f490`, macOS arm64 Apple M4 CPU, Python `3.12.13`, PyTorch `2.15.0`; **one-off check without a tracked probe**, backs pre-existing observation #12 in spec §12 and the `1e-6` float64 export-reload tolerance in `distributed_trainer_check.py`). Exact command below this table | `model.safetensors` stores `torch.float64` weights, but `load_model(..., dtype=torch.float64)` constructs `TuneTimestralModel(config)` in `float32`, calls `load_state_dict(...)` into those `float32` parameters (truncating `float64` weights to `float32`), and only then casts to `float64`. Across 6 modes (4 steps each under `float64_reference()`, relative forecast diff `max(|reloaded - live|) / max(|live|, 1e-12)`): `head_only` `1.52e-08` (`param_max_abs 7.45e-09`), `lora_variate` `5.38e-09` (`1.33e-08`), `lora_temporal` `2.76e-09` (`7.45e-09`), `full_ft` `1.49e-08` (`5.93e-08`), `lora_variate+replay` `3.36e-09` (`1.41e-08`), `full_ft+replay` `1.55e-08` (`5.96e-08`). Casting the model to `torch.float64` *before* `load_state_dict` dropped the same forecast differences to `1.67e-16`–`4.54e-16` |
+| `load_model(..., dtype=torch.float64)` export-reload truncation on `tiny_random` (2026-11-24, commit `8e8f490`, macOS arm64 CPU [Apple M4 per the session's provisioning record], Python `3.12.13`, PyTorch `2.15.0`; **one-off check without a tracked probe**, backs pre-existing observation #12 in spec §12 and the `1e-6` float64 export-reload tolerance in `distributed_trainer_check.py`). Exact command below this table | `model.safetensors` stores `torch.float64` weights, but `load_model(..., dtype=torch.float64)` constructs `TuneTimestralModel(config)` in `float32`, calls `load_state_dict(...)` into those `float32` parameters (truncating `float64` weights to `float32`), and only then casts to `float64`. Across 6 modes (4 steps each under `float64_reference()`, relative forecast diff `max(|reloaded - live|) / max(|live|, 1e-12)`): `head_only` `1.52e-08` (`param_max_abs 7.45e-09`), `lora_variate` `5.38e-09` (`1.33e-08`), `lora_temporal` `2.76e-09` (`7.45e-09`), `full_ft` `1.49e-08` (`5.93e-08`), `lora_variate+replay` `3.36e-09` (`1.41e-08`), `full_ft+replay` `1.55e-08` (`5.96e-08`). Casting the model to `torch.float64` *before* `load_state_dict` dropped the same forecast differences to `1.67e-16`–`4.54e-16` |
 
 Exact command for the one-off `load_model(..., dtype=torch.float64)` check above (no tracked probe):
 
@@ -876,17 +877,18 @@ only). Reproduces and supersedes the earlier `71514a6` one-off shared-GPU NCCL t
 **Primary environments and commands (`8e8f490`, `2026-11-24`):**
 
 - **Single-L4 shared-GPU NCCL + Linux CPU/`gloo` session (S4, `8e8f490`):** one rented NVIDIA L4
-  (`23034 MiB`, driver `580.178.04`), Linux x86_64, 8 vCPU, project environment Python `3.12.16`,
-  `torch 2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`, `python_h=True`, `c_compiler=True`;
-  `scripts/multi_gpu_check.py` ran on system Python `3.10.12`; `tree_state_method=git` (`2d896c0c4b41`).
+  (`23034 MiB`, driver `580.178.04`), Linux x86_64 (8 vCPU per the session's provisioning record), project
+  environment Python `3.12.16`, `torch 2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`, `python_h=True`,
+  `c_compiler=True`; `scripts/multi_gpu_check.py` ran on `python3` `3.10.12` on `PATH` (interpreter path not
+  recorded); `tree_state_method=git` (`2d896c0c4b41`).
   ```bash
   bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12 --log-dir mgc_logs
   ```
   Exports `NCCL_MULTI_RANK_GPU_ENABLE=1`, `TMPDIR=/tmp`, `PYTHONFAULTHANDLER=1`, and passes
   `--device-map shared` (all ranks share `cuda:0`; `threads=1` in `torchrun` and CPU/`gloo` stages,
   `threads=4` in CUDA reference stages). Wall time `47 min 51 s` (`~48 min`), exit code `0`.
-  **17 of 17 runnable stages exited `0`**, 1 skipped by design (`02_prototype_parity_cuda`:
-  `SKIPPED (shared GPU)`): `01_env`, `03_ref_nccl_tiny_n{2,4}` / `04_nccl_tiny_n{2,4}`,
+  **17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` `SKIPPED (shared GPU)`):**
+  `01_env`, `03_ref_nccl_tiny_n{2,4}` / `04_nccl_tiny_n{2,4}`,
   `05_ref_nccl_released_n{2,4}` / `06_nccl_released_n{2,4}`, `07_ref_gloo_tiny_n{2,4}` /
   `08_gloo_tiny_n{2,4}`, `09_rank_failure_gloo_n{2,4}`, and `10_rank_failure_nccl_n{2,4}`. Zero leftover
   processes and 0 GPU compute processes afterwards. Reference archives (`--reference-mode auto`,
@@ -894,15 +896,18 @@ only). Reproduces and supersedes the earlier `71514a6` one-off shared-GPU NCCL t
   `5M`+`28M` CUDA `37.47 MiB` (80 entries per `N`), `tiny_random` CPU `25.11 MiB` (34 entries per `N`).
   **316 executed rows** in total (`246` NCCL = `41+41` `tiny_random`, `82+82` `5M`+`28M` at `N = 2, 4`;
   `70` Linux CPU/`gloo` = `35+35` `tiny_random` at `N = 2, 4` with 6 `bf16` rows skipped per `N`).
-- **macOS arm64 CPU/`gloo` session (`8e8f490`):** Apple M4, Darwin arm64, project Python `3.12.13`
-  (system `python3` was `< 3.10`, so the wrapper selected an interpreter via `uv python find`),
-  `torch 2.15.0`, `python_h=True`, `c_compiler=True`, `threads=1`, `tree_state_method=git` (`2d896c0c4b41`).
+- **macOS arm64 CPU/`gloo` session (`8e8f490`):** Darwin arm64 (Apple M4 per the session's provisioning
+  record), project Python `3.12.13`, `torch 2.15.0`, `python_h=True`, `c_compiler=True`, `threads=1`,
+  `tree_state_method=git` (`2d896c0c4b41`). Per the session's provisioning record, the wrapper took its first
+  branch (`python3` `3.13.x` on `PATH`) here as on Linux (`3.10.12`); **no real run in this evidence set
+  exercised the wrapper's `uv python find` or `uv run` fallback branches** (covered only by the stubbed unit
+  test `test_wrapper_interpreter_fallback_order_and_opaque_arg_passthrough`).
   ```bash
   bash scripts/multi_gpu_check.sh --backend gloo --ranks 2 4 --pg-timeout 10 --log-dir <dir>
   ```
-  Wall time `156 s`, exit code `0`; **7 of 7 runnable stages exited `0`**, 1 skipped
-  (`02_prototype_parity_cuda`: `SKIPPED (gloo backend)`); reference archives `25.11 MiB` (34 entries per
-  `N`); **70 executed rows** (`35+35`), zero hangs.
+  Wall time `156 s`, exit code `0`; **7 of 7 runnable stages exited `0` (8 listed, `02_prototype_parity_cuda`
+  `SKIPPED (gloo backend)`)**; reference archives `25.11 MiB` (34 entries per `N`); **70 executed rows**
+  (`35+35`), zero hangs.
 
 **What `--reference-mode auto` and each driver column measure (as built at `8e8f490`):**
 
@@ -912,13 +917,16 @@ only). Reproduces and supersedes the earlier `71514a6` one-off shared-GPU NCCL t
   `float32`/`bf16` scenario with `numel <= 8,192`; uses a deterministic `k = 8,192` `float64` CountSketch
   (`64 KiB`/scenario) for larger vectors (`5M`/`28M` `full_ft` and `28M` `head_only` in `float64`, plus
   large `float32`/`bf16` sets). On sketch entries, differences within `10×` of the expected `float64`
-  bucket-accumulation floor `0.25 * sqrt(n/k) * eps_f64` (~`1.4e-15` at `5M`, ~`3.2e-15` at `28M`) are
-  flagged `sketch_bound(...)` and hash mismatches with zero sketch diff are flagged
-  `sketch_underflow(sha_differs)`. Pre-flight validation on every rank verifies zip CRCs, `spec.json` /
-  `entries.json`, exact tensor member byte sizes, base model digests (parameters + buffers),
-  `frozen_base_sha256`, per-scenario resolved `TrainingConfig`/`LoraConfig`/`ReplayConfig` + `moved_student`
-  warmup digests, dataset fingerprints, `torch`/`CUDA`/`git_head`, and `script_sha256` over
-  `distributed_trainer_check.py`, `_dist_common.py`, and `_common.py`.
+  bucket-accumulation floor `0.25 * sqrt(n/k) * eps_f64` (~`8.4e-16` for `28M head_only` with `1,880,064`
+  trainable parameters, ~`1.4e-15` for `5M full_ft`, ~`3.2e-15` for `28M full_ft`) are flagged
+  `sketch_bound(...)` and hash mismatches with zero sketch diff are flagged `sketch_underflow(sha_differs)`.
+  Every-rank pre-flight validation (`_read_reference_metadata` and `_validate_reference_spec`) verifies zip
+  CRCs, `spec.json` / `entries.json`, exact tensor member byte sizes, base model digests (parameters +
+  buffers), per-scenario resolved `TrainingConfig`/`LoraConfig`/`ReplayConfig` + `moved_student` warmup
+  digests, `torch`/`CUDA` versions, `git_head`, and `script_sha256` (over `distributed_trainer_check.py`,
+  `_dist_common.py`, and `_common.py`). Per scenario on rank 0, `_compare_to_reference` additionally verifies
+  `init_model_sha256`, `init_trainable_sha256`, `frozen_base_sha256`, and dataset fingerprints (`dom_fp`,
+  `val_fp`, `rep_fp`), broadcasting any mismatch flag so all ranks abort cleanly.
 - *Columns:*
   - `xr_eq`: exact 256-bit SHA-256 unanimity across all ranks over **all `model.named_parameters()` and all
     `model.named_buffers()`** (`TrainingResult` 10-field unanimity is checked separately; mismatch appends
@@ -968,7 +976,7 @@ table.
 | **macOS arm64 CPU/`gloo`**, `tiny_random`, `N = 2` (`threads=1`) | `35 / 6` | `param_l2` `1.12e-16`–`1.34e-15` (med `3.61e-16`, exact); `upd_l2` `2.10e-15` / `4.82e-15` / **`1.49e-14`** (`domain_lora_variate_f64`, ~`6,710×` below `1e-10`); `loss_rel` `<= 8.63e-16`; `val_rel` `3.34e-16` | Non-id (18): `param_l2` `6.27e-08`–`7.78e-06` (med `2.66e-07`), `upd_l2` `1.58e-06` / `3.14e-06` / **`1.58e-04`** (`compile_default_lora_replay`; non-compile max `1.53e-05`), `loss_rel` `<= 1.34e-05`, `val_rel` `6.38e-08`–`1.23e-07`. Id-start (2, §17.2): `param_l2` `4.42e-05`–`4.90e-05`, `upd_l2` `1.95e-03`–`2.18e-03` | — |
 | **macOS arm64 CPU/`gloo`**, `tiny_random`, `N = 4` (`threads=1`) | `35 / 6` | `param_l2` `8.36e-17`–`2.07e-15` (med `2.59e-16`, exact); `upd_l2` `1.42e-15` / `5.20e-15` / **`1.38e-14`** (`replay_lora_variate_distill_only_f64`, ~`7,250×` below `1e-10`); `loss_rel` `<= 7.93e-16`; `val_rel` `3.03e-16` | Non-id (18): `param_l2` `5.10e-08`–`8.32e-06` (med `2.84e-07`), `upd_l2` `1.08e-06` / `3.97e-06` / **`1.73e-04`** (`compile_default_lora_replay`; non-compile max `1.19e-05`), `loss_rel` `<= 2.29e-05`, `val_rel` `5.03e-08`–`1.22e-07`. Id-start (2, §17.2): `param_l2` `4.39e-05`–`6.02e-05`, `upd_l2` `1.89e-03`–`2.60e-03` | — |
 
-**Worst multi-process vs one-process differences across all 316 L4 rows (S4, `8e8f490`; identical to all printed digits in S2 `a20d386` and S3 `866816a`):**
+**Worst multi-process vs one-process differences across all 316 L4 rows (S4, `8e8f490`; identical printed worst-case `param_l2`, `upd_l2`, and `loss_rel` in S2 `a20d386` and S3 `866816a`):**
 
 | Dtype tier | Max `param_l2` (row) | Max `upd_l2` (row) | Max `loss_rel` (row) |
 |---|---|---|---|
@@ -985,7 +993,7 @@ multi-process and one-process paths execute the same algorithm. The larger `floa
 differences on released weights are **measured and not explained**: for `float32`, the working reading that
 CUDA default-SDPA `float32` gradient round-off on released weights (§13, spec §12) is amplified through a
 short AdamW run—while `head_only` stays `<= 1.78e-04` and `float64` on the exact same `lora_temporal` /
-`full_ft` domain rows stays at `1.56e-14`–`5.97e-12`—is a **hypothesis**, not a demonstrated cause; for
+`full_ft` domain rows stays at `8.87e-14`–`5.97e-12`—is a **hypothesis**, not a demonstrated cause; for
 `bf16`, the cause of `upd_l2` up to `3.48e-01` and `loss_rel` up to `1.27e-01` is uninvestigated (spec §12).
 
 **Feature rows (`compile_mode="default"`, `num_workers=2`, `val_s`, `vram_mib`) at `8e8f490`:**
@@ -1006,7 +1014,8 @@ short AdamW run—while `head_only` stays `<= 1.78e-04` and `float64` on the exa
 - *`vram_mib` (per-rank peak allocated MiB during `fit()`, not summed across shared-GPU ranks):*
   `tiny_random` `10.6–58.1` (`f32`), `11.2–20.4` (`bf16`), `13.1–34.4` (`f64`); `5M` `30.5–135.6` (`f32`),
   `36.0–132.2` (`bf16`), `53.4–265.2` (`f64`); `28M` `123.4–671.5` (`f32`), `143.1–663.6` (`bf16`),
-  `243.6–1,350.5` (`f64`, peaking on `replay_full_ft_both_f64` with live `_frozen_base`).
+  `243.6–1,350.5` (`f64`, tied peak on `replay_full_ft_distill_only_f64` and `replay_full_ft_both_f64` at
+  both `N = 2` and `N = 4` with live `_frozen_base`).
 
 #### Rank-failure timeout probe (`distributed_rank_failure_check.py`, commit `8e8f490`)
 
@@ -1028,39 +1037,41 @@ and CUDA/NCCL (`10_rank_failure_nccl_n*`):
 
 | Check (`8e8f490`) | Platform & scope | Observed |
 |---|---|---|
-| Resume (identical command on finished log dir) | L4 Linux (`mgc_logs`) & macOS arm64 (`gloo`) | L4: exit `0`, `17/17` stages `0 (resumed)`. macOS: exit `0` in `1 s`, `7/7` stages `0 (resumed)`. Nothing re-executed |
-| Default-disposition `SIGINT` / `SIGTERM` / `SIGHUP` sent to session process group mid-stage | L4 Linux (real NCCL `torchrun` `04_nccl_tiny_n2`, ranks 2 tiny) & macOS arm64 (`04_gloo_tiny_n2`) | L4: exit `130` / `143` / `129` in `1.2 s` / `1.2 s` / `1.0 s` (signalled `4` PIDs per stage); summary records `<code> (interrupted:SIG...)` and `"Session interrupted by SIG... (exit <code>); remaining stages were not started."`; `0` leftover and `0` GPU compute processes. macOS: exit `130` / `143` / `129` in `0.4–0.5 s` (signalled `4` PIDs), `0` leftover |
-| Ignored-on-entry signals (as under `nohup`) sent at the same moment | L4 Linux (`SIGHUP`, `SIGINT` mid-`04_nccl_tiny_n2`, ranks 2 tiny) & macOS arm64 (`SIGHUP`, `SIGINT`, `SIGTERM` mid-`04_gloo_tiny_n2`) | L4: session unaffected; all `7` runnable stages exited `0`, session exit `0` (`after_signal` `194.1 s` / `228.1 s`, `0` leftover / `0` GPU processes). macOS: all three completed with exit `0` (`12.8–13.5 s`), `0` leftover |
+| Resume (identical command on finished log dir) | L4 Linux (`mgc_logs`) & macOS arm64 (`gloo`) | L4: exit `0`, `17 of 17` runnable stages `0 (resumed)`. macOS: exit `0` in `1 s`, `7 of 7` runnable stages `0 (resumed)`. Nothing re-executed |
+| Default-disposition `SIGINT` / `SIGTERM` / `SIGHUP` sent to session process group mid-stage | L4 Linux (`04_nccl_tiny_n2`, `--ranks 2 --sizes ""`, all 41 tiny scenarios / 7 runnable stages) & macOS arm64 (`04_gloo_tiny_n2`, `--ranks 2 --pg-timeout 10 --only domain_head_only_f32`, 1 scenario / 4 runnable stages per session harness) | L4: exit `130` / `143` / `129` in `1.2 s` / `1.2 s` / `1.0 s` (signalled `4` PIDs per stage); summary records `<code> (interrupted:SIG...)` and `"Session interrupted by SIG... (exit <code>); remaining stages were not started."`; `0` leftover and `0` GPU compute processes. macOS: exit `130` / `143` / `129` in `0.4–0.5 s` (signalled `4` PIDs), `0` leftover |
+| Ignored-on-entry signals (as under `nohup`) sent at the same moment | L4 Linux (`SIGHUP`, `SIGINT` mid-`04_nccl_tiny_n2`, all 41 tiny scenarios / 7 runnable stages) & macOS arm64 (`SIGHUP`, `SIGINT`, `SIGTERM` mid-`04_gloo_tiny_n2`, `--only domain_head_only_f32` / 4 runnable stages per session harness) | L4: session unaffected; all `7` runnable stages exited `0`, session exit `0` (`after_signal` `194.1 s` / `228.1 s`, `0` leftover / `0` GPU processes). macOS (single-scenario run): all three completed with exit `0` (`12.8–13.5 s`), `0` leftover |
 | Reference-stage interrupt (`SIGINT` default mid-`03_ref_nccl_tiny_n2`) | L4 Linux (ranks 2 tiny) | Exit `130` in `0.3 s` (signalled `2` PIDs); only `01_env.done` remains; `refs/` empty (`[]`); `0` leftover and `0` GPU processes |
 | Stage timeout (`--stage-timeout 20`, ranks 2 tiny) | L4 Linux | `01_env` `0`, `02_prototype_parity_cuda` `SKIPPED (shared GPU)`, `03_ref_nccl_tiny_n2` `124` (signalled `2` PIDs), `04_nccl_tiny_n2` `SKIPPED (ref failed)`, `07_ref_gloo_tiny_n2` `124` (`2` PIDs), `08_gloo_tiny_n2` `SKIPPED (ref failed)`, `09_rank_failure_gloo_n2` `0`, `10_rank_failure_nccl_n2` `124` (`4` PIDs); session exit `1`; `0` leftover, `0` GPU processes, `0` files left in `refs/` |
-| Tree without `.git` (exported archive, `--backend gloo --ranks 2 --only domain_head_only_f32`) | L4 Linux | Fresh: exit `0`, `tree_state_method=content_hash` (`c0f97d37748a`). Resume: exit `0`, `4/4` runnable stages resumed. After appending a line to `scripts/probes/_dist_common.py`: `tree_state_sig` changed to `5e1e553b7cb5`, exit `0`, `0` resumed (all `4` re-ran) |
-| Relative `--log-dir` path hygiene | L4 Linux (`--log-dir mgc_logs`) & macOS arm64 (default `multi_gpu_check_logs`) | Zero home-path hits in `.done` markers, `summary.txt`, or stage CLI arguments/headers on L4 (only Python-emitted Triton `UserWarning` paths inside `.venv/` and `faulthandler` stack frames on NCCL `SIGABRT` appear inside stage logs); zero home/user hits in any file on macOS |
+| Tree without `.git` (exported via `git archive HEAD \| tar -x` per session harness, `--backend gloo --ranks 2 --only domain_head_only_f32`) | L4 Linux | Fresh: exit `0`, `tree_state_method=content_hash` (`c0f97d37748a`). Resume: exit `0`, `4 of 4` runnable stages resumed. After appending `# touched` to `scripts/probes/_dist_common.py` (per session harness): `tree_state_sig` changed to `5e1e553b7cb5`, exit `0`, `0` resumed (all `4` re-ran) |
+| Relative `--log-dir` path hygiene | L4 Linux (`--log-dir mgc_logs`) & macOS arm64 (single-scenario default-dir run `--ranks 2 --pg-timeout 5 --only domain_head_only_f32` per session harness) | L4: zero home-path hits in `.done` markers or `summary.txt`; the session harness's first-3-lines check over stage logs reported `2` hits, both Python-emitted Triton `UserWarning` lines inside `.venv/` in `10_rank_failure_nccl_n{2,4}.log` (not stage arguments), and full stage logs also contain Python-emitted paths from `.venv/`, the `uv`-managed interpreter, and repository `src/`/`scripts/` frames in `faulthandler` output on NCCL `SIGABRT`. macOS: zero home/user hits in `multi_gpu_check_logs` and its session output for that default-dir run (other macOS gate logs contain Python traceback `.venv/` paths on interrupted stages and PyTorch compiled build paths in `09_rank_failure_gloo_n*.log`) |
 | Test suite & driver unit tests on macOS arm64 | macOS arm64, Python `3.12.13`, `torch 2.15.0` | `-m "not network"`: **`614 passed, 15 skipped, 213 deselected`** (`211.39 s`; skips: 1 `lacuna`, 14 CUDA `bf16`); `tests/test_multi_gpu_check.py`: **`103 passed`** across 3 consecutive standalone runs (`88.21 s`, `85.70 s`, `85.68 s`, `0` leftover) |
 | Test suite & driver unit tests on Linux L4 VM (**not green — 1 failure open**) | Linux x86_64 L4 VM, CUDA visible, Python `3.12.16` (plus driver tests on Python `3.10`) | `-m "not network"` (Python `3.12.16`): **`625 passed, 3 skipped, 1 failed, 213 deselected`** (`745.23 s`). `tests/test_multi_gpu_check.py`: **`102 passed, 1 failed`** across three Python `3.12` runs (`67.95 s`, `76.38 s`, `76.40 s`) and one Python `3.10` run (`78.66 s`). The single failure (`test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order`) mocks `/proc` empty to exercise the `ps`-based scan fallback, which returned no hits on that Linux host; the real `/proc` scan path (used by all live Linux runs above) passed. Fix pending |
 
 #### Cross-session reproducibility and earlier shared-GPU sessions (`82a21ca`, `a20d386`, `866816a`)
 
-Four shared-GPU NVIDIA L4 sessions (`23034 MiB`, Linux x86_64, 8 vCPU, project Python `3.12.16`,
-`torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`, `--shared-gpu --python 3.12`) ran across the review-fix
-and driver-rewrite stretch:
+Four shared-GPU NVIDIA L4 sessions (`23034 MiB`, Linux x86_64; 8 vCPU per the sessions' provisioning records;
+project Python `3.12.16`, `torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`, `--shared-gpu --python 3.12`) ran
+across the review-fix and driver-rewrite stretch:
 
 | Session & commit | Driver | Reference mode | Stages / wall time | Notes |
 |---|---|---|---|---|
-| S1 (`82a21ca`, 2026-11-23) | `595.112.07` | `sketch` (`k=8,192`) | 15/16 exit `0` (`02` skipped); no Linux `gloo` rank-failure stage yet | First tracked session; also ran `cuda_check.sh` on Python `3.12.16` (§13) and the `exact` vs `sketch` comparison below. Review findings prompted S2–S4 |
-| S2 (`a20d386`, 2026-11-23) | `595.112.07` | `auto` | 17/17 exit `0` (`02` skipped); `30 min 05 s` | Post-round-1 fixes (buffers, `auto` mode, schema v4, split rank-failure stages) on a second rented L4 VM; `316/316` `xr_eq=yes` |
-| S3 (`866816a`, 2026-11-23) | `580.178.04` | `auto` | 17/17 exit `0` (`02` skipped); `42 min 22 s` | Post-round-2 fixes on a rented L4 VM with driver `580.178.04`; `316/316` `xr_eq=yes`, plus resume (`17/17`), `--stage-timeout 20` (`0` leftover/GPU procs), and `SIGINT` to process group (note: started under inherited `SIG_IGN`, so the stage runner's handler—not the top-level handler—took the interrupt; fixed in `4682669`) |
-| S4 (`8e8f490`, 2026-11-24) | `580.178.04` | `auto` | 17/17 exit `0` (`02` skipped); `47 min 51 s` | Final-tip primary record above (Python `multi_gpu_check.py` driver, schema v5, `1e-6` f64 reload tol, full signal/timeout/no-git/hygiene checks) |
+| S1 (`82a21ca`, 2026-11-23) | `595.112.07` | `sketch` (`k=8,192`) | 15 of 15 runnable stages exited `0` (16 listed, `02_prototype_parity_cuda` skipped); no Linux `gloo` rank-failure stage yet | First tracked session; also ran `cuda_check.sh` on Python `3.12.16` (§13) and the `exact` vs `sketch` comparison below. Review findings prompted S2–S4 |
+| S2 (`a20d386`, 2026-11-23) | `595.112.07` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `30 min 05 s` | Post-round-1 fixes (buffers, `auto` mode, schema v4, split rank-failure stages) on a different host from S3/S4 per the provisioning record; `316/316` `xr_eq=yes` |
+| S3 (`866816a`, 2026-11-23) | `580.178.04` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `42 min 22 s` | Post-round-2 fixes; `316/316` `xr_eq=yes`, plus resume (`17 of 17`), `--stage-timeout 20` (`0` leftover/GPU procs), and a `SIGINT` check. Per the S3 session harness, that interrupt check launched as a background job of a non-interactive shell with `SIGINT` ignored on entry, and the `866816a` embedded runner overrode the ignore and exited `130`—a defect removed in `4682669`—so the default-disposition Linux interrupt path was first exercised in S4 |
+| S4 (`8e8f490`, 2026-11-24) | `580.178.04` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `47 min 51 s` | Final-tip primary record above on the same machine type as S3 (a different VM instance per the provisioning record): Python `multi_gpu_check.py` driver, schema v5, `1e-6` f64 reload tol, full signal/timeout/no-git/hygiene checks |
 
 **Observed cross-session reproducibility and variation (S2–S4, reported as observations without claiming
 unverified causes):**
 
-- *Worst cases identical across VMs and drivers:* S2 (`a20d386`, driver `595.112.07`), S3 (`866816a`, driver
-  `580.178.04`), and S4 (`8e8f490`, driver `580.178.04`) produced the exact same worst-case `param_l2`,
-  `upd_l2`, and `loss_rel` to all printed digits in every dtype tier (`float64`, `float32`, `bf16`).
-- *Same VM type & driver (S3 vs S4):* every non-compiled NCCL row and every Linux CPU/`gloo` row was
-  identical to all printed digits; **only compiled NCCL rows varied** (`compile_default_lora_variate` and
-  `compile_default_lora_replay` differed in 10 of 12 model×rank entries across `tiny`/`5M`/`28M` × `N = 2, 4`,
-  while `5M` `N = 2` happened to match in both).
+- *Worst-case parity identical across sessions:* S2 (`a20d386`, driver `595.112.07`), S3 (`866816a`, driver
+  `580.178.04`), and S4 (`8e8f490`, driver `580.178.04`) produced the exact same printed worst-case `param_l2`,
+  `upd_l2`, and `loss_rel` in every dtype tier (`float64`, `float32`, `bf16`).
+- *Same machine type, different VM instance (S3 vs S4, per the provisioning record; same driver `580.178.04`):*
+  every non-compiled NCCL row and every Linux CPU/`gloo` row (including compiled CPU/`gloo` rows) was
+  identical in the printed parity columns (`steps`, `skip`, `xr_eq`, `xr_max`, `param_l2`, `upd_l2`,
+  `loss_rel`, `val_rel`) and `vram_mib` (timing columns and `val_s` varied between sessions); **only compiled
+  NCCL rows varied** (`compile_default_lora_variate` and `compile_default_lora_replay` differed in 10 of 12
+  model×rank entries across `tiny`/`5M`/`28M` × `N = 2, 4`, while `5M` `N = 2` happened to match in both).
 - *Compiled rows on CUDA vary run-to-run (cause uninvestigated):* across S2, S3, and S4, `compile_default_*`
   NCCL rows varied on both tiny and released weights—for example, released `28M` `N = 2`
   `compile_default_lora_variate` `upd_l2` measured `7.83e-04` (S2), `5.09e-04` (S3), and `2.25e-03` (S4),
@@ -1068,11 +1079,16 @@ unverified causes):**
   (`s1:1->end:2` / `s1:3->end:5`) and bitwise cross-rank equality (`xr_eq=yes, xr_max=0.00e+00`) held in
   every run. The compiled `float32` distance from its one-process compiled reference is not reproducible
   run-to-run on CUDA (spec §12).
-- *CPU-dependent rows vary across hosts (S2 vs S3/S4):* against S2 (a different VM CPU and driver), all 34
-  compared Linux CPU/`gloo` rows at each `N` and the `*_moved_f32` NCCL rows (whose deterministic warm-up
-  runs on CPU) differed in their trailing digits (for example `5M` `N = 4` `replay_full_ft_both_moved_f32`
-  `upd_l2`: `2.35e-02` in S2 vs `1.44e-02` in S3 and S4), while all other non-compiled NCCL rows matched
-  across S2, S3, and S4.
+- *CPU-dependent rows vary across hosts (S2 vs S3/S4):* against S2 (a different host per the provisioning
+  record, driver `595.112.07`; CPU models were not recorded), all 34 compared Linux CPU/`gloo` rows at each
+  `N` and all 12 `*_moved_f32` NCCL rows (whose deterministic warm-up runs on CPU) differed in their printed
+  values—by up to **12×** on CPU/`gloo` (`08_gloo_tiny_n2` `domain_head_only_f32` `param_l2` `5.97e-07` vs
+  `4.98e-08`, `upd_l2` `1.87e-06` vs `1.56e-07`; plus two zero-vs-round-off `float64` cells `3.71e-16` vs
+  `0.00e+00` and `1.15e-16` vs `0.00e+00`) and up to **4.1×** on NCCL `*_moved_f32` (`28M` `N = 4`
+  `replay_full_ft_distill_only_moved_f32` `loss_rel` `2.06e-05` vs `8.54e-05`; `upd_l2` up to `2.37×` on
+  `tiny_random` `N = 4` `3.03e-05` vs `1.28e-05`, and `1.63×` on `5M` `N = 4` `2.35e-02` vs `1.44e-02`)—while
+  all other non-compiled NCCL rows matched in their printed parity columns and `vram_mib` across S2, S3, and
+  S4.
 
 *Historical `exact` vs `sketch` comparison (`82a21ca`, L4 shared NCCL `N = 2`, `k = 8,192`; not re-run at
 `8e8f490`):* ten entries across `tiny_random` and `5M` gave `ref_exact.zip` `114,469,429` bytes
@@ -1124,8 +1140,9 @@ Status of the six limitations previously recorded at `82a21ca`:
   round-off for float64 export-reload forecast checks because `load_model(..., dtype=torch.float64)`
   truncates weights through float32 on load (§11, spec §12).
 - *Large `full_ft` `float64` CountSketch entries under `auto`:* `5M`/`28M` `full_ft` and `28M` `head_only`
-  exceed `1,000,000` parameters and still use CountSketch (`k = 8,192`, floor ~`1.4e-15`–`3.2e-15`; pass
-  `--reference-mode exact` when exact sub-`1e-14` measurement is needed on those rows).
+  exceed `1,000,000` parameters and still use CountSketch (`k = 8,192`, floor ~`8.4e-16` for `28M head_only`,
+  ~`1.4e-15` for `5M full_ft`, ~`3.2e-15` for `28M full_ft`; pass `--reference-mode exact` when exact
+  sub-`1e-14` measurement is needed on those rows).
 
 **What this session does NOT cover:** ranks on separate GPUs (`--device-map per-rank` on 2 or 4 GPUs); real
 `torch.cuda.set_device` / `LOCAL_RANK` per-rank binding; acceptance test T15 on NCCL
