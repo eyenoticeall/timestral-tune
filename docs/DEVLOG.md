@@ -1653,3 +1653,95 @@ this entry. No code, tests, or scripts were changed.
   `_frozen_base`), and scaling to confirm D22.
 - Live concurrent Hub download check at `huggingface_hub==0.23.0`, maintainer decisions on spec §12 findings,
   and optional gradient accumulation.
+
+---
+
+## 2026-11-25 — Opt-in CUDA/NCCL distributed test harness + runner (`0d14138`) and `01_env` host/topology logging (`362e5c6`)
+
+**Goal:** Implement the two pre-rental engineering items needed ahead of the next 4-GPU Stage 3 hardware
+session: (1) opt-in CUDA/NCCL support in `tests/distributed_harness.py`, T15, and the other three
+multi-process harness test files with a repeatable multi-GPU runner (`scripts/run_t15_nccl.py`), keeping the
+CPU/`gloo` default and all five parity tiers unchanged; and (2) logging CPU model, physical/logical core
+counts, GPU peer-access matrix, and `nvidia-smi topo -m` directly in `01_env` of `scripts/multi_gpu_check.py`.
+
+**What was built (`src/` untouched, `0` diff lines):**
+
+1. **Opt-in CUDA/NCCL harness, T15 adaptation, and runner (`0d14138`):**
+   - Added env-var selection (`TIMESTRAL_TEST_DIST_BACKEND=gloo|nccl`,
+     `TIMESTRAL_TEST_DIST_DEVICE_MAP=per-rank|shared`) in `tests/distributed_harness.py` with fail-fast
+     `pytest_configure` validation (`pytest.UsageError` on invalid values or `shared` without
+     `NCCL_MULTI_RANK_GPU_ENABLE=1`; no-op when unset) in `tests/conftest.py` and fail-loud `RuntimeError`
+     pre-spawn GPU checks (`validate_cuda_harness_prereqs`, `reference_device_for_mode`) so insufficient GPUs
+     never skip or pass silently.
+   - Switched `run_distributed` to `torch.multiprocessing.get_context("spawn")`; set `LOCAL_RANK=str(rank)`
+     in CUDA workers without pre-calling `torch.cuda.set_device(...)` in `per-rank` mode so
+     `DistributedContext.detect("auto")` exercises its real `cuda:LOCAL_RANK` path; gated `os.setsid()`,
+     PGID-aware `_terminate_workers`, and the 5 s crash-grace teardown strictly to CUDA backends so CPU/`gloo`
+     process-group and `DistributedTimeoutError` semantics remain unchanged.
+   - Made `barrier()` and `active_dist_device()` always resolve to the rank's target GPU (`0` in `shared`,
+     `dist.get_rank()` in `per-rank`) with explicit `device_ids=[idx]` on NCCL, avoiding any stale
+     `current_device() == 0` fallback.
+   - Adapted all four multi-process test files (`tests/acceptance/test_distributed.py`,
+     `tests/test_distributed.py`, `tests/test_trainer_distributed.py`,
+     `tests/test_trainer_distributed_replay.py`) for per-rank CUDA devices, `cuda:0` one-process references,
+     CPU+CUDA RNG isolation snapshots, device-qualified `"cuda:nccl"` rejection in T15(h), and scaled NCCL
+     timeouts without renaming any `test_t15_*` test or loosening any CPU parity tier (existing `tiny_random`
+     tiers kept provisionally on CUDA based on S6/S4/S5 measurements in `docs/VERIFICATION.md` §17.4).
+   - Added stdlib-only `scripts/run_t15_nccl.py` (Python `>= 3.10`, keeping `scripts/multi_gpu_check.py`'s
+     frozen ungraded-probe surface intact): runs pytest `-v -rs` across disjoint 2-rank (`124` items) and
+     4-rank (`18` items) passes covering all `142` items, prints outcome counts, fails non-zero on any skip or
+     `0` passed (while permitting expected deselections under `--ranks 2`), and writes a combined log.
+   - **Review fixes applied before landing (`0d14138`):** added `if ctx.device.type == "cuda":
+     torch.cuda.synchronize(ctx.device)` after `dist.all_reduce` in `_worker_unbalanced_hang`
+     (`tests/test_distributed.py`) so async NCCL kernel enqueue blocks rank 0 inside the scenario rather than
+     relying on `_worker_main`'s teardown `synchronize()`, and popped `NCCL_MULTI_RANK_GPU_ENABLE` inside
+     `scripts/run_t15_nccl.py::build_pass_env` in `per-rank` mode so an ambient shell variable cannot disable
+     NCCL's same-GPU guard.
+   - Added 14 non-GPU unit tests in `tests/test_distributed_harness_cuda.py` (including a real
+     `pytest --collect-only` proof that the 2-rank/4-rank `-k` expressions partition all `142` tests
+     disjointly without CUDA) and usage docs in `docs/DEVELOPMENT.md`.
+
+2. **Host CPU, GPU peer-access matrix, and `nvidia-smi topo -m` in `01_env` (`362e5c6`):**
+   - Extended `_ENV_PROBE_SNIPPET` in `scripts/multi_gpu_check.py` strictly after `nccl_multi_rank_gpu_enable=`
+     (preserving all frozen `01_env.log` lines unchanged and in exact order, stdlib-only and Python 3.10
+     compatible) to append `cpu_model`, `cpu_physical_cores` / `cpu_logical_cpus` (Linux `/proc/cpuinfo`
+     unique `(physical id, core id)` pairs with `lscpu` fallback; macOS `sysctl`; degrades cleanly to
+     `unknown`), and when CUDA is available, `gpu_peer_access[i]` from `torch.cuda.can_device_access_peer(i, j)`
+     plus `nvidia-smi topo -m` (`nvidia_smi_topo_begin`/`end`, skipped quietly when `nvidia-smi` is absent).
+   - Stage-01 resume semantics: upgrading to `362e5c6` invalidates existing `.done` markers once via
+     `tree_sig` (re-populating `01_env.log`); on the same commit, repeated runs resume cleanly as before.
+   - Added 3 unit tests in `tests/test_multi_gpu_check.py` (`108` total).
+
+**Evidence (macOS arm64, Apple M4, Python `3.13.12`, PyTorch `2.15.0`; also green on Python `3.12.13` during
+implementation):**
+
+- `git diff 710185a -- src/`: `0` lines changed.
+- `uv run ruff check . && uv run ruff format --check .`: clean (`90` files).
+- Python 3.10 AST check (`ast.parse(..., feature_version=(3, 10))`): clean on `scripts/multi_gpu_check.py`,
+  `_ENV_PROBE_SNIPPET`, and `scripts/run_t15_nccl.py`.
+- Live macOS `01_env` probe: emitted all 6 frozen lines unchanged + `cpu_model=Apple M4`,
+  `cpu_physical_cores=10 cpu_logical_cpus=10`.
+- Commit `0d14138`: `tests/test_distributed_harness_cuda.py` **`14 passed`**; 4 multi-process files CPU
+  default **`142 passed, 0 skipped`** and `TIMESTRAL_TEST_F32_TOL_SCALE=0.1` **`142 passed, 0 skipped`**;
+  `TMPDIR=/tmp uv run pytest -m "not network" -q -p no:cacheprovider` **`630 passed, 15 skipped, 213 deselected`**.
+- Commit `362e5c6`: `tests/test_multi_gpu_check.py` **`108 passed`**; full `-m "not network"` **`633 passed,
+  15 skipped, 213 deselected`** (`+17` new tests over `616`; identical `15` skips: `1` lacuna, `14` CUDA `bf16`).
+
+**Documentation synced (no Stage 3 roadmap box ticked; no new §11 D-entry added for test/script tooling,
+matching existing practice):** `docs/SPEC.md` (§5.6, §9, §10, §12), `docs/STATUS.md`,
+`docs/phases/phase-5-multi-gpu.md`, `docs/DEVELOPMENT.md`, `docs/VERIFICATION.md`, `CHANGELOG.md`, and this
+entry.
+
+**Left open for the rented GPU session (Stage 3, spec §10 & §12):**
+
+- Run T15 `(a)–(l)` and the multi-process harness suite on 2-GPU and 4-GPU CUDA/NCCL via
+  `uv run python scripts/run_t15_nccl.py --python 3.12 --log-file t15_nccl.log` (and `--f32-tol-scale 0.2`
+  headroom pass) to settle GPU-only risks: cross-rank bitwise `torch.equal` on separate GPUs, repeated-run /
+  Philox dropout determinism on CUDA, provisional `STEP_TOL`/`STEP_PARAM_TOL` direct-step replay parity on
+  CUDA, CUDA `compile_mode="default"` smoke tests, and `DataLoader` workers on CUDA.
+- Run an NVLink / GPU P2P separate-GPU `scripts/multi_gpu_check.sh` session (capturing the new `01_env`
+  CPU/peer-access/topology lines) and cross-GPU run-to-run determinism repeat.
+- Investigate larger `bf16` differences and compiled CUDA run-to-run variation, calibrate `bf16` and
+  released-weights tiers (with cosine similarity), and measure 1/2/4-GPU throughput, VRAM, and scaling (D22).
+- Live concurrent Hub download check at `huggingface_hub==0.23.0`, maintainer decisions on spec §12 findings,
+  and optional gradient accumulation.

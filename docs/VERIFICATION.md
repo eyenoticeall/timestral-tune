@@ -1361,8 +1361,8 @@ Status of the six limitations previously recorded at `82a21ca`:
   ~`1.4e-15` for `5M full_ft`, ~`3.2e-15` for `28M full_ft`; pass `--reference-mode exact` when exact
   sub-`1e-14` measurement is needed on those rows).
 
-**What S6 (and S1–S5) do NOT cover:** acceptance test T15 on NCCL (`tests/distributed_harness.py` still
-restricts to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`); NVLink or GPU P2P NCCL transport (S6 ran on PCIe gen 3
+**What S6 (and S1–S5) do NOT cover:** acceptance test T15 on NCCL (at `3ac7c6d`, `tests/distributed_harness.py`
+still restricted to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`); NVLink or GPU P2P NCCL transport (S6 ran on PCIe gen 3
 ×16 with `can_device_access_peer` all `0`, NCCL `via SHM/direct`); cross-GPU run-to-run determinism (S6 was a
 single separate-GPU session); `bf16` and released-weights parity tier calibration (across `5M`/`28M`/`123M`/
 `209M`, seeds, devices, replay regimes, and cosine similarity); and 1/2/4-GPU throughput, VRAM, and scaling
@@ -1374,8 +1374,9 @@ CPU/`gloo` on macOS arm64 and Linux x86_64 (§17.1), single-GPU `scripts/cuda_ch
 Stage 3 driver and rank-failure probes ran both on one shared NVIDIA L4 (S4/S5) and on 4 separate RTX 3060
 GPUs over PCIe/SHM (S6 at `3ac7c6d`, including `device="auto"` → `cuda:LOCAL_RANK` binding, 4-GPU
 `02_prototype_parity_cuda`, 316 driver rows, and separate-GPU NCCL rank failure; §17.4). Still unverified: T15
-on NCCL (requires adding a backend and per-rank device switch to `tests/distributed_harness.py`, which
-currently restricts to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`), NVLink / GPU P2P multi-GPU setups and
+execution on NCCL hardware (opt-in CUDA/NCCL harness support in `tests/distributed_harness.py` and the
+`scripts/run_t15_nccl.py` runner are implemented and unit-tested without a GPU at `0d14138`, but 2-GPU and
+4-GPU CUDA runs have not executed yet), NVLink / GPU P2P multi-GPU setups and
 cross-GPU run-to-run determinism, `bf16` parity tiers and the cause of the large released-checkpoint `bf16`
 differences and compiled CUDA run-to-run variation in §17.4, multi-GPU throughput/VRAM/scaling (including
 per-parameter pack/unpack, 3–4 collectives per step, flat gradient buffer live through validation, and

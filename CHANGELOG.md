@@ -25,12 +25,14 @@ minor releases, and such changes are called out under **Changed**.
   multi-rank `TimestralTrainer` measuring driver under `torchrun` with `--reference-mode auto|sketch|exact`,
   schema v5 archive verification, and parameter+buffer cross-rank equality),
   `scripts/probes/distributed_rank_failure_check.py` (mid-`fit()` rank-death probe with separate startup and
-  post-kill deadlines and a strict survivor-abort allow-list), `scripts/probes/_dist_common.py`, and
+  post-kill deadlines and a strict survivor-abort allow-list), `scripts/probes/_dist_common.py`,
   `scripts/multi_gpu_check.sh` wrapping `scripts/multi_gpu_check.py` (single stdlib-only Python `>= 3.10`
   session driver with content-bound resume, preserved ignored-on-entry signals for `nohup`, confirmed-live
   `/proc` and pure-BSD `ps` process-tree cleanup, pre-stage `--log-dir` writability checks and clean `OSError`
-  handling, and 105 stub-stage tests in `tests/test_multi_gpu_check.py`; `docs/DEVELOPMENT.md`,
-  `docs/VERIFICATION.md` §17.4).
+  handling, `01_env` CPU/peer-access/topology logging, and 108 stub-stage tests in
+  `tests/test_multi_gpu_check.py`), and opt-in CUDA/NCCL support in `tests/distributed_harness.py` paired
+  with the stdlib-only `scripts/run_t15_nccl.py` runner and 14 non-GPU unit tests in
+  `tests/test_distributed_harness_cuda.py` (`docs/DEVELOPMENT.md`, `docs/VERIFICATION.md` §17.4).
 - **`RankFailureError`** exported from `timestral_tune.trainer` (`RuntimeError` subclass raised on healthy
   peers when another rank fails during multi-process setup, training, validation, or rank-0 callbacks).
 - **Multi-process export metadata:** optional paired `world_size` and `effective_batch_size` arguments on

@@ -196,8 +196,8 @@ lines, pin revisions through `_common.load`, and record the result in `docs/VERI
 ### Multi-process / Stage 3 verification scripts
 
 Tracked scripts under `scripts/` drive Stage 3 hardware measurement on CPU/`gloo`, a single shared GPU, or a
-multi-GPU host (they are ungraded measuring instruments, separate from T15, which runs on CPU/`gloo` through
-`tests/distributed_harness.py`):
+multi-GPU host (they are ungraded measuring instruments, separate from T15, which defaults to CPU/`gloo` with
+opt-in CUDA/`nccl` through `tests/distributed_harness.py` and `scripts/run_t15_nccl.py`):
 
 - **`scripts/multi_gpu_check.sh` and `scripts/multi_gpu_check.py`** — `multi_gpu_check.sh` is a thin bash
   3.2+ wrapper that locates any Python `>= 3.10` and `exec`s `scripts/multi_gpu_check.py`, a single
@@ -242,7 +242,7 @@ bash scripts/multi_gpu_check.sh --python 3.12 --log-dir multi_gpu_4gpu
 ```
 
 **Stages executed:** `01_env` (syncs the locked venv and records OS/arch/Python/tree-state/PyTorch/CUDA/NCCL/GPU
-facts); `02_prototype_parity_cuda` (`distributed_parity.py --device cuda`, forwarding `--sizes`; runs only for
+facts, followed by CPU model, physical/logical core counts, CUDA GPU peer-access matrix, and `nvidia-smi topo -m`); `02_prototype_parity_cuda` (`distributed_parity.py --device cuda`, forwarding `--sizes`; runs only for
 `--backend nccl` without `--shared-gpu` when `>= 4` GPUs are visible and `4` is in `--ranks`, skipped
 otherwise); `03_ref_<backend>_tiny_n<N>` / `04_<backend>_tiny_n<N>`; `05_ref_<backend>_released_n<N>` /
 `06_<backend>_released_n<N>` (default `--sizes 5M 28M` for `nccl`, empty for `gloo`; pass `--sizes ""` to
