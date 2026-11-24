@@ -8,7 +8,7 @@ Guide for anyone, human or coding agent, picking up work in this repository.
 Timestral time-series models. It is **alpha** (v0.1): Phases 0–4 (rescoped: replay/distillation and
 Apple GPU 123M/209M/long-context coverage) and Phase 5 Stages 1–2 (experimental single-node multi-process
 training including replay/distillation, verified on CPU/`gloo` on macOS arm64 and Linux x86_64, exercised on
-one NVIDIA L4 with shared-GPU NCCL, and verified in a separate-GPU PCIe/SHM Stage 3 session on 4× NVIDIA
+one NVIDIA L4 with shared-GPU NCCL, and exercised in a separate-GPU PCIe/SHM Stage 3 session on 4× NVIDIA
 GeForce RTX 3060; remaining Stage 3 items — T15 on NCCL, NVLink/P2P, tier calibration, and scaling — open)
 are built; tiled DHF training is deferred as exploratory.
 

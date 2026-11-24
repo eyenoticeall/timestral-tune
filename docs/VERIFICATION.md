@@ -25,13 +25,13 @@ CUDA results (§13, §17.4) come from two rented Linux x86_64 GPU setups, both r
   (8 vCPU per the sessions' provisioning records) with one NVIDIA L4 (drivers `595.112.07` and `580.178.04`)
   and project Python `3.12.16` (with `scripts/multi_gpu_check.py` at `8e8f490` and `d474f82` running on
   `python3` `3.10.12` on `PATH`).
-- **4× NVIDIA GeForce RTX 3060 (`12288 MiB`, Ampere compute capability `8.6`) separate-GPU host (session S6
-  at `3ac7c6d`, 2026-11-24, §13, §17.4):** a rented GPU-marketplace Linux x86_64 container host (per the
-  session's provisioning record; `Intel(R) Xeon(R) CPU E5-2673 v4 @ 2.30GHz`, 2 sockets × 20 cores × 2
-  threads = `80` logical CPUs, 2 NUMA nodes, `94 GiB` RAM, `47G` `/dev/shm`), driver `580.178.04`, PCIe
-  gen 3 ×16 (GPU0–GPU1 and GPU2–GPU3 `PHB`, cross-socket `SYS`, GPU peer access disabled, NCCL
-  `2.30.7+cuda13.3` over `SHM/direct`), project Python `3.12.16`, and `scripts/multi_gpu_check.py` running on
-  `python3` `3.12.3` on `PATH`. `scripts/`, `src/`, and `tests/` at `3ac7c6d` are identical to `d474f82`.
+- **4× NVIDIA GeForce RTX 3060 (`12288 MiB`, Ampere compute capability `8.6`) host (session S6 at `3ac7c6d`,
+  2026-11-24, §13, §17.4):** a rented GPU-marketplace Linux x86_64 Docker container host (per the session's
+  provisioning record), with a dual-socket `Intel(R) Xeon(R) CPU E5-2673 v4 @ 2.30GHz` (`80` logical CPUs),
+  driver `580.178.04`, project Python `3.12.16`, and `scripts/multi_gpu_check.py` running on `python3`
+  `3.12.3` on `PATH` (full host, topology, and NCCL transport inventory in §17.4; single-GPU `cuda_check.sh`
+  in §13 ran on one RTX 3060 of this host). `scripts/`, `src/`, and `tests/` at `3ac7c6d` are identical to
+  `d474f82`.
 
 Linux CPU results in §11, §16, and §17 come from 8-vCPU Linux x86_64 cloud VMs (Ubuntu 22.04, including an
 AMD EPYC 7B12 VM for post-fix runs) with `uv`-managed Python `3.12.16` (`torch 2.15.0+cu132`) and
@@ -483,11 +483,12 @@ Phase 5 branch re-runs of `bash scripts/cuda_check.sh` on `2026-11-23`/`24` (Lin
 matrix of Python `3.10–3.13`), then at `82a21ca` on an 8-vCPU cloud VM (driver `595.112.07`, `Python 3.12.16`,
 closing the Python `3.12` gap on this branch), and at `d474f82` (`2026-11-24`, driver `580.178.04`,
 `uv`-managed `Python 3.12.16`, 8 vCPU per the session's provisioning record, including all 105 tests in
-`tests/test_multi_gpu_check.py`) — plus a fourth run on **4× NVIDIA GeForce RTX 3060 (`12288 MiB`, Ampere
-`8.6`)** at `3ac7c6d` (`2026-11-24`, driver `580.178.04`, `uv`-managed `Python 3.12.16`, `80` logical Xeon
-CPUs; `scripts/`, `src/`, and `tests/` identical to `d474f82`):
+`tests/test_multi_gpu_check.py`) — plus a fourth run on **one NVIDIA GeForce RTX 3060** (on the 4-GPU host,
+`12288 MiB`, Ampere `8.6`; single-process tests and probes run on `cuda:0`) at `3ac7c6d` (`2026-11-24`, driver
+`580.178.04`, `uv`-managed `Python 3.12.16`, `80` logical Xeon CPUs; `scripts/`, `src/`, and `tests/`
+identical to `d474f82`):
 
-| Check (`torch 2.15.0+cu132`, CUDA `13.2`) | `71514a6` (one L4, driver `580.178.04`, Python `3.15.2`) | `82a21ca` (one L4, driver `595.112.07`, Python `3.12.16`) | `d474f82` (one L4, driver `580.178.04`, Python `3.12.16`) | `3ac7c6d` (4× RTX 3060, driver `580.178.04`, Python `3.12.16`) |
+| Check (`torch 2.15.0+cu132`, CUDA `13.2`) | `71514a6` (one L4, driver `580.178.04`, Python `3.15.2`) | `82a21ca` (one L4, driver `595.112.07`, Python `3.12.16`) | `d474f82` (one L4, driver `580.178.04`, Python `3.12.16`) | `3ac7c6d` (one RTX 3060 on 4-GPU host, driver `580.178.04`, Python `3.12.16`) |
 |---|---|---|---|---|
 | T14 and all other device-parametrised tests | `266 passed, 3 skipped` (`188.12 s`; 3 Apple GPU tests skipped) | `266 passed, 3 skipped` (`128.61 s`; 3 Apple GPU tests skipped) | `266 passed, 3 skipped` (`173.84 s`; 3 Apple GPU tests skipped) | `266 passed, 3 skipped` (`153.71 s`; 3 Apple GPU tests skipped) |
 | Whole suite (`uv run pytest -q`, incl. T1–T14, network tests, 142 CPU/`gloo` multi-process items, and at `d474f82`/`3ac7c6d` 105 `tests/test_multi_gpu_check.py` items) | `735 passed, 4 skipped` (`603.65 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) | `735 passed, 4 skipped` (`433.05 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) | `840 passed, 4 skipped` (`419.94 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) | `840 passed, 4 skipped` (`620.05 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) |
@@ -1019,9 +1020,10 @@ distillation rows (`*_moved_f32`, now unprovisional with buffers untouched) meas
 multi-process and one-process paths execute the same algorithm. The larger `float32` and `bf16` update
 differences on released weights are **measured and not explained**: for `float32`, the working reading that
 CUDA default-SDPA `float32` gradient round-off on released weights (§13, spec §12) is amplified through a
-short AdamW run—while `head_only` stays `<= 1.78e-04` and `float64` on the exact same `lora_temporal` /
-`full_ft` domain rows stays at `8.87e-14`–`5.97e-12`—is a **hypothesis**, not a demonstrated cause; for
-`bf16`, the cause of `upd_l2` up to `3.48e-01` and `loss_rel` up to `1.27e-01` is uninvestigated (spec §12).
+short AdamW run—while `head_only` `upd_l2` stays `<= 1.78e-04` and `float64` `upd_l2` on the exact same
+`lora_temporal` / `full_ft` domain rows stays at `8.87e-14`–`5.97e-12`—is a **hypothesis**, not a
+demonstrated cause; for `bf16`, the cause of `upd_l2` up to `3.48e-01` and `loss_rel` up to `1.27e-01` is
+uninvestigated (spec §12).
 
 **Feature rows (`compile_mode="default"`, `num_workers=2`, `val_s`, `vram_mib`) at `8e8f490`:**
 
@@ -1166,34 +1168,37 @@ First separate-GPU Stage 3 session, run at commit `3ac7c6d` (`scripts/`, `src/`,
 `NCCL_MULTI_RANK_GPU_ENABLE` unset, `CUDA_VISIBLE_DEVICES` unset):
 
 - **Environment, topology, and provenance:** rented GPU-marketplace Linux x86_64 Docker container host (per
-  the session's provisioning record). Host CPU/memory: `Intel(R) Xeon(R) CPU E5-2673 v4 @ 2.30GHz`, 2 sockets
-  × 20 cores/socket × 2 threads/core = `80` logical CPUs across 2 NUMA nodes; `94 GiB` RAM (`90 GiB`
-  available), `32G` `/` overlay, `47G` `/dev/shm`. GPUs: **4× `NVIDIA GeForce RTX 3060`** (`12288 MiB` each,
-  Ampere compute capability `(8, 6)`, driver `580.178.04`, `distinct GPU models: 1`), PCIe gen `3` max, width
-  current `16` / max `16`, `bf16 native: True`, `is_bf16_supported(): True`, `matmul ok on all 4`. Topology:
-  GPU0–GPU1 `PHB` (NUMA 0, CPU affinity `0-19,40-59`), GPU2–GPU3 `PHB` (NUMA 1, CPU affinity `20-39,60-79`),
-  cross-socket `SYS`; `torch.cuda.can_device_access_peer` all `0`. Software: project Python `3.12.16`,
-  `torch 2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7` (`2.30.7+cuda13.3` in NCCL init),
-  `arch_list ['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']`, `python_h=True`, `c_compiler=True`,
-  `uv 0.13.9`, `/usr/bin/cc`, `/usr/bin/git`, and `scripts/multi_gpu_check.py` running on `python3` `3.12.3`
-  on `PATH`.
-- **4-rank NCCL transport & bandwidth check (`NCCL_DEBUG=INFO`, standalone 4-rank check before the session):**
-  exited `0`; `Check P2P Type isAllDirectP2p 0 directMode 0 isAllCudaP2p 0`; 2 ring channels (`Channel 00/02`
-  and `01/02`: `0 1 2 3`), all 8 ring links **`via SHM/direct`** (PCIe/SHM transport, no NVLink or GPU P2P);
-  `all_reduce 64 MiB on 4 ranks: 11.0 ms/iter, bus bandwidth 9.17 GB/s, values correct=True`.
+  the session's provisioning record). Logged host CPU/memory (one-off session-harness pre-flight check, not a
+  tracked probe): `Intel(R) Xeon(R) CPU E5-2673 v4 @ 2.30GHz`, 2 sockets × 20 cores/socket × 2 threads/core =
+  `80` logical CPUs across 2 NUMA nodes; `94 GiB` RAM (`90 GiB` available), `32G` `/` overlay, `47G`
+  `/dev/shm`. GPUs: **4× `NVIDIA GeForce RTX 3060`** (`12288 MiB` each, driver `580.178.04` in tracked
+  `01_env`; Ampere compute capability `(8, 6)`, `distinct GPU models: 1`, PCIe gen `3` max, width current `16`
+  / max `16`, `bf16 native: True`, `is_bf16_supported(): True`, `matmul ok on all 4`, topology GPU0–GPU1 `PHB`
+  [NUMA 0, CPU affinity `0-19,40-59`] / GPU2–GPU3 `PHB` [NUMA 1, CPU affinity `20-39,60-79`] / cross-socket
+  `SYS`, and `torch.cuda.can_device_access_peer` all `0` — one-off session-harness observations, not tracked
+  probes). Software: project Python `3.12.16`, `torch 2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`
+  (`2.30.7+cuda13.3` in NCCL init), `arch_list ['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']`,
+  `python_h=True`, `c_compiler=True`, `uv 0.13.9`, `/usr/bin/cc`, `/usr/bin/git`, and
+  `scripts/multi_gpu_check.py` running on `python3` `3.12.3` on `PATH`.
+- **4-rank NCCL transport & bandwidth check (one-off session-harness observation with `NCCL_DEBUG=INFO`, not a
+  tracked probe):** exited `0`; `Check P2P Type isAllDirectP2p 0 directMode 0 isAllCudaP2p 0`; 2 ring channels
+  (`Channel 00/02` and `01/02`: `0 1 2 3`), all 8 ring links **`via SHM/direct`** (PCIe/SHM transport, no
+  NVLink or GPU P2P); `all_reduce 64 MiB on 4 ranks: 11.0 ms/iter, bus bandwidth 9.17 GB/s, values
+  correct=True`.
 - **Full session command and summary:**
   ```bash
   bash scripts/multi_gpu_check.sh --python 3.12 --log-dir mgc_logs
   ```
   Ran with `backend=nccl`, `device_map=per-rank`, `ranks=2 4`, `NCCL_MULTI_RANK_GPU_ENABLE` unset;
-  real `LOCAL_RANK` per-rank binding logged `device=cuda:0..1` (`N = 2`) and `device=cuda:0..3` (`N = 4`),
-  `gpu_count=4`. Wall time **`47 min 42 s`** (`06:06:41`–`06:54:23`), exit code `0`. **18 of 18 listed stages
-  exited `0` (0 skipped)**, including `02_prototype_parity_cuda` on 4 separate GPUs; `0` leftover and `0` GPU
-  compute processes afterwards; `0` `$HOME` hits in `.done`/summary. Threads: `threads=40` in single-process
-  CUDA reference stages, `threads=1` in all `torchrun` and CPU/`gloo` stages. Reference archives
-  (`auto(f64<=1000000,k=8192)`, schema v5): `tiny_random` CUDA `25.44 MiB` (40 entries per `N`), `5M`+`28M`
-  CUDA `37.47 MiB` (80 entries per `N`), `tiny_random` CPU `25.11 MiB` (34 entries per `N`). TorchInductor
-  emitted `Not enough SMs to use max_autotune_gemm mode` on RTX 3060 during compiled runs.
+  real `LOCAL_RANK` per-rank binding (`device="auto"` → `cuda:LOCAL_RANK`) logged `device=cuda:0..1`
+  (`N = 2`) and `device=cuda:0..3` (`N = 4`), `gpu_count=4`. Wall time **`47 min 42 s`** (`06:06:41`–`06:54:23`),
+  exit code `0`. **18 of 18 listed stages exited `0` (0 skipped)**, including `02_prototype_parity_cuda` on 4
+  separate GPUs; `0` leftover and `0` GPU compute processes afterwards; `0` `$HOME` hits in `.done`/summary.
+  Threads: `threads=40` in single-process CUDA reference stages, `threads=1` in all `torchrun` and CPU/`gloo`
+  stages. Reference archives (`auto(f64<=1000000,k=8192)`, schema v5): `tiny_random` CUDA `25.44 MiB` (40
+  entries per `N`), `5M`+`28M` CUDA `37.47 MiB` (80 entries per `N`), `tiny_random` CPU `25.11 MiB` (34
+  entries per `N`). TorchInductor emitted `Not enough SMs to use max_autotune_gemm mode` on RTX 3060 during
+  compiled runs.
 
 **4-GPU `02_prototype_parity_cuda` (`scripts/probes/distributed_parity.py --device cuda --sizes 5M 28M`, `N = 2` and `N = 4`, rank `r` on `cuda:r`):**
 
@@ -1202,9 +1207,10 @@ First separate-GPU Stage 3 session, run at commit `3ac7c6d` (`scripts/`, `src/`,
   (`70` per model) measured **`0.00e+00`**.
 - **Enforced PASS maxima:** `tiny_random` `float64` `2.60e-14` (`[5] lora_variate N=4 param_update <= 1e-10`),
   `float32` `4.56e-06` (`[5] lora_variate N=2 param_update <= 1e-4`); `Timestral-5M` `float64` `3.63e-14`
-  (`[3] N=2 head_only grad <= 1e-12`), `float32` `6.93e-07` (`[2] N=4 empty_shard loss <= 1e-5`);
-  `Timestral-28M` `float64` `2.03e-15` (`[2] N=4 unequal loss <= 1e-12`), `float32` `1.08e-06` (`[3] N=2
-  head_only grad <= 1e-5`).
+  (two-way tie: `[3] N=2 head_only grad` and `[3] N=2 head_only_cached grad`, `<= 1e-12`), `float32`
+  `6.93e-07` (`[2] N=4 empty_shard loss <= 1e-5`); `Timestral-28M` `float64` `2.03e-15` (two-way tie: `[2]
+  N=4 unequal loss` and `[3] N=2 head_only grad`, `<= 1e-12`), `float32` `1.08e-06` (two-way tie: `[3] N=2
+  head_only grad` and `[3] N=2 head_only_cached grad`, `<= 1e-5`).
 - **Ungraded `[INFO]` released body-backprop ranges:**
   - `Timestral-5M`: single-step `float64` `4.94e-15`–`2.59e-11` (`[3] N=2 full_ft grad`), `float32`
     `7.14e-05`–`2.11e-03` (`[3] N=4 full_ft grad`); 10-step `[5]` `float64` `9.76e-17`–`1.81e-12` (`full_ft
@@ -1255,9 +1261,9 @@ shared-GPU-vs-separate-GPU delta.
 
 On released `float32` weights (`5M`/`28M`, `N = 2` and `N = 4`, S6 `3ac7c6d`), the moved-student `full_ft`
 distillation rows (`*_moved_f32`) measured `param_l2` `5.49e-06`–`1.17e-05` and `upd_l2`
-`9.67e-03`–`2.40e-02`; on those same released models, `float64` `domain_lora_temporal_f64` and
-`domain_full_ft_f64` stayed at `upd_l2` `5.20e-14`–`1.52e-12` while `float32` `head_only` stayed
-`<= 3.53e-04`.
+`9.67e-03`–`2.40e-02`; on those same released models, `float64` `upd_l2` on `domain_lora_temporal_f64` and
+`domain_full_ft_f64` stayed at `5.20e-14`–`1.52e-12` while `float32` `head_only` `upd_l2` stayed
+`<= 3.53e-04` (`param_l2 <= 1.91e-06`).
 
 **S6 feature rows (`compile_mode="default"`, `num_workers=2`, `val_s`, `vram_mib`):**
 
@@ -1288,9 +1294,9 @@ distillation rows (`*_moved_f32`) measured `param_l2` `5.49e-06`–`1.17e-05` an
 | **Linux Xeon CPU/`gloo`**, `N = 2` | `20.0 s` / `90.0 s` / `65.0 s` | `exit:1` (`0.14 s`) | Rank 0 `exit:2`; raises Python `builtins.RuntimeError` (`Connection reset by peer`); normal `except`/`finally` unwinds | `0.09 s` / `0.79 s` | `PASS (no hang)` (`parent_killed=none`) |
 | **Linux Xeon CPU/`gloo`**, `N = 4` | `20.0 s` / `90.0 s` / `65.0 s` | `exit:1` (`0.16 s`) | Ranks 0, 2 (`Connection reset by peer`, `0.08 s` / `0.81–0.86 s`) and rank 3 (`Connection closed by peer`, `0.75 s` / `1.57 s`) all `exit:2`; normal `except`/`finally` unwinds | `0.08–0.75 s` / `0.81–1.57 s` | `PASS (no hang)` (`parent_killed=none`) |
 
-**S6 session-driver gates, driver unit tests, and `cuda_check.sh` (`3ac7c6d`, 4× RTX 3060):**
+**S6 session-driver gates (one-off session-harness checks, not tracked probes), driver unit tests, and single-GPU `cuda_check.sh` (`3ac7c6d`, 4× RTX 3060 host):**
 
-| Check (`3ac7c6d`, 4× RTX 3060) | Scope | Observed |
+| Check (`3ac7c6d`, 4× RTX 3060 host) | Scope | Observed |
 |---|---|---|
 | Resume (identical command on finished `mgc_logs`) | Full 4-GPU separate-GPU session | Exit `0`, **`18 of 18`** stages `0 (resumed)`; nothing re-executed |
 | Default-disposition `SIGINT` / `SIGTERM` / `SIGHUP` mid-`04_nccl_tiny_n2` | `--ranks 2 --sizes ""` (`device_map=per-rank`) | Exit `130` / `143` / `129` in `1.1 s` / `1.0 s` / `1.0 s` (signalled `4` PIDs per stage); `0` leftover and `0` GPU procs |
@@ -1298,12 +1304,15 @@ distillation rows (`*_moved_f32`) measured `param_l2` `5.49e-06`–`1.17e-05` an
 | Reference-stage interrupt (`SIGINT` default mid-`03_ref_nccl_tiny_n2`) | `--ranks 2 --sizes ""` | Exit `130` in `0.5 s` (signalled `2` PIDs); only `01_env.done` remains (`['01_env.done']`), `refs: []`, `0` leftover and `0` GPU procs |
 | Stage timeout (`--stage-timeout 20`, `--ranks 2 --sizes ""`) | Separate-GPU `device_map=per-rank` | `01_env` `0`, **`02_prototype_parity_cuda SKIPPED (rank 4 not requested)`**, `03_ref_nccl_tiny_n2` `124` (`2` PIDs), `04_nccl_tiny_n2` `SKIPPED (ref failed)`, `07_ref_gloo_tiny_n2` `124` (`2` PIDs), `08_gloo_tiny_n2` `SKIPPED (ref failed)`, `09_rank_failure_gloo_n2` `0`, `10_rank_failure_nccl_n2` `124` (`4` PIDs); session exit `1`; `0` leftover, `0` GPU procs, `0` files left in `refs/` |
 | Relative `--log-dir` path hygiene | `--log-dir mgc_logs` | `0` `$HOME` hits in `.done` markers or `summary.txt` |
-| Driver unit tests (`tests/test_multi_gpu_check.py`) | Python `3.12.16` on 4× RTX 3060 host | **`105 passed in 66.95s`**, `0` leftover |
-| Full `scripts/cuda_check.sh` | Python `3.12.16` on 4× RTX 3060 host | **`266 passed, 3 skipped`** device tests (`153.71 s`); **`840 passed, 4 skipped`** whole suite (`620.05 s`); full probe breakdown in §13 |
+| Driver unit tests (`tests/test_multi_gpu_check.py`) | Python `3.12.16` on 4× RTX 3060 host (single run) | **`105 passed in 66.95s`**, `0` leftover |
+| Full `scripts/cuda_check.sh` | Python `3.12.16` on **one RTX 3060** (`cuda:0`) of the 4-GPU host | **`266 passed, 3 skipped`** device tests (`153.71 s`); **`840 passed, 4 skipped`** whole suite (`620.05 s`); full probe breakdown in §13 |
 
-*(Gates not re-run in S6 because `scripts/` was unchanged from `d474f82` where they were already exercised on
-Linux L4: isolated Python `3.10` driver tests, no-`.git` `content_hash` export tree, and unusable `--log-dir`
-exit `2` checks.)*
+*(Checks from S4/S5 not re-run in S6: isolated Python `3.10` driver tests and unusable `--log-dir` exit `2`
+checks last ran on Linux L4 at `d474f82` [S5, where `scripts/` matches `3ac7c6d`]; the no-`.git`
+`content_hash` export-tree check last ran on Linux L4 at `8e8f490` [S4, before the `335cf7d` and `d474f82`
+changes to `scripts/multi_gpu_check.py`]; and S6 ran `tests/test_multi_gpu_check.py` once rather than S5's
+three-run repeat and omitted a standalone `pytest -m "not network"` run, superseded by `scripts/cuda_check.sh`'s
+whole-suite run.)*
 
 #### Resolution of the `82a21ca` tooling limitations and remaining limitations at `d474f82` / `3ac7c6d`
 
@@ -1360,16 +1369,16 @@ single separate-GPU session); `bf16` and released-weights parity tier calibratio
 measurements (the 6-step `B = 2` measuring driver is not a scaling benchmark).
 
 **Not verified anywhere (Stage 3, spec §10 & §12):** Stages 1–2 multi-process training is verified on
-CPU/`gloo` on macOS arm64 and Linux x86_64 (§17.1), `scripts/cuda_check.sh` passed on both one NVIDIA L4
-(`d474f82`) and 4× NVIDIA GeForce RTX 3060 (`3ac7c6d`) with Python `3.12.16` (§13), and the hardened Stage 3
-driver and rank-failure probes passed both on one shared NVIDIA L4 (S4/S5) and on 4 separate RTX 3060 GPUs
-over PCIe/SHM (S6 at `3ac7c6d`, including real `LOCAL_RANK` binding, 4-GPU `02_prototype_parity_cuda`, 316
-driver rows, and separate-GPU NCCL rank failure; §17.4). Still unverified: T15 on NCCL (requires adding a
-backend and per-rank device switch to `tests/distributed_harness.py`, which currently restricts to CPU/`gloo`
-via `_ALLOWED_CPU_BACKENDS`), NVLink / GPU P2P multi-GPU setups and cross-GPU run-to-run determinism, `bf16`
-parity tiers and the cause of the large released-checkpoint `bf16` differences and compiled CUDA run-to-run
-variation in §17.4, multi-GPU throughput/VRAM/scaling (including per-parameter pack/unpack, 3–4 collectives
-per step, flat gradient buffer live through validation, and per-rank `_frozen_base` VRAM in `full_ft`
-distillation), released-weights T15 bounds (with or without replay, including cosine similarity), live
-concurrent `huggingface_hub==0.23.0` downloads (source reading only, §12), and `F.linear` `requires_grad`
-dispatch on GPUs/CUDA.
+CPU/`gloo` on macOS arm64 and Linux x86_64 (§17.1), single-GPU `scripts/cuda_check.sh` passed on one NVIDIA L4
+(`d474f82`) and on one RTX 3060 of the 4-GPU host (`3ac7c6d`) with Python `3.12.16` (§13), and the hardened
+Stage 3 driver and rank-failure probes ran both on one shared NVIDIA L4 (S4/S5) and on 4 separate RTX 3060
+GPUs over PCIe/SHM (S6 at `3ac7c6d`, including `device="auto"` → `cuda:LOCAL_RANK` binding, 4-GPU
+`02_prototype_parity_cuda`, 316 driver rows, and separate-GPU NCCL rank failure; §17.4). Still unverified: T15
+on NCCL (requires adding a backend and per-rank device switch to `tests/distributed_harness.py`, which
+currently restricts to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`), NVLink / GPU P2P multi-GPU setups and
+cross-GPU run-to-run determinism, `bf16` parity tiers and the cause of the large released-checkpoint `bf16`
+differences and compiled CUDA run-to-run variation in §17.4, multi-GPU throughput/VRAM/scaling (including
+per-parameter pack/unpack, 3–4 collectives per step, flat gradient buffer live through validation, and
+per-rank `_frozen_base` VRAM in `full_ft` distillation), released-weights T15 bounds (with or without replay,
+including cosine similarity), live concurrent `huggingface_hub==0.23.0` downloads (source reading only, §12),
+and `F.linear` `requires_grad` dispatch on GPUs/CUDA.
