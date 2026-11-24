@@ -27,8 +27,9 @@ minor releases, and such changes are called out under **Changed**.
   post-kill deadlines and a strict survivor-abort allow-list), `scripts/probes/_dist_common.py`, and
   `scripts/multi_gpu_check.sh` wrapping `scripts/multi_gpu_check.py` (single stdlib-only Python `>= 3.10`
   session driver with content-bound resume, preserved ignored-on-entry signals for `nohup`, confirmed-live
-  process-tree cleanup, and `tests/test_multi_gpu_check.py`; `docs/DEVELOPMENT.md`, `docs/VERIFICATION.md`
-  §17.4).
+  `/proc` and pure-BSD `ps` process-tree cleanup, pre-stage `--log-dir` writability checks and clean `OSError`
+  handling, and 105 stub-stage tests in `tests/test_multi_gpu_check.py`; `docs/DEVELOPMENT.md`,
+  `docs/VERIFICATION.md` §17.4).
 - **`RankFailureError`** exported from `timestral_tune.trainer` (`RuntimeError` subclass raised on healthy
   peers when another rank fails during multi-process setup, training, validation, or rank-0 callbacks).
 - **Multi-process export metadata:** optional paired `world_size` and `effective_batch_size` arguments on

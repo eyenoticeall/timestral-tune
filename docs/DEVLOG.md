@@ -1438,7 +1438,7 @@ Phase 5 Stage 3 unticked.
 
 ## 2026-11-24 — Stage 3 tooling review fixes, Python session driver rewrite, and final-tip shared-GPU verification
 
-**What was built (`713aaac`–`8e8f490`).** The limitations flagged in the `82a21ca` Stage 3 script review were
+**What was built (`713aaac`–`d474f82`).** The limitations flagged in the `82a21ca` Stage 3 script review were
 addressed across two stretches of work (library code under `src/` was unchanged; the CountSketch `float64`
 floor is resolved for vectors `<= 1,000,000` parameters under `--reference-mode auto` and remains present with
 explicit floor flags on larger `full_ft` / `28M head_only` entries):
@@ -1464,13 +1464,18 @@ explicit floor flags on larger `full_ft` / `28M head_only` entries):
      nccl` exercises both Linux CPU/`gloo` and CUDA/NCCL rank failures (`a20d386`, `866816a`, `1963050`),
      forwarded `--sizes` into `02_prototype_parity_cuda` (requiring `4` in `--ranks`), and added content-bound
      resume markers.
-2. **Rewrite of the session driver in standard-library Python (`bd24e47`–`8e8f490`):**
+2. **Rewrite of the session driver in standard-library Python (`bd24e47`–`d474f82`):**
    - Replaced the bash + embedded-Python implementation in `scripts/multi_gpu_check.sh` with a single
      standard-library-only Python `>= 3.10` program (`scripts/multi_gpu_check.py`, structured around
      `SessionRunner` phase methods and `StageProcess` in `64f4dbe`) behind a thin bash wrapper
      (`scripts/multi_gpu_check.sh`) that locates a `>= 3.10` interpreter without parsing CLI flags and `exec`s
      `multi_gpu_check.py`.
-   - Added 103 stub-stage unit tests in `tests/test_multi_gpu_check.py` (included in `-m "not network"`).
+   - Followed up after the `8e8f490` Linux run with `335cf7d` (pure BSD `ps` syntax `axewwo`/`axo` compatible
+     with Linux `procps-ng`, documenting that `procps-ng` `ps` itself reads `/proc`) and `d474f82`
+     (`_prepare_log_dirs` pre-stage writability validation exiting `2` with one `error:` line naming the path as
+     typed, plus guarded `os.chdir` and mid-session `OSError` handling for stale-file removal, `.done` marker
+     writes, and `summary.txt` writes).
+   - Added 105 stub-stage unit tests in `tests/test_multi_gpu_check.py` (included in `-m "not network"`).
 
 **Why the session script was rewritten.** Three consecutive review rounds (`a20d386`, `866816a`, `1963050`)
 kept surfacing subtle defects at the boundary between bash (bash 3.2 on macOS vs GNU bash on Linux, `| tee`
@@ -1523,51 +1528,65 @@ directly testable with stub stages.
   modes (one-off measurements in `docs/VERIFICATION.md` §11). Recorded without changing
   `src/timestral_tune/models/loader.py`; the probe retains `1e-6` float64 export-reload tolerance in the
   meantime.
-- **Open Linux `ps`-fallback unit-test failure in `tests/test_multi_gpu_check.py`:** at `8e8f490` on the Linux
-  L4 VM, `test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order` failed (mocking `/proc` empty
-  to exercise the non-Linux `ps`-based scan fallback, which returned no hits on that Linux host; the live Linux
-  `/proc` scan path passed every signal and timeout gate; counts in `docs/VERIFICATION.md` §17.4). Fix pending.
+- **Mixed BSD/SysV `ps` syntax failing on Linux `procps-ng` (`335cf7d`):** at `8e8f490` on the Linux L4 VM,
+  `test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order` failed (1 failure in `-m "not
+  network"`) because `ps eww -axo …` mixed dashless BSD and dash-prefixed options, which Linux `procps-ng`
+  (`3.3.17`) rejects with exit `1` (live Linux `/proc` scans were unaffected). Switching all `ps` calls to pure
+  BSD syntax (`axewwo`, `axo`) in `335cf7d` fixed both macOS and `procps-ng`, and the module note now records
+  that on Linux `procps-ng` `ps` itself reads `/proc`.
+- **Unwritable `--log-dir` and pre-stage `OSError` tracebacks (`d474f82`):** previously an unusable `--log-dir`
+  raised a raw `OSError` traceback with exit `1` or aborted mid-stage. `_prepare_log_dirs()` now validates
+  creation and writability of `--log-dir` and `<log-dir>/refs` before any stage starts, emitting one `error:`
+  line with the user-supplied path spelling and exiting `2`, while mid-session file `OSError`s are reported
+  cleanly as stage failures or warnings.
 
-**Evidence (full tables, commands, and cross-session comparisons in `docs/VERIFICATION.md` §11 and §17.4):**
+**Evidence (full tables, commands, and cross-session comparisons in `docs/VERIFICATION.md` §11, §13, and §17.4):**
 
-- **Final-tip shared-GPU L4 session (`8e8f490`, one rented NVIDIA L4, driver `580.178.04`, Python `3.12.16`,
-  `torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`, driver on `python3` `3.10.12` on `PATH`):**
-  `bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12 --log-dir mgc_logs` finished in `47 min 51 s`:
-  **17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped as `shared GPU`)**, `0`
-  leftover CPU/GPU processes, bitwise parameter **and** buffer equality (`xr_eq=yes, xr_max=0.00e+00`) in all
-  `316` rows (`246` shared-GPU NCCL + `70` Linux CPU/`gloo`), plus Linux `gloo` (Python `RuntimeError` on TCP
-  transport reset) and shared-L4 NCCL (`SIGABRT` without Python cleanup) rank-failure stages and live gates for
-  resume, `SIGINT`/`SIGTERM`/`SIGHUP` (default and `SIG_IGN`) on real NCCL stages, reference-stage interrupt
-  artifact removal, `--stage-timeout 20` tree-kill, no-`.git` `content_hash`, and relative `--log-dir` hygiene
-  (`docs/VERIFICATION.md` §17.4).
-- **Cross-session reproducibility across `a20d386`, `866816a`, and `8e8f490` (`docs/VERIFICATION.md` §17.4):**
-  between S3 (`866816a`) and S4 (`8e8f490`, same machine type, different VM instance per the provisioning
-  record; same driver `580.178.04`), all non-compiled NCCL rows and all Linux CPU/`gloo` rows matched in the
-  printed parity columns and `vram_mib` (timing columns and `val_s` varied), whereas
-  `compile_default_lora_variate` / `compile_default_lora_replay` varied run-to-run on CUDA (10 of 12 compiled
-  NCCL rows differed between S3 and S4; cause uninvestigated). Against S2 (`a20d386`, a different host per the
-  provisioning record), CPU-dependent rows (Linux `gloo` and CPU-warmed `*_moved_f32`) differed in their printed
-  values (up to `12×` on `gloo` and `4.1×` on NCCL `*_moved_f32`; full breakdown in `docs/VERIFICATION.md`
-  §17.4).
-- **Local macOS arm64 verification (`8e8f490`, Python `3.12.13`, `torch 2.15.0`):**
+- **Detailed shared-GPU L4 session (`8e8f490`, S4) and final-tip repeat (`d474f82`, S5) on one rented NVIDIA L4
+  (driver `580.178.04`, Python `3.12.16`, `torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`, driver on `python3`
+  `3.10.12` on `PATH`):** `bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12 --log-dir mgc_logs`
+  finished in `47 min 51 s` (S4) and `42 min 15 s` (S5): **17 of 17 runnable stages exited `0` (18 listed,
+  `02_prototype_parity_cuda` skipped as `shared GPU`)**, `0` leftover CPU/GPU processes, bitwise parameter
+  **and** buffer equality (`xr_eq=yes, xr_max=0.00e+00`) in all `316` rows (`246` shared-GPU NCCL + `70` Linux
+  CPU/`gloo`), plus Linux `gloo` (Python `RuntimeError` on TCP transport reset) and shared-L4 NCCL (`SIGABRT`
+  without Python cleanup) rank-failure stages and live gates for resume, `SIGINT`/`SIGTERM`/`SIGHUP` (default
+  and `SIG_IGN`) on real NCCL stages, reference-stage interrupt artifact removal, `--stage-timeout 20`
+  tree-kill, no-`.git` `content_hash`, unusable `--log-dir` (`d474f82`, exit `2`, 1 `error:` line, 0
+  tracebacks), and relative `--log-dir` hygiene (`docs/VERIFICATION.md` §17.4).
+- **Linux test suites and `scripts/cuda_check.sh` green at `d474f82` (`docs/VERIFICATION.md` §13, §17.4):**
+  `tests/test_multi_gpu_check.py` **`105 passed`** ×3 on Python `3.12` and ×1 on isolated Python `3.10`;
+  `-m "not network"` **`628 passed, 3 skipped, 213 deselected`**; full `scripts/cuda_check.sh` (Python
+  `3.12.16`) **`266 passed, 3 skipped`** device tests and **`840 passed, 4 skipped`** whole suite (`device
+  tests exit 0, whole suite exit 0`).
+- **Cross-session reproducibility across `a20d386` (S2), `866816a` (S3), `8e8f490` (S4), and `d474f82` (S5)
+  (`docs/VERIFICATION.md` §17.4):** across S3, S4, and S5 (same machine type, different VM instances per the
+  provisioning records; same driver `580.178.04`), all `234` non-compiled NCCL rows and all `70` Linux
+  CPU/`gloo` rows matched in the printed parity columns and `vram_mib` (timing columns and `val_s` varied),
+  whereas `compile_default_lora_variate` / `compile_default_lora_replay` varied run-to-run on CUDA (10 of 12
+  compiled NCCL rows differed between S3 and S4; all 12 of 12 differed between S4 and S5; cause
+  uninvestigated). Against S2 (`a20d386`, a different host per the provisioning record), CPU-dependent rows
+  (Linux `gloo` and CPU-warmed `*_moved_f32`) differed in their printed values (up to `12×` on `gloo` and
+  `4.1×` on NCCL `*_moved_f32`; full breakdown in `docs/VERIFICATION.md` §17.4).
+- **Local macOS arm64 verification (`d474f82`, Python `3.12.13`, `torch 2.15.0`):**
   `--backend gloo --ranks 2 4 --pg-timeout 10` passed (**7 of 7 runnable stages exited `0`**, 8 listed,
-  `xr_eq=yes` in all `70` rows, `gloo` rank failure raised `RuntimeError` at timeout); all 6 signal/disposition
-  live checks passed; `-m "not network"` **`614 passed, 15 skipped, 213 deselected`** and
-  `tests/test_multi_gpu_check.py` **`103 passed`** across 3 consecutive runs; one-off
-  `load_model(..., dtype=torch.float64)` reproduction recorded in `docs/VERIFICATION.md` §11.
+  `xr_eq=yes` in all `70` rows matching `8e8f490` identically in all parity columns, `gloo` rank failure raised
+  `RuntimeError` at timeout); all 6 signal/disposition checks, relative-path check, and both unusable-log-dir
+  checks passed; `-m "not network"` **`616 passed, 15 skipped, 213 deselected`** (including all `105` tests in
+  `tests/test_multi_gpu_check.py`); one-off `load_model(..., dtype=torch.float64)` reproduction recorded at
+  `8e8f490` in `docs/VERIFICATION.md` §11.
 - `uv run ruff check . && uv run ruff format --check .` clean.
 
-**Documentation updated:** `docs/VERIFICATION.md` (§11, §13, §17.1, §17.4), `docs/SPEC.md` (§5.6, §7.6, §9,
-§10, D35, §12 — Phase 5 Stage 3 kept unticked; no §11 D-entry added for the session driver, matching existing
-practice where §11 records library decisions only), `docs/DEVELOPMENT.md`, `docs/STATUS.md`,
+**Documentation updated:** `docs/VERIFICATION.md` (§11, §13, §17.1, §17.4), `docs/SPEC.md` (§5.4, §5.6, §7.6,
+§9, §10, D35, §12 — Phase 5 Stage 3 kept unticked; no §11 D-entry added for the session driver, matching
+existing practice where §11 records library decisions only), `docs/DEVELOPMENT.md`, `docs/STATUS.md`,
 `docs/phases/phase-5-multi-gpu.md`, `CHANGELOG.md`, and this entry.
 
 **Not done / open:**
 
-- Fix the 1 failing Linux `ps`-fallback unit test in `tests/test_multi_gpu_check.py`
-  (`test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order`).
-- **Stage 3 (separate-GPU CUDA/NCCL hardware verification):** run `bash scripts/multi_gpu_check.sh --python
-  3.12 --log-dir <dir>` on a 4-GPU host (or `--ranks 2` on 2 GPUs; real `LOCAL_RANK` binding, 4-GPU
+- **Stage 3 (separate-GPU CUDA/NCCL hardware verification):** before running on separate GPUs, consider
+  extending `01_env` in `scripts/multi_gpu_check.py` to log the CPU model and core count so cross-host
+  differences can be read directly from stage logs. Then run `bash scripts/multi_gpu_check.sh --python 3.12
+  --log-dir <dir>` on a 4-GPU host (or `--ranks 2` on 2 GPUs; real `LOCAL_RANK` binding, 4-GPU
   `02_prototype_parity_cuda` with `--sizes 5M 28M`, cross-GPU NCCL determinism, separate-GPU rank-failure
   checks), add a backend/device switch to `tests/distributed_harness.py` for T15 on NCCL, investigate the
   larger `bf16` differences and compiled CUDA run-to-run variation, calibrate `bf16` and released-weights T15

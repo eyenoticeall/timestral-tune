@@ -230,10 +230,15 @@ and `09_rank_failure_gloo_n<N>`; and primary rank-failure checks `09_rank_failur
 
 **Logs, markers, reference archives, and relative `--log-dir`:** per-stage logs (`<stage>.log`), completion
 markers (`<stage>.done`), `summary.txt`, and reference archives (`refs/ref_*.zip`) are written under
-`--log-dir` (default `multi_gpu_check_logs`; untracked, do not commit). Passing a **relative** `--log-dir`
-(such as the default or `--log-dir mgc_logs`) keeps stage arguments, `.done` signatures, and `summary.txt`
-relative to the repository root so machine and home paths do not leak into those files (note that Python
-itself may still print absolute paths inside stage logs for warnings or `faulthandler` tracebacks).
+`--log-dir` (default `multi_gpu_check_logs`; untracked, do not commit). Before any stage runs, the driver
+creates and probes writability of both `--log-dir` and `<log-dir>/refs`: if either path is unwritable,
+inaccessible, or blocked by a regular file, it prints one `error:` line naming the path as typed (without
+expanding a relative path to `REPO_ROOT` or printing a traceback) and exits `2`. Other file `OSError`s that
+occur mid-session (clearing stale files, writing `.done` markers, or writing `summary.txt`) are reported as
+stage failures or warnings rather than raw tracebacks. Passing a **relative** `--log-dir` (such as the
+default or `--log-dir mgc_logs`) keeps stage arguments, `.done` signatures, and `summary.txt` relative to the
+repository root so machine and home paths do not leak into those files (note that Python itself may still
+print absolute paths inside stage logs for warnings or `faulthandler` tracebacks).
 
 **Content-bound resume and `--force`:** every passing stage writes `<stage>.done` containing a SHA-256 `sig=`
 (plus `artifact_sha256=` for reference stages) bound to:
@@ -269,40 +274,44 @@ inherited disposition of `SIGINT`, `SIGTERM`, and `SIGHUP`:
 **Stage timeout and process-tree handling:** each stage runs in its own session tagged with a per-stage
 environment variable (`_TIMESTRAL_STAGE_TOKEN`), streaming combined stdout/stderr through a non-blocking pipe
 (no shell `| tee` pipeline). If a stage exceeds `--stage-timeout` (default `900` s), the driver collects
-confirmed-live non-zombie PIDs carrying the stage token (via `/proc` on Linux, `ps` fallback elsewhere),
-their live descendants, and safe stage-only PGIDs, sends `SIGTERM` with a `3 s` pipe-draining grace period,
-then `SIGKILL` with a `2 s` reap loop, deletes any partial artifact, records `124`, and continues to
-independent remaining stages. If a stage leader exits while descendants still hold stdio open or stay alive,
-the driver drains for up to a `2 s` post-exit grace period and then kills and logs a warning for any
-surviving descendants without waiting out `--stage-timeout`. Runtime/GPU helper probe failures or timeouts
-(`180 s` helper limit) are reported explicitly with stderr snippets (never silently as "0 GPUs"), and broken
-stdout/stderr pipes are redirected to `/dev/null` so interpreter shutdown never overwrites the real exit code
-with `120`.
+confirmed-live non-zombie PIDs carrying the stage token from `/proc` (primary on Linux) or pure-BSD `ps`
+(`axewwo`/`axo` on macOS/BSD, or as fallback if Python cannot enumerate `/proc`), their live descendants, and
+safe stage-only PGIDs, sends `SIGTERM` with a `3 s` pipe-draining grace period, then `SIGKILL` with a `2 s`
+reap loop, deletes any partial artifact, records `124`, and continues to independent remaining stages. If a
+stage leader exits while descendants still hold stdio open or stay alive, the driver drains for up to a `2 s`
+post-exit grace period and then kills and logs a warning for any surviving descendants without waiting out
+`--stage-timeout`. Runtime/GPU helper probe failures or timeouts (`180 s` helper limit) are reported
+explicitly with stderr snippets (never silently as "0 GPUs"), and broken stdout/stderr pipes are redirected
+to `/dev/null` so interpreter shutdown never overwrites the real exit code with `120`.
 
 **Exit codes:**
 - `0`: all runnable stages passed (or `-h`/`--help`).
 - `1`: at least one stage failed or timed out (`124` in `summary.txt`, corrupt archive, port allocation
-  failure, or stage exception).
-- `2`: invalid CLI arguments, missing Python `>= 3.10` or `uv`, failed tree-state/runtime/GPU helper probe,
-  `0` visible CUDA GPUs for `--backend nccl`, only `1` visible GPU with default ranks and no `--shared-gpu`,
-  or `--ranks` exceeding visible GPUs without `--shared-gpu`.
+  failure, stage exception, or mid-session stale-file / `.done`-marker write `OSError`).
+- `2`: invalid CLI arguments, missing Python `>= 3.10` or `uv`, inability to change to the repository root,
+  unusable or unwritable `--log-dir` / `<log-dir>/refs`, failed tree-state/runtime/GPU helper probe, `0`
+  visible CUDA GPUs for `--backend nccl`, only `1` visible GPU with default ranks and no `--shared-gpu`, or
+  `--ranks` exceeding visible GPUs without `--shared-gpu`.
 - Any non-zero exit code from `01_env`: `01_env` failed and aborted the session (for example `3` when
   `--backend nccl` is requested on a non-CUDA PyTorch build, `uv sync`'s or the environment probe's non-zero
   exit code, `124` on a stage timeout, or `127` if the command cannot be launched).
 - `129` / `130` / `143`: interrupted by `SIGHUP` / `SIGINT` / `SIGTERM` (when not ignored on entry).
 
 **Known process-escape limitation:** a descendant that strips `_TIMESTRAL_STAGE_TOKEN` from its environment
-and outlives its parent (being reparented outside the tracked PPID tree), or runs on a system with neither
-`/proc` nor `ps`, can escape tree termination; neither `torchrun` nor PyTorch `DataLoader` workers do this.
+and outlives its parent (being reparented outside the tracked PPID tree), or runs on a system where neither
+`/proc` nor `ps` can inspect processes (note that on Linux `procps-ng` `ps` itself reads `/proc`, so an
+OS-level unmounted or inaccessible `/proc` cannot be worked around via `ps`), can escape tree termination;
+neither `torchrun` nor PyTorch `DataLoader` workers do this.
 
 **macOS `TMPDIR` handling:** `multi_gpu_check.py` automatically exports `TMPDIR=/tmp` whenever `TMPDIR` is
 unset or longer than 60 characters (and `distributed_trainer_check.py` fails fast via
 `check_tmpdir_for_workers()` before spawning workers if `TMPDIR` would overflow macOS's 103-byte `sun_path`
 limit; see "Testing strategy" above).
 
-**Driver unit tests (`tests/test_multi_gpu_check.py`):** 103 stub-stage tests covering CLI parsing, wrapper
+**Driver unit tests (`tests/test_multi_gpu_check.py`):** 105 stub-stage tests covering CLI parsing, wrapper
 selection, resume signatures, `git` and `content_hash` tree hashing, signal dispositions, timeouts,
-process-tree cleanup, partial-artifact removal, relative log paths, and closed stdio streams (included in
+process-tree cleanup (including pure-BSD `ps` fallback), pre-stage `--log-dir` and `OSError` handling,
+partial-artifact removal, relative log paths, and closed stdio streams (included in
 `uv run pytest -m "not network"`; the tests strip `PYTHONUNBUFFERED` internally):
 
 ```bash
