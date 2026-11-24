@@ -298,10 +298,10 @@ way: point `model_name_or_path` at a local directory holding `config.json` and `
 | Device | Needs | Precision | Checked on |
 |---|---|---|---|
 | CPU | PyTorch 2.4+ | float32 | PyTorch 2.4, 2.8, 2.14, 2.15; Python 3.10 to 3.13 |
-| NVIDIA GPU | PyTorch 2.4+ | float32 or `bf16` | One NVIDIA L4, PyTorch 2.15 |
+| NVIDIA GPU | PyTorch 2.4+ | float32 or `bf16` | One NVIDIA L4 and 4× NVIDIA GeForce RTX 3060, PyTorch 2.15 |
 | Apple GPU | PyTorch 2.8+ | float32 | One Apple M4 (16 GB), all four sizes |
 
-Experimental single-node multi-process data-parallel training (including `ReplayConfig` replay and distillation) is implemented and verified on CPU/`gloo`, and exercised on one NVIDIA L4 with 2 and 4 NCCL ranks sharing that GPU; separate-GPU verification is pending (see [docs/SPEC.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/SPEC.md) §5.6 and [docs/VERIFICATION.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/VERIFICATION.md) §17.4). Memory and timing figures are in [Memory and speed](#memory-and-speed).
+Experimental single-node multi-process data-parallel training (including `ReplayConfig` replay and distillation) is implemented and verified on CPU/`gloo`, exercised on one NVIDIA L4 with shared-GPU NCCL, and run on 4 separate NVIDIA GeForce RTX 3060 GPUs over PCIe/SHM via the Stage 3 verification driver; T15 on NCCL, NVLink/P2P, tier calibration, and multi-GPU scaling measurements remain open (see [docs/SPEC.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/SPEC.md) §5.6, §10 and [docs/VERIFICATION.md](https://github.com/eyenoticeall/timestral-tune/blob/main/docs/VERIFICATION.md) §17.4). Memory and timing figures are in [Memory and speed](#memory-and-speed).
 
 ## Limits
 

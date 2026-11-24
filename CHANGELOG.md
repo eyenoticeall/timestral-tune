@@ -17,9 +17,10 @@ minor releases, and such changes are called out under **Changed**.
   reduction (`ReduceOp.SUM`), startup consistency checks and rank-0 weight/buffer broadcast, sharded
   validation inside `fit()`, rank-0 callbacks/early-stopping/restore with identical `TrainingResult` fields
   across ranks, and best-effort single-rank failure propagation (`docs/SPEC.md` §5.6). Experimental: verified
-  on CPU/`gloo` (macOS arm64 and Linux x86_64, `N = 2` and `N = 4`, acceptance test T15 cases `(a)–(l)`), and
-  exercised on one NVIDIA L4 with 2 and 4 NCCL ranks sharing that GPU (`docs/VERIFICATION.md` §17.4);
-  separate-GPU verification remains open (Stage 3).
+  on CPU/`gloo` (macOS arm64 and Linux x86_64, `N = 2` and `N = 4`, acceptance test T15 cases `(a)–(l)`),
+  exercised on one NVIDIA L4 with 2 and 4 shared-GPU NCCL ranks, and run on 4 separate NVIDIA GeForce RTX 3060
+  GPUs over PCIe/SHM (`--device-map per-rank`, `docs/VERIFICATION.md` §17.4); remaining Stage 3 items (T15 on
+  NCCL, NVLink/GPU P2P, tier calibration, and multi-GPU scaling) stay open.
 - **Stage 3 multi-process verification tooling:** `scripts/probes/distributed_trainer_check.py` (41-scenario
   multi-rank `TimestralTrainer` measuring driver under `torchrun` with `--reference-mode auto|sketch|exact`,
   schema v5 archive verification, and parameter+buffer cross-rank equality),

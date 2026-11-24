@@ -1596,3 +1596,70 @@ existing practice where §11 records library decisions only), `docs/DEVELOPMENT.
   observations (including `load_model(..., dtype=torch.float64)` truncation and the macOS `TMPDIR` guard), and
   the four Stage 3 driver API observations in spec §12.
 - Optional gradient accumulation (unticked, unscheduled).
+
+---
+
+## 2026-11-24 — Phase 5 Stage 3 separate-GPU PCIe/SHM verification session (S6, `3ac7c6d`)
+
+**Goal:** Record the first separate-GPU Stage 3 verification session (**S6**) run at commit `3ac7c6d`
+(`scripts/`, `src/`, and `tests/` identical to `d474f82`) on a rented 4× NVIDIA GeForce RTX 3060 Linux host
+with one rank per GPU (`--device-map per-rank`, `NCCL_MULTI_RANK_GPU_ENABLE` unset), update the CUDA and
+multi-process documentation accordingly, and split the spec §10 Stage 3 checklist cleanly between the completed
+PCIe/SHM session and the Stage 3 work still open.
+
+**What ran (evidence in `docs/VERIFICATION.md` §13 and §17.4):**
+
+- **Environment & NCCL transport (`3ac7c6d`):** rented Linux x86_64 GPU-marketplace host (per the session's
+  provisioning record; `Intel(R) Xeon(R) CPU E5-2673 v4 @ 2.30GHz`, 80 logical CPUs across 2 NUMA nodes,
+  `94 GiB` RAM, `47G` `/dev/shm`), **4× NVIDIA GeForce RTX 3060** (`12288 MiB`, Ampere `(8, 6)`, driver
+  `580.178.04`, PCIe gen 3 ×16, GPU0–GPU1 / GPU2–GPU3 `PHB`, cross-socket `SYS`,
+  `torch.cuda.can_device_access_peer` all `0`), project Python `3.12.16`, `torch 2.15.0+cu132`, CUDA `13.2`,
+  NCCL `2.30.7` (`2.30.7+cuda13.3` in NCCL init), `scripts/multi_gpu_check.py` on `python3` `3.12.3` on `PATH`.
+  The 4-rank NCCL check confirmed `isAllDirectP2p 0 directMode 0 isAllCudaP2p 0` with all 8 ring links across
+  2 channels running `via SHM/direct` (`64 MiB` `all_reduce`: `11.0 ms/iter`, `9.17 GB/s` bus bandwidth,
+  `values correct=True`).
+- **Full separate-GPU session (`bash scripts/multi_gpu_check.sh --python 3.12 --log-dir mgc_logs`):**
+  `47 min 42 s`, exit `0`; **18 of 18 listed stages exited `0` (0 skipped)**, `0` leftover and `0` GPU
+  processes, `0` `$HOME` hits in `.done`/summary. Real `LOCAL_RANK` binding ran `cuda:0..1` (`N = 2`) and
+  `cuda:0..3` (`N = 4`).
+  - `02_prototype_parity_cuda` on 4 separate GPUs (`--sizes 5M 28M`): **`706/706 passed, 0 failed, 136 info
+    (ungraded)`** (`tiny_random` `326/0`, `5M` `190/68`, `28M` `190/68`; all `210` cross-rank checks
+    `0.00e+00`).
+  - `distributed_trainer_check.py`: all **`316/316`** executed rows (`246` separate-GPU NCCL + `70` Linux Xeon
+    CPU/`gloo`; `12` skipped `bf16` on `gloo`) reported **`xr_eq=yes, xr_max=0.00e+00`** across all parameters
+    and buffers and `0` flags. Overall worst cases across all 316 S6 rows: `float64` `param_l2` `1.84e-13`
+    (Linux `gloo`; worst NCCL `1.52e-13`), `upd_l2` `6.18e-11`, `loss_rel` `9.99e-12`; `float32` `param_l2`
+    `3.70e-04`, `upd_l2` `8.02e-02`, `loss_rel` `5.01e-04`; `bf16` `param_l2` `2.34e-02`, `upd_l2` `3.07e-01`,
+    `loss_rel` `1.00e-01` (not comparable digit-for-digit with L4 S4/S5 because each run compares against a
+    one-process reference on its own GPU/host).
+  - Rank failure (`pg=20 s`): separate-GPU NCCL reproduced the single-L4 `SIGABRT` behaviour (`exit_s` `36.05 s`
+    at `N = 2`, `35.95–36.05 s` at `N = 4`, no Python exception, `except`/`finally` skipped, `PASS (no hang)`);
+    Linux Xeon `gloo` raised `RuntimeError` (`Connection reset/closed by peer`, `exc_s 0.08–0.75 s`, `exit_s
+    0.79–1.57 s`, `PASS (no hang)`).
+- **Live session-driver gates, driver unit tests, & `cuda_check.sh` (`3ac7c6d`):** resume (`18 of 18`
+  resumed), default `SIGINT`/`SIGTERM`/`SIGHUP` (`130`/`143`/`129` in `1.0–1.1 s`), ignored `SIGHUP`/`SIGINT`
+  (`exit 0`), ref-stage `SIGINT` (`130` in `0.5 s`, `refs: []`), `--stage-timeout 20` (`--ranks 2 --sizes ""`,
+  `02_prototype_parity_cuda SKIPPED (rank 4 not requested)`, timed-out stages `124`, `0` leftover/GPU procs),
+  `tests/test_multi_gpu_check.py` **`105 passed`** (`66.95 s`), and `scripts/cuda_check.sh` **`266 passed, 3
+  skipped`** device tests / **`840 passed, 4 skipped`** whole suite (`docs/VERIFICATION.md` §13; note
+  `step_timing.py` ran with `cpu threads 80`, not comparable with L4's `cpu threads 8`).
+
+**Documentation updated:** `docs/VERIFICATION.md` (Environment header, §13 4th column, §17.4 S6 subsection +
+side-by-side L4 vs RTX 3060 worst-case observation table + updated coverage/not-verified-anywhere lists),
+`docs/SPEC.md` (§5.4, §5.6, §7.6, §9, §10 Stage 3 split into an unticked parent with 1 ticked PCIe/SHM session
+sub-item and 4 unticked sub-items per `AGENTS.md` rule 8, §11 D28/D35, §12), `docs/STATUS.md`,
+`docs/phases/phase-5-multi-gpu.md`, `CHANGELOG.md`, `AGENTS.md` §1, `README.md`, `docs/DEVELOPMENT.md`, and
+this entry. No code, tests, or scripts were changed.
+
+**Still open in Stage 3 (spec §10 & §12):**
+
+- Add a backend and per-rank device switch to `tests/distributed_harness.py` and run T15 `(a)–(l)` on 2-GPU and
+  4-GPU CUDA/NCCL.
+- Run an NVLink / GPU P2P separate-GPU session and a cross-GPU run-to-run determinism check (consider logging
+  CPU model and core count in `01_env` beforehand).
+- Investigate the larger released-checkpoint `bf16` differences and compiled CUDA run-to-run variation, and
+  calibrate `bf16` and released-weights T15 tiers (including cosine similarity).
+- Measure 1/2/4-GPU throughput, VRAM (including flat gradient buffer across validation and per-rank
+  `_frozen_base`), and scaling to confirm D22.
+- Live concurrent Hub download check at `huggingface_hub==0.23.0`, maintainer decisions on spec §12 findings,
+  and optional gradient accumulation.
