@@ -1549,10 +1549,8 @@ directly testable with stub stages.
   `02_prototype_parity_cuda` skipped as `shared GPU`)**, `0` leftover CPU/GPU processes, bitwise parameter
   **and** buffer equality (`xr_eq=yes, xr_max=0.00e+00`) in all `316` rows (`246` shared-GPU NCCL + `70` Linux
   CPU/`gloo`), plus Linux `gloo` (Python `RuntimeError` on TCP transport reset) and shared-L4 NCCL (`SIGABRT`
-  without Python cleanup) rank-failure stages and live gates for resume, `SIGINT`/`SIGTERM`/`SIGHUP` (default
-  and `SIG_IGN`) on real NCCL stages, reference-stage interrupt artifact removal, `--stage-timeout 20`
-  tree-kill, no-`.git` `content_hash`, unusable `--log-dir` (`d474f82`, exit `2`, 1 `error:` line, 0
-  tracebacks), and relative `--log-dir` hygiene (`docs/VERIFICATION.md` §17.4).
+  without Python cleanup) rank-failure stages and live session-driver gates across S4–S5 (gate-by-session
+  table in `docs/VERIFICATION.md` §17.4).
 - **Linux test suites and `scripts/cuda_check.sh` green at `d474f82` (`docs/VERIFICATION.md` §13, §17.4):**
   `tests/test_multi_gpu_check.py` **`105 passed`** ×3 on Python `3.12` and ×1 on isolated Python `3.10`;
   `-m "not network"` **`628 passed, 3 skipped, 213 deselected`**; full `scripts/cuda_check.sh` (Python
