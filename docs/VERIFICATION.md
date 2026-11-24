@@ -19,11 +19,11 @@ CUDA results (§13, §17.4) come from rented Linux x86_64 cloud VMs with one NVI
 2.15.0+cu132: Phase 1–4 runs used Ubuntu 22.04, 4 CPU threads, and Python 3.12.16 (`89ac249`); the first
 2026-11-23 Phase 5 run (`71514a6`, §11, §13, §17.2) used driver `580.178.04`, CUDA runtime `13.2`, NCCL
 `2.30.7`, and `uv`-selected Python `3.15.2` (outside the CI matrix of Python `3.10–3.13`); and the
-2026-11-23/24 tracked Stage 3 shared-GPU sessions (`82a21ca`, `a20d386`, `866816a`, and the final-tip
-primary record at `8e8f490`, §13, §17.4) used rented Linux x86_64 cloud VMs (8 vCPU per the sessions'
-provisioning records) with one NVIDIA L4 (`23034 MiB`, drivers `595.112.07` and `580.178.04`), CUDA runtime
-`13.2`, NCCL `2.30.7`, and project Python `3.12.16` (with `scripts/multi_gpu_check.py` at `8e8f490` running on
-`python3` `3.10.12` on `PATH`).
+2026-11-23/24 tracked Stage 3 shared-GPU sessions (`82a21ca`, `a20d386`, `866816a`, the detailed primary
+record at `8e8f490`, and the final-tip repeat at `d474f82`, §13, §17.4) used rented Linux x86_64 cloud VMs
+(8 vCPU per the sessions' provisioning records) with one NVIDIA L4 (`23034 MiB`, drivers `595.112.07` and
+`580.178.04`), CUDA runtime `13.2`, NCCL `2.30.7`, and project Python `3.12.16` (with
+`scripts/multi_gpu_check.py` at `8e8f490` and `d474f82` running on `python3` `3.10.12` on `PATH`).
 Linux CPU results in §11, §16, and §17 come from 8-vCPU Linux x86_64 cloud VMs (Ubuntu 22.04, including an
 AMD EPYC 7B12 VM for post-fix runs) with `uv`-managed Python `3.12.16` (`torch 2.15.0+cu132`) and
 `3.10.22` (`torch 2.14.1+cu130`).
@@ -467,25 +467,28 @@ float64-RMSNorm reference of §6.
 | `step_timing.py --device cuda --mode lora_variate --bf16 --compile reduce-overhead` (`b0980cb`) | 5M cov5 18 ms; 28M cov5 43 ms |
 | Real Hub export of `mistralai/Timestral-5M` (`lora_variate`, `bf16`, run at `3fe5bc9`) | Copies verbatim 1,687-byte `Modified MIT License` from Hub; reloads via upstream `load_model(..., strict=True)` on CUDA (`5,208,960` params) |
 
-Phase 5 branch re-runs of `bash scripts/cuda_check.sh` on `2026-11-23` on one NVIDIA L4 (`23034 MiB`,
+Phase 5 branch re-runs of `bash scripts/cuda_check.sh` on `2026-11-23`/`24` on one NVIDIA L4 (`23034 MiB`,
 Linux x86_64, `torch 2.15.0+cu132`, CUDA runtime `13.2`, NCCL `2.30.7`): first at `71514a6` (`40a580a`
 differs in comments only; driver `580.178.04`, `uv`-selected `CPython 3.15.2`, outside the CI matrix of
-Python `3.10–3.13`), and then at `82a21ca` on an 8-vCPU cloud VM (driver `595.112.07`, `Python 3.12.16`,
-closing the Python `3.12` gap on this branch):
+Python `3.10–3.13`), then at `82a21ca` on an 8-vCPU cloud VM (driver `595.112.07`, `Python 3.12.16`, closing
+the Python `3.12` gap on this branch), and finally at `d474f82` (`2026-11-24`, driver `580.178.04`,
+`uv`-managed `Python 3.12.16`, 8 vCPU per the session's provisioning record, including all 105 tests in
+`tests/test_multi_gpu_check.py`):
 
-| Check (one NVIDIA L4, `torch 2.15.0+cu132`) | `71514a6` (driver `580.178.04`, Python `3.15.2`) | `82a21ca` (driver `595.112.07`, Python `3.12.16`) |
-|---|---|---|
-| T14 and all other device-parametrised tests | `266 passed, 3 skipped` (`188.12 s`; 3 Apple GPU tests skipped) | `266 passed, 3 skipped` (`128.61 s`; 3 Apple GPU tests skipped) |
-| Whole suite (`uv run pytest -q`, incl. T1–T14, network tests, and all 142 CPU/`gloo` multi-process items) | `735 passed, 4 skipped` (`603.65 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) | `735 passed, 4 skipped` (`433.05 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) |
-| `head_only` gradients on CUDA against the reference | At most `1.68e-6` (bound `1e-5`) | At most `1.68e-06` (bound `1e-5`) |
-| `device_parity.py --device cuda` (`5M` / `28M`) | `5M` fwd `1.19e-7`–`1.49e-5` (`bf16` `1.49e-2`, `fp16` `1.96e-3`), grad `1.15e-2`; `28M` fwd `1.04e-7`–`2.20e-6` (`bf16` `5.74e-2`, `fp16` `5.92e-3`), grad `2.24e-3` | `5M` fwd `1.08e-07`–`3.19e-05` (`bf16` `1.49e-02`, `fp16` `1.96e-03`), grad `1.15e-02`; `28M` fwd `1.13e-07`–`2.53e-06` (`bf16` `5.74e-02`, `fp16` `5.92e-03`), grad `2.24e-03` |
-| `gradient_accuracy.py --device cuda` (`default` / `math` / `explicit`) | Tiny `1.6e-7`–`3.1e-7`; `5M` `1.7e-3`–`1.2e-2` / `3.6e-6`–`5.4e-5` / `6.0e-6`–`2.5e-5`; `28M` `1.4e-3`–`2.8e-3` / `4.8e-6`–`7.8e-5` / `3.5e-6`–`7.0e-5` | Tiny `1.6e-7`–`3.1e-7`; `5M` `1.7e-3`–`1.2e-2` / `3.6e-6`–`5.4e-5` / `6.0e-6`–`2.5e-5`; `28M` `1.4e-3`–`2.8e-3` / `4.8e-6`–`7.8e-5` / `3.5e-6`–`7.0e-5` |
-| `step_timing.py --device cuda` (`full_ft`, `fp32`, eager, batch 32, ctx 1,024, `cpu threads 8`) | `5M` uni `52 ms` / `0.27 GiB` (`3.7×` vs CPU `190 ms`), cov5 `55 ms` / `1.10 GiB` (`14.3×` vs `786 ms`); `28M` uni `68 ms` / `0.98 GiB` (`9.7×` vs `654 ms`), cov5 `209 ms` / `3.39 GiB` (`14.7×` vs `3,081 ms`) | `5M` uni `34 ms` / `0.27 GiB` (`5.1×` vs CPU `171 ms`), cov5 `51 ms` / `1.10 GiB` (`16.2×` vs `834 ms`); `28M` uni `49 ms` / `0.98 GiB` (`13.8×` vs `678 ms`), cov5 `194 ms` / `3.39 GiB` (`19.2×` vs `3,715 ms`) |
+| Check (one NVIDIA L4, `torch 2.15.0+cu132`) | `71514a6` (driver `580.178.04`, Python `3.15.2`) | `82a21ca` (driver `595.112.07`, Python `3.12.16`) | `d474f82` (driver `580.178.04`, Python `3.12.16`) |
+|---|---|---|---|
+| T14 and all other device-parametrised tests | `266 passed, 3 skipped` (`188.12 s`; 3 Apple GPU tests skipped) | `266 passed, 3 skipped` (`128.61 s`; 3 Apple GPU tests skipped) | `266 passed, 3 skipped` (`173.84 s`; 3 Apple GPU tests skipped) |
+| Whole suite (`uv run pytest -q`, incl. T1–T14, network tests, 142 CPU/`gloo` multi-process items, and at `d474f82` 105 `tests/test_multi_gpu_check.py` items) | `735 passed, 4 skipped` (`603.65 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) | `735 passed, 4 skipped` (`433.05 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped) | `840 passed, 4 skipped` (`419.94 s`; 3 Apple GPU tests + 1 optional `lacuna` skipped; `device tests exit 0, whole suite exit 0`) |
+| `head_only` gradients on CUDA against the reference | At most `1.68e-6` (bound `1e-5`) | At most `1.68e-06` (bound `1e-5`) | At most `1.68e-06` (bound `1e-5`) |
+| `device_parity.py --device cuda` (`5M` / `28M`) | `5M` fwd `1.19e-7`–`1.49e-5` (`bf16` `1.49e-2`, `fp16` `1.96e-3`), grad `1.15e-2`; `28M` fwd `1.04e-7`–`2.20e-6` (`bf16` `5.74e-2`, `fp16` `5.92e-3`), grad `2.24e-3` | `5M` fwd `1.08e-07`–`3.19e-05` (`bf16` `1.49e-02`, `fp16` `1.96e-03`), grad `1.15e-02`; `28M` fwd `1.13e-07`–`2.53e-06` (`bf16` `5.74e-02`, `fp16` `5.92e-03`), grad `2.24e-03` | `5M` fwd `1.19e-07`–`1.49e-05` (`bf16` `1.49e-02`, `fp16` `1.96e-03`), grad `1.15e-02`; `28M` fwd `1.04e-07`–`2.20e-06` (`bf16` `5.74e-02`, `fp16` `5.92e-03`), grad `2.24e-03` |
+| `gradient_accuracy.py --device cuda` (`default` / `math` / `explicit`) | Tiny `1.6e-7`–`3.1e-7`; `5M` `1.7e-3`–`1.2e-2` / `3.6e-6`–`5.4e-5` / `6.0e-6`–`2.5e-5`; `28M` `1.4e-3`–`2.8e-3` / `4.8e-6`–`7.8e-5` / `3.5e-6`–`7.0e-5` | Tiny `1.6e-7`–`3.1e-7`; `5M` `1.7e-3`–`1.2e-2` / `3.6e-6`–`5.4e-5` / `6.0e-6`–`2.5e-5`; `28M` `1.4e-3`–`2.8e-3` / `4.8e-6`–`7.8e-5` / `3.5e-6`–`7.0e-5` | Tiny `1.6e-07`–`3.1e-07`; `5M` `1.7e-03`–`1.2e-02` / `3.6e-06`–`5.4e-05` / `6.0e-06`–`2.5e-05`; `28M` `1.4e-03`–`2.8e-03` / `4.8e-06`–`7.8e-05` / `3.5e-06`–`7.0e-05` |
+| `step_timing.py --device cuda` (`full_ft`, `fp32`, eager, batch 32, ctx 1,024, `cpu threads 8`) | `5M` uni `52 ms` / `0.27 GiB` (`3.7×` vs CPU `190 ms`), cov5 `55 ms` / `1.10 GiB` (`14.3×` vs `786 ms`); `28M` uni `68 ms` / `0.98 GiB` (`9.7×` vs `654 ms`), cov5 `209 ms` / `3.39 GiB` (`14.7×` vs `3,081 ms`) | `5M` uni `34 ms` / `0.27 GiB` (`5.1×` vs CPU `171 ms`), cov5 `51 ms` / `1.10 GiB` (`16.2×` vs `834 ms`); `28M` uni `49 ms` / `0.98 GiB` (`13.8×` vs `678 ms`), cov5 `194 ms` / `3.39 GiB` (`19.2×` vs `3,715 ms`) | `5M` uni `48 ms` / `0.27 GiB` (`4.0×` vs CPU `192 ms`), cov5 `54 ms` / `1.10 GiB` (`14.8×` vs `795 ms`); `28M` uni `68 ms` / `0.98 GiB` (`9.4×` vs `636 ms`), cov5 `200 ms` / `3.39 GiB` (`15.9×` vs `3,187 ms`) |
 
 The earlier `71514a6` one-off CUDA checks (one-process bit-identity vs `57a781c`, single-rank NCCL
 collective-dtype smoke, and 2-/4-rank shared-GPU trainer trial) are kept as history in §11; the tracked
-Stage 3 driver and rank-failure sessions on rented single-L4 VMs (from `82a21ca` through the final-tip
-session at `8e8f490`, plus the `8e8f490` Linux non-network test run) are recorded in §17.4.
+Stage 3 driver and rank-failure sessions on rented single-L4 VMs (from `82a21ca` through the detailed
+primary record at `8e8f490` and the final-tip repeat at `d474f82`, plus the Linux non-network test runs) are
+recorded in §17.4.
 
 The first attempt at this run (at `163ae4a`, one commit earlier) failed
 `test_shape_bucketing_preserves_exact_loss_gradients_and_works_under_reduce_overhead` because
@@ -766,7 +769,7 @@ TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/t
 
 | Suite (macOS arm64, `40a580a`) | PyTorch `2.15.0` (`CPU`/`gloo`, Python `3.12.13`) | PyTorch `2.4.0` (`CPU`/`gloo`, Python `3.12`) |
 |---|---|---|
-| Full network-free suite (`-m "not network"`) | **`511 passed, 15 skipped, 213 deselected`** (`265.63 s`, `0` failed; skips: 1 optional `lacuna`, 14 CUDA `bf16`; superseded at `8e8f490` by `614 passed, 15 skipped, 213 deselected` after adding `tests/test_multi_gpu_check.py`, §17.4) | Not run in full here (four distributed files below) |
+| Full network-free suite (`-m "not network"`) | **`511 passed, 15 skipped, 213 deselected`** (`265.63 s`, `0` failed; skips: 1 optional `lacuna`, 14 CUDA `bf16`; superseded at `d474f82` by `616 passed, 15 skipped, 213 deselected` after adding `tests/test_multi_gpu_check.py`, §17.4) | Not run in full here (four distributed files below) |
 | Acceptance test T15 (`tests/acceptance/test_distributed.py`, cases `(a)–(l)`, 19 test functions / 34 collected items, `N = 2` and `N = 4`, tiny random model) | **`34 passed`** (`0` skipped, `0` failed, within both the `-m "not network"` run above and the `scale=0.1` 4-file run below; includes `test_t15_f_dataloader_workers` at `N = 4`, `test_t15_h_compile_default_smoke`, and `test_t15_l_compile_default_replay_distill_smoke`) | **`33 passed, 1 skipped`** within the 4-file run below (`test_t15_f_dataloader_workers` skipped on macOS PyTorch `< 2.8` per §10; both compiled smoke tests passed) |
 | All four multi-process test files (`tests/test_distributed.py`, `tests/test_trainer_distributed.py`, `tests/test_trainer_distributed_replay.py`, `tests/acceptance/test_distributed.py`; `142` items collected) | **`142 passed`** at default scale (`1.0`, inside `-m "not network"`) and **`142 passed`** at **`TIMESTRAL_TEST_F32_TOL_SCALE=0.1`** (`139.02 s`, `>= 10×` float32 headroom) | **`138 passed, 4 skipped`** (`142.43 s`; all 4 skips are `num_workers > 0` on macOS PyTorch `< 2.8` per §10: 2 in `tests/test_distributed.py`, 1 in `tests/test_trainer_distributed_replay.py`, 1 in `tests/acceptance/test_distributed.py`) |
 
@@ -857,17 +860,19 @@ count while macOS arm64 trajectories do not; on this synthetic workload the prob
 the larger `1.14e-04` one-process thread-count difference that motivated `TRAJ_UPDATE_TOL["float32"] = 1e-3`
 occurred on a T15(j) `lora_variate` distillation scenario (one-off measurement in §11).
 
-### 17.4 Stage 3 measuring driver & rank-failure sessions (`scripts/multi_gpu_check.sh` / `multi_gpu_check.py`, primary record at `8e8f490`)
+### 17.4 Stage 3 measuring driver & rank-failure sessions (`scripts/multi_gpu_check.sh` / `multi_gpu_check.py`, primary record at `8e8f490`, repeated at `d474f82`)
 
 Backs the `[V]` claims in spec §5.6, §7.6, §9, D28, D35, and §12 for the tracked Stage 3 scripts
 (`scripts/probes/distributed_trainer_check.py`, `scripts/probes/distributed_rank_failure_check.py`,
 `scripts/probes/_dist_common.py`, and `scripts/multi_gpu_check.sh` wrapping `scripts/multi_gpu_check.py`).
-**The primary record in this subsection is the final-tip session at commit `8e8f490` (2026-11-24)**, after
-three probe/driver review-fix rounds (`713aaac`–`1963050`) and the rewrite of the session driver into a single
-standard-library-only Python program (`bd24e47`–`8e8f490`; `src/` did not change). Earlier shared-GPU
-sessions (`82a21ca`, `a20d386`, `866816a`) are kept below as history and cross-session reproducibility
-evidence. This is still **one GPU shared by all ranks** (`NCCL_MULTI_RANK_GPU_ENABLE=1`,
-`--device-map shared`), not separate-GPU hardware verification; no Stage 3 roadmap box is ticked.
+**The detailed primary parity record in this subsection is session S4 at commit `8e8f490` (2026-11-24)**,
+after three probe/driver review-fix rounds (`713aaac`–`1963050`) and the rewrite of the session driver into
+a single standard-library-only Python program (`bd24e47`–`8e8f490`; `src/` did not change). A compact
+**final-tip repeat at `d474f82`** (S5, after the pure-BSD `ps` fix `335cf7d` and pre-stage `--log-dir`
+hardening `d474f82`) is recorded below, alongside earlier shared-GPU sessions (`82a21ca`, `a20d386`,
+`866816a`) as history and cross-session reproducibility evidence. This is still **one GPU shared by all
+ranks** (`NCCL_MULTI_RANK_GPU_ENABLE=1`, `--device-map shared`), not separate-GPU hardware verification; no
+Stage 3 roadmap box is ticked.
 
 `scripts/probes/distributed_trainer_check.py` is an ungraded measuring driver (41 scenarios across groups
 `g1`–`g8`; 6 steps default, 10 for `val_restore_early_stop_*`, 4 for `export_multirank_f32`; `B = 2`,
@@ -909,7 +914,7 @@ only). Reproduces and supersedes the earlier `71514a6` one-off shared-GPU NCCL t
   `SKIPPED (gloo backend)`)**; reference archives `25.11 MiB` (34 entries per `N`); **70 executed rows**
   (`35+35`), zero hangs.
 
-**What `--reference-mode auto` and each driver column measure (as built at `8e8f490`):**
+**What `--reference-mode auto` and each driver column measure (as built at `8e8f490` / `d474f82`):**
 
 - *`--reference-mode auto` (default; `auto(f64<=1000000,k=8192)`, schema v5):* stores exact `float64`
   `delta = final - init` (`exact_delta`) for every `float64` scenario with `numel <= 1,000,000` (all 14
@@ -976,7 +981,7 @@ table.
 | **macOS arm64 CPU/`gloo`**, `tiny_random`, `N = 2` (`threads=1`) | `35 / 6` | `param_l2` `1.12e-16`–`1.34e-15` (med `3.61e-16`, exact); `upd_l2` `2.10e-15` / `4.82e-15` / **`1.49e-14`** (`domain_lora_variate_f64`, ~`6,710×` below `1e-10`); `loss_rel` `<= 8.63e-16`; `val_rel` `3.34e-16` | Non-id (18): `param_l2` `6.27e-08`–`7.78e-06` (med `2.66e-07`), `upd_l2` `1.58e-06` / `3.14e-06` / **`1.58e-04`** (`compile_default_lora_replay`; non-compile max `1.53e-05`), `loss_rel` `<= 1.34e-05`, `val_rel` `6.38e-08`–`1.23e-07`. Id-start (2, §17.2): `param_l2` `4.42e-05`–`4.90e-05`, `upd_l2` `1.95e-03`–`2.18e-03` | — |
 | **macOS arm64 CPU/`gloo`**, `tiny_random`, `N = 4` (`threads=1`) | `35 / 6` | `param_l2` `8.36e-17`–`2.07e-15` (med `2.59e-16`, exact); `upd_l2` `1.42e-15` / `5.20e-15` / **`1.38e-14`** (`replay_lora_variate_distill_only_f64`, ~`7,250×` below `1e-10`); `loss_rel` `<= 7.93e-16`; `val_rel` `3.03e-16` | Non-id (18): `param_l2` `5.10e-08`–`8.32e-06` (med `2.84e-07`), `upd_l2` `1.08e-06` / `3.97e-06` / **`1.73e-04`** (`compile_default_lora_replay`; non-compile max `1.19e-05`), `loss_rel` `<= 2.29e-05`, `val_rel` `5.03e-08`–`1.22e-07`. Id-start (2, §17.2): `param_l2` `4.39e-05`–`6.02e-05`, `upd_l2` `1.89e-03`–`2.60e-03` | — |
 
-**Worst multi-process vs one-process differences across all 316 L4 rows (S4, `8e8f490`; identical printed worst-case `param_l2`, `upd_l2`, and `loss_rel` in S2 `a20d386` and S3 `866816a`):**
+**Worst multi-process vs one-process differences across all 316 L4 rows (S4, `8e8f490`; identical printed worst-case `param_l2`, `upd_l2`, and `loss_rel` across S2 `a20d386`, S3 `866816a`, S4 `8e8f490`, and S5 `d474f82`):**
 
 | Dtype tier | Max `param_l2` (row) | Max `upd_l2` (row) | Max `loss_rel` (row) |
 |---|---|---|---|
@@ -1033,53 +1038,82 @@ and CUDA/NCCL (`10_rank_failure_nccl_n*`):
 | **macOS arm64 CPU/`gloo`**, `N = 2` | `10.0 s` / `90.0 s` / `60.0 s` | `exit:1` (`0.04 s`) | Rank 0 `exit:2`; raises Python `builtins.RuntimeError` (Gloo `recv` timeout `10000ms`); normal `except`/`finally` unwinds | `10.01 s` / `10.27 s` | `PASS (no hang)` (`parent_killed=none`) |
 | **macOS arm64 CPU/`gloo`**, `N = 4` | `10.0 s` / `90.0 s` / `60.0 s` | `exit:1` (`0.06 s`) | Ranks 0, 2, 3 all `exit:2`; raise Python `builtins.RuntimeError` (Gloo `recv`/`send` timeout `10000ms`) | `10.01 s` / `10.38–10.44 s` | `PASS (no hang)` (`parent_killed=none`) |
 
-#### Session-driver behaviour & suite checks (`scripts/multi_gpu_check.py`, commit `8e8f490`)
+#### Session-driver behaviour & suite checks (`scripts/multi_gpu_check.py`, commits `8e8f490` and `d474f82`)
 
-| Check (`8e8f490`) | Platform & scope | Observed |
+| Check | Platform & scope | Observed |
 |---|---|---|
-| Resume (identical command on finished log dir) | L4 Linux (`mgc_logs`) & macOS arm64 (`gloo`) | L4: exit `0`, `17 of 17` runnable stages `0 (resumed)`. macOS: exit `0` in `1 s`, `7 of 7` runnable stages `0 (resumed)`. Nothing re-executed |
-| Default-disposition `SIGINT` / `SIGTERM` / `SIGHUP` sent to session process group mid-stage | L4 Linux (`04_nccl_tiny_n2`, `--ranks 2 --sizes ""`, all 41 tiny scenarios / 7 runnable stages) & macOS arm64 (`04_gloo_tiny_n2`, `--ranks 2 --pg-timeout 10 --only domain_head_only_f32`, 1 scenario / 4 runnable stages per session harness) | L4: exit `130` / `143` / `129` in `1.2 s` / `1.2 s` / `1.0 s` (signalled `4` PIDs per stage); summary records `<code> (interrupted:SIG...)` and `"Session interrupted by SIG... (exit <code>); remaining stages were not started."`; `0` leftover and `0` GPU compute processes. macOS: exit `130` / `143` / `129` in `0.4–0.5 s` (signalled `4` PIDs), `0` leftover |
-| Ignored-on-entry signals (as under `nohup`) sent at the same moment | L4 Linux (`SIGHUP`, `SIGINT` mid-`04_nccl_tiny_n2`, all 41 tiny scenarios / 7 runnable stages) & macOS arm64 (`SIGHUP`, `SIGINT`, `SIGTERM` mid-`04_gloo_tiny_n2`, `--only domain_head_only_f32` / 4 runnable stages per session harness) | L4: session unaffected; all `7` runnable stages exited `0`, session exit `0` (`after_signal` `194.1 s` / `228.1 s`, `0` leftover / `0` GPU processes). macOS (single-scenario run): all three completed with exit `0` (`12.8–13.5 s`), `0` leftover |
-| Reference-stage interrupt (`SIGINT` default mid-`03_ref_nccl_tiny_n2`) | L4 Linux (ranks 2 tiny) | Exit `130` in `0.3 s` (signalled `2` PIDs); only `01_env.done` remains; `refs/` empty (`[]`); `0` leftover and `0` GPU processes |
-| Stage timeout (`--stage-timeout 20`, ranks 2 tiny) | L4 Linux | `01_env` `0`, `02_prototype_parity_cuda` `SKIPPED (shared GPU)`, `03_ref_nccl_tiny_n2` `124` (signalled `2` PIDs), `04_nccl_tiny_n2` `SKIPPED (ref failed)`, `07_ref_gloo_tiny_n2` `124` (`2` PIDs), `08_gloo_tiny_n2` `SKIPPED (ref failed)`, `09_rank_failure_gloo_n2` `0`, `10_rank_failure_nccl_n2` `124` (`4` PIDs); session exit `1`; `0` leftover, `0` GPU processes, `0` files left in `refs/` |
-| Tree without `.git` (exported via `git archive HEAD \| tar -x` per session harness, `--backend gloo --ranks 2 --only domain_head_only_f32`) | L4 Linux | Fresh: exit `0`, `tree_state_method=content_hash` (`c0f97d37748a`). Resume: exit `0`, `4 of 4` runnable stages resumed. After appending `# touched` to `scripts/probes/_dist_common.py` (per session harness): `tree_state_sig` changed to `5e1e553b7cb5`, exit `0`, `0` resumed (all `4` re-ran) |
-| Relative `--log-dir` path hygiene | L4 Linux (`--log-dir mgc_logs`) & macOS arm64 (single-scenario default-dir run `--ranks 2 --pg-timeout 5 --only domain_head_only_f32` per session harness) | L4: zero home-path hits in `.done` markers or `summary.txt`; the session harness's first-3-lines check over stage logs reported `2` hits, both Python-emitted Triton `UserWarning` lines inside `.venv/` in `10_rank_failure_nccl_n{2,4}.log` (not stage arguments), and full stage logs also contain Python-emitted paths from `.venv/`, the `uv`-managed interpreter, and repository `src/`/`scripts/` frames in `faulthandler` output on NCCL `SIGABRT`. macOS: zero home/user hits in `multi_gpu_check_logs` and its session output for that default-dir run (other macOS gate logs contain Python traceback `.venv/` paths on interrupted stages and PyTorch compiled build paths in `09_rank_failure_gloo_n*.log`) |
-| Test suite & driver unit tests on macOS arm64 | macOS arm64, Python `3.12.13`, `torch 2.15.0` | `-m "not network"`: **`614 passed, 15 skipped, 213 deselected`** (`211.39 s`; skips: 1 `lacuna`, 14 CUDA `bf16`); `tests/test_multi_gpu_check.py`: **`103 passed`** across 3 consecutive standalone runs (`88.21 s`, `85.70 s`, `85.68 s`, `0` leftover) |
-| Test suite & driver unit tests on Linux L4 VM (**not green — 1 failure open**) | Linux x86_64 L4 VM, CUDA visible, Python `3.12.16` (plus driver tests on Python `3.10`) | `-m "not network"` (Python `3.12.16`): **`625 passed, 3 skipped, 1 failed, 213 deselected`** (`745.23 s`). `tests/test_multi_gpu_check.py`: **`102 passed, 1 failed`** across three Python `3.12` runs (`67.95 s`, `76.38 s`, `76.40 s`) and one Python `3.10` run (`78.66 s`). The single failure (`test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order`) mocks `/proc` empty to exercise the `ps`-based scan fallback, which returned no hits on that Linux host; the real `/proc` scan path (used by all live Linux runs above) passed. Fix pending |
+| Resume (identical command on finished log dir) | L4 Linux (`mgc_logs`) & macOS arm64 (`gloo`) at `8e8f490` and `d474f82` | L4: exit `0`, `17 of 17` runnable stages `0 (resumed)` at both `8e8f490` and `d474f82`. macOS: exit `0` in `1 s`, `7 of 7` runnable stages `0 (resumed)` at both commits. Nothing re-executed |
+| Default-disposition `SIGINT` / `SIGTERM` / `SIGHUP` sent to session process group mid-stage | L4 Linux (`04_nccl_tiny_n2`, `--ranks 2 --sizes ""`, all 41 tiny scenarios / 7 runnable stages) & macOS arm64 (`04_gloo_tiny_n2`, `--ranks 2 --pg-timeout 10 --only domain_head_only_f32`, 1 scenario / 4 runnable stages per session harness) | `8e8f490` L4: exit `130` / `143` / `129` in `1.2 s` / `1.2 s` / `1.0 s` (signalled `4` PIDs per stage); summary records `<code> (interrupted:SIG...)` and `"Session interrupted by SIG... (exit <code>); remaining stages were not started."`; `0` leftover and `0` GPU compute processes (`d474f82` L4 `SIGINT`: exit `130` in `0.6 s`, `0` leftover/GPU procs). macOS: exit `130` / `143` / `129` in `0.4–0.5 s` (`8e8f490`) and `0.4 s` (`d474f82`), `0` leftover |
+| Ignored-on-entry signals (as under `nohup`) sent at the same moment | L4 Linux (`SIGHUP`, `SIGINT` mid-`04_nccl_tiny_n2`, all 41 tiny scenarios / 7 runnable stages) & macOS arm64 (`SIGHUP`, `SIGINT`, `SIGTERM` mid-`04_gloo_tiny_n2`, `--only domain_head_only_f32` / 4 runnable stages per session harness) | `8e8f490` L4 (`SIGHUP`, `SIGINT`): session unaffected; all `7` runnable stages exited `0`, session exit `0` (`after_signal` `194.1 s` / `228.1 s`, `0` leftover / `0` GPU processes); `d474f82` L4 (`SIGHUP`): all `7` runnable stages exited `0` (`after_signal` `180.2 s`, `0` leftover/GPU procs). macOS (single-scenario run): all three completed with exit `0` (`12.8–13.5 s` at `8e8f490`, `12.8–12.9 s` at `d474f82`), `0` leftover |
+| Reference-stage interrupt (`SIGINT` default mid-`03_ref_nccl_tiny_n2`, `8e8f490`) | L4 Linux (ranks 2 tiny) | Exit `130` in `0.3 s` (signalled `2` PIDs); only `01_env.done` remains; `refs/` empty (`[]`); `0` leftover and `0` GPU processes |
+| Stage timeout (`--stage-timeout 20`, ranks 2 tiny) | L4 Linux (`8e8f490` and `d474f82`) | `01_env` `0`, `02_prototype_parity_cuda` `SKIPPED (shared GPU)`, `03_ref_nccl_tiny_n2` `124` (signalled `2` PIDs), `04_nccl_tiny_n2` `SKIPPED (ref failed)`, `07_ref_gloo_tiny_n2` `124` (`2` PIDs), `08_gloo_tiny_n2` `SKIPPED (ref failed)`, `09_rank_failure_gloo_n2` `0`, `10_rank_failure_nccl_n2` `124` (`4` PIDs); session exit `1`; `0` leftover, `0` GPU processes, `0` files left in `refs/` (identical stage outcomes and PID counts at `8e8f490` and `d474f82`) |
+| Tree without `.git` (exported via `git archive HEAD \| tar -x` per session harness, `--backend gloo --ranks 2 --only domain_head_only_f32`, `8e8f490`) | L4 Linux | Fresh: exit `0`, `tree_state_method=content_hash` (`c0f97d37748a`). Resume: exit `0`, `4 of 4` runnable stages resumed. After appending `# touched` to `scripts/probes/_dist_common.py` (per session harness): `tree_state_sig` changed to `5e1e553b7cb5`, exit `0`, `0` resumed (all `4` re-ran) |
+| Unusable `--log-dir` (`d474f82`: read-only parent dir and regular file at `--log-dir`) | L4 Linux (`--backend gloo --ranks 2`) & macOS arm64 | L4: both cases exited `2` with `1` `error:` line naming the supplied path and `0` tracebacks (`Permission denied` / `File exists`), before any stage started. macOS: both `ro_p/logs` (`Permission denied`) and `not_a_dir` (`File exists`) exited `2` with `1` `error:` line and no traceback |
+| Relative `--log-dir` path hygiene | L4 Linux (`--log-dir mgc_logs`) & macOS arm64 (single-scenario default-dir run `--ranks 2 --pg-timeout 5 --only domain_head_only_f32` per session harness) | L4: zero home-path hits in `.done` markers or `summary.txt` at both `8e8f490` and `d474f82`; at `8e8f490`, the session harness's first-3-lines check over stage logs reported `2` hits, both Python-emitted Triton `UserWarning` lines inside `.venv/` in `10_rank_failure_nccl_n{2,4}.log` (not stage arguments), and full stage logs also contain Python-emitted paths from `.venv/`, the `uv`-managed interpreter, and repository `src/`/`scripts/` frames in `faulthandler` output on NCCL `SIGABRT`. macOS: zero home/user hits in `multi_gpu_check_logs` and its session output for that default-dir run at both `8e8f490` and `d474f82` (other macOS gate logs contain Python traceback `.venv/` paths on interrupted stages and PyTorch compiled build paths in `09_rank_failure_gloo_n*.log`) |
+| Test suite & driver unit tests on macOS arm64 | macOS arm64, Python `3.12.13`, `torch 2.15.0` | **`d474f82` (current):** `-m "not network"` **`616 passed, 15 skipped, 213 deselected`** (`212.76 s`; includes all `105` tests in `tests/test_multi_gpu_check.py`; skips: 1 `lacuna`, 14 CUDA `bf16`; `0` leftover). Earlier `8e8f490`: `-m "not network"` `614 passed, 15 skipped, 213 deselected` (`211.39 s`) and `tests/test_multi_gpu_check.py` `103 passed` across 3 consecutive standalone runs (`88.21 s`, `85.70 s`, `85.68 s`, `0` leftover) |
+| Test suite & driver unit tests on Linux L4 VM (**failed at `8e8f490` → fixed in `335cf7d` → green at `d474f82`**) | Linux x86_64 L4 VM, CUDA visible, Python `3.12.16` (plus driver tests on Python `3.10`; `ps from procps-ng 3.3.17`) | **At `8e8f490`:** `-m "not network"` (Python `3.12.16`) was `625 passed, 3 skipped, 1 failed, 213 deselected` (`745.23 s`) and `tests/test_multi_gpu_check.py` was `102 passed, 1 failed` (×3 on Python `3.12` [`67.95–76.40 s`], ×1 on Python `3.10` [`78.66 s`]); the failure (`test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order`) caught a real defect where the `ps` fallback mixed BSD `eww` with `-axo`, which Linux `procps-ng` rejects with exit `1` (live Linux `/proc` scans were unaffected). **Fixed in `335cf7d`** (pure BSD `axewwo`/`axo`) and **green at `d474f82`:** `tests/test_multi_gpu_check.py` **`105 passed`** across 3 consecutive Python `3.12` runs (`68.29 s`, `67.94 s`, `67.78 s`, `0` leftover) and 1 isolated Python `3.10` run (`67.93 s`); `-m "not network"` (Python `3.12.16`) **`628 passed, 3 skipped, 213 deselected`** (`620.00 s`; skips: 1 `lacuna`, 2 Apple GPU; `0` failed, `0` leftover/GPU procs); full `scripts/cuda_check.sh` **`840 passed, 4 skipped`** (§13) |
 
-#### Cross-session reproducibility and earlier shared-GPU sessions (`82a21ca`, `a20d386`, `866816a`)
+#### Repeat at the final tip (`d474f82`, S5) and cross-session history (`82a21ca`, `a20d386`, `866816a`, `8e8f490`)
 
-Four shared-GPU NVIDIA L4 sessions (`23034 MiB`, Linux x86_64; 8 vCPU per the sessions' provisioning records;
+Five shared-GPU NVIDIA L4 sessions (`23034 MiB`, Linux x86_64; 8 vCPU per the sessions' provisioning records;
 project Python `3.12.16`, `torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`, `--shared-gpu --python 3.12`) ran
 across the review-fix and driver-rewrite stretch:
 
 | Session & commit | Driver | Reference mode | Stages / wall time | Notes |
 |---|---|---|---|---|
-| S1 (`82a21ca`, 2026-11-23) | `595.112.07` | `sketch` (`k=8,192`) | 15 of 15 runnable stages exited `0` (16 listed, `02_prototype_parity_cuda` skipped); no Linux `gloo` rank-failure stage yet | First tracked session; also ran `cuda_check.sh` on Python `3.12.16` (§13) and the `exact` vs `sketch` comparison below. Review findings prompted S2–S4 |
-| S2 (`a20d386`, 2026-11-23) | `595.112.07` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `30 min 05 s` | Post-round-1 fixes (buffers, `auto` mode, schema v4, split rank-failure stages) on a different host from S3/S4 per the provisioning record; `316/316` `xr_eq=yes` |
+| S1 (`82a21ca`, 2026-11-23) | `595.112.07` | `sketch` (`k=8,192`) | 15 of 15 runnable stages exited `0` (16 listed, `02_prototype_parity_cuda` skipped); no Linux `gloo` rank-failure stage yet | First tracked session; also ran `cuda_check.sh` on Python `3.12.16` (§13) and the `exact` vs `sketch` comparison below. Review findings prompted S2–S5 |
+| S2 (`a20d386`, 2026-11-23) | `595.112.07` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `30 min 05 s` | Post-round-1 fixes (buffers, `auto` mode, schema v4, split rank-failure stages) on a different host from S3–S5 per the provisioning record; `316/316` `xr_eq=yes` |
 | S3 (`866816a`, 2026-11-23) | `580.178.04` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `42 min 22 s` | Post-round-2 fixes; `316/316` `xr_eq=yes`, plus resume (`17 of 17`), `--stage-timeout 20` (`0` leftover/GPU procs), and a `SIGINT` check. Per the S3 session harness, that interrupt check launched as a background job of a non-interactive shell with `SIGINT` ignored on entry, and the `866816a` embedded runner overrode the ignore and exited `130`—a defect removed in `4682669`—so the default-disposition Linux interrupt path was first exercised in S4 |
-| S4 (`8e8f490`, 2026-11-24) | `580.178.04` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `47 min 51 s` | Final-tip primary record above on the same machine type as S3 (a different VM instance per the provisioning record): Python `multi_gpu_check.py` driver, schema v5, `1e-6` f64 reload tol, full signal/timeout/no-git/hygiene checks |
+| S4 (`8e8f490`, 2026-11-24) | `580.178.04` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `47 min 51 s` | Detailed primary parity record above on the same machine type as S3 (a different VM instance per the provisioning record): Python `multi_gpu_check.py` driver, schema v5, `1e-6` f64 reload tol, full signal/timeout/no-git/hygiene checks; 1 Linux `ps`-fallback unit test failed (fixed in `335cf7d`) |
+| S5 (`d474f82`, 2026-11-24) | `580.178.04` | `auto` | 17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped); `42 min 15 s` | Final-tip repeat on the same machine type and image as S3/S4 (another VM instance per the provisioning record; `python3` `3.10.12` on `PATH`, `ps from procps-ng 3.3.17`, `tree_state_method=git` `8a13c6c4c86d`): `316/316` `xr_eq=yes`, resume (`17 of 17`), `SIGINT`/`SIGHUP` gates, `--stage-timeout 20`, unusable-`--log-dir` checks, green Linux driver & non-network tests, and green `cuda_check.sh` (§13) |
 
-**Observed cross-session reproducibility and variation (S2–S4, reported as observations without claiming
+**Compact repeat summary at `d474f82` (S5 on one NVIDIA L4 + macOS arm64):**
+
+- *L4 S5 parity vs S4 (`8e8f490`):* all `316` rows (`246` NCCL + `70` Linux `gloo`) reported `xr_eq=yes,
+  xr_max=0.00e+00` and `0` flags, and overall per-tier worst cases across all `316` rows matched S4. Row by
+  row against S4 across all 8 parity columns (`steps`, `skip`, `xr_eq`, `xr_max`, `param_l2`, `upd_l2`,
+  `loss_rel`, `val_rel`): every non-compiled NCCL row (`234/234`) and every Linux CPU/`gloo` row (`70/70`,
+  including compiled CPU/`gloo`) matched S4 identically, and all `316` rows matched S4 in `vram_mib`; all
+  **12 of 12** compiled NCCL rows differed from S4 in at least one parity column (`28M` `N = 4`
+  `compile_default_lora_replay` differed in `param_l2` `9.46e-05` vs `9.44e-05` while printing the same
+  `upd_l2` `1.81e-02`).
+- *L4 S5 rank-failure stages:* Linux `gloo` survivors raised `builtins.RuntimeError` (`Connection
+  reset/closed by peer`) in `exc_s` `0.05 s` / `exit_s` `0.80 s` (`N = 2`) and `0.06–0.85 s` / `0.88–1.68 s`
+  (`N = 4`); shared-L4 NCCL survivors aborted via `SIGABRT` at `36.30 s` (`N = 2`, watchdog `20988 ms` +
+  `15000 ms`) and `35.42–35.52 s` (`N = 4`, watchdog `20072–20130 ms` + `15000 ms`) with no Python exception;
+  all `PASS (no hang)`, `parent_killed=none`.
+- *macOS arm64 repeat at `d474f82`:* `--backend gloo --ranks 2 4 --pg-timeout 10` finished in `155 s` (`7 of
+  7` runnable stages exited `0`, 8 listed), all `70` rows matched `8e8f490` across all 8 parity columns (`0`
+  diffs), `gloo` rank-failure survivors raised `builtins.RuntimeError` at `10.01 s` (`exit_s` `10.24–10.44 s`),
+  and resume/signal/path/unusable-`--log-dir`/pytest gates all passed (table above).
+
+**Observed cross-session reproducibility and variation (S2–S5, reported as observations without claiming
 unverified causes):**
 
 - *Worst-case parity identical across sessions:* S2 (`a20d386`, driver `595.112.07`), S3 (`866816a`, driver
-  `580.178.04`), and S4 (`8e8f490`, driver `580.178.04`) produced the exact same printed worst-case `param_l2`,
-  `upd_l2`, and `loss_rel` in every dtype tier (`float64`, `float32`, `bf16`).
-- *Same machine type, different VM instance (S3 vs S4, per the provisioning record; same driver `580.178.04`):*
-  every non-compiled NCCL row and every Linux CPU/`gloo` row (including compiled CPU/`gloo` rows) was
-  identical in the printed parity columns (`steps`, `skip`, `xr_eq`, `xr_max`, `param_l2`, `upd_l2`,
+  `580.178.04`), S4 (`8e8f490`, driver `580.178.04`), and S5 (`d474f82`, driver `580.178.04`) produced the
+  exact same printed worst-case `param_l2`, `upd_l2`, and `loss_rel` across all 316 L4 rows in every dtype
+  tier (`float64`, `float32`, `bf16`).
+- *Same machine type, different VM instances (S3 vs S4 vs S5, per the provisioning records; same driver
+  `580.178.04`):* every non-compiled NCCL row and every Linux CPU/`gloo` row (including compiled CPU/`gloo`
+  rows) was identical in the printed parity columns (`steps`, `skip`, `xr_eq`, `xr_max`, `param_l2`, `upd_l2`,
   `loss_rel`, `val_rel`) and `vram_mib` (timing columns and `val_s` varied between sessions); **only compiled
-  NCCL rows varied** (`compile_default_lora_variate` and `compile_default_lora_replay` differed in 10 of 12
-  model×rank entries across `tiny`/`5M`/`28M` × `N = 2, 4`, while `5M` `N = 2` happened to match in both).
-- *Compiled rows on CUDA vary run-to-run (cause uninvestigated):* across S2, S3, and S4, `compile_default_*`
-  NCCL rows varied on both tiny and released weights—for example, released `28M` `N = 2`
-  `compile_default_lora_variate` `upd_l2` measured `7.83e-04` (S2), `5.09e-04` (S3), and `2.25e-03` (S4),
-  while `28M` `N = 4` recurred at `2.24e-04` in S2 and S4 versus `1.45e-04` in S3. Graph counts
-  (`s1:1->end:2` / `s1:3->end:5`) and bitwise cross-rank equality (`xr_eq=yes, xr_max=0.00e+00`) held in
-  every run. The compiled `float32` distance from its one-process compiled reference is not reproducible
-  run-to-run on CUDA (spec §12).
-- *CPU-dependent rows vary across hosts (S2 vs S3/S4):* against S2 (a different host per the provisioning
+  NCCL rows varied** (10 of 12 model×rank entries differed between S3 and S4, while `5M` `N = 2` matched; all
+  12 of 12 differed between S4 and S5).
+- *Compiled rows on CUDA vary run-to-run (4-session sample S2–S5; cause uninvestigated):* across S2, S3, S4,
+  and S5, `compile_default_*` NCCL rows varied on both tiny and released weights—for example:
+  - `28M` `N = 2` `compile_default_lora_variate` `upd_l2`: `7.83e-04` (S2), `5.09e-04` (S3), `2.25e-03` (S4),
+    `5.09e-04` (S5);
+  - `28M` `N = 2` `compile_default_lora_replay` `upd_l2`: `1.39e-02` (S2), `1.44e-02` (S3), `1.25e-02` (S4),
+    `1.44e-02` (S5);
+  - `28M` `N = 4` `compile_default_lora_variate` `upd_l2`: `2.24e-04` (S2), `1.45e-04` (S3), `2.24e-04` (S4),
+    `1.45e-04` (S5);
+  - `tiny_random` `N = 4` `compile_default_lora_replay` `upd_l2`: `9.99e-05` (S2), `8.14e-05` (S3), `7.52e-05`
+    (S4), `1.34e-04` (S5).
+  Graph counts (`s1:1->end:2` / `s1:3->end:5`) and bitwise cross-rank equality (`xr_eq=yes, xr_max=0.00e+00`)
+  held in every run. The compiled `float32` distance from its one-process compiled reference is not
+  reproducible run-to-run on CUDA (spec §12).
+- *CPU-dependent rows vary across hosts (S2 vs S3–S5):* against S2 (a different host per the provisioning
   record, driver `595.112.07`; CPU models were not recorded), all 34 compared Linux CPU/`gloo` rows at each
   `N` and all 12 `*_moved_f32` NCCL rows (whose deterministic warm-up runs on CPU) differed in their printed
   values—by up to **12×** on CPU/`gloo` (`08_gloo_tiny_n2` `domain_head_only_f32` `param_l2` `5.97e-07` vs
@@ -1087,18 +1121,17 @@ unverified causes):**
   `0.00e+00` and `1.15e-16` vs `0.00e+00`) and up to **4.1×** on NCCL `*_moved_f32` (`28M` `N = 4`
   `replay_full_ft_distill_only_moved_f32` `loss_rel` `2.06e-05` vs `8.54e-05`; `upd_l2` up to `2.37×` on
   `tiny_random` `N = 4` `3.03e-05` vs `1.28e-05`, and `1.63×` on `5M` `N = 4` `2.35e-02` vs `1.44e-02`)—while
-  all other non-compiled NCCL rows matched in their printed parity columns and `vram_mib` across S2, S3, and
-  S4.
+  all other non-compiled NCCL rows matched in their printed parity columns and `vram_mib` across S2–S5.
 
 *Historical `exact` vs `sketch` comparison (`82a21ca`, L4 shared NCCL `N = 2`, `k = 8,192`; not re-run at
-`8e8f490`):* ten entries across `tiny_random` and `5M` gave `ref_exact.zip` `114,469,429` bytes
+`8e8f490` or `d474f82`):* ten entries across `tiny_random` and `5M` gave `ref_exact.zip` `114,469,429` bytes
 (`109.17 MiB`) vs `ref_sketch.zip` `674,359` bytes (`0.64 MiB`, ~`170×` smaller), `0.00%` `loss_rel` diff
 on all 10 entries, and `0.00%`–`1.60%` max relative diff in `param_l2`/`upd_l2` (`5M` `domain_lora_temporal_f32`
 `param_l2` `5.61e-04` exact vs `5.58e-04` sketch, `upd_l2` `1.04e-01` both; `5M` `bf16_full_ft_replay`
 `upd_l2` `3.51e-01` exact vs `3.48e-01` sketch, `loss_rel` `1.27e-01` both; `tiny` `lora_temporal` `0.00%`
 because `numel = 8,192 <= SKETCH_DIM` stores `exact_delta`).
 
-#### Resolution of the `82a21ca` tooling limitations and remaining limitations at `8e8f490`
+#### Resolution of the `82a21ca` tooling limitations and remaining limitations at `d474f82`
 
 Status of the six limitations previously recorded at `82a21ca`:
 
@@ -1110,7 +1143,7 @@ Status of the six limitations previously recorded at `82a21ca`:
    `numel <= 1,000,000` (100% of `tiny_random` `float64` rows, all `5M` LoRA + `head_only`, and all `28M`
    LoRA). Larger vectors still using CountSketch (`k = 8,192`) emit `sketch_bound(...)` within `10×` of
    `floor_rel` and `sketch_underflow(sha_differs)` on hash mismatch with zero sketch diff (`0` flags fired in
-   S2–S4).
+   S2–S5).
 3. *Timing columns (`step_ms`, `wall_s`)* → **Resolved (`fd24a2a`, `9ab347d`)**: `wall_s` starts after a
    1-scalar `all_reduce` barrier + CUDA sync; `step_ms` measures symmetric full per-step wall time on steps
    `3..K` minus `evaluate_val()` + `on_evaluate()`, and `val_s` is reported separately in `notes`.
@@ -1120,20 +1153,20 @@ Status of the six limitations previously recorded at `82a21ca`:
    zip CRCs, member byte sizes, base model digests (parameters + buffers), `frozen_base_sha256`, per-scenario
    resolved config + `moved_student` warmup digests, dataset fingerprints, `torch`/`CUDA`/`git_head`, and
    `script_sha256` covering `distributed_trainer_check.py`, `_dist_common.py`, and `_common.py`.
-6. *Session script timeout, signals, and resume* → **Resolved (`a20d386`–`8e8f490`)**: replaced by the single
+6. *Session script timeout, signals, and resume* → **Resolved (`a20d386`–`d474f82`)**: replaced by the single
    stdlib-only `scripts/multi_gpu_check.py` behind `scripts/multi_gpu_check.sh`, with content-addressed resume
-   markers (`git` or `content_hash`), confirmed-live `/proc`/`ps` token-tagged process-tree teardown, partial
-   archive cleanup, preserved ignored-on-entry signals (`nohup`), `2 s` post-exit pipe-drain grace, relative
-   `--log-dir` hygiene, and broken-stdio exit-code preservation.
+   markers (`git` or `content_hash`), confirmed-live `/proc` + pure-BSD `ps` (`335cf7d`) token-tagged
+   process-tree teardown, partial archive cleanup, preserved ignored-on-entry signals (`nohup`), `2 s`
+   post-exit pipe-drain grace, relative `--log-dir` hygiene, pre-stage `--log-dir` writability checks and
+   clean `OSError` reporting (`d474f82`), and broken-stdio exit-code preservation.
 
-**Remaining tooling limitations at `8e8f490`:**
+**Remaining tooling limitations at `d474f82`:**
 
 - *Process-escape edge case:* as documented in `scripts/multi_gpu_check.py`, a descendant that strips
   `_TIMESTRAL_STAGE_TOKEN` from its environment and outlives its parent (being reparented outside the tracked
-  PPID tree), or runs on a system with neither `/proc` nor `ps`, can escape tree termination (neither
-  `torchrun` nor PyTorch `DataLoader` workers do this).
-- *Linux `ps`-fallback unit-test failure (open):* `tests/test_multi_gpu_check.py::test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order`
-  fails on Linux when `/proc` is mocked empty (see table above); live Linux runs use `/proc` directly.
+  PPID tree), or runs on a system where neither `/proc` nor `ps` can inspect processes (note that on Linux
+  `procps-ng` `ps` itself reads `/proc`, so an OS-level unmounted or inaccessible `/proc` cannot be worked
+  around via `ps`), can escape tree termination (neither `torchrun` nor PyTorch `DataLoader` workers do this).
 - *Non-reproducible compiled CUDA parity:* `compile_default_*` rows on CUDA vary run-to-run against their
   one-process compiled reference across sessions (cause uninvestigated).
 - *Float64 export-reload precision:* `distributed_trainer_check.py` uses `1e-6` rather than float64
@@ -1153,15 +1186,16 @@ and 1/2/4-GPU throughput, VRAM, and scaling measurements.
 
 **Not verified anywhere (Stage 3, spec §10 & §12):** Stages 1–2 multi-process training is verified on
 CPU/`gloo` on macOS arm64 and Linux x86_64 (§17.1), `scripts/cuda_check.sh` passed on one NVIDIA L4 with
-Python `3.12.16` at `82a21ca` (§13), and the hardened Stage 3 driver and rank-failure probes ran at `8e8f490`
-under `torchrun` with `N = 2` and `N = 4` NCCL ranks sharing one NVIDIA L4 (plus Linux and macOS CPU/`gloo`
-sessions, §17.4). Still unverified: T15 on NCCL (requires adding a backend and per-rank device switch to
-`tests/distributed_harness.py`, which currently restricts to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`), ranks
-on separate GPUs and real multi-GPU `torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests
-only), `scripts/probes/distributed_parity.py --device cuda` on 4 separate GPUs, cross-GPU NCCL reduction
-determinism, separate-GPU NCCL rank-failure behaviour, `bf16` parity tiers and the cause of the large
-released-checkpoint `bf16` differences and compiled CUDA run-to-run variation in §17.4, multi-GPU
-throughput/VRAM/scaling (including per-parameter pack/unpack, 3–4 collectives per step, flat gradient buffer
-live through validation, and per-rank `_frozen_base` VRAM in `full_ft` distillation), released-weights T15
-bounds (with or without replay, including cosine similarity), live concurrent `huggingface_hub==0.23.0`
-downloads (source reading only, §12), and `F.linear` `requires_grad` dispatch on GPUs/CUDA.
+Python `3.12.16` at `d474f82` (§13), and the hardened Stage 3 driver and rank-failure probes ran at `8e8f490`
+and `d474f82` under `torchrun` with `N = 2` and `N = 4` NCCL ranks sharing one NVIDIA L4 (plus Linux and
+macOS CPU/`gloo` sessions and green Linux/macOS test suites at `d474f82`, §17.4). Still unverified: T15 on
+NCCL (requires adding a backend and per-rank device switch to `tests/distributed_harness.py`, which currently
+restricts to CPU/`gloo` via `_ALLOWED_CPU_BACKENDS`), ranks on separate GPUs and real multi-GPU
+`torch.cuda.set_device` / `LOCAL_RANK` binding (monkeypatched unit tests only),
+`scripts/probes/distributed_parity.py --device cuda` on 4 separate GPUs, cross-GPU NCCL reduction determinism,
+separate-GPU NCCL rank-failure behaviour, `bf16` parity tiers and the cause of the large released-checkpoint
+`bf16` differences and compiled CUDA run-to-run variation in §17.4, multi-GPU throughput/VRAM/scaling
+(including per-parameter pack/unpack, 3–4 collectives per step, flat gradient buffer live through validation,
+and per-rank `_frozen_base` VRAM in `full_ft` distillation), released-weights T15 bounds (with or without
+replay, including cosine similarity), live concurrent `huggingface_hub==0.23.0` downloads (source reading
+only, §12), and `F.linear` `requires_grad` dispatch on GPUs/CUDA.
