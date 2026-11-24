@@ -7,12 +7,39 @@ roadmap's exit criteria ask for).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
 from timestral_tune.models import TuneTimestralForecaster, load_forecaster, mps_is_usable
 
+from .distributed_harness import (
+    DIST_BACKEND_ENV,
+    DIST_DEVICE_MAP_ENV,
+    dist_backend,
+    dist_device_map,
+    is_cuda_backend,
+)
 from .helpers import RawSeries, make_raw, make_tiny_forecaster
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Fail fast on invalid opt-in distributed test environment variables (no-op when unset)."""
+    del config
+    if DIST_BACKEND_ENV not in os.environ and DIST_DEVICE_MAP_ENV not in os.environ:
+        return
+    try:
+        backend = dist_backend()
+        device_map = dist_device_map(backend=backend)
+        if is_cuda_backend(backend) and device_map == "shared" and os.environ.get("NCCL_MULTI_RANK_GPU_ENABLE") != "1":
+            raise ValueError(
+                f"{DIST_DEVICE_MAP_ENV}='shared' requires NCCL_MULTI_RANK_GPU_ENABLE=1 "
+                "(development-only single-GPU mode; distinct from per-rank multi-GPU verification)"
+            )
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+
 
 MODEL_PARAMS = [
     pytest.param("tiny", id="tiny"),

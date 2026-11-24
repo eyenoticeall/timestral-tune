@@ -40,7 +40,7 @@ from timestral_tune.trainer import trainer as trainer_module
 from timestral_tune.trainer.distributed import DistributedContext
 
 from . import distributed_harness as harness
-from .distributed_harness import run_scenarios, unwrap_results
+from .distributed_harness import run_scenarios, scale_timeout, trainer_device_for_mode, unwrap_results
 from .helpers import TINY_CONFIG, make_tiny_forecaster, make_toy_dataset
 
 
@@ -70,7 +70,7 @@ def _release_trainer_logs(tlog: logging.Logger, handler: _RecordHandler, prev_le
 
 
 def _followup_sum(ctx: DistributedContext) -> int:
-    probe = torch.tensor([1], dtype=torch.int64)
+    probe = torch.tensor([1], dtype=torch.int64, device=ctx.device)
     ctx.all_reduce_sum(probe)
     return int(probe.item())
 
@@ -79,7 +79,7 @@ def _base_config(**overrides: Any) -> TrainingConfig:
     defaults: dict[str, Any] = {
         "model_name_or_path": "local-test",
         "mode": "head_only",
-        "device": "cpu",
+        "device": trainer_device_for_mode(),
         "batch_size": 2,
         "epochs": 1,
         "max_steps": 1,
@@ -214,7 +214,7 @@ def _sc_non_zero_export_forbid_spies(rank: int, world_size: int) -> dict[str, An
 
 
 def _sc_strategy_cleanup_and_private_state(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     ds = make_toy_dataset(TINY_CONFIG.patch_size, series=4, seed=13, covariates=True)
     train_ds, val_ds = ds.split_by_time(12 * TINY_CONFIG.patch_size)
@@ -399,7 +399,7 @@ def _sc_strategy_cleanup_and_private_state(rank: int, world_size: int) -> dict[s
 
 def _sc_mixed_trainable_dtype_startup(rank: int, world_size: int) -> dict[str, Any]:
     del world_size
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     ds = make_toy_dataset(TINY_CONFIG.patch_size, series=4, seed=15, covariates=True)
     mixed_model = _fresh_model(0)
@@ -486,8 +486,8 @@ def test_distributed_trainer_whitebox_internals() -> None:
             "startup_logs": _sc_rank0_only_startup_log_isolation,
         },
         world_size=2,
-        pg_timeout=5.0,
-        wall_timeout=30.0,
+        pg_timeout=scale_timeout(5.0, 30.0),
+        wall_timeout=scale_timeout(30.0, 120.0),
     )
 
     # 1. Non-zero rank export() never calls Hub, dataset_fingerprint, merge/extract, or save_file.

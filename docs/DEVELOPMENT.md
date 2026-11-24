@@ -60,9 +60,9 @@ src/timestral_tune/
   replay/                Replay sources and distillation to the frozen base model
 tests/
   conftest.py, helpers.py   Fixtures, global PyTorch state leak guard, and builders shared by all tests
-  distributed_harness.py    Multi-process CPU/gloo spawn harness, shared parity tiers, and headroom knob
-  test_*.py                 Unit tests per module (including test_distributed.py, test_trainer_distributed.py, test_trainer_distributed_replay.py, test_multi_gpu_check.py)
-  acceptance/               T1–T15 from spec §9 (all 15 implemented and passing; T15 on CPU/gloo)
+  distributed_harness.py    Multi-process spawn harness (CPU/gloo default, opt-in CUDA/nccl), shared parity tiers, and headroom knob
+  test_*.py                 Unit tests per module (including test_distributed.py, test_distributed_harness_cuda.py, test_trainer_distributed.py, test_trainer_distributed_replay.py, test_multi_gpu_check.py)
+  acceptance/               T1–T15 from spec §9 (all 15 implemented and passing; T15 supports CPU/gloo default and opt-in CUDA/nccl)
 scripts/
   vendor_upstream.py     Regenerates _vendor/timestral
   check_upstream_drift.py
@@ -72,6 +72,7 @@ scripts/
   cuda_check.sh          Runs the device tests and the whole suite on a CUDA machine
   multi_gpu_check.sh     Thin bash 3.2+ wrapper that execs multi_gpu_check.py
   multi_gpu_check.py     Stdlib-only Stage 3 multi-process/multi-GPU verification session driver
+  run_t15_nccl.py        Stdlib-only CUDA/NCCL runner for T15 and the multi-process harness test suite
 ```
 
 No stub modules remain. Every module's docstring names the spec section it implements; start there when
@@ -123,15 +124,35 @@ a batch with upstream's own input assembly as ground truth).
 - **Multi-process tests** (`tests/acceptance/test_distributed.py` for T15 cases `(a)–(l)`,
   `tests/test_distributed.py` for primitives and the harness, `tests/test_trainer_distributed.py` for
   white-box trainer internals, and `tests/test_trainer_distributed_replay.py` for multi-process replay and
-  distillation) spawn separate Python processes on CPU/`gloo` through `tests/distributed_harness.py`. The
-  harness uses the `spawn` start method, file-based rendezvous inside a fresh temporary directory (avoiding
-  ephemeral TCP port collisions), `torch.set_num_threads(1)` per worker (restored in `finally`),
-  `run_scenarios` to amortise process startup across balanced scenarios, and a hard wall-clock deadline that
-  terminates/kills stuck workers (`DistributedTimeoutError`) so collective hangs fail fast. Run them with:
+  distillation) spawn separate Python processes through `tests/distributed_harness.py` on CPU/`gloo` by
+  default (what CI runs). The harness uses `torch.multiprocessing`'s `spawn` start method, file-based
+  rendezvous inside a fresh temporary directory (avoiding ephemeral TCP port collisions),
+  `torch.set_num_threads(1)` per worker (restored in `finally`), `run_scenarios` to amortise process
+  startup across balanced scenarios, and a hard wall-clock deadline that terminates/kills stuck worker
+  process groups (`DistributedTimeoutError`) so collective hangs fail fast. Run them on CPU/`gloo` with:
   `TMPDIR=/tmp uv run pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py`
   or on the floor with
   `TMPDIR=/tmp uv run --isolated --python 3.12 --with "torch==2.4.0" pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py`
   (the four `num_workers > 0` tests skip on macOS below PyTorch 2.8; see `docs/VERIFICATION.md` §10, §17).
+  **Running T15 and the multi-process suite on CUDA/NCCL (opt-in):** set
+  `TIMESTRAL_TEST_DIST_BACKEND=nccl` (default when unset is `gloo`). By default,
+  `TIMESTRAL_TEST_DIST_DEVICE_MAP=per-rank` binds one rank per GPU via the trainer's real
+  `DistributedContext.detect("auto")` / `LOCAL_RANK` path, runs one-process references on `cuda:0`, and
+  fails loudly (never skips silently) if CUDA is unavailable or fewer than `world_size` GPUs are visible.
+  For single-GPU debugging only (not a substitute for separate-GPU verification), pass
+  `TIMESTRAL_TEST_DIST_DEVICE_MAP=shared NCCL_MULTI_RANK_GPU_ENABLE=1` to place all ranks on `cuda:0`.
+  On a rented 4-GPU host, run all 2-GPU and 4-GPU passes (T15 + the other three harness test files) and
+  capture a combined log in one command:
+  ```bash
+  uv run python scripts/run_t15_nccl.py --python 3.12 --log-file t15_nccl.log
+  ```
+  Pass `--ranks 2` on a 2-GPU host (excludes 4-rank tests `[4]` and `test_t15_f_dataloader_workers`),
+  `--t15-only` to run only `tests/acceptance/test_distributed.py`, `--f32-tol-scale 0.2` to check float32
+  tolerance headroom, or `--shared-gpu --ranks 2` for single-GPU debugging. The runner invokes pytest
+  with `-v -rs`, reports passed/skipped/failed/error/deselected counts per pass, and exits non-zero if
+  any test fails, skips, or if zero tests pass (deselected tests under `--ranks 2` are expected).
+  Equivalently with raw `pytest` on a 4-GPU host:
+  `TIMESTRAL_TEST_DIST_BACKEND=nccl TMPDIR=/tmp uv run --python 3.12 pytest tests/test_distributed.py tests/test_trainer_distributed.py tests/test_trainer_distributed_replay.py tests/acceptance/test_distributed.py`
   **Why `TMPDIR=/tmp` on macOS:** PyTorch `DataLoader` workers share tensors through `torch_shm_manager`,
   which binds an `AF_UNIX` socket under `TMPDIR`. If the socket path exceeds macOS's 103-byte `sun_path`
   limit (a `TMPDIR` of roughly 70 bytes is enough, common in sandboxed or deeply nested environments), the

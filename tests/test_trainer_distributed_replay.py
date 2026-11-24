@@ -48,8 +48,11 @@ from .distributed_harness import (
     STEP_PARAM_TOL,
     STEP_TOL,
     TRAJ_TOL,
+    reference_device_for_mode,
     run_distributed,
     run_scenarios,
+    scale_timeout,
+    trainer_device_for_mode,
     unwrap_results,
 )
 from .helpers import as_double, float64_reference, l2_rel, make_tiny_forecaster
@@ -84,11 +87,11 @@ def _flat_grads(params: Sequence[Tensor]) -> Tensor:
     )
 
 
-def _base_config(**overrides: Any) -> TrainingConfig:
+def _base_config(*, for_reference: bool = False, **overrides: Any) -> TrainingConfig:
     defaults: dict[str, Any] = {
         "model_name_or_path": "local-test",
         "mode": "full_ft",
-        "device": "cpu",
+        "device": reference_device_for_mode() if for_reference else trainer_device_for_mode(),
         "batch_size": 2,
         "epochs": 1,
         "max_steps": 4,
@@ -413,6 +416,7 @@ def _run_trajectory_case(
     dtype_name: str,
     batch_size: int,
     replay_batch_size: int,
+    for_reference: bool = False,
 ) -> dict[str, Any]:
     dtype = torch.float64 if dtype_name == "float64" else torch.float32
     dom_ds = _make_single_window_dataset(case["dom_len"], seed=40, covariates=True, horizon=DOM_HORIZON)
@@ -423,6 +427,7 @@ def _run_trajectory_case(
     mode = case["mode"]
     lora_cfg = LoraConfig(axes=("time",), dropout=0.0) if mode == "lora_temporal" else None
     cfg = _base_config(
+        for_reference=for_reference,
         mode=mode,
         batch_size=batch_size,
         max_steps=case["steps"],
@@ -550,8 +555,11 @@ def _sc_loader_seed_and_stochastic_synth(rank: int, world_size: int) -> dict[str
         )
         assert strat_check._replay_cycle is not None
         rng_before = torch.get_rng_state()
+        cuda_rng_before = torch.cuda.get_rng_state(t_synth.device).clone() if t_synth.device.type == "cuda" else None
         _ = strat_check._replay_cycle.next_batch()
-        replay_rng_preserved = bool(torch.equal(torch.get_rng_state(), rng_before))
+        replay_rng_preserved = bool(torch.equal(torch.get_rng_state(), rng_before)) and (
+            cuda_rng_before is None or bool(torch.equal(torch.cuda.get_rng_state(t_synth.device), cuda_rng_before))
+        )
     finally:
         strat_check.cleanup()
 
@@ -577,7 +585,12 @@ def test_distributed_replay_whitebox_scenarios(world_size: int) -> None:
         "skipped_step_whitebox": _sc_skipped_step_preserves_generators_and_cursor,
         "loader_seed_and_synth": _sc_loader_seed_and_stochastic_synth,
     }
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=15.0, wall_timeout=120.0)
+    outcomes = run_scenarios(
+        scenarios,
+        world_size=world_size,
+        pg_timeout=scale_timeout(15.0, 45.0),
+        wall_timeout=scale_timeout(120.0, 360.0),
+    )
 
     # --- 1. Step-level parity vs 1-process shipped TimestralTrainer.training_step on union batches ---
     sp = unwrap_results(outcomes["step_parity"])
@@ -613,6 +626,7 @@ def test_distributed_replay_whitebox_scenarios(world_size: int) -> None:
                         model_config=base_model.config,
                     )
                     cfg = _base_config(
+                        for_reference=True,
                         mode=mode,
                         batch_size=2,
                         max_steps=1,
@@ -630,7 +644,9 @@ def test_distributed_replay_whitebox_scenarios(world_size: int) -> None:
                     )
                     ref_trainer.model.load_state_dict(student_state)
                     ref_trainer.model.train()
-                    ref_loss = ref_trainer.training_step(dom_u, validate=False, replay_batch=rep_u)
+                    dom_u_dev = dom_u.to(ref_trainer.device)
+                    rep_u_dev = rep_u.to(ref_trainer.device)
+                    ref_loss = ref_trainer.training_step(dom_u_dev, validate=False, replay_batch=rep_u_dev)
                     ref_grads = _flat_grads(ref_trainer._trainable)
                     ref_params = _flat_tensors(ref_trainer._trainable)
 
@@ -674,7 +690,11 @@ def test_distributed_replay_whitebox_scenarios(world_size: int) -> None:
                         )
                         drop_trainer.model.load_state_dict(student_state)
                         drop_trainer.model.train()
-                        drop_trainer.training_step(dom_u, validate=False, replay_batch=drop_rep_u)
+                        drop_trainer.training_step(
+                            dom_u.to(drop_trainer.device),
+                            validate=False,
+                            replay_batch=drop_rep_u.to(drop_trainer.device),
+                        )
                         drop_grads = _flat_grads(drop_trainer._trainable)
                         assert l2_rel(r0["grads"], drop_grads) > 1e-3, (
                             "empty-domain rank's replay contribution was not distinguishable from dropping it"
@@ -687,7 +707,11 @@ def test_distributed_replay_whitebox_scenarios(world_size: int) -> None:
         for case in _unique_trajectory_cases(world_size):
             key = f"{dtype_name}:{case['name']}"
             ref = _run_trajectory_case(
-                case, dtype_name=dtype_name, batch_size=world_size * 2, replay_batch_size=world_size * 2
+                case,
+                dtype_name=dtype_name,
+                batch_size=world_size * 2,
+                replay_batch_size=world_size * 2,
+                for_reference=True,
             )
             r0 = tp[0][key]
             assert r0["result"].steps == ref["result"].steps == case["steps"]
@@ -823,7 +847,12 @@ def _worker_fit_replay_persistent_workers(rank: int, world_size: int) -> dict[st
 def test_distributed_fit_with_replay_and_persistent_workers() -> None:
     """With `num_workers=1`, training and validation use workers while replay runs in the main process."""
     results = unwrap_results(
-        run_distributed(_worker_fit_replay_persistent_workers, world_size=2, pg_timeout=20.0, wall_timeout=60.0)
+        run_distributed(
+            _worker_fit_replay_persistent_workers,
+            world_size=2,
+            pg_timeout=scale_timeout(20.0, 45.0),
+            wall_timeout=scale_timeout(60.0, 180.0),
+        )
     )
     for r in range(2):
         main_pid = results[r]["main_pid"]

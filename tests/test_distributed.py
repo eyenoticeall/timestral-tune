@@ -42,9 +42,16 @@ from .distributed_harness import (
     F32_TOL_SCALE_ENV,
     DistributedTimeoutError,
     RankResult,
+    barrier,
+    dist_backend,
+    dist_device_map,
+    expected_worker_device,
     f32_tol_scale,
+    is_cuda_dist_mode,
     run_distributed,
     run_scenarios,
+    scale_timeout,
+    trainer_device_for_mode,
     unwrap_results,
 )
 
@@ -75,15 +82,17 @@ def _identity_collate(items: list[int]) -> list[int]:
 class _ToyModule(nn.Module):
     """Module exercising trainable params, frozen params, float/int buffers, and non-contiguous buffers."""
 
-    def __init__(self, rank: int) -> None:
+    def __init__(self, rank: int, device: torch.device | str = "cpu") -> None:
         super().__init__()
         base = float(rank + 1)
-        self.weight = nn.Parameter(torch.full((3, 4), base, dtype=torch.float32), requires_grad=True)
-        self.frozen = nn.Parameter(torch.full((2, 3), base * 10.0, dtype=torch.float32), requires_grad=False)
-        self.register_buffer("scale_buf", torch.full((4,), base * 0.5, dtype=torch.float64))
-        self.register_buffer("step_buf", torch.tensor([rank, rank + 7], dtype=torch.int64))
+        self.weight = nn.Parameter(torch.full((3, 4), base, dtype=torch.float32, device=device), requires_grad=True)
+        self.frozen = nn.Parameter(
+            torch.full((2, 3), base * 10.0, dtype=torch.float32, device=device), requires_grad=False
+        )
+        self.register_buffer("scale_buf", torch.full((4,), base * 0.5, dtype=torch.float64, device=device))
+        self.register_buffer("step_buf", torch.tensor([rank, rank + 7], dtype=torch.int64, device=device))
         # Non-contiguous transposed buffer.
-        nc = torch.arange(6, dtype=torch.float32).reshape(2, 3).t() + base
+        nc = torch.arange(6, dtype=torch.float32, device=device).reshape(2, 3).t() + base
         assert not nc.is_contiguous()
         self.register_buffer("non_contig_buf", nc)
 
@@ -806,44 +815,62 @@ def test_gradient_reducer_all_present_skips_readback_and_all_absent_reuses_flags
 
 def _sc_snapshot_and_device_guards(rank: int, world_size: int) -> dict[str, Any]:
     assert torch.get_num_threads() == 1
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     assert ctx.rank == rank
     assert ctx.world_size == world_size
-    assert ctx.backend == "gloo"
-    assert ctx.device == torch.device("cpu")
+    assert ctx.backend == dist_backend()
+    expected_dev = expected_worker_device(rank)
+    assert ctx.device == expected_dev
     assert ctx.is_rank_zero == (rank == 0)
     ctx.check_active()
 
-    assert DistributedContext.detect("cpu") == ctx
-    assert DistributedContext.detect(None) == ctx
-    with pytest.raises(ValueError):
-        DistributedContext.detect("cuda")
-    with pytest.raises(ValueError):
-        DistributedContext.detect("mps")
+    if is_cuda_dist_mode():
+        assert os.environ.get("LOCAL_RANK") == str(rank)
+        assert expected_dev.index is not None
+        assert torch.cuda.current_device() == expected_dev.index
+        if dist_device_map() == "per-rank":
+            assert DistributedContext.detect() == ctx
+            assert DistributedContext.detect(None) == ctx
+            assert DistributedContext.detect("cuda") == ctx
+            assert DistributedContext.detect(f"cuda:{rank}") == ctx
+        else:
+            assert DistributedContext.detect("cuda:0") == ctx
+        with pytest.raises(ValueError):
+            DistributedContext.detect("cpu")
+        with pytest.raises(ValueError):
+            DistributedContext.detect("mps")
+    else:
+        assert DistributedContext.detect("cpu") == ctx
+        assert DistributedContext.detect(None) == ctx
+        with pytest.raises(ValueError):
+            DistributedContext.detect("cuda")
+        with pytest.raises(ValueError):
+            DistributedContext.detect("mps")
     return {"rank": ctx.rank, "world_size": ctx.world_size}
 
 
 def _sc_sum_and_broadcast_roundtrips(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
+    dev = ctx.device
 
     # SUM reductions across float64, float32, int64, and non-contiguous views.
-    t_f64 = torch.tensor([float(rank + 1), float((rank + 1) ** 2)], dtype=torch.float64)
+    t_f64 = torch.tensor([float(rank + 1), float((rank + 1) ** 2)], dtype=torch.float64, device=dev)
     ctx.all_reduce_sum(t_f64)
-    t_i64 = torch.tensor([rank + 10], dtype=torch.int64)
+    t_i64 = torch.tensor([rank + 10], dtype=torch.int64, device=dev)
     ctx.all_reduce_sum(t_i64)
-    nc = torch.full((3, 2), float(rank + 1), dtype=torch.float32).t()
+    nc = torch.full((3, 2), float(rank + 1), dtype=torch.float32, device=dev).t()
     assert not nc.is_contiguous()
     ctx.all_reduce_sum(nc)
 
     # Broadcasts from rank 0: plain tensor, non-contiguous view, and requires_grad=True parameter.
-    b_i64 = torch.tensor([100 + rank, 200 + rank], dtype=torch.int64)
+    b_i64 = torch.tensor([100 + rank, 200 + rank], dtype=torch.int64, device=dev)
     ctx.broadcast(b_i64)
-    b_nc = torch.full((3, 2), float(rank + 5), dtype=torch.float32).t()
+    b_nc = torch.full((3, 2), float(rank + 5), dtype=torch.float32, device=dev).t()
     assert not b_nc.is_contiguous()
     ctx.broadcast(b_nc)
-    param = nn.Parameter(torch.full((2, 2), float(rank + 1), dtype=torch.float32), requires_grad=True)
+    param = nn.Parameter(torch.full((2, 2), float(rank + 1), dtype=torch.float32, device=dev), requires_grad=True)
     ctx.broadcast(param)
     assert param.requires_grad is True
 
@@ -873,28 +900,28 @@ def _run_failure_case_with_followup(
             "stage": exc.stage if isinstance(exc, RankFailureError) else None,
         }
     # Follow-up collective must succeed cleanly on every rank.
-    probe = torch.tensor([1], dtype=torch.int64)
+    probe = torch.tensor([1], dtype=torch.int64, device=ctx.device)
     ctx.all_reduce_sum(probe)
     caught["followup_sum"] = int(probe.item())
     return caught
 
 
 def _sc_failure_nonzero_rank(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     err = KeyError("missing_col") if rank == 1 else None
     return _run_failure_case_with_followup(ctx, err, stage="data_load")
 
 
 def _sc_failure_rank_zero(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     err = ValueError("bad_rank0_cfg") if rank == 0 else None
     return _run_failure_case_with_followup(ctx, err, stage="startup")
 
 
 def _sc_failure_two_ranks(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     failing = (0, 1) if world_size == 2 else (1, 3)
     err: Exception | None = None
@@ -906,20 +933,20 @@ def _sc_failure_two_ranks(rank: int, world_size: int) -> dict[str, Any]:
 
 
 def _sc_failure_none(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     return _run_failure_case_with_followup(ctx, None, stage="startup")
 
 
 def _sc_failure_uncaught_propagates(rank: int, world_size: int) -> None:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     err = ValueError("uncaught_rank1") if rank == 1 else None
     ctx.propagate_failure(err, stage="uncaught_stage")
 
 
 def _sc_consistency_match(rank: int, world_size: int) -> bool:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     ctx.check_consistency(hashlib.sha256(b"same-model-layout").digest(), stage="layout")
     ctx.check_consistency(b"arbitrary-length-digest", stage="config")
@@ -927,7 +954,7 @@ def _sc_consistency_match(rank: int, world_size: int) -> bool:
 
 
 def _sc_consistency_mismatch_single(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     # Deliberately use a different byte length on the last rank to verify fixed-size encoding avoids deadlock.
     digest = b"short-mismatch" if rank == world_size - 1 else hashlib.sha256(b"canonical").digest()
@@ -942,14 +969,14 @@ def _sc_consistency_mismatch_single(rank: int, world_size: int) -> dict[str, Any
             "failing_ranks": exc.failing_ranks if isinstance(exc, RankFailureError) else None,
             "stage": exc.stage if isinstance(exc, RankFailureError) else None,
         }
-    probe = torch.tensor([1], dtype=torch.int64)
+    probe = torch.tensor([1], dtype=torch.int64, device=ctx.device)
     ctx.all_reduce_sum(probe)
     out["followup_sum"] = int(probe.item())
     return out
 
 
 def _sc_consistency_mismatch_two(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     mismatched = (1,) if world_size == 2 else (1, 2)
     digest = f"divergent-{rank}".encode() if rank in mismatched else b"canonical"
@@ -964,16 +991,16 @@ def _sc_consistency_mismatch_two(rank: int, world_size: int) -> dict[str, Any]:
             "failing_ranks": exc.failing_ranks if isinstance(exc, RankFailureError) else None,
             "stage": exc.stage if isinstance(exc, RankFailureError) else None,
         }
-    probe = torch.tensor([1], dtype=torch.int64)
+    probe = torch.tensor([1], dtype=torch.int64, device=ctx.device)
     ctx.all_reduce_sum(probe)
     out["followup_sum"] = int(probe.item())
     return out
 
 
 def _sc_module_state_broadcast(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
-    module = _ToyModule(rank)
+    module = _ToyModule(rank, device=ctx.device)
     broadcast_module_state(ctx, module)
     return {
         "weight": module.weight.detach().tolist(),
@@ -989,39 +1016,40 @@ def _sc_module_state_broadcast(rank: int, world_size: int) -> dict[str, Any]:
 
 
 def _sc_gradient_reducer(rank: int, world_size: int) -> dict[str, Any]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
-    p0 = nn.Parameter(torch.zeros(3, dtype=torch.float64))
-    p1 = nn.Parameter(torch.zeros(2, 2, dtype=torch.float64))
-    p2 = nn.Parameter(torch.zeros(4, dtype=torch.float64))
-    p3 = nn.Parameter(torch.tensor(0.0, dtype=torch.float64))  # 0-D scalar parameter
+    dev = ctx.device
+    p0 = nn.Parameter(torch.zeros(3, dtype=torch.float64, device=dev))
+    p1 = nn.Parameter(torch.zeros(2, 2, dtype=torch.float64, device=dev))
+    p2 = nn.Parameter(torch.zeros(4, dtype=torch.float64, device=dev))
+    p3 = nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=dev))  # 0-D scalar parameter
     reducer = GradientReducer(ctx, [p0, p1, p2, p3])
     assert reducer.numel == 3 + 4 + 4 + 1
 
     # Round 1: p0 present on all ranks, p1 None on rank 0 only, p2 None on all ranks, p3 scalar on all ranks.
-    p0.grad = torch.tensor([rank + 1.0, (rank + 1.0) * 2.0, -float(rank)], dtype=torch.float64)
-    p1.grad = None if rank == 0 else torch.full((2, 2), float(rank + 3), dtype=torch.float64)
+    p0.grad = torch.tensor([rank + 1.0, (rank + 1.0) * 2.0, -float(rank)], dtype=torch.float64, device=dev)
+    p1.grad = None if rank == 0 else torch.full((2, 2), float(rank + 3), dtype=torch.float64, device=dev)
     p2.grad = None
-    p3.grad = torch.tensor(float(rank + 2), dtype=torch.float64)
+    p3.grad = torch.tensor(float(rank + 2), dtype=torch.float64, device=dev)
     reducer.reduce()
     assert p0.grad is not None and p1.grad is not None and p2.grad is None and p3.grad is not None
     assert p3.grad.shape == ()
     r1 = {"p0": p0.grad.tolist(), "p1": p1.grad.tolist(), "p2": None, "p3": p3.grad.item()}
 
     # Round 2 (reusing the same flat buffer): flip None pattern; p2 is an all-zero tensor on rank 0 and None on peers.
-    p0.grad = None if rank == world_size - 1 else torch.full((3,), 0.5 * (rank + 1), dtype=torch.float64)
-    p1.grad = torch.arange(4, dtype=torch.float64).reshape(2, 2) * (rank + 1)
-    p2.grad = torch.full((4,), float(rank), dtype=torch.float64) if rank == 0 else None
-    p3.grad = None if rank != 0 else torch.tensor(-7.5, dtype=torch.float64)
+    p0.grad = None if rank == world_size - 1 else torch.full((3,), 0.5 * (rank + 1), dtype=torch.float64, device=dev)
+    p1.grad = torch.arange(4, dtype=torch.float64, device=dev).reshape(2, 2) * (rank + 1)
+    p2.grad = torch.full((4,), float(rank), dtype=torch.float64, device=dev) if rank == 0 else None
+    p3.grad = None if rank != 0 else torch.tensor(-7.5, dtype=torch.float64, device=dev)
     reducer.reduce()
     assert p0.grad is not None and p1.grad is not None and p2.grad is not None and p3.grad is not None
     r2 = {"p0": p0.grad.tolist(), "p1": p1.grad.tolist(), "p2": p2.grad.tolist(), "p3": p3.grad.item()}
 
     # Round 3: previously populated parameters that become all-None return to None; present zero scalar stays tensor.
     p0.grad = None
-    p1.grad = torch.full((2, 2), 2.5, dtype=torch.float64) if rank == 1 else None
+    p1.grad = torch.full((2, 2), 2.5, dtype=torch.float64, device=dev) if rank == 1 else None
     p2.grad = None
-    p3.grad = torch.tensor(0.0, dtype=torch.float64) if rank == 0 else None
+    p3.grad = torch.tensor(0.0, dtype=torch.float64, device=dev) if rank == 0 else None
     reducer.reduce()
     assert p0.grad is None and p1.grad is not None and p2.grad is None and p3.grad is not None
     assert p3.grad.shape == ()
@@ -1030,24 +1058,24 @@ def _sc_gradient_reducer(rank: int, world_size: int) -> dict[str, Any]:
     # Round 4: asymmetric fast path — rank 0 has all grads present (skips flag read-back),
     # while rank 1 has all grads None (reads back flags and allocates every param's .grad).
     if rank == 0:
-        p0.grad = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
-        p1.grad = torch.full((2, 2), 4.0, dtype=torch.float64)
-        p2.grad = torch.zeros(4, dtype=torch.float64)
-        p3.grad = torch.tensor(5.0, dtype=torch.float64)
+        p0.grad = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64, device=dev)
+        p1.grad = torch.full((2, 2), 4.0, dtype=torch.float64, device=dev)
+        p2.grad = torch.zeros(4, dtype=torch.float64, device=dev)
+        p3.grad = torch.tensor(5.0, dtype=torch.float64, device=dev)
     elif rank == 1:
         p0.grad = p1.grad = p2.grad = p3.grad = None
     else:
-        p0.grad = torch.full((3,), 0.5, dtype=torch.float64)
-        p1.grad = torch.full((2, 2), 1.0, dtype=torch.float64)
+        p0.grad = torch.full((3,), 0.5, dtype=torch.float64, device=dev)
+        p1.grad = torch.full((2, 2), 1.0, dtype=torch.float64, device=dev)
         p2.grad = None
-        p3.grad = torch.tensor(2.0, dtype=torch.float64)
+        p3.grad = torch.tensor(2.0, dtype=torch.float64, device=dev)
     reducer.reduce()
     assert p0.grad is not None and p1.grad is not None and p2.grad is not None and p3.grad is not None
     r4 = {"p0": p0.grad.tolist(), "p1": p1.grad.tolist(), "p2": p2.grad.tolist(), "p3": p3.grad.item()}
 
     # AdamW weight-decay parity: all-None param skips decay; present all-zero param decays identically across ranks.
-    p_unused = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64))
-    p_zero = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64))
+    p_unused = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64, device=dev))
+    p_zero = nn.Parameter(torch.tensor([2.0, -4.0], dtype=torch.float64, device=dev))
     wd_reducer = GradientReducer(ctx, [p_unused, p_zero])
     opt = torch.optim.AdamW([p_unused, p_zero], lr=0.1, weight_decay=0.5)
     opt.zero_grad(set_to_none=True)
@@ -1067,7 +1095,7 @@ def _sc_gradient_reducer(rank: int, world_size: int) -> dict[str, Any]:
 
 
 def _sc_status_broadcast(rank: int, world_size: int) -> list[tuple[ControlStatus, float]]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
     results: list[tuple[ControlStatus, float]] = []
     cases = [
@@ -1104,7 +1132,12 @@ def test_distributed_primitives_multiprocess(world_size: int) -> None:
         "grad_reducer": _sc_gradient_reducer,
         "status_broadcast": _sc_status_broadcast,
     }
-    outcomes = run_scenarios(scenarios, world_size=world_size, pg_timeout=5.0, wall_timeout=30.0)
+    outcomes = run_scenarios(
+        scenarios,
+        world_size=world_size,
+        pg_timeout=scale_timeout(5.0, 30.0),
+        wall_timeout=scale_timeout(30.0, 120.0),
+    )
 
     # 1. Snapshot and device guards.
     snap = unwrap_results(outcomes["snapshot"])
@@ -1290,9 +1323,9 @@ def test_distributed_primitives_multiprocess(world_size: int) -> None:
 
 
 def _worker_stale_group_after_destroy(rank: int, world_size: int) -> dict[str, bool]:
-    ctx = DistributedContext.detect()
+    ctx = DistributedContext.detect(trainer_device_for_mode())
     assert ctx is not None
-    dist.barrier()
+    barrier(ctx.device)
     dist.destroy_process_group()
     check_raised = False
     try:
@@ -1301,7 +1334,7 @@ def _worker_stale_group_after_destroy(rank: int, world_size: int) -> dict[str, b
         check_raised = True
     collective_raised = False
     try:
-        ctx.all_reduce_sum(torch.ones(1))
+        ctx.all_reduce_sum(torch.ones(1, device=ctx.device))
     except RuntimeError:
         collective_raised = True
 
@@ -1324,7 +1357,14 @@ def _worker_stale_group_after_destroy(rank: int, world_size: int) -> dict[str, b
 
 
 def test_stale_group_raises_after_destroy_in_real_group() -> None:
-    results = unwrap_results(run_distributed(_worker_stale_group_after_destroy, world_size=2, pg_timeout=5.0))
+    results = unwrap_results(
+        run_distributed(
+            _worker_stale_group_after_destroy,
+            world_size=2,
+            pg_timeout=scale_timeout(5.0, 30.0),
+            wall_timeout=scale_timeout(30.0, 90.0),
+        )
+    )
     assert results == [{"check_raised": True, "collective_raised": True, "size_changed_raised": True}] * 2
 
 
@@ -1341,12 +1381,18 @@ def test_device_qualified_cpu_gloo_backend_rejected_in_real_group() -> None:
 
 
 def _worker_unbalanced_hang(rank: int, world_size: int, ready_dir: str) -> str:
-    # Synchronise once after startup, then signal readiness via file before blocking.
-    dist.barrier()
+    # Bind device and synchronise once after startup, then signal readiness via file before blocking.
+    ctx = DistributedContext.detect(trainer_device_for_mode())
+    assert ctx is not None
+    barrier(ctx.device)
     Path(ready_dir, f"rank_{rank}.ready").write_text("ready", encoding="utf-8")
     if rank == 0:
         # Rank 0 blocks in a collective that rank 1 will never enter.
-        dist.all_reduce(torch.ones(1), op=dist.ReduceOp.SUM)
+        dist.all_reduce(torch.ones(1, device=ctx.device), op=dist.ReduceOp.SUM)
+        if ctx.device.type == "cuda":
+            # NCCL collectives enqueue asynchronously on the CUDA stream; wait on the stream so
+            # rank 0 blocks inside this scenario rather than returning to teardown cleanup.
+            torch.cuda.synchronize(ctx.device)
     else:
         # Rank 1 sleeps so neither rank destroys the group early; both remain blocked until killed.
         time.sleep(60.0)
@@ -1360,11 +1406,12 @@ def test_harness_kills_blocked_group_quickly_and_reports_unfinished_ranks(tmp_pa
             _worker_unbalanced_hang,
             world_size=2,
             args=(str(tmp_path),),
-            pg_timeout=30.0,
-            wall_timeout=6.0,
+            pg_timeout=scale_timeout(30.0, 90.0),
+            wall_timeout=scale_timeout(6.0, 25.0),
         )
     elapsed = time.monotonic() - t0
-    assert elapsed < 20.0, f"harness took too long to kill blocked group: {elapsed:.2f}s"
+    max_elapsed = scale_timeout(20.0, 45.0)
+    assert elapsed < max_elapsed, f"harness took too long to kill blocked group: {elapsed:.2f}s"
     assert (tmp_path / "rank_0.ready").is_file() and (tmp_path / "rank_1.ready").is_file(), (
         "workers did not finish start-up and reach the blocking point before wall_timeout"
     )
@@ -1386,8 +1433,8 @@ def test_harness_reports_only_unfinished_rank_on_timeout(tmp_path: Path) -> None
             _worker_only_rank1_blocks,
             world_size=2,
             args=(str(tmp_path),),
-            pg_timeout=30.0,
-            wall_timeout=6.0,
+            pg_timeout=scale_timeout(30.0, 90.0),
+            wall_timeout=scale_timeout(6.0, 25.0),
         )
     assert (tmp_path / "rank_0.ready").is_file() and (tmp_path / "rank_1.ready").is_file(), (
         "workers did not finish start-up before wall_timeout"
@@ -1403,7 +1450,12 @@ def _worker_rank1_killed_by_signal(rank: int, world_size: int) -> str:
 
 def test_harness_reports_worker_terminated_by_signal() -> None:
     with pytest.raises(RuntimeError) as exc_info:
-        run_distributed(_worker_rank1_killed_by_signal, world_size=2, pg_timeout=5.0, wall_timeout=10.0)
+        run_distributed(
+            _worker_rank1_killed_by_signal,
+            world_size=2,
+            pg_timeout=scale_timeout(5.0, 30.0),
+            wall_timeout=scale_timeout(10.0, 30.0),
+        )
     msg = str(exc_info.value)
     assert "rank 1" in msg
     assert "SIGKILL" in msg
@@ -1419,7 +1471,10 @@ def _worker_rank1_raises_without_killing_rank0(rank: int, world_size: int) -> st
 
 def test_harness_does_not_kill_siblings_when_one_rank_raises() -> None:
     results: list[RankResult] = run_distributed(
-        _worker_rank1_raises_without_killing_rank0, world_size=2, pg_timeout=5.0, wall_timeout=15.0
+        _worker_rank1_raises_without_killing_rank0,
+        world_size=2,
+        pg_timeout=scale_timeout(5.0, 30.0),
+        wall_timeout=scale_timeout(15.0, 45.0),
     )
     assert results[0].ok and results[0].value == "rank0_completed"
     assert results[1].error is not None

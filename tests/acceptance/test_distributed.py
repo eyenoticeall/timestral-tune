@@ -1,9 +1,10 @@
 """Multi-process training acceptance tests (spec §5.6, §7.4, §9 T15, D22–D37).
 
-Covers T15 cases (a)–(l) (Stage 1 domain loss and Stage 2 replay/distillation) network-free on CPU/`gloo`
-for `N = 2` and `N = 4` using the tiny random model and `tests/distributed_harness.py` (spawn start
-method, file-based rendezvous, 1 intra-op thread per worker, hard wall-clock deadlines, multiple
-scenarios grouped per spawned group).
+Covers T15 cases (a)–(l) (Stage 1 domain loss and Stage 2 replay/distillation) network-free on
+CPU/`gloo` by default (and opt-in CUDA/`nccl` via `TIMESTRAL_TEST_DIST_BACKEND=nccl`) for `N = 2`
+and `N = 4` using the tiny random model and `tests/distributed_harness.py` (spawn start method,
+file-based rendezvous, 1 intra-op thread per worker, hard wall-clock deadlines, multiple scenarios
+grouped per spawned group).
 
 All parity tests compare against the shipped one-process `TimestralTrainer` at `batch_size = N * B`
 with `shuffle=False`, `sign_flip=False`, and LoRA `dropout=0`, using the exact tolerance tiers from
@@ -60,8 +61,15 @@ from ..distributed_harness import (
     TRAJ_TOL,
     TRAJ_UPDATE_TOL,
     RankResult,
+    active_dist_device,
+    barrier,
+    expected_worker_device,
+    is_cuda_dist_mode,
+    reference_device_for_mode,
     run_distributed,
     run_scenarios,
+    scale_timeout,
+    trainer_device_for_mode,
     unwrap_results,
 )
 from ..helpers import TINY_CONFIG, as_double, float64_reference, l2_rel, make_tiny_forecaster
@@ -214,11 +222,11 @@ def _scalar_rel(actual: float, expected: float) -> float:
     return abs(actual - expected) / max(abs(expected), 1e-300)
 
 
-def _base_config(mode: str = "head_only", **overrides: Any) -> TrainingConfig:
+def _base_config(mode: str = "head_only", *, for_reference: bool = False, **overrides: Any) -> TrainingConfig:
     defaults: dict[str, Any] = {
         "model_name_or_path": "tiny-local-test",
         "mode": mode,
-        "device": "cpu",
+        "device": reference_device_for_mode() if for_reference else trainer_device_for_mode(),
         "log_every": 1000,
         "shuffle": False,
         "sign_flip": False,
@@ -228,9 +236,21 @@ def _base_config(mode: str = "head_only", **overrides: Any) -> TrainingConfig:
 
 
 def _followup_collective_sum(world_size: int) -> int:
-    probe = torch.ones(1, dtype=torch.int64)
+    del world_size
+    probe = torch.ones(1, dtype=torch.int64, device=active_dist_device())
     dist.all_reduce(probe, op=dist.ReduceOp.SUM)
     return int(probe.item())
+
+
+def _rng_snapshot(device: torch.device) -> tuple[Tensor, ...]:
+    """Capture CPU (and active CUDA device, when on CUDA) RNG state for isolation assertions."""
+    if device.type == "cuda":
+        return (torch.get_rng_state().clone(), torch.cuda.get_rng_state(device).clone())
+    return (torch.get_rng_state().clone(),)
+
+
+def _rng_equal(a: tuple[Tensor, ...], b: tuple[Tensor, ...]) -> bool:
+    return len(a) == len(b) and all(bool(torch.equal(x, y)) for x, y in zip(a, b, strict=True))
 
 
 def _record_propagated_exception(fn: Any, world_size: int) -> dict[str, Any]:
@@ -402,12 +422,15 @@ def _t15a_counts(world_size: int) -> list[int]:
     return [8, 8, 1, 1, 6, 6, 1, 2, 1, 1, 8, 7, 2, 1, 8, 8, 8, 1]
 
 
-def _run_t15a_one(world_size: int, mode: str, dtype_name: str, *, per_rank_batch: int) -> dict[str, Any]:
+def _run_t15a_one(
+    world_size: int, mode: str, dtype_name: str, *, per_rank_batch: int, for_reference: bool = False
+) -> dict[str, Any]:
     dtype = torch.float64 if dtype_name == "float64" else torch.float32
     ds = _make_uneven_dataset(_t15a_counts(world_size), seed=101, covariates=True)
     lr = 1e-3 if mode == "full_ft" else 1e-2
     cfg = _base_config(
         mode=mode,
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         epochs=3,
         max_steps=None,
@@ -452,10 +475,11 @@ def _sc_t15a_trajectory(rank: int, world_size: int, mode: str, dtype_name: str) 
     return _run_t15a_one(world_size, mode, dtype_name, per_rank_batch=2)
 
 
-def _run_t15a_repeated_det(world_size: int, *, per_rank_batch: int) -> dict[str, Any]:
+def _run_t15a_repeated_det(world_size: int, *, per_rank_batch: int, for_reference: bool = False) -> dict[str, Any]:
     ds = _make_uneven_dataset(_t15a_counts(world_size), seed=105, covariates=True)
     cfg = _base_config(
         mode="lora_variate",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         epochs=2,
         max_steps=None,
@@ -569,7 +593,7 @@ def test_t15_a_multi_epoch_trajectory_parity(world_size: int, _t15_pool: Any) ->
         tol = TRAJ_TOL[dt]
         update_tol = TRAJ_UPDATE_TOL[dt]
         for mode in ALL_MODES:
-            ref = _run_t15a_one(world_size, mode, dt, per_rank_batch=world_size * 2)
+            ref = _run_t15a_one(world_size, mode, dt, per_rank_batch=world_size * 2, for_reference=True)
             ref_res: TrainingResult = ref["result"]
             assert ref_res.steps == 9 and ref_res.epochs == 3 and ref_res.skipped_batches == 0
             ref_update = ref["final_trainable"] - ref["init_trainable"]
@@ -601,7 +625,7 @@ def test_t15_a_multi_epoch_trajectory_parity(world_size: int, _t15_pool: Any) ->
                 )
 
     # Repeated fit() (shuffle=False): fresh warmup+cosine schedule, continuous global_step, parity with 1-process.
-    ref_rep = _run_t15a_repeated_det(world_size, per_rank_batch=world_size * 2)
+    ref_rep = _run_t15a_repeated_det(world_size, per_rank_batch=world_size * 2, for_reference=True)
     assert ref_rep["res1"].steps == 6 and ref_rep["res2"].steps == 6
     assert ref_rep["step1"] == 6 and ref_rep["step2"] == 12
     assert ref_rep["lrs2"] == pytest.approx(ref_rep["lrs1"], rel=1e-12)
@@ -740,6 +764,7 @@ def _run_t15b_union_ref(world_size: int, mode: str, dtype_name: str) -> list[dic
     ds = _make_uneven_dataset(counts, seed=202, covariates=True)
     cfg = _base_config(
         mode=mode,
+        for_reference=True,
         batch_size=2 * world_size,
         max_steps=len(step_shards),
         warmup_steps=0,
@@ -760,6 +785,7 @@ def _run_t15b_union_ref(world_size: int, mode: str, dtype_name: str) -> list[dic
             union_indices = [idx for shard in shard_map if shard is not None for idx in shard]
             raw_union = collator([ds[i] for i in union_indices])
             union_batch = as_double(raw_union) if dtype == torch.float64 else raw_union
+            union_batch = union_batch.to(trainer.device)
             trainer.optimizer.zero_grad(set_to_none=True)
             loss = compute_loss(trainer.model, union_batch, cfg.target_frame, validate=False).loss
             loss.backward()
@@ -964,10 +990,11 @@ def _t15c_counts(world_size: int) -> list[int]:
     return b0 + b1 + b2
 
 
-def _run_t15c_skip(world_size: int, *, per_rank_batch: int) -> dict[str, Any]:
+def _run_t15c_skip(world_size: int, *, per_rank_batch: int, for_reference: bool = False) -> dict[str, Any]:
     ds = _make_uneven_dataset(_t15c_counts(world_size), seed=301, covariates=True)
     cfg = _base_config(
         mode="full_ft",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         max_steps=4,
         warmup_steps=1,
@@ -1031,7 +1058,7 @@ def test_t15_c_global_zero_scored_step_and_empty_epoch(world_size: int, _t15_poo
     """T15(c). Globally zero-scored batch (`W_D == 0`) skips backward/optimiser/scheduler and
     increments `skipped_batches` on every rank; an all-unscored epoch raises `RuntimeError` on every rank.
     """
-    ref = _run_t15c_skip(world_size, per_rank_batch=2 * world_size)
+    ref = _run_t15c_skip(world_size, per_rank_batch=2 * world_size, for_reference=True)
     assert ref["result"].steps == 4 and ref["result"].skipped_batches == 2 and ref["result"].epochs == 2
 
     outcomes = _t15_pool("c", world_size)
@@ -1067,13 +1094,13 @@ def _sc_t15d_initial_broadcast(rank: int, world_size: int, mode: str, base_dir: 
     model = _fresh_tiny_model(seed=100 + rank)
     model.register_buffer("_t15_rank_buf", torch.full((4,), float(rank + 1), dtype=torch.float32))
     # `representation.patch_proj.hidden_layer.weight` is never LoRA-wrapped and is frozen in every non-full_ft mode.
-    init_body = model.representation.patch_proj.hidden_layer.weight.detach().clone()
+    init_body = model.representation.patch_proj.hidden_layer.weight.detach().cpu().clone()
 
     # Deliberately give each rank a distinct `output_dir`: spec §5.6 excludes rank-specific `output_dir` from digest.
     cfg = _base_config(mode=mode, batch_size=2, max_steps=1, seed=31, output_dir=Path(base_dir) / f"out_r{rank}")
     trainer = TimestralTrainer(cfg, ds, lora_config=_lora_for(mode), model=model)
     after_body_param = trainer.model.representation.patch_proj.hidden_layer.weight
-    after_body = after_body_param.detach().clone()
+    after_body = after_body_param.detach().cpu().clone()
     req_grad = {name: p.requires_grad for name, p in sorted(trainer.model.named_parameters())}
     return {
         "all_params": _flat_params(trainer.model),
@@ -1081,6 +1108,9 @@ def _sc_t15d_initial_broadcast(rank: int, world_size: int, mode: str, base_dir: 
         "body_changed_from_local_init": not torch.equal(init_body, after_body),
         "body_frozen": not after_body_param.requires_grad,
         "req_grad": req_grad,
+        "trainer_device": str(trainer.device),
+        "param_device": str(after_body_param.device),
+        "cuda_current_device": torch.cuda.current_device() if trainer.device.type == "cuda" else None,
     }
 
 
@@ -1162,6 +1192,15 @@ def test_t15_d_initial_broadcast_and_consistency(world_size: int, _t15_pool: Any
         r0 = outs[0]
         assert torch.equal(r0["rank_buf"], torch.full((4,), 1.0))
         for r, out in enumerate(outs):
+            expected_dev = expected_worker_device(r)
+            assert out["trainer_device"] == str(expected_dev), (
+                f"{mode} r{r}: bound device {out['trainer_device']} != {expected_dev}"
+            )
+            assert out["param_device"] == str(expected_dev), (
+                f"{mode} r{r}: parameter device {out['param_device']} != {expected_dev}"
+            )
+            if expected_dev.type == "cuda":
+                assert out["cuda_current_device"] == expected_dev.index
             assert torch.equal(out["all_params"], r0["all_params"]), f"{mode} r{r}: weights differ from rank 0"
             assert torch.equal(out["rank_buf"], r0["rank_buf"]), f"{mode} r{r}: buffer differs from rank 0"
             assert out["req_grad"] == r0["req_grad"], f"{mode} r{r}: requires_grad map differs"
@@ -1218,12 +1257,15 @@ def _sc_t15e_stop_on_step_end(rank: int, world_size: int) -> dict[str, Any]:
     }
 
 
-def _run_t15e_early_stop_restore(world_size: int, *, per_rank_batch: int) -> dict[str, Any]:
+def _run_t15e_early_stop_restore(
+    world_size: int, *, per_rank_batch: int, for_reference: bool = False
+) -> dict[str, Any]:
     train_ds = _make_uneven_dataset([8, 2, 7, 1, 8, 3, 6, 2] * (1 if world_size == 2 else 2), seed=503, covariates=True)
     val_ds = _make_uneven_dataset([8, 1, 6, 2, 7, 3, 5], seed=504, covariates=True)
     # High constant LR degrades validation loss after early steps, triggering EarlyStopping and restore_best.
     cfg = _base_config(
         mode="head_only",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         eval_batch_size=2,
         max_steps=16,
@@ -1337,7 +1379,7 @@ def test_t15_e_stop_restore_and_training_result(world_size: int, _t15_pool: Any)
     one-process `fit()`; all ten `TrainingResult` fields are equal on every rank, with non-zero ranks
     visibly adopting rank 0's broadcast step and evaluation losses.
     """
-    ref_es = _run_t15e_early_stop_restore(world_size, per_rank_batch=2 * world_size)
+    ref_es = _run_t15e_early_stop_restore(world_size, per_rank_batch=2 * world_size, for_reference=True)
     ref_res: TrainingResult = ref_es["result"]
     assert ref_res.stopped_early and ref_res.restored_best
     assert ref_res.best_step is not None and ref_res.best_step < ref_res.steps
@@ -1410,11 +1452,14 @@ def test_t15_e_stop_restore_and_training_result(world_size: int, _t15_pool: Any)
             assert out["perturbed_steps"] == 0 and out["perturbed_evals"] == 0
 
 
-def _run_t15e_set_clear_stop(world_size: int, *, mode: str, per_rank_batch: int) -> dict[str, Any]:
+def _run_t15e_set_clear_stop(
+    world_size: int, *, mode: str, per_rank_batch: int, for_reference: bool = False
+) -> dict[str, Any]:
     train_ds = _make_uneven_dataset([8, 4, 6, 2] * world_size, seed=505, covariates=True)
     val_ds = _make_uneven_dataset([8, 2, 7, 3, 5], seed=506, covariates=True)
     cfg = _base_config(
         mode="head_only",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         eval_batch_size=2,
         max_steps=4,
@@ -1444,12 +1489,16 @@ def test_t15_e_should_stop_cleared_after_set(world_size: int, _t15_pool: Any) ->
     `should_stop = False` on every non-zero rank so training continues to `max_steps` without
     deadlocking and matches one-process `fit()` with the same callback.
     """
-    ref_step = _run_t15e_set_clear_stop(world_size, mode="step_end_to_eval", per_rank_batch=2 * world_size)
+    ref_step = _run_t15e_set_clear_stop(
+        world_size, mode="step_end_to_eval", per_rank_batch=2 * world_size, for_reference=True
+    )
     assert ref_step["result"].steps == 4 and not ref_step["result"].stopped_early
     assert ref_step["should_stop"] is False
     assert ref_step["cb_steps"] == [1, 2, 3, 4] and ref_step["cb_evals"] == [1, 2, 3, 4]
 
-    ref_start = _run_t15e_set_clear_stop(world_size, mode="fit_start_to_step0_eval", per_rank_batch=2 * world_size)
+    ref_start = _run_t15e_set_clear_stop(
+        world_size, mode="fit_start_to_step0_eval", per_rank_batch=2 * world_size, for_reference=True
+    )
     assert ref_start["result"].steps == 0 and ref_start["result"].stopped_early
     assert ref_start["should_stop"] is False
     assert ref_start["cb_steps"] == [] and ref_start["cb_evals"] == [0]
@@ -1526,13 +1575,16 @@ def _sc_t15f_shuffled_epochs(rank: int, world_size: int) -> dict[str, Any]:
     }
 
 
-def _run_t15f_sign_flip(world_size: int, *, per_rank_batch: int, max_steps: int | None) -> dict[str, Any]:
+def _run_t15f_sign_flip(
+    world_size: int, *, per_rank_batch: int, max_steps: int | None, for_reference: bool = False
+) -> dict[str, Any]:
     # 8 full global steps + 1 trailing window -> R = 1 < N (ranks 1..N-1 empty on step 8).
     n_items = 8 * world_size * 2 + 1
     counts = [8 - (i % 6) for i in range(n_items)]
     ds = _make_uneven_dataset(counts, seed=602, covariates=False, positive_only=True)
     cfg = _base_config(
         mode="lora_temporal",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         epochs=1,
         max_steps=max_steps,
@@ -1620,12 +1672,14 @@ def _run_t15f_lora_dropout(
     seed: int = 63,
     with_val: bool = False,
     track_rng_isolation: bool = False,
+    for_reference: bool = False,
 ) -> dict[str, Any]:
     """Run `lora_variate` with active dropout, recording training zero-masks and optional RNG isolation."""
     ds = _make_copied_dataset(num_windows, seed=604)
     val_ds = _make_uneven_dataset([8, 4, 6, 2][:world_size], seed=608, covariates=True) if with_val else None
     cfg = _base_config(
         mode="lora_variate",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         eval_batch_size=2,
         epochs=epochs,
@@ -1643,9 +1697,9 @@ def _run_t15f_lora_dropout(
     _activate_lora_b(trainer.model)
 
     handles, masks, dropped_counts, seen_initial_seeds = _attach_lora_dropout_recorder(trainer.model)
-    rng_after_prepare: list[Tensor] = []
-    train_pre_states: list[Tensor] = []
-    train_post_states: list[Tensor] = []
+    rng_after_prepare: list[tuple[Tensor, ...]] = []
+    train_pre_states: list[tuple[Tensor, ...]] = []
+    train_post_states: list[tuple[Tensor, ...]] = []
     val_rng_preserved: list[bool] = []
 
     if track_rng_isolation:
@@ -1658,13 +1712,13 @@ def _run_t15f_lora_dropout(
 
             def _wrapped_prepare() -> None:
                 orig_prepare()
-                rng_after_prepare.append(torch.get_rng_state().clone())
+                rng_after_prepare.append(_rng_snapshot(trainer.device))
 
             def _wrapped_eval() -> EvalResult:
-                before = torch.get_rng_state().clone()
+                before = _rng_snapshot(trainer.device)
                 ev = orig_eval()
-                after = torch.get_rng_state().clone()
-                val_rng_preserved.append(bool(torch.equal(before, after)))
+                after = _rng_snapshot(trainer.device)
+                val_rng_preserved.append(_rng_equal(before, after))
                 return ev
 
             strategy.prepare_fit = _wrapped_prepare
@@ -1675,14 +1729,14 @@ def _run_t15f_lora_dropout(
         handles.append(
             trainer.model.transformer.register_forward_pre_hook(
                 lambda _m, _inp: (
-                    train_pre_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+                    train_pre_states.append(_rng_snapshot(trainer.device)) if trainer.model.training else None
                 )
             )
         )
         handles.append(
             trainer.model.transformer.register_forward_hook(
                 lambda _m, _inp, _out: (
-                    train_post_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+                    train_post_states.append(_rng_snapshot(trainer.device)) if trainer.model.training else None
                 )
             )
         )
@@ -1694,12 +1748,10 @@ def _run_t15f_lora_dropout(
             h.remove()
 
     train_loader_rng_isolated = (
-        bool(rng_after_prepare)
-        and bool(train_pre_states)
-        and bool(torch.equal(rng_after_prepare[0], train_pre_states[0]))
+        bool(rng_after_prepare) and bool(train_pre_states) and _rng_equal(rng_after_prepare[0], train_pre_states[0])
     )
     between_steps_rng_isolated = len(train_pre_states) == len(train_post_states) and all(
-        bool(torch.equal(train_post_states[i], train_pre_states[i + 1])) for i in range(len(train_pre_states) - 1)
+        _rng_equal(train_post_states[i], train_pre_states[i + 1]) for i in range(len(train_pre_states) - 1)
     )
     return {
         "result": res,
@@ -1780,7 +1832,7 @@ def _sc_t15f_late_first_slice_rng(rank: int, world_size: int) -> dict[str, Any]:
     strategy = trainer._make_fit_strategy()
     strategy.prepare_fit()
     assert strategy._sampler is not None and strategy._train_loader is not None
-    rng_after_prepare = torch.get_rng_state().clone()
+    rng_after_prepare = _rng_snapshot(trainer.device)
 
     if rank == world_size - 1:
         orig_slice_size = strategy._sampler.slice_size
@@ -1797,17 +1849,17 @@ def _sc_t15f_late_first_slice_rng(rank: int, world_size: int) -> dict[str, Any]:
             train_iter_calls += 1
         return orig_iter(self_loader)
 
-    train_pre_states: list[Tensor] = []
-    train_post_states: list[Tensor] = []
+    train_pre_states: list[tuple[Tensor, ...]] = []
+    train_post_states: list[tuple[Tensor, ...]] = []
     handles.append(
         trainer.model.transformer.register_forward_pre_hook(
-            lambda _m, _inp: train_pre_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+            lambda _m, _inp: train_pre_states.append(_rng_snapshot(trainer.device)) if trainer.model.training else None
         )
     )
     handles.append(
         trainer.model.transformer.register_forward_hook(
             lambda _m, _inp, _out: (
-                train_post_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+                train_post_states.append(_rng_snapshot(trainer.device)) if trainer.model.training else None
             )
         )
     )
@@ -1818,11 +1870,11 @@ def _sc_t15f_late_first_slice_rng(rank: int, world_size: int) -> dict[str, Any]:
         step_gen = strategy.iter_epoch_steps(0)
         outcome0 = next(step_gen)
         iter_after_step0 = train_iter_calls
-        rng_after_step0 = torch.get_rng_state().clone()
+        rng_after_step0 = _rng_snapshot(trainer.device)
 
-        rng_before_val = torch.get_rng_state().clone()
+        rng_before_val = _rng_snapshot(trainer.device)
         strategy.evaluate_val()
-        rng_after_val = torch.get_rng_state().clone()
+        rng_after_val = _rng_snapshot(trainer.device)
 
         outcome1 = next(step_gen)
         iter_after_step1 = train_iter_calls
@@ -1837,14 +1889,12 @@ def _sc_t15f_late_first_slice_rng(rank: int, world_size: int) -> dict[str, Any]:
         "skipped": [outcome0.skipped, outcome1.skipped],
         "iter_after_step0": iter_after_step0,
         "iter_after_step1": iter_after_step1,
-        "step0_preserved_prepare_rng": bool(torch.equal(rng_after_step0, rng_after_prepare)),
-        "val_preserved_rng": bool(torch.equal(rng_before_val, rng_after_val)),
+        "step0_preserved_prepare_rng": _rng_equal(rng_after_step0, rng_after_prepare),
+        "val_preserved_rng": _rng_equal(rng_before_val, rng_after_val),
         "first_train_fwd_preserved_prepare_rng": bool(train_pre_states)
-        and bool(torch.equal(train_pre_states[0], rng_after_prepare)),
+        and _rng_equal(train_pre_states[0], rng_after_prepare),
         "between_steps_preserved_rng": len(train_pre_states) == len(train_post_states)
-        and all(
-            bool(torch.equal(train_post_states[i], train_pre_states[i + 1])) for i in range(len(train_pre_states) - 1)
-        ),
+        and all(_rng_equal(train_post_states[i], train_pre_states[i + 1]) for i in range(len(train_pre_states) - 1)),
         "train_fwd_count": len(train_pre_states),
         "masks": masks,
         "dropped_counts": dropped_counts,
@@ -1853,7 +1903,13 @@ def _sc_t15f_late_first_slice_rng(rank: int, world_size: int) -> dict[str, Any]:
 
 
 def _run_t15f_short_dataset(
-    world_size: int, *, with_val: bool, per_rank_batch: int, num_workers: int = 0, shuffle: bool = False
+    world_size: int,
+    *,
+    with_val: bool,
+    per_rank_batch: int,
+    num_workers: int = 0,
+    shuffle: bool = False,
+    for_reference: bool = False,
 ) -> dict[str, Any]:
     """Train on a dataset shorter than `world_size` (`len = world_size - 1`) and count `DataLoader.__iter__`."""
     train_counts = [8, 2, 6][: world_size - 1]
@@ -1864,6 +1920,7 @@ def _run_t15f_short_dataset(
     )
     cfg = _base_config(
         mode="head_only",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         eval_batch_size=2,
         epochs=2,
@@ -1936,11 +1993,15 @@ def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
     `rank_seed(seed, rank)`; datasets shorter than `world_size` (with and without `val_dataset`)
     never create a `DataLoader` iterator on idle ranks and match one-process `fit()`.
     """
-    ref_flip = _run_t15f_sign_flip(world_size, per_rank_batch=2, max_steps=8)
+    ref_flip = _run_t15f_sign_flip(world_size, per_rank_batch=2, max_steps=8, for_reference=True)
     assert len(ref_flip["flips"]) == 16
 
-    ref_short_noval = _run_t15f_short_dataset(world_size, with_val=False, per_rank_batch=2 * world_size)
-    ref_short_val = _run_t15f_short_dataset(world_size, with_val=True, per_rank_batch=2 * world_size)
+    ref_short_noval = _run_t15f_short_dataset(
+        world_size, with_val=False, per_rank_batch=2 * world_size, for_reference=True
+    )
+    ref_short_val = _run_t15f_short_dataset(
+        world_size, with_val=True, per_rank_batch=2 * world_size, for_reference=True
+    )
 
     outcomes = _t15_pool("f", world_size)
 
@@ -2019,6 +2080,7 @@ def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
             max_steps=2,
             seed=rank_seed(63, r),
             with_val=False,
+            for_reference=True,
         )
         assert out["masks"] == ref_drop["masks"], (
             f"lora_dropout r{r}: LoRA dropout masks diverged from uninterrupted rank_seed(63, {r}) stream"
@@ -2036,7 +2098,7 @@ def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
     # rank 0 matches 1-process fit() from seed=68; peers match uninterrupted rank_seed(68, r) after the empty step.
     empty_rng_outs = unwrap_results(outcomes["empty_step_rng"])
     ref_empty_r0 = _run_t15f_lora_dropout(
-        world_size, per_rank_batch=2, num_windows=3, epochs=2, max_steps=3, seed=68, with_val=False
+        world_size, per_rank_batch=2, num_windows=3, epochs=2, max_steps=3, seed=68, with_val=False, for_reference=True
     )
     for r, out in enumerate(empty_rng_outs):
         assert out["result"] == empty_rng_outs[0]["result"]
@@ -2065,6 +2127,7 @@ def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
                 max_steps=2,
                 seed=rank_seed(68, r),
                 with_val=False,
+                for_reference=True,
             )
             assert out["masks"] == ref_peer["masks"], (
                 f"empty_step_rng r{r}: post-empty-step dropout stream diverged from uninterrupted rank_seed(68, {r})"
@@ -2074,7 +2137,7 @@ def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
     # lazy iter(self._train_loader) on step 1 leaves global RNG untouched and matches uninterrupted rank_seed(69, r).
     late_outs = unwrap_results(outcomes["late_first_slice_rng"])
     ref_late_r0 = _run_t15f_lora_dropout(
-        world_size, per_rank_batch=2, num_windows=3, epochs=1, max_steps=2, seed=69, with_val=False
+        world_size, per_rank_batch=2, num_windows=3, epochs=1, max_steps=2, seed=69, with_val=False, for_reference=True
     )
     ref_late_last = _run_t15f_lora_dropout(
         world_size,
@@ -2084,6 +2147,7 @@ def test_t15_f_sampling_and_sign_flips(world_size: int, _t15_pool: Any) -> None:
         max_steps=1,
         seed=rank_seed(69, world_size - 1),
         with_val=False,
+        for_reference=True,
     )
     for r, out in enumerate(late_outs):
         assert out["skipped"] == [False, False]
@@ -2172,7 +2236,7 @@ def _sc_t15f_workers(rank: int, world_size: int, num_workers: int) -> dict[str, 
 def _worker_t15f_workers_paired(rank: int, world_size: int) -> dict[str, Any]:
     """Run `num_workers=0` reference first, then `num_workers=2` in one spawned process group."""
     w0 = _sc_t15f_workers(rank, world_size, 0)
-    dist.barrier()
+    barrier()
     w2 = _sc_t15f_workers(rank, world_size, 2)
     return {"w0": w0, "w2": w2}
 
@@ -2195,8 +2259,8 @@ def test_t15_f_dataloader_workers() -> None:
         run_distributed(
             _worker_t15f_workers_paired,
             world_size=world_size,
-            pg_timeout=30.0,
-            wall_timeout=90.0,
+            pg_timeout=scale_timeout(30.0, 60.0),
+            wall_timeout=scale_timeout(90.0, 240.0),
         )
     )
     expected_steps = 2 * steps_per_epoch(world_size * 2 + 1, world_size, 2)
@@ -2242,7 +2306,7 @@ def _run_t15g_eval_ref(
     dtype = torch.float64 if dtype_name == "float64" else torch.float32
     train_ds = _make_uneven_dataset([8, 6, 4, 2], seed=700, covariates=True)
     val_ds = _make_uneven_dataset(val_counts, seed=701, covariates=True)
-    cfg = _base_config(mode=mode, batch_size=2, eval_batch_size=2, max_steps=1, seed=71)
+    cfg = _base_config(mode=mode, for_reference=True, batch_size=2, eval_batch_size=2, max_steps=1, seed=71)
     ctx_mgr = float64_reference() if dtype == torch.float64 else torch.enable_grad()
     with ctx_mgr:
         trainer = TimestralTrainer(
@@ -2529,9 +2593,10 @@ def _sc_t15h_guards_and_export(rank: int, world_size: int, base_dir: str) -> dic
             err = type(exc)
         replay_errs[label] = err
 
-    # 3. Device/backend mismatches on gloo raise ValueError immediately.
+    # 3. Device/backend mismatches raise ValueError immediately ("cuda"/"mps" on gloo, "cpu"/"mps" on nccl).
     dev_errs: dict[str, type[BaseException] | None] = {}
-    for dev in ("cuda", "mps"):
+    mismatch_devs = ("cpu", "mps") if is_cuda_dist_mode() else ("cuda", "mps")
+    for dev in mismatch_devs:
         err = None
         try:
             TimestralTrainer(_base_config(device=dev, batch_size=2), ds, model=_fresh_tiny_model(seed=13))
@@ -2690,7 +2755,9 @@ def test_t15_h_guards_and_export(world_size: int, tmp_path: Path, _t15_pool: Any
     """
     # Positive control: one-process export must NOT contain `world_size` or `effective_batch_size` (spec §7.4).
     one_ds = _make_uneven_dataset([8, 4, 6, 2], seed=801, covariates=True)
-    one_trainer = TimestralTrainer(_base_config(batch_size=2, max_steps=1), one_ds, model=_fresh_tiny_model(seed=14))
+    one_trainer = TimestralTrainer(
+        _base_config(for_reference=True, batch_size=2, max_steps=1), one_ds, model=_fresh_tiny_model(seed=14)
+    )
     one_out = one_trainer.export(tmp_path / "one_process_export")
     one_meta = json.loads((one_out / "tune_metadata.json").read_text(encoding="utf-8"))
     assert "world_size" not in one_meta and "effective_batch_size" not in one_meta
@@ -2704,6 +2771,9 @@ def test_t15_h_guards_and_export(world_size: int, tmp_path: Path, _t15_pool: Any
     assert outs[0]["warn_counts"]["default_lr_small"] == 0
     assert outs[0]["cache_init_logs"] == 1 and outs[0]["cache_fit_logs"] == 0
 
+    expected_dev_errs = (
+        {"cpu": ValueError, "mps": ValueError} if is_cuda_dist_mode() else {"cuda": ValueError, "mps": ValueError}
+    )
     expected_head_steps = 3 * steps_per_epoch(4 * world_size, world_size, 2)
     for r, out in enumerate(outs):
         assert out["reduce_overhead_err"] is ValueError
@@ -2714,7 +2784,7 @@ def test_t15_h_guards_and_export(world_size: int, tmp_path: Path, _t15_pool: Any
             "ds_is_val": ValueError,
             "valid_cfg": None,
         }
-        assert out["dev_errs"] == {"cuda": ValueError, "mps": ValueError}
+        assert out["dev_errs"] == expected_dev_errs
         assert out["head_cache_is_none"] is True
         assert out["head_steps"] == expected_head_steps
         assert out["head_body_calls"] == expected_head_steps, (
@@ -2753,7 +2823,7 @@ def _worker_t15h_post_destroy_snapshot(rank: int, world_size: int, base_dir: str
     del world_size
     ds = _make_uneven_dataset([8, 4, 6, 2], seed=804, covariates=True)
     trainer = TimestralTrainer(_base_config(batch_size=2, max_steps=1), ds, model=_fresh_tiny_model(seed=16))
-    dist.barrier()
+    barrier(trainer.device)
     dist.destroy_process_group()
 
     trainer.should_stop = True
@@ -2802,13 +2872,14 @@ def test_t15_h_unsupported_backend_and_post_destroy_snapshot(tmp_path: Path) -> 
     `RuntimeError` without mutating trainer state while `export()` still uses the construction
     snapshot cleanly.
     """
+    bad_backend = "cuda:nccl" if is_cuda_dist_mode() else "cpu:gloo"
     bad_backend_outs = unwrap_results(
         run_distributed(
             _worker_t15h_cpu_gloo_backend,
             world_size=2,
-            backend="cpu:gloo",
-            pg_timeout=PG_TIMEOUT,
-            wall_timeout=WALL_TIMEOUT,
+            backend=bad_backend,
+            pg_timeout=scale_timeout(PG_TIMEOUT, 30.0),
+            wall_timeout=scale_timeout(WALL_TIMEOUT, 120.0),
         )
     )
     assert bad_backend_outs == [ValueError, ValueError]
@@ -2818,8 +2889,8 @@ def test_t15_h_unsupported_backend_and_post_destroy_snapshot(tmp_path: Path) -> 
             _worker_t15h_post_destroy_snapshot,
             world_size=2,
             args=(str(tmp_path),),
-            pg_timeout=PG_TIMEOUT,
-            wall_timeout=WALL_TIMEOUT,
+            pg_timeout=scale_timeout(PG_TIMEOUT, 30.0),
+            wall_timeout=scale_timeout(WALL_TIMEOUT, 120.0),
         )
     )
     for r, out in enumerate(snap_outs):
@@ -2868,18 +2939,23 @@ def _worker_t15h_compile_default(rank: int, world_size: int, base_dir: str) -> d
 
 @pytest.mark.acceptance
 def test_t15_h_compile_default_smoke(tmp_path: Path) -> None:
-    """T15(h). `compile_model=True` with `compile_mode="default"` trains cleanly across ranks on CPU,
+    """T15(h). `compile_model=True` with `compile_mode="default"` trains cleanly across ranks,
     produces bitwise identical weights, merges without `_orig_mod` keys, and exports on rank 0 only.
     """
-    if shutil.which("g++") is None and shutil.which("clang++") is None:
-        pytest.skip("CPU torch.compile requires a C++ compiler (g++ or clang++)")
+    has_compiler = (
+        any(shutil.which(cc) is not None for cc in ("cc", "gcc", "g++", "clang++"))
+        if is_cuda_dist_mode()
+        else (shutil.which("g++") is not None or shutil.which("clang++") is not None)
+    )
+    if not has_compiler:
+        pytest.skip("torch.compile requires a C/C++ compiler")
     outs = unwrap_results(
         run_distributed(
             _worker_t15h_compile_default,
             world_size=2,
             args=(str(tmp_path),),
-            pg_timeout=60.0,
-            wall_timeout=180.0,
+            pg_timeout=scale_timeout(60.0, 120.0),
+            wall_timeout=scale_timeout(180.0, 360.0),
         )
     )
     for r, out in enumerate(outs):
@@ -3145,11 +3221,12 @@ def _replay_cfg_for(kind: str, *, batch_size: int, cache_base_outputs: bool) -> 
 
 
 def _t15j_warmed_full_ft_state(world_size: int, dtype_name: str) -> dict[str, Tensor]:
-    """Run 3 deterministic domain-only `full_ft` steps on one process so student != step-0 teacher."""
+    """Run 3 deterministic domain-only `full_ft` steps on one CPU process so student != step-0 teacher."""
     dtype = torch.float64 if dtype_name == "float64" else torch.float32
     domain_ds = _make_uneven_dataset(_t15j_domain_counts(world_size), seed=1001, covariates=True)
     cfg = _base_config(
         mode="full_ft",
+        device="cpu",
         batch_size=world_size * 2,
         max_steps=3,
         warmup_steps=0,
@@ -3177,6 +3254,7 @@ def _run_t15j_one(
     per_rank_replay_batch: int,
     cache_base_outputs: bool = True,
     student_state: dict[str, Tensor] | None = None,
+    for_reference: bool = False,
 ) -> dict[str, Any]:
     dtype = torch.float64 if dtype_name == "float64" else torch.float32
     domain_ds = _make_uneven_dataset(_t15j_domain_counts(world_size), seed=1001, covariates=True)
@@ -3186,6 +3264,7 @@ def _run_t15j_one(
     lr = 1e-3 if mode == "full_ft" else 1e-2
     cfg = _base_config(
         mode=mode,
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         epochs=2,
         max_steps=None,
@@ -3308,6 +3387,7 @@ def test_t15_j_replay_and_distillation_trajectory_parity(world_size: int, _t15_p
     for mode in REPLAY_TEACHER_MODES:
         cfg = _base_config(
             mode=mode,
+            for_reference=True,
             batch_size=world_size * 2,
             epochs=2,
             max_steps=None,
@@ -3342,6 +3422,7 @@ def test_t15_j_replay_and_distillation_trajectory_parity(world_size: int, _t15_p
             per_rank_batch=world_size * 2,
             per_rank_replay_batch=world_size * 2,
             cache_base_outputs=(dt == "float32"),
+            for_reference=True,
         )
         ref_res: TrainingResult = ref["result"]
         assert ref_res.steps == 6 and ref_res.epochs == 2 and ref_res.skipped_batches == 0
@@ -3389,6 +3470,7 @@ def test_t15_j_full_ft_distill_float32(world_size: int, _t15_pool: Any) -> None:
     domain_ds = _make_uneven_dataset(_t15j_domain_counts(world_size), seed=1001, covariates=True)
     plain_cfg = _base_config(
         mode="full_ft",
+        for_reference=True,
         batch_size=world_size * 2,
         epochs=2,
         max_steps=None,
@@ -3417,6 +3499,7 @@ def test_t15_j_full_ft_distill_float32(world_size: int, _t15_pool: Any) -> None:
             per_rank_replay_batch=world_size * 2,
             cache_base_outputs=True,
             student_state=warmed_f32,
+            for_reference=True,
         )
         ref_res: TrainingResult = ref["result"]
         assert ref_res.steps == 6 and ref_res.epochs == 2 and ref_res.skipped_batches == 0
@@ -3472,7 +3555,12 @@ def test_t15_j_full_ft_distill_float32(world_size: int, _t15_pool: Any) -> None:
 
 
 def _run_t15k_skip_no_advance(
-    world_size: int, dtype_name: str, *, per_rank_batch: int, per_rank_replay_batch: int
+    world_size: int,
+    dtype_name: str,
+    *,
+    per_rank_batch: int,
+    per_rank_replay_batch: int,
+    for_reference: bool = False,
 ) -> dict[str, Any]:
     dtype = torch.float64 if dtype_name == "float64" else torch.float32
     domain_ds = _make_uneven_dataset(_t15c_counts(world_size), seed=1101, covariates=True)
@@ -3481,6 +3569,7 @@ def _run_t15k_skip_no_advance(
     assert isinstance(replay_ds, _RecordingDataset)
     cfg = _base_config(
         mode="lora_variate",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         max_steps=4,
         warmup_steps=1,
@@ -3554,6 +3643,7 @@ def _run_t15k_replay_scoring_edge(
     dtype_name: str,
     *,
     per_rank_batch: int,
+    for_reference: bool = False,
 ) -> dict[str, Any]:
     dtype = torch.float64 if dtype_name == "float64" else torch.float32
     domain_counts = [8, 2, 7, 1] if world_size == 2 else [8, 2, 7, 1, 6, 3, 8, 1]
@@ -3565,6 +3655,7 @@ def _run_t15k_replay_scoring_edge(
     )
     cfg = _base_config(
         mode="lora_variate",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         max_steps=3,
         warmup_steps=0,
@@ -3627,7 +3718,9 @@ def _sc_t15k_partial_replay(rank: int, world_size: int, with_distill: bool, dtyp
     )
 
 
-def _run_t15k_repeated_fit_det(world_size: int, *, per_rank_batch: int, per_rank_replay_batch: int) -> dict[str, Any]:
+def _run_t15k_repeated_fit_det(
+    world_size: int, *, per_rank_batch: int, per_rank_replay_batch: int, for_reference: bool = False
+) -> dict[str, Any]:
     domain_ds = _make_uneven_dataset([8 - (i % 6) for i in range(6 * world_size)], seed=1106, covariates=True)
     # 3*(2*N) + 1 = 4 replay steps per replay epoch; max_steps=3 stops mid-replay-epoch.
     replay_len = 3 * (2 * world_size) + 1
@@ -3637,6 +3730,7 @@ def _run_t15k_repeated_fit_det(world_size: int, *, per_rank_batch: int, per_rank
     assert isinstance(replay_ds, _RecordingDataset)
     cfg = _base_config(
         mode="lora_variate",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         max_steps=3,
         warmup_steps=1,
@@ -3780,7 +3874,7 @@ def test_t15_k_replay_skip_unscored_and_repeated_fit(world_size: int, _t15_pool:
         tol = TRAJ_TOL[dt]
         update_tol = TRAJ_UPDATE_TOL[dt]
         ref_skip = _run_t15k_skip_no_advance(
-            world_size, dt, per_rank_batch=2 * world_size, per_rank_replay_batch=2 * world_size
+            world_size, dt, per_rank_batch=2 * world_size, per_rank_replay_batch=2 * world_size, for_reference=True
         )
         assert ref_skip["result"].steps == 4 and ref_skip["result"].skipped_batches == 2
         assert ref_skip["result"].epochs == 2
@@ -3821,7 +3915,9 @@ def test_t15_k_replay_skip_unscored_and_repeated_fit(world_size: int, _t15_pool:
     for dt in ("float64", "float32"):
         tol = TRAJ_TOL[dt]
         update_tol = TRAJ_UPDATE_TOL[dt]
-        ref_plain = _run_t15k_replay_scoring_edge(world_size, [], None, dt, per_rank_batch=2 * world_size)
+        ref_plain = _run_t15k_replay_scoring_edge(
+            world_size, [], None, dt, per_rank_batch=2 * world_size, for_reference=True
+        )
         ref_unscored_only = _run_t15k_replay_scoring_edge(
             world_size,
             [0] * (2 * world_size),
@@ -3834,6 +3930,7 @@ def test_t15_k_replay_skip_unscored_and_repeated_fit(world_size: int, _t15_pool:
             ),
             dt,
             per_rank_batch=2 * world_size,
+            for_reference=True,
         )
         assert l2_rel(ref_unscored_only["final_trainable"], ref_plain["final_trainable"]) <= tol
 
@@ -3868,6 +3965,7 @@ def test_t15_k_replay_skip_unscored_and_repeated_fit(world_size: int, _t15_pool:
             ),
             dt,
             per_rank_batch=2 * world_size,
+            for_reference=True,
         )
         assert l2_rel(ref_distill_only["final_trainable"], ref_plain["final_trainable"]) > 1e-4
 
@@ -3908,6 +4006,7 @@ def test_t15_k_replay_skip_unscored_and_repeated_fit(world_size: int, _t15_pool:
                 ),
                 dt,
                 per_rank_batch=2 * world_size,
+                for_reference=True,
             )
             part_outs = unwrap_results(outcomes[f"{key_prefix}_{dt}"])
             r0 = part_outs[0]
@@ -3924,7 +4023,7 @@ def test_t15_k_replay_skip_unscored_and_repeated_fit(world_size: int, _t15_pool:
 
     # 5. Repeated fit() with replay (shuffle=False): resets replay to the start even after stopping mid-replay-epoch.
     ref_rep = _run_t15k_repeated_fit_det(
-        world_size, per_rank_batch=2 * world_size, per_rank_replay_batch=2 * world_size
+        world_size, per_rank_batch=2 * world_size, per_rank_replay_batch=2 * world_size, for_reference=True
     )
     assert ref_rep["idx1"] == ref_rep["idx2"] and len(ref_rep["idx1"]) == 3 * (2 * world_size)
     rep_outs = unwrap_results(outcomes["repeated_det"])
@@ -3984,7 +4083,12 @@ def test_t15_k_replay_skip_unscored_and_repeated_fit(world_size: int, _t15_pool:
 
 
 def _run_t15l_replay_sign_flip(
-    world_size: int, *, per_rank_batch: int, per_rank_replay_batch: int, max_steps: int
+    world_size: int,
+    *,
+    per_rank_batch: int,
+    per_rank_replay_batch: int,
+    max_steps: int,
+    for_reference: bool = False,
 ) -> dict[str, Any]:
     domain_ds = _make_uneven_dataset(
         [8 - (i % 6) for i in range(max_steps * 2 * world_size)], seed=1201, covariates=True
@@ -3999,6 +4103,7 @@ def _run_t15l_replay_sign_flip(
     )
     cfg = _base_config(
         mode="lora_temporal",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         max_steps=max_steps,
         learning_rate=1e-2,
@@ -4235,13 +4340,16 @@ def _sc_t15l_teachers_and_caches(rank: int, world_size: int, mode: str) -> dict[
     }
 
 
-def _run_t15l_default_synth(world_size: int, *, per_rank_batch: int, per_rank_replay_batch: int) -> dict[str, Any]:
+def _run_t15l_default_synth(
+    world_size: int, *, per_rank_batch: int, per_rank_replay_batch: int, for_reference: bool = False
+) -> dict[str, Any]:
     domain_ds = _make_uneven_dataset([8, 4, 6, 2] * world_size, seed=1207, covariates=True)
     # Use `lora_temporal` so all four Q/K/V/O LoRA adapters are active on univariate
     # `SyntheticReplaySource` windows (unlike `lora_variate`, whose Q/K slices are inert on
     # single-row windows and dominated by near-eps AdamW amplification).
     cfg = _base_config(
         mode="lora_temporal",
+        for_reference=for_reference,
         batch_size=per_rank_batch,
         max_steps=3,
         learning_rate=1e-2,
@@ -4484,9 +4592,9 @@ def _sc_t15l_replay_loader_rng_isolation(rank: int, world_size: int) -> dict[str
     _activate_lora_b(trainer.model)
     handles, masks, dropped_counts, _ = _attach_lora_dropout_recorder(trainer.model)
 
-    rng_after_prepare: list[Tensor] = []
-    pre_fwd_states: list[Tensor] = []
-    post_fwd_states: list[Tensor] = []
+    rng_after_prepare: list[tuple[Tensor, ...]] = []
+    pre_fwd_states: list[tuple[Tensor, ...]] = []
+    post_fwd_states: list[tuple[Tensor, ...]] = []
 
     orig_make_strategy = trainer._make_fit_strategy
 
@@ -4496,7 +4604,7 @@ def _sc_t15l_replay_loader_rng_isolation(rank: int, world_size: int) -> dict[str
 
         def _wrapped_prepare() -> None:
             orig_prepare()
-            rng_after_prepare.append(torch.get_rng_state().clone())
+            rng_after_prepare.append(_rng_snapshot(trainer.device))
 
         strategy.prepare_fit = _wrapped_prepare
         return strategy
@@ -4504,13 +4612,13 @@ def _sc_t15l_replay_loader_rng_isolation(rank: int, world_size: int) -> dict[str
     trainer._make_fit_strategy = _wrapped_make_strategy  # type: ignore[method-assign]
     handles.append(
         trainer.model.transformer.register_forward_pre_hook(
-            lambda _m, _inp: pre_fwd_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+            lambda _m, _inp: pre_fwd_states.append(_rng_snapshot(trainer.device)) if trainer.model.training else None
         )
     )
     handles.append(
         trainer.model.transformer.register_forward_hook(
             lambda _m, _inp, _out: (
-                post_fwd_states.append(torch.get_rng_state().clone()) if trainer.model.training else None
+                post_fwd_states.append(_rng_snapshot(trainer.device)) if trainer.model.training else None
             )
         )
     )
@@ -4521,10 +4629,10 @@ def _sc_t15l_replay_loader_rng_isolation(rank: int, world_size: int) -> dict[str
             h.remove()
 
     init_isolated = (
-        bool(rng_after_prepare) and bool(pre_fwd_states) and bool(torch.equal(rng_after_prepare[0], pre_fwd_states[0]))
+        bool(rng_after_prepare) and bool(pre_fwd_states) and _rng_equal(rng_after_prepare[0], pre_fwd_states[0])
     )
     between_fwds_isolated = len(pre_fwd_states) == len(post_fwd_states) == 4 and all(
-        bool(torch.equal(post_fwd_states[i], pre_fwd_states[i + 1])) for i in range(3)
+        _rng_equal(post_fwd_states[i], pre_fwd_states[i + 1]) for i in range(3)
     )
     return {
         "result": res,
@@ -4621,9 +4729,13 @@ def test_t15_l_replay_flips_teachers_startup_failures_and_export(world_size: int
     exceptions (including failure-over-skip precedence when healthy peers are zero-scored)
     propagate cleanly; and `export()` writes replay and multi-process metadata on rank 0 only.
     """
-    ref_flips = _run_t15l_replay_sign_flip(world_size, per_rank_batch=2, per_rank_replay_batch=2, max_steps=8)
+    ref_flips = _run_t15l_replay_sign_flip(
+        world_size, per_rank_batch=2, per_rank_replay_batch=2, max_steps=8, for_reference=True
+    )
     assert len(ref_flips["replay_flips"]) == 16
-    ref_synth = _run_t15l_default_synth(world_size, per_rank_batch=2 * world_size, per_rank_replay_batch=2 * world_size)
+    ref_synth = _run_t15l_default_synth(
+        world_size, per_rank_batch=2 * world_size, per_rank_replay_batch=2 * world_size, for_reference=True
+    )
 
     outcomes = _t15_pool("l", world_size)
 
@@ -4866,15 +4978,20 @@ def test_t15_l_compile_default_replay_distill_smoke(tmp_path: Path) -> None:
     produces bitwise identical weights, merges without `_orig_mod` keys, and exports replay +
     multi-process metadata on rank 0 only.
     """
-    if shutil.which("g++") is None and shutil.which("clang++") is None:
-        pytest.skip("CPU torch.compile requires a C++ compiler (g++ or clang++)")
+    has_compiler = (
+        any(shutil.which(cc) is not None for cc in ("cc", "gcc", "g++", "clang++"))
+        if is_cuda_dist_mode()
+        else (shutil.which("g++") is not None or shutil.which("clang++") is not None)
+    )
+    if not has_compiler:
+        pytest.skip("torch.compile requires a C/C++ compiler")
     outs = unwrap_results(
         run_distributed(
             _worker_t15l_compile_default_replay_distill,
             world_size=2,
             args=(str(tmp_path),),
-            pg_timeout=60.0,
-            wall_timeout=180.0,
+            pg_timeout=scale_timeout(60.0, 120.0),
+            wall_timeout=scale_timeout(180.0, 360.0),
         )
     )
     for r, out in enumerate(outs):
@@ -4969,7 +5086,12 @@ def _t15_pool(
                 g_dir = str(tmp_path_factory.mktemp(f"t15_{g}_ws{world_size}"))
                 for name, spec in _SCENARIO_GROUPS[g](world_size, g_dir).items():
                     combined[f"{g}:{name}"] = spec
-            raw = run_scenarios(combined, world_size=world_size, pg_timeout=PG_TIMEOUT, wall_timeout=90.0)
+            raw = run_scenarios(
+                combined,
+                world_size=world_size,
+                pg_timeout=scale_timeout(PG_TIMEOUT, 30.0),
+                wall_timeout=scale_timeout(90.0, 360.0),
+            )
             grouped: dict[str, dict[str, list[RankResult]]] = {g: {} for g in groups}
             for full_name, results in raw.items():
                 g, name = full_name.split(":", 1)
