@@ -1438,8 +1438,10 @@ Phase 5 Stage 3 unticked.
 
 ## 2026-11-24 — Stage 3 tooling review fixes, Python session driver rewrite, and final-tip shared-GPU verification
 
-**What was built (`713aaac`–`8e8f490`).** Every limitation flagged in the `82a21ca` Stage 3 script review was
-addressed across two stretches of work (library code under `src/` was unchanged):
+**What was built (`713aaac`–`8e8f490`).** The limitations flagged in the `82a21ca` Stage 3 script review were
+addressed across two stretches of work (library code under `src/` was unchanged; the CountSketch `float64`
+floor is resolved for vectors `<= 1,000,000` parameters under `--reference-mode auto` and remains present with
+explicit floor flags on larger `full_ft` / `28M head_only` entries):
 
 1. **Three probe and session-script review-and-fix rounds (`713aaac`–`1963050`):**
    - Extracted shared helpers into `scripts/probes/_dist_common.py` (`713aaac`) and hardened
@@ -1447,11 +1449,14 @@ addressed across two stretches of work (library code under `src/` was unchanged)
      equality (`xr_eq`, `xr_max`) now hashes and compares **both** parameters and buffers (`rope.inv_freq`),
      `--reference-mode auto` became the default (exact `float64` deltas up to `1,000,000` parameters and exact
      deltas for any dtype up to `8,192` parameters, `k = 8,192` CountSketch otherwise), archive schema v5 added
-     pre-flight zip CRC, metadata, and tensor byte-size validation plus frozen-base and script-revision digests
-     (covering `distributed_trainer_check.py`, `_dist_common.py`, and `_common.py`), timing and memory columns
-     became `step_ms` (pure `fit()` step average), `val_s`, `tail_s`, and `vram_mib`, compiled graph notes
-     switched to `graphs=s1:<k0>->end:<k1>(+<delta>,bumps_post_s1=<b1>)`, CUDA `moved_student` rows moved to `cuda:0` cleanly so
-     buffer devices match, and `export()` reload parity was added (`1e-6` float64 / `1e-4` float32).
+     every-rank pre-flight zip CRC, metadata, tensor byte-size, model/config, and script-revision checks plus
+     per-scenario rank-0 `frozen_base_sha256` and dataset-fingerprint verification, timing and memory columns
+     became `wall_s`, `step_ms` (largest-over-ranks mean per-step wall time over steps `3..K` excluding
+     validation), `tail_s`, and `vram_mib` (with `val_s` in `notes` on validating scenarios), compiled graph
+     notes switched to `graphs=s1:<k0>->end:<k1>(+<delta>,bumps_post_s1=<b1>)`, CUDA `moved_student` rows now
+     copy warmed parameters only onto each rank's device (`_build_moved_full_ft_params`,
+     `_apply_moved_student_params`) without touching device-built `rope.inv_freq`, and `export()` reload parity
+     was added (`1e-6` float64 / `1e-4` float32).
    - Hardened `scripts/probes/distributed_rank_failure_check.py` (`0edb56e`, `15bf1c5`, `e1dece0`): separate
      `--startup-timeout` and post-kill `--wall-timeout`, strict allow-list of distributed transport/collective
      exceptions and in-`fit()` `SIGABRT`, finite-positive CLI guards, and orphan cleanup.
@@ -1515,40 +1520,41 @@ directly testable with stub stages.
   `docs/VERIFICATION.md` §11):** tightening float64 export-reload checks exposed that `load_model` constructs
   `TuneTimestralModel(config)` in default `float32`, loads weights into it (truncating `float64` weights to
   `float32`), and casts afterward. Reproduced locally at `8e8f490` on `tiny_random` across all six adaptation
-  modes (`param_max_abs` `7.45e-09`–`5.96e-08`, `forecast_rel` `2.76e-09`–`1.55e-08`, vs `1.67e-16`–`4.54e-16`
-  if cast before `load_state_dict`). Recorded without changing `src/timestral_tune/models/loader.py`; the probe
-  retains `1e-6` float64 export-reload tolerance in the meantime.
+  modes (one-off measurements in `docs/VERIFICATION.md` §11). Recorded without changing
+  `src/timestral_tune/models/loader.py`; the probe retains `1e-6` float64 export-reload tolerance in the
+  meantime.
 - **Open Linux `ps`-fallback unit-test failure in `tests/test_multi_gpu_check.py`:** at `8e8f490` on the Linux
-  L4 VM, `test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order` failed (`102 passed, 1
-  failed` in the driver test file; `625 passed, 3 skipped, 1 failed, 213 deselected` for `-m "not network"`).
-  That test mocks `/proc` empty to exercise the non-Linux `ps`-based scan fallback, which returned no hits on
-  that Linux host; the live Linux `/proc` scan path passed every signal and timeout gate. Fix pending.
+  L4 VM, `test_find_token_pids_exact_matching_empty_proc_fallback_and_scan_order` failed (mocking `/proc` empty
+  to exercise the non-Linux `ps`-based scan fallback, which returned no hits on that Linux host; the live Linux
+  `/proc` scan path passed every signal and timeout gate; counts in `docs/VERIFICATION.md` §17.4). Fix pending.
 
 **Evidence (full tables, commands, and cross-session comparisons in `docs/VERIFICATION.md` §11 and §17.4):**
 
 - **Final-tip shared-GPU L4 session (`8e8f490`, one rented NVIDIA L4, driver `580.178.04`, Python `3.12.16`,
-  `torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`, orchestrator Python `3.10.12`):**
-  `bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12 --log-dir mgc_logs` ran 18 stages in
-  `47 min 51 s`: `17` exit `0`, `1` skipped (`02_prototype_parity_cuda`, `shared GPU`), `0` leftover CPU/GPU
-  processes, bitwise parameter **and** buffer equality (`xr_eq=yes, xr_max=0.00e+00`) in all `246` shared-GPU
-  NCCL rows (`tiny_random`, `5M`, `28M` × `N = 2, 4`) and all `70` Linux CPU/`gloo` rows (`tiny_random` ×
-  `N = 2, 4`), plus Linux `gloo` (`DistNetworkError` in `0.07–1.67 s`) and shared-L4 NCCL (`SIGABRT` in
-  `35.50–36.44 s`) rank-failure stages and live gates for resume, `SIGINT`/`SIGTERM`/`SIGHUP` (default and
-  `SIG_IGN`) on real NCCL stages, reference-stage interrupt artifact removal, `--stage-timeout 20` tree-kill,
-  no-`.git` `content_hash`, and relative `--log-dir` hygiene (`docs/VERIFICATION.md` §17.4).
+  `torch 2.15.0+cu132`, CUDA `13.2`, NCCL `2.30.7`, driver on `python3` `3.10.12` on `PATH`):**
+  `bash scripts/multi_gpu_check.sh --shared-gpu --python 3.12 --log-dir mgc_logs` finished in `47 min 51 s`:
+  **17 of 17 runnable stages exited `0` (18 listed, `02_prototype_parity_cuda` skipped as `shared GPU`)**, `0`
+  leftover CPU/GPU processes, bitwise parameter **and** buffer equality (`xr_eq=yes, xr_max=0.00e+00`) in all
+  `316` rows (`246` shared-GPU NCCL + `70` Linux CPU/`gloo`), plus Linux `gloo` (Python `RuntimeError` on TCP
+  transport reset) and shared-L4 NCCL (`SIGABRT` without Python cleanup) rank-failure stages and live gates for
+  resume, `SIGINT`/`SIGTERM`/`SIGHUP` (default and `SIG_IGN`) on real NCCL stages, reference-stage interrupt
+  artifact removal, `--stage-timeout 20` tree-kill, no-`.git` `content_hash`, and relative `--log-dir` hygiene
+  (`docs/VERIFICATION.md` §17.4).
 - **Cross-session reproducibility across `a20d386`, `866816a`, and `8e8f490` (`docs/VERIFICATION.md` §17.4):**
-  all eager CUDA rows reproduced identically to every printed digit across identical-VM sessions (`866816a` vs
-  `8e8f490`), whereas `compile_default_lora_variate` / `compile_default_lora_replay` varied run-to-run on CUDA
-  across `tiny_random`, `5M`, and `28M` (10 of 12 compiled NCCL rows differed between `866816a` and `8e8f490`;
-  e.g., `28M` `N = 2` `compile_default_lora_variate` `upd_l2` `7.83e-04`, `5.09e-04`, `2.25e-03`; cause
-  uninvestigated), and CPU-dependent rows (Linux `gloo` and CPU-warmed `*_moved_f32`) varied between different
-  host CPUs (`a20d386` vs `866816a`/`8e8f490`).
+  between S3 (`866816a`) and S4 (`8e8f490`, same machine type, different VM instance per the provisioning
+  record; same driver `580.178.04`), all non-compiled NCCL rows and all Linux CPU/`gloo` rows matched in the
+  printed parity columns and `vram_mib` (timing columns and `val_s` varied), whereas
+  `compile_default_lora_variate` / `compile_default_lora_replay` varied run-to-run on CUDA (10 of 12 compiled
+  NCCL rows differed between S3 and S4; cause uninvestigated). Against S2 (`a20d386`, a different host per the
+  provisioning record), CPU-dependent rows (Linux `gloo` and CPU-warmed `*_moved_f32`) differed in their printed
+  values (up to `12×` on `gloo` and `4.1×` on NCCL `*_moved_f32`; full breakdown in `docs/VERIFICATION.md`
+  §17.4).
 - **Local macOS arm64 verification (`8e8f490`, Python `3.12.13`, `torch 2.15.0`):**
-  `--backend gloo --ranks 2 4 --pg-timeout 10` passed (`7` exit `0`, `1` skipped `gloo backend`, `xr_eq=yes`
-  in all `70` rows, `gloo` rank failure raised `RuntimeError` at `10.01 s`); all 6 signal/disposition live
-  checks passed; `-m "not network"` **`614 passed, 15 skipped, 213 deselected`** (`211.39 s`);
-  `tests/test_multi_gpu_check.py` **`103 passed`** across 3 consecutive standalone runs (`85.68–88.21 s`);
-  one-off `load_model(..., dtype=torch.float64)` reproduction recorded in `docs/VERIFICATION.md` §11.
+  `--backend gloo --ranks 2 4 --pg-timeout 10` passed (**7 of 7 runnable stages exited `0`**, 8 listed,
+  `xr_eq=yes` in all `70` rows, `gloo` rank failure raised `RuntimeError` at timeout); all 6 signal/disposition
+  live checks passed; `-m "not network"` **`614 passed, 15 skipped, 213 deselected`** and
+  `tests/test_multi_gpu_check.py` **`103 passed`** across 3 consecutive runs; one-off
+  `load_model(..., dtype=torch.float64)` reproduction recorded in `docs/VERIFICATION.md` §11.
 - `uv run ruff check . && uv run ruff format --check .` clean.
 
 **Documentation updated:** `docs/VERIFICATION.md` (§11, §13, §17.1, §17.4), `docs/SPEC.md` (§5.6, §7.6, §9,

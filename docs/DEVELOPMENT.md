@@ -284,9 +284,11 @@ with `120`.
 - `1`: at least one stage failed or timed out (`124` in `summary.txt`, corrupt archive, port allocation
   failure, or stage exception).
 - `2`: invalid CLI arguments, missing Python `>= 3.10` or `uv`, failed tree-state/runtime/GPU helper probe,
-  `0` visible CUDA GPUs for `--backend nccl`, or `--ranks` exceeding visible GPUs without `--shared-gpu`.
-- `3` (or `01_env`'s exit code): `01_env` failed (`3` when `--backend nccl` is requested on a non-CUDA
-  PyTorch build, or `uv sync`'s non-zero exit code).
+  `0` visible CUDA GPUs for `--backend nccl`, only `1` visible GPU with default ranks and no `--shared-gpu`,
+  or `--ranks` exceeding visible GPUs without `--shared-gpu`.
+- Any non-zero exit code from `01_env`: `01_env` failed and aborted the session (for example `3` when
+  `--backend nccl` is requested on a non-CUDA PyTorch build, `uv sync`'s or the environment probe's non-zero
+  exit code, `124` on a stage timeout, or `127` if the command cannot be launched).
 - `129` / `130` / `143`: interrupted by `SIGHUP` / `SIGINT` / `SIGTERM` (when not ignored on entry).
 
 **Known process-escape limitation:** a descendant that strips `_TIMESTRAL_STAGE_TOKEN` from its environment
@@ -301,10 +303,10 @@ limit; see "Testing strategy" above).
 **Driver unit tests (`tests/test_multi_gpu_check.py`):** 103 stub-stage tests covering CLI parsing, wrapper
 selection, resume signatures, `git` and `content_hash` tree hashing, signal dispositions, timeouts,
 process-tree cleanup, partial-artifact removal, relative log paths, and closed stdio streams (included in
-`uv run pytest -m "not network"`):
+`uv run pytest -m "not network"`; the tests strip `PYTHONUNBUFFERED` internally):
 
 ```bash
-env -u PYTHONUNBUFFERED TMPDIR=/tmp uv run pytest tests/test_multi_gpu_check.py
+TMPDIR=/tmp uv run pytest tests/test_multi_gpu_check.py
 ```
 
 ## Style
