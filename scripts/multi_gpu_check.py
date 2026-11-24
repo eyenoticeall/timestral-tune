@@ -166,6 +166,128 @@ has_cc = shutil.which("cc") is not None or shutil.which("gcc") is not None
 print(f"python_h={has_header} c_compiler={has_cc}")
 nccl_shared = os.environ.get("NCCL_MULTI_RANK_GPU_ENABLE", "unset")
 print(f"nccl_multi_rank_gpu_enable={nccl_shared}")
+
+def _probe_cpu_info():
+    sys_name = platform.system()
+    model = None
+    physical = None
+    logical = os.cpu_count()
+    if sys_name == "Darwin":
+        if shutil.which("sysctl") is not None:
+            def _sysctl(key):
+                try:
+                    r = subprocess.run(["sysctl", "-n", key], check=False, capture_output=True, text=True, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    return None
+                return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+            model = _sysctl("machdep.cpu.brand_string")
+            phys_s = _sysctl("hw.physicalcpu")
+            if phys_s and phys_s.isdigit():
+                physical = int(phys_s)
+            log_s = _sysctl("hw.logicalcpu")
+            if log_s and log_s.isdigit():
+                logical = int(log_s)
+    elif sys_name == "Linux":
+        phys_pairs = set()
+        cpu_cores_vals = []
+        phys_ids = set()
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as fh:
+                cur_phys = None
+                cur_core = None
+                for raw in fh:
+                    line = raw.strip()
+                    if not line:
+                        if cur_phys is not None and cur_core is not None:
+                            phys_pairs.add((cur_phys, cur_core))
+                        cur_phys = None
+                        cur_core = None
+                        continue
+                    if ":" not in line:
+                        continue
+                    k, v = [p.strip() for p in line.split(":", 1)]
+                    kl = k.lower()
+                    if model is None and kl in ("model name", "model", "hardware") and v:
+                        model = v
+                    elif kl == "physical id" and v:
+                        cur_phys = v
+                        phys_ids.add(v)
+                    elif kl == "core id" and v:
+                        cur_core = v
+                    elif kl == "cpu cores" and v.isdigit():
+                        cpu_cores_vals.append(int(v))
+                if cur_phys is not None and cur_core is not None:
+                    phys_pairs.add((cur_phys, cur_core))
+        except OSError:
+            pass
+        if phys_pairs:
+            physical = len(phys_pairs)
+        elif cpu_cores_vals:
+            sockets = max(1, len(phys_ids))
+            physical = cpu_cores_vals[0] * sockets
+        if (model is None or physical is None or logical is None) and shutil.which("lscpu") is not None:
+            try:
+                lscpu_env = dict(os.environ, LC_ALL="C")
+                r = subprocess.run(["lscpu"], check=False, capture_output=True, text=True, timeout=5, env=lscpu_env)
+            except (OSError, subprocess.SubprocessError):
+                r = None
+            if r is not None and r.returncode == 0:
+                cores_per_sock = None
+                sockets = None
+                for raw in r.stdout.splitlines():
+                    if ":" not in raw:
+                        continue
+                    k, v = [p.strip() for p in raw.split(":", 1)]
+                    kl = k.lower()
+                    if model is None and kl == "model name" and v:
+                        model = v
+                    elif kl == "core(s) per socket" and v.isdigit():
+                        cores_per_sock = int(v)
+                    elif kl in ("socket(s)", "cluster(s)") and v.isdigit():
+                        sockets = int(v)
+                    elif logical is None and kl == "cpu(s)" and v.isdigit():
+                        logical = int(v)
+                if physical is None and cores_per_sock is not None and sockets is not None:
+                    physical = cores_per_sock * sockets
+    else:
+        proc = platform.processor().strip()
+        if proc:
+            model = proc
+    model_str = " ".join(model.split()) if model else "unknown"
+    phys_str = str(physical) if physical is not None else "unknown"
+    log_str = str(logical) if logical is not None else "unknown"
+    return model_str, phys_str, log_str
+
+cpu_model, cpu_phys, cpu_log = _probe_cpu_info()
+print(f"cpu_model={cpu_model}")
+print(f"cpu_physical_cores={cpu_phys} cpu_logical_cpus={cpu_log}")
+if torch.cuda.is_available():
+    n_gpus = torch.cuda.device_count()
+    for i in range(n_gpus):
+        cells = []
+        for j in range(n_gpus):
+            if i == j:
+                cells.append("-")
+            else:
+                try:
+                    cells.append("1" if torch.cuda.can_device_access_peer(i, j) else "0")
+                except Exception:
+                    cells.append("err")
+        row = ",".join(cells)
+        print(f"gpu_peer_access[{i}]={row}")
+    if shutil.which("nvidia-smi") is not None:
+        try:
+            topo = subprocess.run(
+                ["nvidia-smi", "topo", "-m"],
+                check=False, capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            topo = None
+        if topo is not None and topo.returncode == 0 and topo.stdout.strip():
+            print("nvidia_smi_topo_begin")
+            for topo_line in topo.stdout.rstrip().splitlines():
+                print(topo_line)
+            print("nvidia_smi_topo_end")
 if backend == "nccl" and not torch.cuda.is_available():
     print("error: --backend nccl requested, but this PyTorch build cannot use CUDA", file=sys.stderr)
     sys.exit(3)

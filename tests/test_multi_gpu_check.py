@@ -3382,3 +3382,303 @@ def test_pre_stage_and_stage_oserrors_fail_cleanly_without_traceback(
     assert "== multi_gpu_check summary" in cap_sum.out
     assert "warning: failed to write summary.txt (rel_sum/summary.txt): Permission denied" in cap_sum.err
     assert str(repo) not in cap_sum.err
+
+
+def _run_env_probe_snippet(
+    *,
+    backend: str = "gloo",
+    tree_method: str = "git",
+    tree_sig_short: str = "abcdef012345",
+    cuda_available: bool = False,
+    gpu_count: int = 0,
+    peer_pairs: set[tuple[int, int]] | None = None,
+    system_override: str | None = None,
+    proc_cpuinfo_text: str | None = None,
+    proc_cpuinfo_missing: bool = False,
+    cpu_count_override: int | None = None,
+    which_map: Mapping[str, str | None] | None = None,
+    subprocess_responses: Mapping[tuple[str, ...], tuple[int, str]] | None = None,
+    env_overrides: Mapping[str, str | None] | None = None,
+) -> tuple[int, str, str]:
+    """Execute `DRIVER._ENV_PROBE_SNIPPET` in-process with stubbed `torch` and optional OS/tool mocks."""
+    import builtins
+    import io
+    import platform as std_platform
+
+    peer_set = peer_pairs or set()
+
+    class _FakeNCCL:
+        @staticmethod
+        def version() -> tuple[int, int, int]:
+            return (2, 30, 7)
+
+    class _FakeCUDA:
+        nccl = _FakeNCCL()
+
+        @staticmethod
+        def is_available() -> bool:
+            return cuda_available
+
+        @staticmethod
+        def device_count() -> int:
+            return gpu_count
+
+        @staticmethod
+        def can_device_access_peer(i: int, j: int) -> bool:
+            return (i, j) in peer_set
+
+    class _FakeVersion:
+        cuda = "13.2" if cuda_available else None
+
+    fake_torch = ModuleType("torch")
+    fake_torch.__version__ = "2.15.0"  # type: ignore[attr-defined]
+    fake_torch.cuda = _FakeCUDA()  # type: ignore[attr-defined]
+    fake_torch.version = _FakeVersion()  # type: ignore[attr-defined]
+
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    real_open = builtins.open
+    real_which = shutil.which
+    real_run = subprocess.run
+
+    def _fake_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if str(file) == "/proc/cpuinfo":
+            if proc_cpuinfo_missing:
+                raise FileNotFoundError(2, "No such file or directory", "/proc/cpuinfo")
+            if proc_cpuinfo_text is not None:
+                return io.StringIO(proc_cpuinfo_text)
+        return real_open(file, *args, **kwargs)
+
+    def _fake_which(cmd: str, *args: Any, **kwargs: Any) -> str | None:
+        if which_map is not None and cmd in which_map:
+            return which_map[cmd]
+        return real_which(cmd, *args, **kwargs)
+
+    def _fake_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
+        if subprocess_responses is not None:
+            key = tuple(str(c) for c in cmd)
+            if key in subprocess_responses:
+                rc, out = subprocess_responses[key]
+                return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+        return real_run(cmd, *args, **kwargs)
+
+    saved_env: dict[str, str | None] = {}
+    if env_overrides:
+        for k, v in env_overrides.items():
+            saved_env[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    rc = 0
+    try:
+        with (
+            mock.patch.dict(sys.modules, {"torch": fake_torch}),
+            mock.patch.object(sys, "argv", ["env_probe", backend, tree_method, tree_sig_short]),
+            mock.patch.object(sys, "stdout", stdout_buf),
+            mock.patch.object(sys, "stderr", stderr_buf),
+            mock.patch.object(builtins, "open", _fake_open),
+            mock.patch.object(shutil, "which", _fake_which),
+            mock.patch.object(subprocess, "run", _fake_run),
+            mock.patch.object(
+                std_platform,
+                "system",
+                side_effect=(lambda: system_override) if system_override is not None else std_platform.system,
+            ),
+            mock.patch.object(
+                os,
+                "cpu_count",
+                side_effect=(lambda: cpu_count_override) if cpu_count_override is not None else os.cpu_count,
+            ),
+        ):
+            try:
+                exec(compile(DRIVER._ENV_PROBE_SNIPPET, "<env_probe>", "exec"), {})
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+    finally:
+        for k, prev in saved_env.items():
+            if prev is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
+
+    return rc, stdout_buf.getvalue(), stderr_buf.getvalue()
+
+
+def test_env_probe_snippet_logs_cpu_facts_on_current_host_preserving_existing_lines() -> None:
+    """Real-OS check: existing `01_env` lines stay unchanged and in order; CPU facts follow after them."""
+    rc, out, err = _run_env_probe_snippet(
+        backend="gloo",
+        cuda_available=False,
+        env_overrides={"CUDA_VISIBLE_DEVICES": None, "NCCL_MULTI_RANK_GPU_ENABLE": None},
+    )
+    assert rc == 0 and err == ""
+    lines = out.splitlines()
+    assert lines[0].startswith("os=") and "arch=" in lines[0] and "python=" in lines[0]
+    assert lines[1] == "tree_state_method=git tree_state_sig=abcdef012345"
+    assert lines[2] == "torch=2.15.0 cuda_available=False cuda_runtime=None"
+    assert lines[3] == "cuda_visible_devices=unset"
+    assert lines[4].startswith("python_h=") and "c_compiler=" in lines[4]
+    assert lines[5] == "nccl_multi_rank_gpu_enable=unset"
+    assert lines[6].startswith("cpu_model=") and lines[6] != "cpu_model="
+    assert lines[7].startswith("cpu_physical_cores=") and " cpu_logical_cpus=" in lines[7]
+    if sys.platform in ("darwin", "linux"):
+        assert lines[6] != "cpu_model=unknown"
+        phys_part, log_part = lines[7].split()
+        assert int(phys_part.split("=", 1)[1]) >= 1
+        assert int(log_part.split("=", 1)[1]) >= 1
+
+
+def test_env_probe_snippet_cpu_linux_macos_and_fallback_paths() -> None:
+    """Verify Linux `/proc/cpuinfo` (multi-socket), `lscpu` fallback, macOS `sysctl`, and missing-tool fallbacks."""
+    # 1. Linux dual-socket /proc/cpuinfo: 2 sockets x 2 cores x 2 HT = 4 physical, 8 logical.
+    cpuinfo = "\n".join(
+        [
+            f"processor\t: {i}\nmodel name\t: Intel(R) Xeon(R) CPU E5-2673 v4 @ 2.30GHz\n"
+            f"physical id\t: {sock}\ncore id\t\t: {core}\ncpu cores\t: 2\n"
+            for i, (sock, core) in enumerate([(0, 0), (0, 1), (0, 0), (0, 1), (1, 0), (1, 1), (1, 0), (1, 1)])
+        ]
+    )
+    rc, out, _ = _run_env_probe_snippet(
+        system_override="Linux",
+        proc_cpuinfo_text=cpuinfo,
+        cpu_count_override=8,
+        which_map={"lscpu": None},
+    )
+    assert rc == 0
+    lines = out.splitlines()
+    assert lines[6] == "cpu_model=Intel(R) Xeon(R) CPU E5-2673 v4 @ 2.30GHz"
+    assert lines[7] == "cpu_physical_cores=4 cpu_logical_cpus=8"
+
+    # 2. Linux where /proc/cpuinfo lacks model name and core ids (e.g. ARM container) -> falls back to lscpu.
+    lscpu_out = (
+        "Architecture:        aarch64\n"
+        "CPU(s):              16\n"
+        "Core(s) per socket:  8\n"
+        "Socket(s):           2\n"
+        "Model name:          Neoverse-N1\n"
+    )
+    rc, out, _ = _run_env_probe_snippet(
+        system_override="Linux",
+        proc_cpuinfo_text="processor\t: 0\nBogoMIPS\t: 50.00\n\n",
+        cpu_count_override=16,
+        which_map={"lscpu": "/usr/bin/lscpu"},
+        subprocess_responses={("lscpu",): (0, lscpu_out)},
+    )
+    assert rc == 0
+    lines = out.splitlines()
+    assert lines[6] == "cpu_model=Neoverse-N1"
+    assert lines[7] == "cpu_physical_cores=16 cpu_logical_cpus=16"
+
+    # 3. macOS sysctl path.
+    rc, out, _ = _run_env_probe_snippet(
+        system_override="Darwin",
+        cpu_count_override=12,
+        which_map={"sysctl": "/usr/sbin/sysctl"},
+        subprocess_responses={
+            ("sysctl", "-n", "machdep.cpu.brand_string"): (0, "Apple M3 Pro\n"),
+            ("sysctl", "-n", "hw.physicalcpu"): (0, "11\n"),
+            ("sysctl", "-n", "hw.logicalcpu"): (0, "11\n"),
+        },
+    )
+    assert rc == 0
+    lines = out.splitlines()
+    assert lines[6] == "cpu_model=Apple M3 Pro"
+    assert lines[7] == "cpu_physical_cores=11 cpu_logical_cpus=11"
+
+    # 4. Missing /proc/cpuinfo and missing lscpu degrade cleanly to 'unknown'; backend=nccl without CUDA still exits 3.
+    rc, out, err = _run_env_probe_snippet(
+        backend="nccl",
+        cuda_available=False,
+        system_override="Linux",
+        proc_cpuinfo_missing=True,
+        cpu_count_override=4,
+        which_map={"lscpu": None},
+    )
+    assert rc == 3
+    assert "cannot use CUDA" in err
+    lines = out.splitlines()
+    assert lines[5].startswith("nccl_multi_rank_gpu_enable=")
+    assert lines[6] == "cpu_model=unknown"
+    assert lines[7] == "cpu_physical_cores=unknown cpu_logical_cpus=4"
+
+
+def test_env_probe_snippet_cuda_peer_access_matrix_and_nvidia_smi_topo() -> None:
+    """In CUDA mode, existing lines stay in exact order; CPU, peer-access matrix, and topo -m append after them."""
+    query_cmd = ("nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader")
+    topo_cmd = ("nvidia-smi", "topo", "-m")
+    topo_out = (
+        "\tGPU0\tGPU1\tGPU2\tGPU3\tCPU Affinity\n"
+        "GPU0\t X \tNV4\tSYS\tSYS\t0-19\n"
+        "GPU1\tNV4\t X \tSYS\tSYS\t0-19\n"
+        "GPU2\tSYS\tSYS\t X \tPHB\t20-39\n"
+        "GPU3\tSYS\tSYS\tPHB\t X \t20-39\n"
+    )
+    rc, out, err = _run_env_probe_snippet(
+        backend="nccl",
+        cuda_available=True,
+        gpu_count=4,
+        peer_pairs={(0, 1), (1, 0)},
+        system_override="Linux",
+        proc_cpuinfo_text="processor\t: 0\nmodel name\t: Test Xeon\nphysical id\t: 0\ncore id\t: 0\n",
+        cpu_count_override=2,
+        which_map={"nvidia-smi": "/usr/bin/nvidia-smi", "lscpu": None},
+        subprocess_responses={
+            query_cmd: (
+                0,
+                "NVIDIA GeForce RTX 3060, 12288 MiB, 580.178.04\n"
+                "NVIDIA GeForce RTX 3060, 12288 MiB, 580.178.04\n"
+                "NVIDIA GeForce RTX 3060, 12288 MiB, 580.178.04\n"
+                "NVIDIA GeForce RTX 3060, 12288 MiB, 580.178.04\n",
+            ),
+            topo_cmd: (0, topo_out),
+        },
+        env_overrides={"CUDA_VISIBLE_DEVICES": "0,1,2,3", "NCCL_MULTI_RANK_GPU_ENABLE": None},
+    )
+    assert rc == 0 and err == ""
+    lines = out.splitlines()
+    # Existing frozen lines come first, unchanged and in exact order.
+    assert lines[0].startswith("os=")
+    assert lines[1] == "tree_state_method=git tree_state_sig=abcdef012345"
+    assert lines[2] == "torch=2.15.0 cuda_available=True cuda_runtime=13.2"
+    assert lines[3] == "cuda_visible_devices=0,1,2,3"
+    assert lines[4] == "nccl=2.30.7 gpu_count=4"
+    assert lines[5] == "gpu[0]=NVIDIA GeForce RTX 3060, 12288 MiB, 580.178.04"
+    assert lines[8] == "gpu[3]=NVIDIA GeForce RTX 3060, 12288 MiB, 580.178.04"
+    assert lines[9].startswith("python_h=")
+    assert lines[10] == "nccl_multi_rank_gpu_enable=unset"
+    # New lines strictly follow nccl_multi_rank_gpu_enable=...
+    assert lines[11] == "cpu_model=Test Xeon"
+    assert lines[12] == "cpu_physical_cores=1 cpu_logical_cpus=2"
+    assert lines[13] == "gpu_peer_access[0]=-,1,0,0"
+    assert lines[14] == "gpu_peer_access[1]=1,-,0,0"
+    assert lines[15] == "gpu_peer_access[2]=0,0,-,0"
+    assert lines[16] == "gpu_peer_access[3]=0,0,0,-"
+    assert lines[17] == "nvidia_smi_topo_begin"
+    assert lines[18 : 18 + 5] == topo_out.rstrip().splitlines()
+    assert lines[23] == "nvidia_smi_topo_end"
+
+    # When nvidia-smi is absent: `nvidia_smi=unavailable` stays in slot, peer-access logs, and topo skips quietly.
+    rc2, out2, err2 = _run_env_probe_snippet(
+        backend="nccl",
+        cuda_available=True,
+        gpu_count=2,
+        peer_pairs=set(),
+        system_override="Linux",
+        proc_cpuinfo_text="processor\t: 0\nmodel name\t: Test Xeon\nphysical id\t: 0\ncore id\t: 0\n",
+        cpu_count_override=2,
+        which_map={"nvidia-smi": None, "lscpu": None},
+        env_overrides={"CUDA_VISIBLE_DEVICES": None, "NCCL_MULTI_RANK_GPU_ENABLE": None},
+    )
+    assert rc2 == 0 and err2 == ""
+    lines2 = out2.splitlines()
+    assert lines2[4] == "nccl=2.30.7 gpu_count=2"
+    assert lines2[5] == "nvidia_smi=unavailable"
+    assert lines2[6].startswith("python_h=")
+    assert lines2[7] == "nccl_multi_rank_gpu_enable=unset"
+    assert lines2[8] == "cpu_model=Test Xeon"
+    assert lines2[9] == "cpu_physical_cores=1 cpu_logical_cpus=2"
+    assert lines2[10] == "gpu_peer_access[0]=-,0"
+    assert lines2[11] == "gpu_peer_access[1]=0,-"
+    assert "nvidia_smi_topo_begin" not in out2
