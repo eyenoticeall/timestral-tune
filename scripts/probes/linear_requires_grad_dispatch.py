@@ -1,9 +1,10 @@
 """Probe: measure `F.linear` and step-0 distillation differences under `requires_grad` flags.
 
     uv run python scripts/probes/linear_requires_grad_dispatch.py
+    uv run python scripts/probes/linear_requires_grad_dispatch.py --device cuda
     uv run --isolated --python 3.12 --with "torch==2.4.0" python scripts/probes/linear_requires_grad_dispatch.py
 
-Runs entirely on CPU without network access and prints three measurements:
+Runs on CPU by default (or CUDA with `--device cuda`) without network access and prints three measurements:
 
 (a) Standalone `torch.nn.functional.linear` outputs across contiguous and permuted non-contiguous
     inputs, with `weight.requires_grad` set to `True` versus `False`, in both `enable_grad` and
@@ -45,8 +46,8 @@ def _grad_l2(params: list[torch.nn.Parameter]) -> float:
     return total**0.5
 
 
-def _section_a(seed: int) -> None:
-    print("\n[a] Standalone F.linear: contiguous vs permuted non-contiguous inputs (CPU)")
+def _section_a(seed: int, device: torch.device) -> None:
+    print(f"\n[a] Standalone F.linear: contiguous vs permuted non-contiguous inputs ({device.type.upper()})")
     print(
         f"{'dtype':<7} {'base_shape':<13} {'perm':<11} {'layout':<11} {'out':>4}  "
         f"{'grad:T-F':>10} {'nograd:T-F':>10} {'rgT:g-ng':>10} {'rgF:g-ng':>10}"
@@ -64,9 +65,9 @@ def _section_a(seed: int) -> None:
         g = torch.Generator().manual_seed(seed)
         for base_shape, perm, out_features in cases:
             in_features = base_shape[-1]
-            x_base = torch.randn(base_shape, generator=g, dtype=dtype)
-            w_data = torch.randn((out_features, in_features), generator=g, dtype=dtype)
-            b_data = torch.randn((out_features,), generator=g, dtype=dtype)
+            x_base = torch.randn(base_shape, generator=g, dtype=dtype).to(device)
+            w_data = torch.randn((out_features, in_features), generator=g, dtype=dtype).to(device)
+            b_data = torch.randn((out_features,), generator=g, dtype=dtype).to(device)
 
             x_perm = x_base.permute(*perm)
             x_contig = x_perm.contiguous()
@@ -90,8 +91,11 @@ def _section_a(seed: int) -> None:
                 )
 
 
-def _section_b_and_c(seed: int) -> None:
-    print("\n[b] Tiny random model: student (train, rg=True) vs identical-weight teacher (eval, no_grad)")
+def _section_b_and_c(seed: int, device: torch.device) -> None:
+    print(
+        f"\n[b] Tiny random model ({device.type.upper()}): "
+        "student (train, rg=True) vs identical-weight teacher (eval, no_grad)"
+    )
     print(
         f"{'dtype':<7} {'layout':<11} {'bs':>3}  "
         f"{'frozen max_abs':>14} {'frozen rel_l2':>14}  "
@@ -105,6 +109,8 @@ def _section_b_and_c(seed: int) -> None:
         ctx = float64_reference() if dtype == torch.float64 else contextlib.nullcontext()
         with ctx:
             base = copy.deepcopy(base_f32).double() if dtype == torch.float64 else copy.deepcopy(base_f32)
+            base = base.to(device)
+            base.transformer.rope.rebuild_inv_freq()
             for layout_name, rows_per_series, covariates, batch_seed in (
                 ("univariate", 1, False, seed + 1),
                 ("covariates", 3, True, seed + 2),
@@ -120,6 +126,7 @@ def _section_b_and_c(seed: int) -> None:
                     )
                     if dtype == torch.float64:
                         batch = as_double(batch)
+                    batch = batch.to(device)
 
                     student = copy.deepcopy(base).train()
                     for p in student.parameters():
@@ -170,14 +177,24 @@ def _section_b_and_c(seed: int) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
 
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("error: --device cuda requested, but torch.cuda.is_available() is False", file=sys.stderr)
+        return 2
+    device = torch.device(args.device)
+    dev_desc = (
+        f"cuda ({torch.cuda.get_device_name(0)}, cuda={torch.version.cuda})"
+        if device.type == "cuda"
+        else f"cpu (threads={torch.get_num_threads()})"
+    )
     print(
         f"== linear_requires_grad_dispatch | torch {torch.__version__} | "
-        f"{platform.system()} {platform.machine()} | threads={torch.get_num_threads()} | seed={args.seed} =="
+        f"{platform.system()} {platform.machine()} | {dev_desc} | seed={args.seed} =="
     )
-    _section_a(args.seed)
-    _section_b_and_c(args.seed)
+    _section_a(args.seed, device)
+    _section_b_and_c(args.seed, device)
     return 0
 
 
