@@ -1745,3 +1745,81 @@ entry.
   released-weights tiers (with cosine similarity), and measure 1/2/4-GPU throughput, VRAM, and scaling (D22).
 - Live concurrent Hub download check at `huggingface_hub==0.23.0`, maintainer decisions on spec §12 findings,
   and optional gradient accumulation.
+
+---
+
+## 2026-11-25 — Prepare Stage 3 calibration probe, scaling benchmark, CUDA dispatch check, and 4-GPU bundle runner
+
+**Goal:** Prepare all remaining Phase 5 Stage 3 measurement probes and a single unattended, resumable
+bundle orchestrator ahead of a rented 4-GPU NVLink (4× A100 SXM4) session so one ~45–60 min run closes
+every open Stage 3 hardware item (`docs/SPEC.md` §10, §12, D22; `docs/phases/phase-5-multi-gpu.md` §3).
+
+**What was built (`d4ddf38`; `src/` untouched, `0` diff lines; `scripts/multi_gpu_check.py` untouched):**
+
+1. **`scripts/probes/distributed_calibration_probe.py`:** self-orchestrating probe with three sections
+   (`--only bf16-cause compile-var calibrate`, `--backend gloo|nccl`, `--sizes tiny 5M 28M 123M 209M`,
+   `--ranks 2 4`, `--seeds 11 22 33`, `--with-fp64`, `--json-out`):
+   - `bf16-cause`: 3-way parity root-cause decomposition comparing one-process union batch (`union_1p`),
+     a zero-NCCL one-GPU micro-batch accumulation control (`micro_accum_1p`, running identical count-weighted
+     per-rank shard backwards summed into `fp32` `.grad` before clipping/stepping AdamW), and `N`-rank
+     distributed training (`dist_run`), printing step-1 gradient L2, sign-flip fraction, update L2, and
+     cancellation-safe `float64` cosine distance (`1 - cos = 0.5 * ||u/||u|| - v/||v|| ||^2`). Separates
+     per-shard `bf16` GEMM tiling / batch-split noise (`union_1p` vs `micro_accum_1p`) from any distributed
+     reduction effect (`micro_accum_1p` vs `dist_run`).
+   - `compile-var`: fresh-process repeat sweep (`eager_lora_variate`, `compile_default_lora_variate`,
+     `compile_default_lora_replay`, plus `TORCHINDUCTOR_FX_GRAPH_CACHE=0` on NCCL) measuring pairwise
+     `ref-ref`, `dist-dist`, `dist_k vs ref_1`, Dynamo `unique_graphs`, and cross-rank equality.
+   - `calibrate`: multi-seed, multi-size exact `float64` L2 and `1 - cos` parity calibration across all
+     four modes (`domain` and `replay_distill`, using moved-student warmup for `full_ft` distillation) with
+     worst-case `(precision, size, mode)` summaries.
+2. **`scripts/probes/distributed_scaling_bench.py`:** 1/2/4-GPU weak and strong scaling benchmark across
+   `28M`/`123M`/`209M`, `full_ft` and `lora_temporal`, eager and `compile_mode="default"`, and
+   `ctx = 256`/`1024`/`4096`:
+   - Pass A: pure step time (`mean_step_ms`, `median_step_ms`, `windows_per_s`), weak/strong speedup &
+     scaling efficiency, peak training VRAM, and `GradientReducer` flat-buffer MiB.
+   - Pass B: peak VRAM during sharded validation inside `fit()` with `GradientReducer`'s buffer live
+     (`val_vram_delta_mib`), plus `full_ft` distillation with per-rank `_frozen_base`.
+   - Pass C: per-step stage timing (`precheck`, `fwd`, `stats_ar`, `bwd`, `pack`, `grad_ar`, `unpack`,
+     `opt`, `bcast`) via method-level hooks around `GradientReducer.reduce()` without editing `src/`,
+     printing a direct D22 summary (`grad_ar_pct` vs the 15–20% revisit threshold).
+3. **`scripts/probes/linear_requires_grad_dispatch.py`:** added `--device cpu|cuda` (preserving default
+   `cpu` output) so the same 4-GPU session measures CUDA `F.linear` `requires_grad` dispatch on
+   non-contiguous inputs (`docs/VERIFICATION.md` §17.2, spec §12).
+4. **`scripts/run_stage3_bundle.py`:** stdlib-only Python `>= 3.10` master runner sequencing all 9 stages
+   (`00_host_preflight` including live `torchrun` NCCL transport probe via `--_nccl-transport-check`,
+   `01_t15_nccl`, `02_t15_nccl_scale02`, `03_multi_gpu_check_r1`, `04_multi_gpu_check_r2` + automatic
+   parity-column repeat diff `04_mgc_repeat_diff.txt`, `05_calibration_probe`, `06_scaling_bench`,
+   `07_linear_dispatch`, `08_cuda_check`) with per-step `.ok` resume markers, residual GPU process check,
+   and `--dry-run-cpu` local verification mode.
+5. **`tests/test_stage3_probes.py`:** 4 unit tests covering exact cosine/L2 metrics, calibration summary,
+   scaling spec/D22 summary, `--device` validation on `linear_requires_grad_dispatch.py`, bundle step
+   planning, and repeat-diff reporting.
+
+**Evidence (macOS arm64, Apple M4, Python `3.13.12`, PyTorch `2.15.0`):**
+
+- `git diff b9b8f59 -- src/`: `0` lines changed.
+- `uv run ruff check . && uv run ruff format --check .`: clean (`94` files).
+- Python 3.10 AST check (`ast.parse(..., feature_version=(3, 10))`): clean on all 5 added/edited files.
+- `TMPDIR=/tmp uv run python scripts/run_stage3_bundle.py --dry-run-cpu --out-dir /tmp/stage3_dry_verify`:
+  all 4 CPU steps (`00_host_preflight`, `05_calibration_probe`, `06_scaling_bench`, `07_linear_dispatch`)
+  passed in `20.8 s`; second invocation resumed all 4 via `.ok` markers in `0.0 s`. In `bf16-cause` on
+  `tiny` CPU `fp32`, `micro_accum_1p` matched 2-rank `gloo` to `0.00e+00` (`step1_grad_l2` and `upd_l2`)
+  across all 5 domain/replay regimes with `xr_eq=True`; `06_scaling.json` produced clean Pass A/B/C
+  breakdowns across all 4 `tiny` specs at `N = 1, 2`.
+- Live `compile-var` + `--with-fp64` CPU smoke (`--sizes tiny --ranks 2 --seeds 11 --steps 2
+  --compile-repeats 2 --with-fp64 --only compile-var calibrate`): passed cleanly (`fp64` `1 - upd_cos`
+  `1.07e-29`–`3.03e-27`, `val_rel = 0.00e+00`, `xr = 2/2`; `fp32` `1 - upd_cos` `4.10e-12`–`1.20e-09`).
+- Full network-free suite (`TMPDIR=/tmp uv run pytest -m "not network" -q -p no:cacheprovider`):
+  **`637 passed, 15 skipped, 213 deselected`** (`+4` new tests over `633`; identical `15` skips).
+
+**Documentation synced (zero Stage 3 hardware roadmap boxes ticked):** `docs/DEVELOPMENT.md`,
+`docs/SPEC.md` (§10, §12), `docs/STATUS.md`, `docs/phases/phase-5-multi-gpu.md`, `CHANGELOG.md`, and this
+entry.
+
+**Left open (ready to run on a rented 4× A100 SXM4 / 4-GPU NVLink host):**
+
+- Execute `uv run python scripts/run_stage3_bundle.py --python 3.12 --out-dir stage3_a100_logs` on a
+  4-GPU NVLink host, inspect all logs/JSON outputs, record results in `docs/VERIFICATION.md` §13 and §17,
+  calibrate released-weights/`bf16` parity tiers and D22 conclusions, and update Stage 3 roadmap boxes.
+- Live concurrent Hub download check at `huggingface_hub==0.23.0`, maintainer decisions on spec §12
+  findings, and optional gradient accumulation.

@@ -219,7 +219,33 @@ opt-in CUDA/`nccl` through `tests/distributed_harness.py` and `scripts/run_t15_n
   `1`) call `os._exit(1)` mid-`fit()` at `--kill-step` (default `2`), and grades surviving ranks against a
   strict allow-list of distributed transport/collective exceptions or in-`fit()` `SIGABRT`.
 - **`scripts/probes/_dist_common.py`** — shared constants, synthetic dataset builders, device-map validation,
-  and `TMPDIR` socket-length checks shared by both probes.
+  and `TMPDIR` socket-length checks shared by the multi-process probes.
+- **`scripts/probes/distributed_calibration_probe.py`** — Stage 3 investigation and calibration probe
+  supporting three selectable sections (`--only bf16-cause compile-var calibrate`) under `torchrun` or single
+  process (`--backend gloo|nccl`, `--sizes tiny 5M 28M 123M 209M`, `--ranks 2 4`, `--seeds 11 22 33`,
+  `--with-fp64`, `--json-out`): (1) 3-way `bf16` parity root-cause decomposition comparing one-process union
+  batch (`union_1p`), zero-NCCL one-GPU micro-batch accumulation (`micro_accum_1p`), and `N`-rank distributed
+  training (`dist_run`); (2) fresh-process compiled CUDA run-to-run variation sweep (`eager`,
+  `compile_mode="default"`, and `TORCHINDUCTOR_FX_GRAPH_CACHE=0`); and (3) multi-seed / multi-size exact
+  `float64` L2 and cancellation-safe cosine-distance (`1 - cos`) parity calibration.
+- **`scripts/probes/distributed_scaling_bench.py`** — 1/2/4-GPU weak and strong scaling benchmark across
+  `28M`/`123M`/`209M`, `full_ft` and `lora_temporal`, eager and `compile_mode="default"`, and `ctx = 256`,
+  `1024`, `4096` (`--backend gloo|nccl`, `--ranks 1 2 4`, `--json-out`). Measures pure step time and
+  windows/s (Pass A), peak training vs sharded-validation VRAM delta with `GradientReducer`'s flat buffer
+  live and per-rank `_frozen_base` in `full_ft` distillation (Pass B), and per-step `GradientReducer`
+  `pack`/`grad_ar`/`unpack` plus small-collective timing breakdown (Pass C) to evaluate D22.
+- **`scripts/probes/linear_requires_grad_dispatch.py`** — accepts `--device cpu|cuda` to measure standalone
+  `F.linear` non-contiguous `requires_grad` dispatch and step-0 `full_ft` distillation residuals on CPU or CUDA.
+- **`scripts/run_stage3_bundle.py`** — standard-library-only Python `>= 3.10` master runner sequencing all
+  remaining Stage 3 checks on a rented 4-GPU NVLink host with per-step logs, resumable `.ok` markers, an
+  automatic back-to-back `multi_gpu_check.sh` repeat-diff report, and a residual GPU process check:
+  ```bash
+  # Local macOS/Linux CPU/gloo dry run (~20 s; runs preflight, tiny calibration, tiny scaling, CPU dispatch)
+  TMPDIR=/tmp uv run python scripts/run_stage3_bundle.py --dry-run-cpu --out-dir /tmp/stage3_dry
+
+  # Full 4-GPU NVLink session (resumable; wrap in nohup or tmux over SSH)
+  uv run python scripts/run_stage3_bundle.py --python 3.12 --out-dir stage3_a100_logs
+  ```
 
 **Which Python runs what:** the wrapper picks the interpreter that runs `multi_gpu_check.py` itself—first
 `python3` on `PATH` if it is `>= 3.10`, then an installed interpreter found by
@@ -330,14 +356,17 @@ unset or longer than 60 characters (and `distributed_trainer_check.py` fails fas
 `check_tmpdir_for_workers()` before spawning workers if `TMPDIR` would overflow macOS's 103-byte `sun_path`
 limit; see "Testing strategy" above).
 
-**Driver unit tests (`tests/test_multi_gpu_check.py`):** 105 stub-stage tests covering CLI parsing, wrapper
-selection, resume signatures, `git` and `content_hash` tree hashing, signal dispositions, timeouts,
-process-tree cleanup (including pure-BSD `ps` fallback), pre-stage `--log-dir` and `OSError` handling,
-partial-artifact removal, relative log paths, and closed stdio streams (included in
-`uv run pytest -m "not network"`; the tests strip `PYTHONUNBUFFERED` internally):
+**Driver & Stage 3 probe unit tests (`tests/test_multi_gpu_check.py`, `tests/test_stage3_probes.py`):** 108
+stub-stage tests in `tests/test_multi_gpu_check.py` covering CLI parsing, wrapper selection, resume
+signatures, `git` and `content_hash` tree hashing, signal dispositions, timeouts, process-tree cleanup
+(including pure-BSD `ps` fallback), `01_env` host/topology logging, pre-stage `--log-dir` and `OSError`
+handling, partial-artifact removal, relative log paths, and closed stdio streams, plus 4 unit tests in
+`tests/test_stage3_probes.py` covering calibration metrics, scaling matrix/D22 summaries, CUDA dispatch
+argument parsing, and bundle planning/repeat-diff reporting (all included in `uv run pytest -m "not network"`;
+`test_multi_gpu_check.py` strips `PYTHONUNBUFFERED` internally):
 
 ```bash
-TMPDIR=/tmp uv run pytest tests/test_multi_gpu_check.py
+TMPDIR=/tmp uv run pytest tests/test_multi_gpu_check.py tests/test_stage3_probes.py
 ```
 
 ## Style

@@ -30,9 +30,12 @@ minor releases, and such changes are called out under **Changed**.
   session driver with content-bound resume, preserved ignored-on-entry signals for `nohup`, confirmed-live
   `/proc` and pure-BSD `ps` process-tree cleanup, pre-stage `--log-dir` writability checks and clean `OSError`
   handling, `01_env` CPU/peer-access/topology logging, and 108 stub-stage tests in
-  `tests/test_multi_gpu_check.py`), and opt-in CUDA/NCCL support in `tests/distributed_harness.py` paired
+  `tests/test_multi_gpu_check.py`), opt-in CUDA/NCCL support in `tests/distributed_harness.py` paired
   with the stdlib-only `scripts/run_t15_nccl.py` runner and 14 non-GPU unit tests in
-  `tests/test_distributed_harness_cuda.py` (`docs/DEVELOPMENT.md`, `docs/VERIFICATION.md` §17.4).
+  `tests/test_distributed_harness_cuda.py`, plus the remaining Stage 3 measurement probes and master
+  runner (`scripts/probes/distributed_calibration_probe.py`, `scripts/probes/distributed_scaling_bench.py`,
+  `scripts/probes/linear_requires_grad_dispatch.py --device cpu|cuda`, `scripts/run_stage3_bundle.py`, and
+  4 unit tests in `tests/test_stage3_probes.py`; `docs/DEVELOPMENT.md`, `docs/VERIFICATION.md` §17.4).
 - **`RankFailureError`** exported from `timestral_tune.trainer` (`RuntimeError` subclass raised on healthy
   peers when another rank fails during multi-process setup, training, validation, or rank-0 callbacks).
 - **Multi-process export metadata:** optional paired `world_size` and `effective_batch_size` arguments on
